@@ -214,8 +214,6 @@ let agentToolCallNames: string[] = [];
 let agentToolCalls: ToolCallDetail[] = [];
 let agentPendingToolCallIds: Map<string, ToolCallDetail> = new Map(); // toolCallId → partial detail
 
-// Stash between session_before_compact and session_compact
-let pendingCompactionTurnFiles: string[] | null = null;
 
 // Turn timeline tracking — maps turnIndex → start timestamp (ms)
 // Populated in agent_start, filtered in context to show only completed turns
@@ -877,101 +875,14 @@ Current date/time: ${new Date().toISOString().replace(/[-:]/g, "").replace(/\.\d
     agentTurnIndex = null;
   });
 
-  // 4. Compaction integration — capture summary as a round
   // ────────────────────────────────────────────
-  // Instead of cancelling compaction (causes unbounded memory growth in pi's
-  // internal entry chain), we let it proceed. The compacted summary becomes a
-  // special round in our index with references to original round files.
-  // This turns compaction into index compression:
-  //   - pi frees memory internally
-  //   - the summary is retrievable by semantic similarity
-  //   - when retrieved, the LLM can drill down via search_interactions(rounds=[])
-  //
-  // In session_before_compact we identify which round files are being compacted
-  // by matching user message content via MD5 hash. This works regardless of
-  // whether the round was saved by our agent_end handler or by digest-all.ts.
-  pi.on("session_before_compact", async (event, _ctx) => {
-    const { preparation } = event;
-
-    // Build a lookup of user prompt MD5 hash → roundFileName from ALL round files
-    // Matches by message content, not by message ID — so it works for rounds
-    // created by digest-all.ts and by the agent_end handler alike.
-    const promptHashToFile = new Map<string, string>();
-    try {
-      const files = fs.readdirSync(ROUNDS_DIR).filter(f => f.endsWith(".json") && !f.startsWith("index"));
-      for (const file of files) {
-        const raw = fs.readFileSync(ROUNDS_DIR + "/" + file, "utf-8");
-        const data = JSON.parse(raw);
-        if (data.userPrompt && data.userPrompt !== "compaction-summary") {
-          const hash = crypto.createHash("md5").update(data.userPrompt).digest("hex");
-          promptHashToFile.set(hash, file);
-        }
-      }
-    } catch { /* ignore read errors */ }
-
-    // Extract user message content from messages being compacted,
-    // hash it, and look up the matching round file.
-    // IMPORTANT: use extractText() here (same as digest-all.ts) so the hash
-    // matches what was stored in the round file's userPrompt field.
-    const matched = new Set<string>();
-    for (const msg of preparation.messagesToSummarize) {
-      if (msg.role !== "user") continue;
-      let text = "";
-      const content = msg.content;
-      if (typeof content === "string") {
-        text = content;
-      } else if (Array.isArray(content)) {
-        text = extractText(content as Array<{ type: string; text?: string }>);
-      }
-      if (!text) continue;
-      const hash = crypto.createHash("md5").update(text).digest("hex");
-      const file = promptHashToFile.get(hash);
-      if (file) matched.add(file);
-    }
-
-    pendingCompactionTurnFiles = Array.from(matched);
-    // Don't cancel — let compaction proceed normally
-  });
-
-  pi.on("session_compact", async (event, ctx) => {
-    const { compactionEntry } = event;
-    if (!compactionEntry || !compactionEntry.summary) return;
-
-    const referencedTurns = pendingCompactionTurnFiles ?? [];
-    pendingCompactionTurnFiles = null;
-
-    // Build the summary round with references
-    const summaryText = `[COMPACTION SUMMARY]\nreferenced_rounds: ${referencedTurns.join(", ")}\nsummary: ${compactionEntry.summary}`;
-    const roundFileName = createRoundFilePath("compaction-summary", summaryText);
-    const roundPath = `${ROUNDS_DIR}/${roundFileName}`;
-
-    if (fs.existsSync(roundPath)) return; // dedup
-
-    const roundData = {
-      id: crypto.createHash("md5").update(summaryText).digest("hex"),
-      userPrompt: "compaction-summary",
-      responseSequence: summaryText,
-      turnIndex: -1,
-      userTimestamp: Date.now(),
-      type: "compaction_summary",
-      referencedTurns,
-      originalSummary: compactionEntry.summary,
-    };
-    fs.mkdirSync(ROUNDS_DIR, { recursive: true });
-    fs.writeFileSync(roundPath, JSON.stringify(roundData, null, 2));
-
-    // Embed the summary
-    try {
-      const apiKey = await getApiKey(ctx);
-      if (apiKey) {
-        const vec = await embedText(summaryText, apiKey);
-        appendToIndex(`${roundFileName}:prompt`, vec);
-        appendToIndex(`${roundFileName}:response`, vec);
-        ctx.ui.setStatus("semblr", `📚 compaction summary saved (${referencedTurns.length} rounds referenced)`);
-      }
-    } catch (err) {
-      ctx.ui.setStatus("semblr", `🧠 compaction embed error: ${(err as Error).message}`);
-    }
+  // 4. Cancel pi's internal compaction
+  // ────────────────────────────────────────────
+  // We save complete rounds via agent_end and retrieve them via semantic search.
+  // Letting pi compact would throw away message-level detail we need for
+  // accurate retrieval and tool call metadata. Cancelling keeps the full chain.
+  pi.on("session_before_compact", async (_event, _ctx) => {
+    return { cancel: true };
   });
 
   // ─────────────────────────────────────────────
@@ -994,15 +905,15 @@ Current date/time: ${new Date().toISOString().replace(/[-:]/g, "").replace(/\.\d
     pi.registerTool({
       name: "search_interactions",
       label: "Search Interactions",
-      description: "Search all past user interactions for topics, questions, or discussions. Unlike the built-in search_memory (which searches within the current session), this searches across ALL sessions the user has ever had — every conversation round ever indexed. Use this when you need to find something from a past session, recall prior discussions, or reconnect with knowledge that was established a long time ago.\n\nYou can optionally scope the search to specific round files by passing the `turns` parameter. This is useful when you find a compaction summary round (type: compaction_summary) — it will contain referenced_rounds (stored as the field referenced_turns for backward compatibility) that you can pass here to drill down into the original detail within that compacted section.",
+      description: "Search all past user interactions for topics, questions, or discussions. Unlike the built-in search_memory (which searches within the current session), this searches across ALL sessions the user has ever had — every conversation round ever indexed. Use this when you need to find something from a past session, recall prior discussions, or reconnect with knowledge that was established a long time ago.\n\nYou can optionally scope the search to specific round files by passing the `turns` parameter. This is useful when you want to drill down into a specific subset of rounds.",
       promptSnippet: "Search past interactions for relevant context",
       parameters: Type.Object({
         query: Type.String({ description: "The search query — what you want to find in past conversations" }),
         minSimilarity: Type.Optional(Type.Number({ description: "Minimum similarity threshold (0.0 to 1.0). Default 0.25. Lower to get broader matches." })),
-        turns: Type.Optional(Type.Array(Type.String(), { description: "Optional list of round filenames to scope the search to (e.g., ['abc.json', 'def.json']). When provided, only these round files are searched — useful for drilling into compaction summary references." })),
+        rounds: Type.Optional(Type.Array(Type.String(), { description: "Optional list of round filenames to scope the search to (e.g., ['abc.json', 'def.json']). When provided, only these round files are searched." })),
       }),
       async execute(toolCallId, params, signal, onUpdate, ctx2) {
-        const p = params as { query: string; minSimilarity?: number; turns?: string[] };
+        const p = params as { query: string; minSimilarity?: number; rounds?: string[] };
         const query = p.query;
         if (!query) {
           return {
@@ -1134,7 +1045,7 @@ Current date/time: ${new Date().toISOString().replace(/[-:]/g, "").replace(/\.\d
     pi.registerTool({
       name: "get_round_details",
       label: "Get Round Details",
-      description: "Retrieve the full content of a past conversation round by its filename hash. Unlike the truncated previews injected into context (which show only the first portion of the user prompt and assistant response), this returns the complete userPrompt and responseSequence for that round, plus all tool call metadata. Use this when you need to see the full conversation from a historical round — especially compacted/summarized rounds where the context injection only shows a summary line.\n\nParameters:\n- round: the round filename (e.g., 'abc123.json')",
+      description: "Retrieve the full content of a past conversation round by its filename hash. Unlike the truncated previews injected into context (which show only the first portion of the user prompt and assistant response), this returns the complete userPrompt and responseSequence for that round, plus all tool call metadata. Use this when you need to see the full conversation from a historical round.\n\nParameters:\n- round: the round filename (e.g., 'abc123.json')",
       promptSnippet: "Get full details of a past conversation round",
       parameters: Type.Object({
         round: Type.String({ description: "The round filename to look up (e.g., 'abc123def456.json')" }),
@@ -1161,7 +1072,6 @@ Current date/time: ${new Date().toISOString().replace(/[-:]/g, "").replace(/\.\d
         }
 
         // Build a readable summary of the full round
-        const typeLabel = roundData.type === "compaction_summary" ? " [COMPACTION SUMMARY]" : "";
         let toolMeta = "";
         if (roundData.toolCallCount != null && Number(roundData.toolCallCount) > 0) {
           const names = (roundData.toolCallNames as string[])?.join(", ") ?? "unknown";
@@ -1192,7 +1102,7 @@ Current date/time: ${new Date().toISOString().replace(/[-:]/g, "").replace(/\.\d
         return {
           content: [{
             type: "text",
-            text: `=== Round: ${p.round}${typeLabel} ===\n` +
+            text: `=== Round: ${p.round} ===\n` +
               `User: ${roundData.userPrompt ?? "(empty)"}\n` +
               `Assistant: ${roundData.responseSequence ?? "(empty)"}${toolMeta}`,
           }],
