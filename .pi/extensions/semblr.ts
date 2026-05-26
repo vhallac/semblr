@@ -227,12 +227,20 @@ let lastContextUserPrompt: string | null = null;
 let lastContextVec: number[] = [];
 let agentPromptVec: number[] | null = null; // cached from context hook, reused in agent_end to avoid redundant embed
 
-async function getApiKey(): Promise<string | null> {
+async function getApiKey(ctx?: { modelRegistry?: { getApiKeyForProvider(provider: string): Promise<string | undefined> } }): Promise<string | null> {
   // 1. Environment variable
   const envKey = process.env.OPENROUTER_API_KEY;
   if (envKey) return envKey;
 
-  // 2. Pass store
+  // 2. Pi's configured OpenRouter auth (e.g. /login, auth storage, models.json)
+  try {
+    const piKey = await ctx?.modelRegistry?.getApiKeyForProvider("openrouter");
+    if (piKey) return piKey;
+  } catch {
+    // Pi auth lookup failed, fall through
+  }
+
+  // 3. Pass store
   try {
     const result = spawnSync("pass", ["show", "ai/openrouter"], {
       timeout: 5000,
@@ -329,7 +337,7 @@ export default function (pi: ExtensionAPI) {
 
 
     try {
-      const apiKey = await getApiKey();
+      const apiKey = await getApiKey(ctx);
       if (!apiKey) return { messages };
 
       // Embed the user prompt — cached per agent cycle to avoid redundant API calls
@@ -836,7 +844,7 @@ Current date/time: ${new Date().toISOString().replace(/[-:]/g, "").replace(/\.\d
     }
 
     // Embed prompt and response separately
-    const apiKey = await getApiKey();
+    const apiKey = await getApiKey(ctx);
     if (!apiKey) {
       ctx.ui.setStatus("semblr", "\u{1f9e0} saved but not embedded (no API key)");
       lastRoundFileName = roundFileName;
@@ -954,7 +962,7 @@ Current date/time: ${new Date().toISOString().replace(/[-:]/g, "").replace(/\.\d
 
     // Embed the summary
     try {
-      const apiKey = await getApiKey();
+      const apiKey = await getApiKey(ctx);
       if (apiKey) {
         const vec = await embedText(summaryText, apiKey);
         appendToIndex(`${roundFileName}:prompt`, vec);
@@ -1005,7 +1013,7 @@ Current date/time: ${new Date().toISOString().replace(/[-:]/g, "").replace(/\.\d
         const threshold = p.minSimilarity ?? 0.25;
         const scopeRounds = p.rounds ?? null;
 
-        const apiKey = await getApiKey();
+        const apiKey = await getApiKey(ctx2);
         if (!apiKey) {
           return {
             content: [{ type: "text", text: "No API key available for embedding. Skipping search." }],

@@ -8,7 +8,7 @@ SEMBLR_ROUNDS_DIR := env_var_or_default("SEMBLR_ROUNDS_DIR", "")
 # Index all new turns from pi session files
 # Skips turns already indexed (by MD5 content hash)
 index:
-    OPENROUTER_API_KEY="$(pass show ai/openrouter)" \
+    OPENROUTER_API_KEY="${OPENROUTER_API_KEY:-$(pass show ai/openrouter 2>/dev/null || true)}" \
         SEMBLR_ROUNDS_DIR="{{SEMBLR_ROUNDS_DIR}}" \
         npx tsx scripts/digest-all.ts
 
