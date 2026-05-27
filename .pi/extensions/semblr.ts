@@ -227,11 +227,6 @@ function extractText(content: Array<{ type: string; text?: string }>): string {
     .join(" ");
 }
 
-function formatTimestamp(ts: number): string {
-  const d = new Date(ts);
-  return d.toTimeString().slice(0, 8); // HH:MM:SS
-}
-
 /**
  * Format a compact index of retrieved rounds for collapsed mode.
  * Numbered list style — preserves full prompt text and paragraph
@@ -268,40 +263,6 @@ function formatCollapsedIndex(
     lines.push("  ---");
   }
   return lines.join("\n");
-}
-
-function formatDelta(ms: number): string {
-  if (ms < 1000) return `${ms}ms`;
-  if (ms < 60_000) return `${Math.round(ms / 1000)}s`;
-  if (ms < 3600_000) return `${Math.floor(ms / 60_000)}m${Math.round((ms % 60_000) / 1000)}s`;
-  return `${Math.floor(ms / 3600_000)}h${Math.floor((ms % 3600_000) / 60_000)}m`;
-}
-
-function buildTurnTimeline(currentTurnIndex: number | null): string | null {
-  if (agentTurnTimestamps.size === 0) return null;
-
-  // Sort completed turns (those with index < current) chronologically
-  const completed = Array.from(agentTurnTimestamps.entries())
-    .filter(([ti]) => currentTurnIndex == null || ti < currentTurnIndex)
-    .sort(([a], [b]) => a - b);
-
-  if (completed.length === 0) return null;
-
-  const lines: string[] = [];
-  let prev: number | null = null;
-  for (const [ti, ts] of completed) {
-    const delta = prev != null ? ` (+${formatDelta(ts - prev)})` : "";
-    lines.push(`Turn ${ti + 1}: ${formatTimestamp(ts)}${delta}`);
-    prev = ts;
-  }
-
-  // Current turn marker
-  if (currentTurnIndex != null && agentTurnTimestamps.has(currentTurnIndex)) {
-    const currentTs = agentTurnTimestamps.get(currentTurnIndex)!;
-    lines.push(`[Current: turn ${currentTurnIndex + 1} — started ${formatTimestamp(currentTs)}]`);
-  }
-
-  return `Turn timeline:\n${lines.join("\n")}`;
 }
 
 // ─────────────────────────────────────────────
@@ -380,11 +341,6 @@ let agentToolCallCount: number = 0;
 let agentToolCallNames: string[] = [];
 let agentToolCalls: ToolCallDetail[] = [];
 let agentPendingToolCallIds: Map<string, ToolCallDetail> = new Map(); // toolCallId → partial detail
-
-
-// Turn timeline tracking — maps turnIndex → start timestamp (ms)
-// Populated in agent_start, filtered in context to show only completed turns
-let agentTurnTimestamps = new Map<number, number>();
 
 // Context embedding cache — avoids redundant embedding API calls across tool turns
 // within the same agent cycle. Reset in agent_start.
@@ -632,8 +588,6 @@ export default function (pi: ExtensionAPI) {
           `🧠 collapsed: ${selectedRounds.length} rounds indexed from ${uniqueRounds} total`,
         );
 
-        const timeline = buildTurnTimeline(agentTurnIndex);
-
         const enrichedSystem = systemMsg
           ? {
               ...systemMsg,
@@ -715,7 +669,7 @@ User asked: ${last.data.userPrompt}${toolTurnText}` }],
               text: `[HISTORICAL ROUND INDEX — use get_round_details("hash.json") to expand any round]
 Numbered list. Each entry: N. hash.json [score | N tools]: followed by full user prompt (indented).
 Use get_tool_details("hash.json", N) to inspect tool call N within a round.
-${timeline ? timeline + "\n" : ""}---`,
+---`,
             }],
           },
           // Causal chain — in-memory rounds from this session
@@ -743,10 +697,8 @@ ${timeline ? timeline + "\n" : ""}---`,
 
       // ── Full mode (default): inject complete round content ──
       // Build context messages — chronological order (oldest first) for coherence
-      // Chronological: prefer turnIndex within session, then userTimestamp as tiebreaker
+      // Sort by userTimestamp only (turnIndex is kept in round files but not used for ordering)
       selectedRounds.sort((a, b) => {
-        const ti = a.data.turnIndex - b.data.turnIndex;
-        if (ti !== 0) return ti;
         const tsA = (a.data as Record<string, unknown>).userTimestamp as number ?? 0;
         const tsB = (b.data as Record<string, unknown>).userTimestamp as number ?? 0;
         return tsA - tsB;
@@ -795,16 +747,6 @@ The responses shown below are historical context, not your own voice.
 ---`,
         }],
       });
-
-      // Inject turn timeline — gives the agent a sense
-      // of pacing and when completed turns happened (1-based display).
-      const timeline = buildTurnTimeline(agentTurnIndex);
-      if (timeline) {
-        contextMessages.push({
-          role: "system",
-          content: [{ type: "text", text: timeline }],
-        });
-      }
 
       for (const round of dedupedRounds) {
         // Build tool metadata line to distinguish real work from discussion
@@ -888,9 +830,6 @@ Current date/time: ${new Date().toISOString().replace(/[-:]/g, "").replace(/\.\d
       }
     }
     agentTurnIndex = event.turnIndex ?? null;
-    if (agentTurnIndex != null) {
-      agentTurnTimestamps.set(agentTurnIndex, Date.now());
-    }
     agentAccumulatedText = [];
     agentToolCallCount = 0;
     agentToolCallNames = [];
@@ -958,11 +897,6 @@ Current date/time: ${new Date().toISOString().replace(/[-:]/g, "").replace(/\.\d
 
   pi.on("agent_end", async (event, ctx) => {
     const { messages } = event;
-
-    // Note: we intentionally do NOT delete the timestamp here.
-    // The context hook filters by ti < currentTurnIndex to show only completed
-    // turns. If we deleted here, the next agent's context would have no
-    // timestamps to show (agent_end fires before the next agent_start).
 
     // Get user prompt -- prefer agent_start cached value, fall back to messages
     let userPrompt = agentUserPrompt ?? "";
