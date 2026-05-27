@@ -6,3 +6,8 @@
 
 # Dependencies
 node_modules/
+
+# Per-project direnv / Nix dev shell files
+.envrc
+shell.nix
+

@@ -64,10 +64,20 @@ function formatCausalChainBlock(chain: ChainEntry[]): string | null {
   if (chain.length === 0) return null;
   const lines: string[] = [];
   lines.push(`[CAUSAL CHAIN — recent rounds in this session, newest first]
-The following list shows the most recent rounds in this session. When the current
-prompt contains references to recent events ("it", "those changes", "the fix", etc.),
-review this chain to discover the referent. Entries with n/a score are in-memory
-only — not yet embedded in the vector index.`);
+Entries are numbered 1 (most recent completed round) to N (oldest in the chain).
+The current turn is NOT in this list — it is the prompt you are processing right now.
+
+Use this chain when the current prompt:
+- contains vague references to recent events ("it", "those changes", "the fix", etc.)
+- is unusually short or lacks clear context/goals/outputs
+- assumes knowledge established in the immediately preceding turns
+
+When this happens:
+1. Start by expanding the most recent 1-2 entries (indices 1, 2) via get_round_details
+2. Stop as soon as you have enough context to understand the current prompt
+3. If these don't clarify, continue further back in the chain before falling back to the scored historical index or search_interactions
+
+These rounds have n/a score because they are presented by recency (not semantic similarity) — they form the immediate conversational context.`);
   lines.push("---");
   // Show newest first (reverse chronological)
   const reversed = [...chain].reverse();
