@@ -35,6 +35,50 @@ const CONTEXT_BUDGET_RATIO = 0.5; // 50% of model context window for historical 
 const ROUND_COLLAPSE_MODE: "full" | "collapsed" = "collapsed";
 
 // ─────────────────────────────────────────────
+// Causal Chain — in-memory buffer of session rounds
+// ─────────────────────────────────────────────
+
+interface ChainEntry {
+  fileName: string;
+  userPrompt: string;
+  responseSequence: string;
+  toolSummary: string;
+}
+
+/** In-memory buffer of rounds from the current session, in chronological order.
+ *  Survives between agent cycles within the same session. Cleared on session_start.
+ *  Injected into context so the model can resolve "it", "those changes", "the fix", etc.
+ *  without needing to search the vector index. */
+let causalChain: ChainEntry[] = [];
+
+/** Format the causal chain buffer as a collapsed-style index block with n/a scores. */
+function formatCausalChainBlock(chain: ChainEntry[]): string | null {
+  if (chain.length === 0) return null;
+  const lines: string[] = [];
+  lines.push(`[CAUSAL CHAIN — recent rounds in this session, newest first]
+The following list shows the most recent rounds in this session. When the current
+prompt contains references to recent events ("it", "those changes", "the fix", etc.),
+review this chain to discover the referent. Entries with n/a score are in-memory
+only — not yet embedded in the vector index.`);
+  lines.push("---");
+  // Show newest first (reverse chronological)
+  const reversed = [...chain].reverse();
+  let idx = 0;
+  for (const entry of reversed) {
+    idx++;
+    const promptLines = entry.userPrompt
+      .split("\n")
+      .map((line, i) => i === 0 ? `  user: ${line}` : `  ${line}`);
+    lines.push(
+      `${idx}. ${entry.fileName} [n/a | ${entry.toolSummary}]:`
+    );
+    lines.push(...promptLines);
+    lines.push("  ---");
+  }
+  return lines.join("\n");
+}
+
+// ─────────────────────────────────────────────
 // Helpers
 // ─────────────────────────────────────────────
 
@@ -514,33 +558,46 @@ User asked: ${last.data.userPrompt}${toolTurnText}` }],
           }
         }
 
-        return {
-          messages: [
-            ...(enrichedSystem ? [enrichedSystem] : []),
-            // Preamble for collapsed mode
-            {
-              role: "system",
-              content: [{
-                type: "text",
-                text: `[HISTORICAL ROUND INDEX — use get_round_details("hash.json") to expand any round]
+        // Build causal chain system message from in-memory buffer
+        const chainBlock = formatCausalChainBlock(causalChain);
+
+        const finalMessages = [
+          ...(enrichedSystem ? [enrichedSystem] : []),
+          // Preamble for collapsed mode — use "user" role because pi's convertToLlm
+          // strips messages with role "system". The system prompt is handled entirely
+          // via the separate systemPrompt field. Using "user" ensures the model sees
+          // this historical context.
+          {
+            role: "user",
+            content: [{
+              type: "text",
+              text: `[HISTORICAL ROUND INDEX — use get_round_details("hash.json") to expand any round]
 Numbered list. Each entry: N. hash.json [score | N tools]: followed by full user prompt (indented).
 Use get_tool_details("hash.json", N) to inspect tool call N within a round.
 ${timeline ? timeline + "\n" : ""}---`,
-              }],
-            },
-            // Compact index
-            {
-              role: "system",
-              content: [{
-                type: "text",
-                text: collapsedIndex,
-              }],
-            },
-            // Last round in full (sans tool calls) — for prompt parsing
-            ...lastRoundFull,
-            ...currentMessages,
-          ],
-        };
+            }],
+          },
+          // Causal chain — in-memory rounds from this session
+          ...(chainBlock
+            ? [{
+                role: "user" as const,
+                content: [{ type: "text" as const, text: chainBlock }],
+              }]
+            : []),
+          // Compact index (also as "user" role)
+          {
+            role: "user",
+            content: [{
+              type: "text",
+              text: collapsedIndex,
+            }],
+          },
+          // Last round in full (sans tool calls) — for prompt parsing
+          ...lastRoundFull,
+          ...currentMessages,
+        ];
+
+        return { messages: finalMessages };
       }
 
       // ── Full mode (default): inject complete round content ──
@@ -809,6 +866,22 @@ Current date/time: ${new Date().toISOString().replace(/[-:]/g, "").replace(/\.\d
     const roundFileName = createRoundFilePath(userPrompt, responseText);
     const roundPath = `${ROUNDS_DIR}/${roundFileName}`;
 
+    // Push to causal chain — even on dedup, this ensures the in-memory buffer
+    // tracks every round seen in this session.
+    {
+      const toolCalls = agentToolCalls.length;
+      const names = agentToolCallNames;
+      const toolSummary = toolCalls > 0
+        ? `${toolCalls} tools (${names.join(", ")})`
+        : "0 tools (discussion)";
+      causalChain.push({
+        fileName: roundFileName,
+        userPrompt,
+        responseSequence: responseText,
+        toolSummary,
+      });
+    }
+
     // Skip if already saved (deduplication by content hash)
     if (fs.existsSync(roundPath)) {
       ctx.ui.setStatus("semblr", `\u{1f9e0} round already saved (${roundFileName})`);
@@ -891,6 +964,9 @@ Current date/time: ${new Date().toISOString().replace(/[-:]/g, "").replace(/\.\d
   // registerTool is called inside session_start because factory-level
   // registration doesn't reliably make tools visible to the LLM.
   pi.on("session_start", async (_event, ctx) => {
+    // Clear causal chain — new session starts fresh
+    causalChain = [];
+
     const indexExists = fs.existsSync(INDEX_PATH);
     const index = indexExists ? loadIndex() : [];
     const uniqueRounds = new Set(
@@ -1177,4 +1253,6 @@ Current date/time: ${new Date().toISOString().replace(/[-:]/g, "").replace(/\.\d
       },
     });
   });
+
+
 }
