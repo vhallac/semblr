@@ -24,6 +24,111 @@ import { spawnSync } from "node:child_process";
 const PI_CONFIG_DIR = process.env.PI_CODING_AGENT_DIR || `${os.homedir()}/.pi/agent`;
 const ROUNDS_DIR = `${PI_CONFIG_DIR}/semblr/rounds`;
 const INDEX_PATH = `${ROUNDS_DIR}/index.csv`;
+const SEMBLR_DIR = `${PI_CONFIG_DIR}/semblr`;
+const STATS_PATH = `${SEMBLR_DIR}/chain-read-stats.json`
+
+// ◈ Causal-chain read statistics — global, never injected into context
+//   Tracks all 5 causal-chain display positions (1-5, where 1 = most recent round).
+//   positionScores[i]: presentedCount vs readCount for display position i+1
+//   (i=0 = most recent round, i=4 = oldest in the 5-entry window)
+//   Flushed atomically at agent_end. NOT reset on /new.
+const TRACK_POSITIONS = 5; // hard-coded per user request — re-evaluate if readRate on any position > 50%
+let statsState = loadStats();
+// Hashes presented at each display position (1-5) in the current context.
+// Set in context hook, consumed by recordRead / recordPresented.
+// Index 0 = display position 1 (most recent), index 4 = display position 5 (oldest).
+let statsPresentedHashes: (string | null)[] = [null, null, null, null, null];
+
+function loadStats() {
+  try {
+    if (fs.existsSync(STATS_PATH)) {
+      const loadedStats = JSON.parse(fs.readFileSync(STATS_PATH, "utf-8"));
+      // Migrate from v1 (position5 scalar) to v2 (positionScores array)
+      if (loadedStats.version === 1 && loadedStats.position5) {
+        const old = loadedStats.position5;
+        loadedStats.version = 2;
+        loadedStats.positionScores = [
+          { presentedCount: 0, readCount: 0, presentedHash: null },
+          { presentedCount: 0, readCount: 0, presentedHash: null },
+          { presentedCount: 0, readCount: 0, presentedHash: null },
+          { presentedCount: 0, readCount: 0, presentedHash: null },
+          { presentedCount: old.presentedCount, readCount: old.readCount, presentedHash: null },
+        ];
+        delete loadedStats.position5;
+        return loadedStats;
+      }
+      return loadedStats;
+    }
+  } catch { /* corrupt file, reset */ }
+  return {
+    version: 2,
+    positionScores: [
+      { presentedCount: 0, readCount: 0, presentedHash: null },
+      { presentedCount: 0, readCount: 0, presentedHash: null },
+      { presentedCount: 0, readCount: 0, presentedHash: null },
+      { presentedCount: 0, readCount: 0, presentedHash: null },
+      { presentedCount: 0, readCount: 0, presentedHash: null },
+    ],
+    lastUpdated: new Date().toISOString(),
+  };
+}
+
+function flushStats() {
+  statsState.lastUpdated = new Date().toISOString();
+  const tmp = `${STATS_PATH}.tmp.${process.pid}`;
+  try {
+    fs.mkdirSync(SEMBLR_DIR, { recursive: true });
+    fs.writeFileSync(tmp, JSON.stringify(statsState, null, 2));
+    fs.renameSync(tmp, STATS_PATH); // atomic on POSIX
+  } catch (e) {
+    // Best-effort; stats collection must never break the extension
+    try { if (fs.existsSync(tmp)) fs.unlinkSync(tmp); } catch {}
+  }
+}
+
+/** Record a read — increment readCount for any position whose hash matches. */
+function recordRead(hash: string) {
+  for (let i = 0; i < TRACK_POSITIONS; i++) {
+    if (statsPresentedHashes[i] && statsPresentedHashes[i] === hash) {
+      statsState.positionScores[i].readCount++;
+    }
+  }
+}
+
+/**
+ * Record presentation for all 5 causal-chain positions; also bin the best score.
+ * `chainEntries` is the chronological causal chain (oldest first, newest last).
+ * Display positions (1-5 = index 0 to 4) map to reversed entries:
+ *   index 0 = newest (last element of chain)
+ *   index 4 = oldest in the 5-entry window (element at chain.length - 5, if available)
+ */
+function recordPresented(chainEntries: { fileName: string }[]) {
+  // Build the reversed (newest-first) view
+  const reversed = [...chainEntries].reverse();
+  for (let i = 0; i < TRACK_POSITIONS; i++) {
+    const entry = i < reversed.length ? reversed[i] : null;
+    const hash = entry ? entry.fileName : null;
+    statsPresentedHashes[i] = hash;
+    if (hash) {
+      statsState.positionScores[i].presentedCount++;
+    }
+  }
+}
+
+/**
+ * Format the chain-read statistics for TUI display as percentages.
+ * Example: "🧠 chain-read: p1→2/16(13%) p2→0/0 p3→0/0 p4→0/0 p5→0/0"
+ */
+function formatChainStats(): string {
+  const parts = statsState.positionScores.map((ps, i) => {
+    const pct = ps.presentedCount > 0
+      ? `(${Math.round((ps.readCount / ps.presentedCount) * 100)}%)`
+      : "(—%)";
+    return `p${i + 1}→${ps.readCount}/${ps.presentedCount}${pct}`;
+  });
+  return `chain-read: ${parts.join(" ")}`;
+}
+
 const EMBEDDING_MODEL = "openai/text-embedding-3-small";
 const OPENROUTER_URL = "https://openrouter.ai/api/v1/embeddings";
 
@@ -286,6 +391,7 @@ let agentTurnTimestamps = new Map<number, number>();
 let lastContextUserPrompt: string | null = null;
 let lastContextVec: number[] = [];
 let agentPromptVec: number[] | null = null; // cached from context hook, reused in agent_end to avoid redundant embed
+let roundPresentedRecorded = false; // dedup: recordPresented only once per agent cycle
 
 async function getApiKey(ctx?: { modelRegistry?: { getApiKeyForProvider(provider: string): Promise<string | undefined> } }): Promise<string | null> {
   // 1. Environment variable
@@ -579,6 +685,23 @@ User asked: ${last.data.userPrompt}${toolTurnText}` }],
         // Build causal chain system message from in-memory buffer
         const chainBlock = formatCausalChainBlock(causalChain);
 
+        // ══ Stats: record all 5 positions presented ══
+        // Combine total-indexed count with chain-read stats (one status line)
+        {
+          // causalChain is chronological (oldest first, newest last).
+          // recordPresented will reverse internally and map each display position.
+          // Dedup: increment once per agent cycle, not at every context hook fire (per turn).
+          if (!roundPresentedRecorded) {
+            recordPresented(causalChain);
+            roundPresentedRecorded = true;
+          }
+          ctx.ui.setStatus(
+            "semblr",
+            `🧠 collapsed: ${selectedRounds.length} matched / ${uniqueRounds} total | ${formatChainStats()}`,
+          );
+        }
+        // ════════════════════════════════════════════════════════════
+
         const finalMessages = [
           ...(enrichedSystem ? [enrichedSystem] : []),
           // Preamble for collapsed mode — use "user" role because pi's convertToLlm
@@ -777,6 +900,7 @@ Current date/time: ${new Date().toISOString().replace(/[-:]/g, "").replace(/\.\d
     lastContextUserPrompt = null;
     lastContextVec = [];
     agentPromptVec = null;
+    roundPresentedRecorded = false;
   });
 
   pi.on("message_end", async (event, _ctx) => {
@@ -907,6 +1031,7 @@ Current date/time: ${new Date().toISOString().replace(/[-:]/g, "").replace(/\.\d
       agentAccumulatedText = [];
       agentUserPrompt = null;
       agentTurnIndex = null;
+      flushStats(); // causal chain was pushed, so position scores may have changed
       return;
     }
 
@@ -964,6 +1089,17 @@ Current date/time: ${new Date().toISOString().replace(/[-:]/g, "").replace(/\.\d
     agentAccumulatedText = [];
     agentUserPrompt = null;
     agentTurnIndex = null;
+
+    // ◈ Flush stats to disk (atomically) and show in TUI
+    flushStats();
+
+    // Combine chain-read stats with total indexed rounds count
+    const indexExists = fs.existsSync(INDEX_PATH);
+    const idx = indexExists ? loadIndex() : [];
+    const totalRounds = new Set(
+      idx.map((e: { filePath: string }) => e.filePath.replace(/:prompt$|:response$/, ""))
+    ).size;
+    ctx.ui.setStatus("semblr", `🧠 ${totalRounds} total indexed | ${formatChainStats()}`);
   });
 
   // ────────────────────────────────────────────
@@ -990,9 +1126,9 @@ Current date/time: ${new Date().toISOString().replace(/[-:]/g, "").replace(/\.\d
     const uniqueRounds = new Set(
       index.map((e: { filePath: string }) => e.filePath.replace(/:prompt$|:response$/, ""))
     ).size;
-    ctx.ui.notify(
+    ctx.ui.setStatus(
+      "semblr",
       `🧠 semblr loaded — ${uniqueRounds} rounds indexed`,
-      "info",
     );
 
     // Register the search_interactions tool here, not at factory level
@@ -1146,6 +1282,9 @@ Current date/time: ${new Date().toISOString().replace(/[-:]/g, "").replace(/\.\d
       }),
       async execute(toolCallId, params, signal, onUpdate, ctx2) {
         const p = params as { round: string };
+
+        // ◈ Stats: check if this hash matches any presented position
+        recordRead(p.round);
 
         const fullPath = `${ROUNDS_DIR}/${p.round}`;
         if (!fs.existsSync(fullPath)) {
