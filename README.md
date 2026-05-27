@@ -1,8 +1,14 @@
 # Semblr
 
-**Semantic context assembly for AI agents.** Instead of lossy summarization, Semblr stores every conversation round permanently, embeds it, and retrieves the most relevant rounds on each user prompt — by meaning, not by recency.
+**Semantic context assembly for AI agents — experimental.**
+
+> **⚠️  Experimental.** We are actively testing the core claims below. They are hypotheses, not settled facts. Everything here is subject to change as we gather data.
+
+Semblr stores every conversation round permanently, embeds it, and retrieves the most relevant rounds on each user prompt — by meaning, not by recency. We want to find out whether semantic retrieval beats lossy summarization in practice.
 
 Runs as a [pi coding agent](https://pi.dev) extension at `.pi/extensions/semblr.ts`.
+
+Version-controlled with [Jujutsu (jj)](https://martinvonz.github.io/jj/latest/), not git.
 
 ## Premise
 
@@ -44,9 +50,11 @@ To see what actually happened, the model calls `get_round_details()` or `get_too
 
 Pass `semblr_mode: full` in your prompt. Retrieved rounds are injected as complete conversation text — user prompt, full response, everything. More tokens, zero tool calls needed. Useful when you're digging into a specific past thread and want the whole picture at once.
 
-### Last round always included
+### Recency buffer (experimental)
 
-There's one special case: the **most recent round** (the one immediately before the current prompt) is always injected at the end of context as a `[LAST ROUND — hash.json (collapsed)]` block. This gives the LLM a way to resolve "those changes" or "as I said" without searching. The last round shows the full prompt + response with tool calls collapsed, bridging the referential gap that a numbered index entry alone couldn't close.
+We hypothesise that a **recency buffer** — keeping the last N rounds in full, outside the indexed retrieval logic — is the right solution for bridging the referential gap (resolving backreferences like "those changes" or "as I said"). To test this cleanly, we currently set `DROP_LAST_ROUND = true`, which suppresses the special-case last-round injection entirely. This isolates the recency buffer effect so we can measure its impact without confounding variables.
+
+Future work: determine the optimal buffer size (N). Current hypothesis is 3–5 rounds.
 
 ## Cost
 
@@ -139,10 +147,10 @@ Each round produces two rows: one for the user prompt embedding, one for the ass
 
 ## Known Problems
 
-### Most-recent-round context loss (collapsed mode)
-In collapsed mode (the default), every retrieved round — including the immediately preceding conversation turn — appears as a compact numbered entry. The LLM cannot directly resolve "those changes" or "it" from the previous round without calling `get_round_details()`. A mitigation injects the last round's full prompt + response (minus tool calls) as plain text, but this doesn't extend to multi-turn chains.
+### Most-recent-round context loss (collapsed mode, being tested)
+In collapsed mode (the default), every retrieved round — including the immediately preceding conversation turn — appears as a compact numbered entry. The LLM cannot directly resolve "those changes" or "it" from the previous round without calling `get_round_details()`. We are experimenting with a **recency buffer** (keeping the last 3–5 rounds in full) as the solution. To isolate its effect, we currently set `DROP_LAST_ROUND = true`, which removes the special-case last-round injection.
 
-**Future fix:** A recency buffer that keeps the last 3–5 rounds in full, outside the indexed retrieval logic.
+**Ongoing experiment:** Does a recency buffer completely eliminate referential ambiguity? Or do we still need the special-case last-round injection? We'll gather data and decide.
 
 ### Embedding API dependency
 Semblr requires a working OpenRouter API key (or an alternative embedding endpoint) to function. If the API is unreachable, context assembly falls back to a no-op (no historical context injected). The extension degrades gracefully but silently.

@@ -34,6 +34,14 @@ const CONTEXT_BUDGET_RATIO = 0.5; // 50% of model context window for historical 
 // get_round_details() / get_tool_details() to expand rounds it needs.
 const ROUND_COLLAPSE_MODE: "full" | "collapsed" = "collapsed";
 
+// When true (experimental), skip the last-round-in-full injection.
+// We set this to isolate the effect of the recency buffer in its entirety.
+// The recency buffer (keeping the last N rounds in full, outside indexed
+// retrieval) is the hypothesised solution for bridging the referential gap.
+// Turning off the special-case last-round injection lets us measure the
+// recency buffer's impact cleanly, without confounding variables.
+const DROP_LAST_ROUND = true;
+
 // ─────────────────────────────────────────────
 // Causal Chain — in-memory buffer of session rounds
 // ─────────────────────────────────────────────
@@ -593,7 +601,7 @@ ${timeline ? timeline + "\n" : ""}---`,
             }],
           },
           // Last round in full (sans tool calls) — for prompt parsing
-          ...lastRoundFull,
+          ...(DROP_LAST_ROUND ? [] : lastRoundFull),
           ...currentMessages,
         ];
 
