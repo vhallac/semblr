@@ -436,9 +436,27 @@ export default function (pi: ExtensionAPI) {
     ) ?? null;
     const lastUserIdx = messages.reduce((last, m, i) =>
       m.role === "user" ? i : last, -1);
+
+    // --- Prepend environment info to the current user prompt ---
+    const envPreamble = `[ENVIRONMENT]\nHost: ${os.hostname()}\nCWD: ${process.cwd()}\nCurrent date/time: ${new Date().toISOString().replace(/[-:]/g, "").replace(/\.\d+/, "")}`;
+
+    const augmentedMessages = [...messages];
+    if (lastUserIdx >= 0) {
+      const userMsg = augmentedMessages[lastUserIdx];
+      if (typeof userMsg.content === "string") {
+        augmentedMessages[lastUserIdx] = { ...userMsg, content: `${envPreamble}\n\n${userMsg.content}` };
+      } else if (Array.isArray(userMsg.content) && userMsg.content.length > 0 && userMsg.content[0].type === "text") {
+        const newContent = [...userMsg.content];
+        newContent[0] = { ...newContent[0], text: `${envPreamble}\n\n${newContent[0].text}` };
+        augmentedMessages[lastUserIdx] = { ...userMsg, content: newContent };
+      } else if (Array.isArray(userMsg.content)) {
+        augmentedMessages[lastUserIdx] = { ...userMsg, content: [{ type: "text", text: `${envPreamble}\n\n` }, ...userMsg.content] };
+      }
+    }
+
     const currentMessages = lastUserIdx >= 0
-      ? [...messages].slice(lastUserIdx)
-      : [...messages];
+      ? augmentedMessages.slice(lastUserIdx)
+      : [...augmentedMessages];
 
     // --- Get the current user prompt (last user message) ---
     const userMessages = currentMessages.filter((m) => m.role === "user");
@@ -452,7 +470,7 @@ export default function (pi: ExtensionAPI) {
     } else if (Array.isArray(lastUserContent)) {
       userPrompt = extractText(lastUserContent);
     } else {
-      return { messages };
+      return { messages: augmentedMessages };
     }
 
     // agentPromptVec is stashed after embedding below for agent_end to reuse
@@ -460,7 +478,7 @@ export default function (pi: ExtensionAPI) {
 
     try {
       const apiKey = await getApiKey(ctx);
-      if (!apiKey) return { messages };
+      if (!apiKey) return { messages: augmentedMessages };
 
       // Embed the user prompt — cached per agent cycle to avoid redundant API calls
       // across multiple tool turns within the same user prompt.
@@ -478,7 +496,7 @@ export default function (pi: ExtensionAPI) {
 
       // Load and score the index
       const index = loadIndex();
-      if (index.length === 0) return { messages };
+      if (index.length === 0) return { messages: augmentedMessages };
 
       const scored = index
         .map((entry) => ({
@@ -568,7 +586,7 @@ export default function (pi: ExtensionAPI) {
           "semblr",
           `🧠 no relevant context (best: ${bestScore.toFixed(3)})`,
         );
-        return { messages };
+        return { messages: augmentedMessages };
       }
 
       // ── Branched context injection: full vs collapsed ──
@@ -587,20 +605,6 @@ export default function (pi: ExtensionAPI) {
           "semblr",
           `🧠 collapsed: ${selectedRounds.length} rounds indexed from ${uniqueRounds} total`,
         );
-
-        const enrichedSystem = systemMsg
-          ? {
-              ...systemMsg,
-              content: typeof systemMsg.content === "string"
-                ? systemMsg.content + `
-
-[ENVIRONMENT]
-Host: ${os.hostname()}
-CWD: ${process.cwd()}
-Current date/time: ${new Date().toISOString().replace(/[-:]/g, "").replace(/\.\d+/, "")}`
-                : systemMsg.content,
-            }
-          : null;
 
         // Find the last round (by fileName) — always added earlier.
         // Inject the user prompt + collapsed agent turns (tool calls redacted,
@@ -657,7 +661,7 @@ User asked: ${last.data.userPrompt}${toolTurnText}` }],
         // ════════════════════════════════════════════════════════════
 
         const finalMessages = [
-          ...(enrichedSystem ? [enrichedSystem] : []),
+          ...(systemMsg ? [systemMsg] : []),
           // Preamble for collapsed mode — use "user" role because pi's convertToLlm
           // strips messages with role "system". The system prompt is handled entirely
           // via the separate systemPrompt field. Using "user" ensures the model sees
@@ -785,23 +789,9 @@ ${round.data.responseSequence}` }],
         `🧠 retrieved ${dedupedRounds.length} rounds (${usedTokens} tok) from ${uniqueRounds} indexed`,
       );
 
-      const enrichedSystem = systemMsg
-        ? {
-            ...systemMsg,
-            content: typeof systemMsg.content === "string"
-              ? systemMsg.content + `
-
-[ENVIRONMENT]
-Host: ${os.hostname()}
-CWD: ${process.cwd()}
-Current date/time: ${new Date().toISOString().replace(/[-:]/g, "").replace(/\.\d+/, "")}`
-              : systemMsg.content,
-          }
-        : null;
-
       return {
         messages: [
-          ...(enrichedSystem ? [enrichedSystem] : []),
+          ...(systemMsg ? [systemMsg] : []),
           ...contextMessages,
           ...currentMessages,
         ],
