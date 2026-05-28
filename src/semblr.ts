@@ -387,6 +387,9 @@ let agentToolCallNames: string[] = [];
 let agentToolCalls: ToolCallDetail[] = [];
 let agentPendingToolCallIds: Map<string, ToolCallDetail> = new Map(); // toolCallId → partial detail
 
+// Interleaved response segments — preserves tool call positions within assistant text
+let agentResponseSegments: Array<{ type: "text" | "toolCall"; text?: string; toolCallIndex?: number }> = [];
+
 // Context embedding cache — avoids redundant embedding API calls across tool turns
 // within the same agent cycle. Reset in agent_start.
 let lastContextUserPrompt: string | null = null;
@@ -709,6 +712,7 @@ export default function (pi: ExtensionAPI) {
     agentToolCallCount = 0;
     agentToolCallNames = [];
     agentToolCalls = [];
+    agentResponseSegments = [];
 
     // Reset context embedding cache — new agent cycle = new user prompt
     lastContextUserPrompt = null;
@@ -731,6 +735,7 @@ export default function (pi: ExtensionAPI) {
         for (const block of content) {
           if (block.type === "text" && block.text) {
             agentAccumulatedText.push(block.text);
+            agentResponseSegments.push({ type: "text", text: block.text });
           } else if (block.type === "toolCall") {
             agentToolCallCount++;
             const blockRec = block as Record<string, unknown>;
@@ -748,6 +753,8 @@ export default function (pi: ExtensionAPI) {
               };
               agentToolCalls.push(detail);
             }
+            // Record this tool call's position in the response stream
+            agentResponseSegments.push({ type: "toolCall", toolCallIndex: agentToolCalls.length - 1 });
           }
         }
       }
@@ -854,6 +861,7 @@ export default function (pi: ExtensionAPI) {
       toolCallCount: agentToolCallCount,
       toolCallNames: agentToolCallNames,
       toolCalls: agentToolCalls,
+      responseSegments: agentResponseSegments,
     };
 
     try {
@@ -1103,20 +1111,32 @@ export default function (pi: ExtensionAPI) {
           };
         }
 
-        // Build a readable summary of the full round
+        // Build a readable summary of the full round.
+        // If responseSegments exists (interleaved format), use it to produce
+        // tool-call-at-position output. Otherwise fall back to flat format.
         let toolMeta = "";
         if (roundData.toolCallCount != null && Number(roundData.toolCallCount) > 0) {
           const names = (roundData.toolCallNames as string[])?.join(", ") ?? "unknown";
           toolMeta = `\n  Tools used: ${roundData.toolCallCount} (${names})`;
-          if (roundData.toolCalls && Array.isArray(roundData.toolCalls) && (roundData.toolCalls as any[]).length > 0) {
-            const hints = (roundData.toolCalls as any[]).slice(0, 10).map((tc: any) =>
-              `${tc.index}:${tc.name}`
-            ).join(" ");
-            const more = (roundData.toolCalls as any[]).length > 10 ? ` ...+${(roundData.toolCalls as any[]).length - 10} more` : "";
-            toolMeta += `\n  Indexes: ${hints}${more}\n  ALL tool call arguments and results are REDACTED — use get_tool_details("${p.round}", N) to expand individual calls.`;
-          }
         } else if (roundData.toolCallCount === 0) {
           toolMeta = "\n  Tools used: 0 (discussion only)";
+        }
+
+        // Build interleaved assistant output using responseSegments when available
+        let assistantOutput: string;
+        if (roundData.responseSegments && Array.isArray(roundData.responseSegments) && (roundData.responseSegments as any[]).length > 0) {
+          const parts: string[] = [];
+          for (const seg of roundData.responseSegments as Array<{ type: string; text?: string; toolCallIndex?: number }>) {
+            if (seg.type === "text" && seg.text) {
+              parts.push(seg.text);
+            } else if (seg.type === "toolCall" && seg.toolCallIndex != null) {
+              parts.push(`[Tool call REDACTED: use get_tool_details("${p.round}", ${seg.toolCallIndex}) to expand]`);
+            }
+          }
+          assistantOutput = parts.join("\n");
+        } else {
+          // Fall back to flat responseSequence for old round files
+          assistantOutput = (roundData.responseSequence as string) ?? "(empty)";
         }
 
         // Collapse tool call arguments and results in the details object.
@@ -1136,7 +1156,7 @@ export default function (pi: ExtensionAPI) {
             type: "text",
             text: `=== Round: ${p.round} ===\n` +
               `User: ${roundData.userPrompt ?? "(empty)"}\n` +
-              `Assistant: ${roundData.responseSequence ?? "(empty)"}${toolMeta}`,
+              `Assistant: ${assistantOutput}${toolMeta}`,
           }],
           details: collapsedDetails,
         };
