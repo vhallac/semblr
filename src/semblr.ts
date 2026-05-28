@@ -273,26 +273,13 @@ function buildContextPreamble(
   hasRelevance: boolean,
 ): string | null {
   if (!hasRecency && !hasRelevance) return null;
-  const parts: string[] = [];
-  parts.push(`[CONTEXT BUILDING REFERENCES]
+  return `[CONTEXT BUILDING REFERENCES]
 The lists below show past conversation rounds. Each entry contains only the user prompt — responses and tool calls are collapsed.
 Use get_round_details("hash.json") to expand a round's full conversation.
 Use get_tool_details("hash.json", N) to inspect tool call N within a round.
 
 Format: N. hash.json [score | N tools]: followed by the full user prompt (indented).
-Number 1 in the list is the most recent round.`);
-  parts.push("");
-  parts.push("Two sections follow:");
-  parts.push("");
-  if (hasRecency) {
-    parts.push(`Recency List — rounds from this session. Context building: consult when
-the prompt references something discussed moments ago.`);
-  }
-  if (hasRelevance) {
-    parts.push(`Relevance List — semantically similar rounds from all past sessions. Immediate
-recall: a pre-made semantic search. Scan for a bell, or ignore.`);
-  }
-  return parts.join("\n");
+Number 1 in the list is the most recent round.`;
 }
 
 // ─────────────────────────────────────────────

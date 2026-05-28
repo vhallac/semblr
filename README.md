@@ -64,7 +64,7 @@ In collapsed mode, Semblr injects historical rounds as three distinct sections i
 
 ### Context building references
 
-This section appears when **any list** is present. It explains the format of what follows and how to use the expansion tools.
+This section appears when **any list** is present. It explains the format of what follows and how to use the expansion tools. The lists themselves are self-describing — they carry their own headers and instructions — so the preamble only provides the shared format and tool reference.
 
 *Exact prompt:*
 
@@ -76,14 +76,6 @@ Use get_tool_details("hash.json", N) to inspect tool call N within a round.
 
 Format: N. hash.json [score | N tools]: followed by the full user prompt (indented).
 Number 1 in the list is the most recent round.
-
-Two sections follow:
-
-Recency List — recent rounds from this session. Context building: consult when
-the prompt references something discussed moments ago.
-
-Relevance List — semantically similar rounds from all past sessions. Immediate
-recall: a pre-made semantic search. Scan for a bell, or ignore.
 ```
 
 ### Recency List
