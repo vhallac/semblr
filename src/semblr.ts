@@ -137,15 +137,11 @@ const CONTEXT_BUDGET_RATIO = 0.5; // 50% of model context window for historical 
 // Collapse mode: "full" injects complete historical rounds into context.
 // "collapsed" injects only a compact index — the LLM must use
 // get_round_details() / get_tool_details() to expand rounds it needs.
-const ROUND_COLLAPSE_MODE: "full" | "collapsed" = "collapsed";
+// Full mode was removed in favor of collapsed-only. All rounds are injected via
+// the Recency and Relevance Lists. Use get_round_details() to expand.
 
-// When true (experimental), skip the last-round-in-full injection.
-// We set this to isolate the effect of the recency buffer in its entirety.
-// The recency buffer (keeping the last N rounds in full, outside indexed
-// retrieval) is the hypothesised solution for bridging the referential gap.
-// Turning off the special-case last-round injection lets us measure the
-// recency buffer's impact cleanly, without confounding variables.
-const DROP_LAST_ROUND = true;
+// DROP_LAST_ROUND is permanently true — the last round appears in the Recency List
+// alongside all other rounds. The post-list inline injection is removed.
 
 // ─────────────────────────────────────────────
 // Causal Chain — in-memory buffer of session rounds
@@ -587,15 +583,10 @@ export default function (pi: ExtensionAPI) {
       }
 
       // 2. Always add the last round (if not already there)
-      // Content hash used later to move it to last position after dedup.
-      let lastRoundContentHash: string | null = null;
       if (lastRoundFileName) {
         const lastData = readRoundFile(lastRoundFileName);
         if (lastData) {
           addRound({ data: lastData, fileName: lastRoundFileName, bestScore: 0 });
-          lastRoundContentHash = crypto.createHash("md5")
-            .update(lastData.userPrompt + lastData.responseSequence)
-            .digest("hex");
         }
       }
 
@@ -608,9 +599,8 @@ export default function (pi: ExtensionAPI) {
       }
 
       // ── Branched context injection: full vs collapsed ──
-      if (ROUND_COLLAPSE_MODE === "collapsed") {
-        // Collapsed mode: inject only a compact index. The LLM expands
-        // rounds it needs via get_round_details() / get_tool_details().
+      // Collapsed mode (only mode): inject lists. The LLM expands
+      // rounds it needs via get_round_details() / get_tool_details().
         const collapsedIndex = formatCollapsedIndex(
           selectedRounds.map(r => ({ fileName: r.fileName, bestScore: r.bestScore, data: r.data }))
         );
@@ -623,40 +613,6 @@ export default function (pi: ExtensionAPI) {
           "semblr",
           `🧠 collapsed: ${selectedRounds.length} rounds indexed from ${uniqueRounds} total`,
         );
-
-        // Find the last round (by fileName) — always added earlier.
-        // Inject the user prompt + collapsed agent turns (tool calls redacted,
-        // expandable via get_tool_details) + assistant text response.
-        // This replaces the old approach of dumping raw responseSequence, which
-        // mixed text and tool calls together. Now the model sees structured turns.
-        let lastRoundFull: Array<{ role: string; content: Array<{ type: string; text: string }> }> = [];
-        if (lastRoundFileName) {
-          const last = selectedRounds.find(r => r.fileName === lastRoundFileName);
-          if (last) {
-            // Build collapsed tool call turns
-            let toolTurnText = "";
-            if (last.data.toolCallCount != null && last.data.toolCallCount > 0 && last.data.toolCalls && last.data.toolCalls.length > 0) {
-              const turnLines = last.data.toolCalls.map((tc: ToolCallDetail) =>
-                `  Turn ${tc.index}: ${tc.name} — [REDACTED: arguments and result collapsed. Use get_tool_details("${last!.fileName}", ${tc.index}) to expand.]`
-              );
-              toolTurnText = "\n--- Agent turns (all tool calls redacted — use get_tool_details to expand) ---\n" + turnLines.join("\n");
-            } else if (last.data.toolCallCount === 0) {
-              toolTurnText = "\n--- Agent turns ---\n  (no tool calls — discussion only)";
-            }
-
-            lastRoundFull = [
-              {
-                role: "user",
-                content: [{ type: "text", text: `[LAST ROUND — ${lastRoundFileName} (collapsed)]
-User asked: ${last.data.userPrompt}${toolTurnText}` }],
-              },
-              {
-                role: "assistant",
-                content: [{ type: "text", text: `${last.data.responseSequence}` }],
-              },
-            ];
-          }
-        }
 
         // Build causal chain system message from in-memory buffer
         const chainBlock = formatCausalChainBlock(causalChain);
@@ -680,21 +636,10 @@ User asked: ${last.data.userPrompt}${toolTurnText}` }],
 
         const finalMessages = [
           ...(systemMsg ? [systemMsg] : []),
-          // Preamble for collapsed mode — use "user" role because pi's convertToLlm
+          // Preamble — use "user" role because pi's convertToLlm
           // strips messages with role "system". The system prompt is handled entirely
           // via the separate systemPrompt field. Using "user" ensures the model sees
           // this historical context.
-          {
-            role: "user",
-            content: [{
-              type: "text",
-              text: `[HISTORICAL ROUND INDEX — use get_round_details("hash.json") to expand any round]
-Numbered list. Each entry: N. hash.json [score | N tools]: followed by full user prompt (indented).
-Use get_tool_details("hash.json", N) to inspect tool call N within a round.
----`,
-            }],
-          },
-          // Causal chain — in-memory rounds from this session
           ...(chainBlock
             ? [{
                 role: "user" as const,
@@ -709,111 +654,10 @@ Use get_tool_details("hash.json", N) to inspect tool call N within a round.
               text: collapsedIndex,
             }],
           },
-          // Last round in full (sans tool calls) — for prompt parsing
-          ...(DROP_LAST_ROUND ? [] : lastRoundFull),
           ...currentMessages,
         ];
 
         return { messages: finalMessages };
-      }
-
-      // ── Full mode (default): inject complete round content ──
-      // Build context messages — chronological order (oldest first) for coherence
-      // Sort by userTimestamp only (turnIndex is kept in round files but not used for ordering)
-      selectedRounds.sort((a, b) => {
-        const tsA = (a.data as Record<string, unknown>).userTimestamp as number ?? 0;
-        const tsB = (b.data as Record<string, unknown>).userTimestamp as number ?? 0;
-        return tsA - tsB;
-      });
-
-      // Dedup by MD5 content hash — last round may duplicate a scored round
-      const seenHashes = new Set<string>();
-      const dedupedRounds: typeof selectedRounds = [];
-      for (const round of selectedRounds) {
-        const hash = crypto.createHash("md5").update(round.data.userPrompt + round.data.responseSequence).digest("hex");
-        if (seenHashes.has(hash)) continue;
-        seenHashes.add(hash);
-        dedupedRounds.push(round);
-      }
-
-      // Post-sort: ensure last round is always the LAST element in the injected context.
-      // This bridges the referential gap — the model sees the preceding round's response
-      // immediately before the current prompt, making "these", "it", "that" resolvable.
-      if (lastRoundContentHash) {
-        const lastIdx = dedupedRounds.findIndex(r => {
-          const h = crypto.createHash("md5").update(r.data.userPrompt + r.data.responseSequence).digest("hex");
-          return h === lastRoundContentHash;
-        });
-        if (lastIdx !== -1 && lastIdx !== dedupedRounds.length - 1) {
-          const [lastRound] = dedupedRounds.splice(lastIdx, 1);
-          dedupedRounds.push(lastRound);
-        }
-      }
-
-      // Rebuild contextMessages from deduped rounds
-      // Each round is wrapped in a clear delimiter so the model knows these
-      // are historical records — not the current conversation. This prevents
-      // the model from mimicking tool calls or phrasing from past rounds.
-      const contextMessages: Array<{ role: string; content: Array<{ type: string; text: string }> }> = [];
-
-      // ── Preamble: explain the historical round format ──
-      // Injected before the first round so the model understands what it's seeing.
-      contextMessages.push({
-        role: "system",
-        content: [{
-          type: "text",
-          text: `[HISTORICAL ROUND INDEX — relevance score (0.0–1.0) | tool count]
-Use get_round_details("hash.json") to expand a round's full conversation.
-Use get_tool_details("hash.json", N) to inspect tool call N within a round.
-The responses shown below are historical context, not your own voice.
----`,
-        }],
-      });
-
-      for (const round of dedupedRounds) {
-        // Build tool metadata line to distinguish real work from discussion
-        let toolMeta = "";
-        if (round.data.toolCallCount != null && round.data.toolCallCount > 0) {
-          const names = round.data.toolCallNames?.length ? round.data.toolCallNames.join(", ") : "unknown";
-          toolMeta = `${round.data.toolCallCount} tools`;
-          // Add tool detail hints if available
-          if (round.data.toolCalls && round.data.toolCalls.length > 0) {
-            const hints = round.data.toolCalls.slice(0, 5).map(tc =>
-              `${tc.index}:${tc.name}`
-            ).join(" ");
-            const more = round.data.toolCalls.length > 5 ? ` ...+${round.data.toolCalls.length - 5} more` : "";
-            toolMeta += `\nUse get_tool_details("${round.fileName}", N) to inspect any call. Indexes: ${hints}${more}`;
-          }
-        } else if (round.data.toolCallCount === 0) {
-          toolMeta = `0 tools`;
-        }
-
-        // Hash-first format: the round filename is the critical reference
-        // for get_tool_details() — put it first so it's easy to copy-paste.
-        contextMessages.push({
-          role: "user",
-          content: [{ type: "text", text: `[HISTORICAL ROUND — ${round.fileName} | similarity: ${round.bestScore.toFixed(3)} [TOOLS USED: ${toolMeta}]
-User asked: ${round.data.userPrompt}` }],
-        });
-        contextMessages.push({
-          role: "assistant",
-          content: [{ type: "text", text: `[END OF HISTORICAL ROUND — this was a past response, not the current one. Stay focused on the user's most recent message above.]
-${round.data.responseSequence}` }],
-        });
-      }
-
-      ctx.ui.setStatus(
-        "semblr",
-        `🧠 retrieved ${dedupedRounds.length} rounds (${usedTokens} tok) from ${uniqueRounds} indexed`,
-      );
-
-      return {
-        messages: [
-          ...(systemMsg ? [systemMsg] : []),
-          ...contextMessages,
-          ...currentMessages,
-        ],
-      };
     } catch (err) {
       ctx.ui.setStatus("semblr", `🧠 error: ${(err as Error).message}`);
     }
