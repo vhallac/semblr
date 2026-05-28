@@ -25,10 +25,17 @@ interface ToolCallDetail {
   result_summary: string;
 }
 
+interface ResponseSegment {
+  type: "text" | "toolCall";
+  text?: string;
+  toolCallIndex?: number;
+}
+
 interface Round {
   id: string;
   userPrompt: string;
   responseSequence: string;
+  responseSegments: ResponseSegment[];
   userTimestamp: number;
   responseEndTimestamp: number;
   turnIndex: number; // serialized — keep name for backward compat
@@ -72,6 +79,7 @@ function parseSession(filePath: string): Round[] {
   const rounds: Round[] = [];
   let currentUserMsg: SessionEntry | null = null;
   let responseParts: string[] = [];
+  let responseSegments: ResponseSegment[] = [];
   let toolNames: string[] = [];
   let toolCallCount = 0;
   let toolCalls: ToolCallDetail[] = [];
@@ -88,6 +96,7 @@ function parseSession(filePath: string): Round[] {
           id: currentUserMsg.id,
           userPrompt: extractText(currentUserMsg.message!.content),
           responseSequence: responseParts.join("\n\n").trim(),
+          responseSegments,
           userTimestamp: currentUserMsg.message!.timestamp ?? 0,
           responseEndTimestamp: entry.message?.timestamp ?? 0,
           turnIndex: roundIndex,
@@ -100,13 +109,17 @@ function parseSession(filePath: string): Round[] {
       }
       currentUserMsg = entry;
       responseParts = [];
+      responseSegments = [];
       toolNames = [];
       toolCallCount = 0;
       toolCalls = [];
     } else if (role === "assistant" && currentUserMsg) {
-      // Count and capture tool calls embedded in assistant content blocks
+      // Single ordered pass: interleave text and tool call blocks
       for (const block of content) {
-        if (block.type === "toolCall") {
+        if (block.type === "text" && block.text) {
+          responseParts.push(block.text);
+          responseSegments.push({ type: "text", text: block.text });
+        } else if (block.type === "toolCall") {
           toolCallCount++;
           const blockRec = block as Record<string, unknown>;
           const name = blockRec.name as string | undefined;
@@ -117,10 +130,9 @@ function parseSession(filePath: string): Round[] {
             arguments: JSON.stringify(blockRec.arguments ?? {}),
             result_summary: "",
           });
+          responseSegments.push({ type: "toolCall", toolCallIndex: toolCalls.length - 1 });
         }
       }
-      const text = extractText(content);
-      if (text) responseParts.push(text);
     } else if (role === "toolResult" && currentUserMsg) {
       const toolName = entry.message.toolName as string | undefined;
       if (toolName) toolNames.push(toolName);
@@ -142,6 +154,7 @@ function parseSession(filePath: string): Round[] {
       id: currentUserMsg.id,
       userPrompt: extractText(currentUserMsg.message!.content),
       responseSequence: responseParts.join("\n\n").trim(),
+      responseSegments,
       userTimestamp: currentUserMsg.message!.timestamp ?? 0,
       responseEndTimestamp: Date.now(),
       turnIndex: roundIndex,
