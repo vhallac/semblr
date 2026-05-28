@@ -168,19 +168,37 @@ let causalChain: ChainEntry[] = [];
 function formatCausalChainBlock(chain: ChainEntry[]): string | null {
   if (chain.length === 0) return null;
   const lines: string[] = [];
-  lines.push(`[CAUSAL CHAIN — recent rounds in this session, newest first]
-Entries are numbered 1 (most recent completed round) to N (oldest in the chain).
-The current turn is NOT in this list — it is the prompt you are processing right now.
+    lines.push(`[HISTORICAL ROUND INDEX — use get_round_details("{hash}.json") to expand any round]
+Numbered list. Each entry: N. hash.json [score | N tools]: followed by full user prompt (indented).
+Use get_tool_details("hash.json", N) to inspect tool call N within a round. Number 1 in the list is
+the most recent round.
+---
+IMPORTANT: The index below shows ONLY the user's questions from past sessions.
+You do NOT have the assistant responses or tool results unless you expand a round.
+If you answer based on these prompts alone, you are hallucinating.
 
-Use this chain when the current prompt:
-- contains vague references to recent events ("it", "those changes", "the fix", etc.)
-- is unusually short or lacks clear context/goals/outputs
-- assumes knowledge established in the immediately preceding turns
+Use this index when the current prompt ...:
+- ... asks about past work, decisions, code, or findings from prior sessions
+- ... is unusually short or lacks clear context/goals/outputs
+- ... uses references with no clear antecedent in the causal chain ("that fix", "the plan", "where we left off")
+- ... asks you to remember, verify, continue, or build upon prior work
+- ... requires cross-session continuity (same project, recurring topic, long-running task)
+- ... is ambiguous: lacks proper context or references, and seems to assume knowledge was established
 
 When this happens:
-1. Start by expanding the most recent 1-2 entries (indices 1, 2) via get_round_details
-2. Stop as soon as you have enough context to understand the current prompt
-3. If these don't clarify, continue further back in the chain before falling back to the scored historical index or search_interactions
+1. Scan the index prompts for relevance. Higher score = stronger match.
+2. If a round looks relevant, expand ONLY that round via get_round_details.
+3. Stop as soon as the expanded round gives you enough context to answer.
+4. If no round looks relevant but the query clearly needs past context, use search_interactions.
+
+When NOT to expand:
+- The query is fully self-contained (math, definitions, new unrelated task). A self contained prompt ...:
+  - ... is a task introduction statement: it only provides some background information or establishes context
+    without actually asking anything or requesting any action.
+  - ... has an action that can be fulfilled completely from the prompt alone
+- The prompts in the context already provides sufficient information.
+
+Rule: When in doubt, expand. A verification tool call is cheaper than a wrong answer.
 
 These rounds have n/a score because they are presented by recency (not semantic similarity) — they form the immediate conversational context.`);
   lines.push("---");
