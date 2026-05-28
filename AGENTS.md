@@ -4,7 +4,7 @@ Next-generation context management for AI agents. See [VISION.md](VISION.md) for
 
 ## The Extension
 
-The extension lives at `.pi/extensions/semblr.ts` (~1240 lines). It:
+The extension lives at `src` (~1240 lines, moved from `.pi/extensions/semblr.ts` to avoid pi auto-loading). It:
 
 - Saves every completed conversation round to a persistent round repository (`rounds/<hash>.json`)
 - Embeds prompt and response vectors to `index.csv` (via OpenRouter, `text-embedding-3-small`)
@@ -20,7 +20,7 @@ The extension lives at `.pi/extensions/semblr.ts` (~1240 lines). It:
 - `VISION.md` — project vision, architecture, roadmap (with ✅ completion markers)
 - `README.md` — project overview, premise, cost, known problems
 - `AGENTS.md` — this file (project context for AI agents)
-- `.pi/extensions/semblr.ts` — the extension (single file, ~1240 lines)
+- `src` — the extension (single file, ~1240 lines)
 - `scripts/digest-all.ts` — bulk-embed all historical pi sessions
 - `scripts/digest-session.ts` — embed a single session JSONL file
 - `justfile` — command recipes (index, digest-session, query)

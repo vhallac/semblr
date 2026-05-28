@@ -6,9 +6,48 @@
 
 Semblr stores every conversation round permanently, embeds it, and retrieves the most relevant rounds on each user prompt — by meaning, not by recency. We want to find out whether semantic retrieval beats lossy summarization in practice.
 
-Runs as a [pi coding agent](https://pi.dev) extension at `.pi/extensions/semblr.ts`.
+Runs as a [pi coding agent](https://pi.dev) extension at `src`.
 
 Version-controlled with [Jujutsu (jj)](https://martinvonz.github.io/jj/latest/), not git.
+
+## Installation
+
+Semblr runs as a [pi coding agent](https://pi.dev) extension.
+
+### Dependencies
+
+- **[pi coding agent](https://pi.dev/install)** — the prerequisite runtime. Install it first, then clone and use Semblr.
+
+### Setup
+
+```bash
+# Clone the repository
+jj git clone <repo-url> semblr
+cd semblr
+
+# Install project dependencies (for indexing scripts)
+npm install
+```
+
+### Loading the extension
+
+The extension lives at `src` (not `.pi/extensions/`), so pi does **not** auto-load it. Two ways to activate:
+
+**Temporarily (per session):**
+```bash
+pi -e ./src
+# or via the re-export entry point:
+pi -e ./index.ts
+```
+
+**Permanently (installed as a local pi package):**
+```bash
+just install        # runs pi install ./src/semblr.ts
+```
+This registers the extension in your pi settings and loads it on every startup. To remove it later:
+```bash
+just uninstall      # runs pi remove ./src/semblr.ts
+```
 
 ## Premise
 
@@ -160,11 +199,11 @@ Currently only one embedding model (`text-embedding-3-small` via OpenRouter) is 
 
 ## Quick Start
 
-Semblr runs automatically when the extension is loaded:
+Semblr runs when the extension is loaded:
 
 ```bash
 # Verify it's working
-pi -e .pi/extensions/semblr.ts
+pi -e ./src
 ```
 
 Check that the status bar shows `🧠 semblr loaded — N rounds indexed`.
@@ -188,10 +227,7 @@ just query "what did we discuss about caching"
 ## Project Structure
 
 ```
-.pipermanent_extension/
-├── .pi/
-│   └── extensions/
-│       └── semblr.ts          # The extension (~1240 lines)
+├── src                         # The extension (~1240 lines)
 ├── scripts/
 │   ├── digest-all.ts             # Bulk-embed all historical sessions
 │   ├── digest-session.ts         # Embed a single session file

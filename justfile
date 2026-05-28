@@ -18,7 +18,15 @@ digest-session path:
     SEMBLR_ROUNDS_DIR="{{SEMBLR_ROUNDS_DIR}}" \
         npx tsx scripts/digest-session.ts {{path}}
 
+# Install the extension as a local pi package (loads on every startup)
+install:
+    pi install ./src/semblr.ts
+
+# Remove the extension from pi settings
+uninstall:
+    pi remove ./src/semblr.ts
+
 # Query the index with a natural language query (via pi + semblr extension)
 # Usage: just query "<your question>"
 query query *args:
-    echo "search interactions for '{{query}}'" | pi --print --no-builtin-tools -e .pi/extensions/semblr.ts
+    echo "search interactions for '{{query}}'" | pi --print --no-builtin-tools -e ./src
