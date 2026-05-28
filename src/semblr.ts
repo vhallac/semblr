@@ -134,14 +134,10 @@ const OPENROUTER_URL = "https://openrouter.ai/api/v1/embeddings";
 
 const CONTEXT_BUDGET_RATIO = 0.5; // 50% of model context window for historical rounds
 
-// Collapse mode: "full" injects complete historical rounds into context.
-// "collapsed" injects only a compact index — the LLM must use
-// get_round_details() / get_tool_details() to expand rounds it needs.
-// Full mode was removed in favor of collapsed-only. All rounds are injected via
-// the Recency and Relevance Lists. Use get_round_details() to expand.
-
-// DROP_LAST_ROUND is permanently true — the last round appears in the Recency List
-// alongside all other rounds. The post-list inline injection is removed.
+// Collapsed-only mode. All rounds are injected via the Recency and Relevance Lists.
+// Use get_round_details() to expand. The Recency List contains the in-memory causal
+// chain from the current session; the Relevance List contains semantically similar
+// rounds from all past sessions.
 
 // ─────────────────────────────────────────────
 // Causal Chain — in-memory buffer of session rounds
@@ -160,59 +156,143 @@ interface ChainEntry {
  *  without needing to search the vector index. */
 let causalChain: ChainEntry[] = [];
 
-/** Format the causal chain buffer as a collapsed-style index block with n/a scores. */
-function formatCausalChainBlock(chain: ChainEntry[]): string | null {
+/**
+ * Format a single round entry — identical structure for both Recency and Relevance lists.
+ * Produces:
+ *   N. hash.json [score | N tools]:
+ *     user: first line of prompt
+ *     subsequent lines indented
+ *     ---
+ */
+function formatRoundEntry(
+  idx: number,
+  fileName: string,
+  score: string,
+  toolSummary: string,
+  userPrompt: string,
+): string[] {
+  const promptLines = userPrompt
+    .split("\n")
+    .map((line, i) => i === 0 ? `  user: ${line}` : `  ${line}`);
+  return [
+    `${idx}. ${fileName} [${score} | ${toolSummary}]:`,
+    ...promptLines,
+    "  ---",
+  ];
+}
+
+/** Build the Recency List section from the in-memory causal chain. */
+function buildRecencyList(chain: ChainEntry[]): string | null {
   if (chain.length === 0) return null;
   const lines: string[] = [];
-    lines.push(`[HISTORICAL ROUND INDEX — use get_round_details("{hash}.json") to expand any round]
-Numbered list. Each entry: N. hash.json [score | N tools]: followed by full user prompt (indented).
-Use get_tool_details("hash.json", N) to inspect tool call N within a round. Number 1 in the list is
-the most recent round.
----
-IMPORTANT: The index below shows ONLY the user's questions from past sessions.
-You do NOT have the assistant responses or tool results unless you expand a round.
-If you answer based on these prompts alone, you are hallucinating.
+  const header = `--- RECENCY LIST (current session, newest first) ---
+These rounds have n/a scores because they are presented by recency — they form
+the immediate conversational context from this session.
 
-Use this index when the current prompt ...:
+IMPORTANT: This list shows ONLY the user's questions from past rounds.
+You do NOT have the assistant responses or tool results unless you expand a
+round. If you answer based on these prompts alone, you are hallucinating.
+
+Use this list when the current prompt ...:
 - ... asks about past work, decisions, code, or findings from prior sessions
 - ... is unusually short or lacks clear context/goals/outputs
-- ... uses references with no clear antecedent in the causal chain ("that fix", "the plan", "where we left off")
+- ... uses references with no clear antecedent in the causal chain ("that fix",
+  "the plan", "where we left off")
 - ... asks you to remember, verify, continue, or build upon prior work
-- ... requires cross-session continuity (same project, recurring topic, long-running task)
-- ... is ambiguous: lacks proper context or references, and seems to assume knowledge was established
+- ... requires cross-session continuity (same project, recurring topic,
+  long-running task)
+- ... is ambiguous: lacks proper context or references, and seems to assume
+  knowledge was established
 
 When this happens:
-1. Scan the index prompts for relevance. Higher score = stronger match.
+1. Scan the list prompts for relevance. Higher score = stronger match.
 2. If a round looks relevant, expand ONLY that round via get_round_details.
 3. Stop as soon as the expanded round gives you enough context to answer.
-4. If no round looks relevant but the query clearly needs past context, use search_interactions.
+4. If no round looks relevant but the query clearly needs past context,
+   use search_interactions.
 
 When NOT to expand:
-- The query is fully self-contained (math, definitions, new unrelated task). A self contained prompt ...:
-  - ... is a task introduction statement: it only provides some background information or establishes context
-    without actually asking anything or requesting any action.
-  - ... has an action that can be fulfilled completely from the prompt alone
+- The query is fully self-contained (clear context, goals, and outputs present).
 - The prompts in the context already provides sufficient information.
 
-Rule: When in doubt, expand. A verification tool call is cheaper than a wrong answer.
+Rule: When in doubt, expand. A verification tool call is cheaper than a wrong
+answer.`;
+  lines.push(header);
+  lines.push("");
 
-These rounds have n/a score because they are presented by recency (not semantic similarity) — they form the immediate conversational context.`);
-  lines.push("---");
   // Show newest first (reverse chronological)
   const reversed = [...chain].reverse();
   let idx = 0;
   for (const entry of reversed) {
     idx++;
-    const promptLines = entry.userPrompt
-      .split("\n")
-      .map((line, i) => i === 0 ? `  user: ${line}` : `  ${line}`);
-    lines.push(
-      `${idx}. ${entry.fileName} [n/a | ${entry.toolSummary}]:`
-    );
-    lines.push(...promptLines);
-    lines.push("  ---");
+    lines.push(...formatRoundEntry(
+      idx,
+      entry.fileName,
+      "n/a",
+      entry.toolSummary,
+      entry.userPrompt,
+    ));
   }
   return lines.join("\n");
+}
+
+/** Build the Relevance List section from scored rounds. */
+function buildRelevanceList(
+  rounds: Array<{ fileName: string; bestScore: number; data: RoundData }>,
+): string | null {
+  if (rounds.length === 0) return null;
+  const lines: string[] = [];
+  const header = `--- RELEVANCE LIST (all sessions, by similarity) ---
+These rounds have numeric similarity scores (0.0–1.0). Higher = stronger
+semantic match. They come from ALL past sessions, not just the current one.
+
+The extension has pre-run a semantic search against your prompt. The results
+are below. If something here rings a bell, expand it via get_round_details.
+If nothing rings a bell, ignore this list — it's a pre-filter, not a map.`;
+  lines.push(header);
+  lines.push("");
+
+  let idx = 0;
+  for (const round of rounds) {
+    idx++;
+    const toolCount = round.data.toolCallCount ?? 0;
+    lines.push(...formatRoundEntry(
+      idx,
+      round.fileName,
+      round.bestScore.toFixed(2),
+      `${toolCount} tools`,
+      round.data.userPrompt,
+    ));
+  }
+  return lines.join("\n");
+}
+
+/** Build the Context Building References preamble section. */
+function buildContextPreamble(
+  hasRecency: boolean,
+  hasRelevance: boolean,
+): string | null {
+  if (!hasRecency && !hasRelevance) return null;
+  const parts: string[] = [];
+  parts.push(`[CONTEXT BUILDING REFERENCES]
+The lists below show past conversation rounds. Each entry contains only the user prompt — responses and tool calls are collapsed.
+Use get_round_details("hash.json") to expand a round's full conversation.
+Use get_tool_details("hash.json", N) to inspect tool call N within a round.
+
+Format: N. hash.json [score | N tools]: followed by the full user prompt (indented).
+Number 1 in the list is the most recent round.`);
+  parts.push("");
+  parts.push("Two sections follow:");
+  parts.push("");
+  if (hasRecency) {
+    parts.push(`Recency List — rounds from this session. Context building: consult when
+the prompt references something discussed moments ago.`);
+  }
+  if (hasRelevance) {
+    parts.push(`Relevance List — semantically similar rounds from all past sessions. Immediate
+recall: a pre-made semantic search. Scan for a bell, or ignore.`);
+  }
+  return parts.join("\n");
 }
 
 // ─────────────────────────────────────────────
@@ -241,43 +321,7 @@ function extractText(content: Array<{ type: string; text?: string }>): string {
     .join(" ");
 }
 
-/**
- * Format a compact index of retrieved rounds for collapsed mode.
- * Numbered list style — preserves full prompt text and paragraph
- * structure so the LLM can weigh the full signal when deciding
- * which rounds to expand via get_round_details().
- *
- * Format:
- *   1. <hash> [0.78 | 8 tools]:
- *      user: this is line 1
- *
- * this is line 2
- *
- * this is line 3
- *      ---
- *   2. <hash2> ...
- */
-function formatCollapsedIndex(
-  rounds: Array<{ fileName: string; bestScore: number; data: RoundData }>
-): string {
-  const lines: string[] = [];
-  let idx = 0;
-  for (const round of rounds) {
-    idx++;
-    const toolCount = round.data.toolCallCount ?? 0;
-    // Indent each line of the user prompt by 6 spaces so paragraphs
-    // are visually distinct from the header line.
-    const promptLines = round.data.userPrompt
-      .split("\n")
-      .map((line, i) => i === 0 ? `  user: ${line}` : `  ${line}`);
-    lines.push(
-      `${idx}. ${round.fileName} [${round.bestScore.toFixed(2)} | ${toolCount} tools]:`
-    );
-    lines.push(...promptLines);
-    lines.push("  ---");
-  }
-  return lines.join("\n");
-}
+// formatCollapsedIndex removed — replaced by buildRecencyList / buildRelevanceList / buildContextPreamble
 
 // ─────────────────────────────────────────────
 // Index CSV format:
@@ -598,64 +642,56 @@ export default function (pi: ExtensionAPI) {
         return { messages: augmentedMessages };
       }
 
-      // ── Branched context injection: full vs collapsed ──
-      // Collapsed mode (only mode): inject lists. The LLM expands
-      // rounds it needs via get_round_details() / get_tool_details().
-        const collapsedIndex = formatCollapsedIndex(
+      // ── Build the three-section context block ──
+        const relevanceList = buildRelevanceList(
           selectedRounds.map(r => ({ fileName: r.fileName, bestScore: r.bestScore, data: r.data }))
         );
-
-        const uniqueRounds = new Set(
-          index.map((e: { filePath: string }) => e.filePath.replace(/:prompt$|:response$/, ""))
-        ).size;
-
-        ctx.ui.setStatus(
-          "semblr",
-          `🧠 collapsed: ${selectedRounds.length} rounds indexed from ${uniqueRounds} total`,
-        );
-
-        // Build causal chain system message from in-memory buffer
-        const chainBlock = formatCausalChainBlock(causalChain);
+        const recencyList = buildRecencyList(causalChain);
+        const preamble = buildContextPreamble(!!recencyList, !!relevanceList);
 
         // ══ Stats: record all 5 positions presented ══
-        // Combine total-indexed count with chain-read stats (one status line)
         {
-          // causalChain is chronological (oldest first, newest last).
-          // recordPresented will reverse internally and map each display position.
-          // Dedup: increment once per agent cycle, not at every context hook fire (per turn).
           if (!roundPresentedRecorded) {
             recordPresented(causalChain);
             roundPresentedRecorded = true;
           }
+          const uniqueRounds = new Set(
+            index.map((e: { filePath: string }) => e.filePath.replace(/:prompt$|:response$/, ""))
+          ).size;
           ctx.ui.setStatus(
             "semblr",
             `🧠 collapsed: ${selectedRounds.length} matched / ${uniqueRounds} total | ${formatChainStats()}`,
           );
         }
-        // ════════════════════════════════════════════════════════════
 
-        const finalMessages = [
-          ...(systemMsg ? [systemMsg] : []),
-          // Preamble — use "user" role because pi's convertToLlm
-          // strips messages with role "system". The system prompt is handled entirely
-          // via the separate systemPrompt field. Using "user" ensures the model sees
-          // this historical context.
-          ...(chainBlock
-            ? [{
-                role: "user" as const,
-                content: [{ type: "text" as const, text: chainBlock }],
-              }]
-            : []),
-          // Compact index (also as "user" role)
-          {
-            role: "user",
-            content: [{
-              type: "text",
-              text: collapsedIndex,
-            }],
-          },
-          ...currentMessages,
-        ];
+        const finalMessages: Array<{ role: string; content: Array<{ type: string; text: string }> }> = [];
+        if (systemMsg) finalMessages.push(systemMsg);
+
+        // Section 1: Context Building References (explains format and names the two lists)
+        if (preamble) {
+          finalMessages.push({
+            role: "user" as const,
+            content: [{ type: "text" as const, text: preamble }],
+          });
+        }
+
+        // Section 2: Recency List (if current session has prior rounds)
+        if (recencyList) {
+          finalMessages.push({
+            role: "user" as const,
+            content: [{ type: "text" as const, text: recencyList }],
+          });
+        }
+
+        // Section 3: Relevance List (if semantic search returned matches)
+        if (relevanceList) {
+          finalMessages.push({
+            role: "user" as const,
+            content: [{ type: "text" as const, text: relevanceList }],
+          });
+        }
+
+        finalMessages.push(...currentMessages);
 
         return { messages: finalMessages };
     } catch (err) {
@@ -1014,33 +1050,23 @@ export default function (pi: ExtensionAPI) {
             ? ` | ${round.data.toolCallCount} tools (${(round.data.toolCallNames ?? []).join(", ")})`
             : (round.data.toolCallCount === 0 ? " | 0 tools (discussion only)" : "");
 
-          if (ROUND_COLLAPSE_MODE === "collapsed") {
-            // Collapsed: full prompt + tool turn index + full response.
-            // Exposes the round filename so the model can call get_round_details().
-            lines.push(`--- Round ${round.fileName} (score: ${round.bestScore.toFixed(3)}${toolStr}) ---`);
-            lines.push(`User: ${round.data.userPrompt}`);
+          // search_interactions always shows full round content.
+          lines.push(`--- Round ${round.fileName} (score: ${round.bestScore.toFixed(3)}${toolStr}) ---`);
+          lines.push(`User: ${round.data.userPrompt}`);
 
-            // Build collapsed tool call turns (mirrors last-round-context injection)
-            if (round.data.toolCallCount != null && round.data.toolCallCount > 0 && round.data.toolCalls && round.data.toolCalls.length > 0) {
-              const turnLines = round.data.toolCalls.map((tc: ToolCallDetail) =>
-                `  Turn ${tc.index}: ${tc.name} — [REDACTED: arguments and result collapsed. Use get_tool_details("${round.fileName}", ${tc.index}) to expand.]`
-              );
-              lines.push("--- Agent turns (all tool calls redacted — use get_tool_details to expand) ---");
-              lines.push(...turnLines);
-            } else if (round.data.toolCallCount === 0) {
-              lines.push("--- Agent turns ---");
-              lines.push("  (no tool calls — discussion only)");
-            }
-
-            lines.push(`Assistant: ${round.data.responseSequence}`);
-            lines.push("");
-          } else {
-            // Full mode: truncated format (existing behavior)
-            lines.push(`--- Round (score: ${round.bestScore.toFixed(3)}${toolStr}) ---`);
-            lines.push(`User: ${round.data.userPrompt.slice(0, 500)}`);
-            lines.push(`Assistant: ${round.data.responseSequence.slice(0, 1000)}`);
-            lines.push("");
+          if (round.data.toolCallCount != null && round.data.toolCallCount > 0 && round.data.toolCalls && round.data.toolCalls.length > 0) {
+            const turnLines = round.data.toolCalls.map((tc: ToolCallDetail) =>
+              `  Turn ${tc.index}: ${tc.name} — [REDACTED: arguments and result collapsed. Use get_tool_details("${round.fileName}", ${tc.index}) to expand.]`
+            );
+            lines.push("--- Agent turns (all tool calls redacted — use get_tool_details to expand) ---");
+            lines.push(...turnLines);
+          } else if (round.data.toolCallCount === 0) {
+            lines.push("--- Agent turns ---");
+            lines.push("  (no tool calls — discussion only)");
           }
+
+          lines.push(`Assistant: ${round.data.responseSequence}`);
+          lines.push("");
         }
 
         if (count === 0) {
