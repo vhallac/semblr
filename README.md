@@ -60,40 +60,121 @@ Current AI agent sessions degrade as they accumulate context. Pi's compaction me
 
 The result: context that is **always roughly the same size, always the most relevant, and never lossy** — even across sessions.
 
-## Context Injection Architecture
+## Injected Context Structure
 
-When Semblr retrieves relevant rounds, it injects them into the LLM's context. By default it uses **collapsed mode** — a compact numbered index rather than full text. This keeps context size predictable and stops historical rounds from drowning out the current task.
+In collapsed mode, Semblr injects historical rounds as three distinct sections in the user prompt (after the system message, before the current conversation). Each section is independently gated — it only appears when its data is non-empty.
 
-### Why collapse?
+### Context building references
 
-Every round contains the full assistant response — tool calls, thinking blocks, final answer. That's a lot of tokens, especially when the LLM might only need the gist to resolve a reference. Collapsing trades convenience for token efficiency: the LLM sees a short entry for each round and can **drill down on demand** using the provided tools.
+This section appears when **any list** is present. It explains the format of what follows and how to use the expansion tools.
 
-### Collapsed mode (default)
-
-Historical rounds appear as a numbered index in the system prompt:
+*Exact prompt:*
 
 ```
-1. a1b2c3d4.json [0.81 | 3 tools]: Why did we decide on PostgreSQL over MySQL?
-2. e5f6g7h8.json [0.64 | 0 tools]: Let's review the schema for the orders table
+[CONTEXT BUILDING REFERENCES]
+The lists below show past conversation rounds. Each entry contains only the user prompt — responses and tool calls are collapsed.
+Use get_round_details("hash.json") to expand a round's full conversation.
+Use get_tool_details("hash.json", N) to inspect tool call N within a round.
+
+Format: N. hash.json [score | N tools]: followed by the full user prompt (indented).
+Number 1 in the list is the most recent round.
+
+Two sections follow:
+
+Recency List — recent rounds from this session. Context building: consult when
+the prompt references something discussed moments ago.
+
+Relevance List — semantically similar rounds from all past sessions. Immediate
+recall: a pre-made semantic search. Scan for a bell, or ignore.
 ```
 
-Each line shows the round's file ID, similarity score, tool count, and the full user prompt. The LLM never sees historical response text unless it expands.
+### Recency List
 
-Every tool call inside a historical round is **redacted** into a stub:
+This section appears when the **current session has prior rounds**. It contains the in-memory causal chain — rounds you just discussed. This is the context-building list: use it when the model needs to reconstruct what was said moments ago.
 
-> `Turn 2: read — [REDACTED: arguments and result collapsed. Use get_tool_details("a1b2c3d4.json", 2) to expand.]`
+*Exact prompt:*
 
-To see what actually happened, the model calls `get_round_details()` or `get_tool_details()` — like opening a file or reading a log.
+```
+--- RECENCY LIST (current session, newest first) ---
+These rounds have n/a scores because they are presented by recency — they form
+the immediate conversational context from this session.
 
-### Full mode
+IMPORTANT: This list shows ONLY the user's questions from past rounds.
+You do NOT have the assistant responses or tool results unless you expand a
+round. If you answer based on these prompts alone, you are hallucinating.
 
-Pass `semblr_mode: full` in your prompt. Retrieved rounds are injected as complete conversation text — user prompt, full response, everything. More tokens, zero tool calls needed. Useful when you're digging into a specific past thread and want the whole picture at once.
+Use this list when the current prompt ...:
+- ... asks about past work, decisions, code, or findings from prior sessions
+- ... is unusually short or lacks clear context/goals/outputs
+- ... uses references with no clear antecedent in the causal chain ("that fix",
+  "the plan", "where we left off")
+- ... asks you to remember, verify, continue, or build upon prior work
+- ... requires cross-session continuity (same project, recurring topic,
+  long-running task)
+- ... is ambiguous: lacks proper context or references, and seems to assume
+  knowledge was established
 
-### Recency buffer (experimental)
+When this happens:
+1. Scan the list prompts for relevance. Higher score = stronger match.
+2. If a round looks relevant, expand ONLY that round via get_round_details.
+3. Stop as soon as the expanded round gives you enough context to answer.
+4. If no round looks relevant but the query clearly needs past context,
+   use search_interactions.
 
-We hypothesise that a **recency buffer** — keeping the last N rounds in full, outside the indexed retrieval logic — is the right solution for bridging the referential gap (resolving backreferences like "those changes" or "as I said"). To test this cleanly, we currently set `DROP_LAST_ROUND = true`, which suppresses the special-case last-round injection entirely. This isolates the recency buffer effect so we can measure its impact without confounding variables.
+When NOT to expand:
+- The query is fully self-contained (clear context, goals, and outputs present).
+- The prompts in the context already provides sufficient information.
 
-Future work: determine the optimal buffer size (N). Current hypothesis is 3–5 rounds.
+Rule: When in doubt, expand. A verification tool call is cheaper than a wrong
+answer.
+
+1. abc123.json [n/a | 0 tools]:
+  user: Find a budget hotel in Hong Kong under $100/night near Causeway Bay.
+---
+2. def456.json [n/a | 3 tools]:
+  user: Tell me more about the Harbour View Hotel, is it within budget?
+---
+```
+
+### Relevance List
+
+This section appears when **semantic search returned matches** above the similarity threshold. It contains rounds from all past sessions, ordered by descending similarity. This is immediate recall, not context building — the extension pre-runs `search_interactions` so you don't have to.
+
+*Exact prompt:*
+
+```
+--- RELEVANCE LIST (all sessions, by similarity) ---
+These rounds have numeric similarity scores (0.0–1.0). Higher = stronger
+semantic match. They come from ALL past sessions, not just the current one.
+
+The extension has pre-run a semantic search against your prompt. The results
+are below. If something here rings a bell, expand it via get_round_details.
+If nothing rings a bell, ignore this list — it's a pre-filter, not a map.
+
+1. ghi789.json [0.37 | 2 tools]:
+  user: Look up boutique hotels in the 7th arrondissement of Paris for
+  under €150/night.
+---
+```
+
+### Section presence matrix
+
+| Scenario | Context building refs | Recency List | Relevance List |
+|---|---|---|---|
+| First message, no semantic matches | omitted | omitted | omitted |
+| First message, has semantic matches | shown | omitted | shown |
+| Ongoing session, has matches | shown | shown | shown |
+| Ongoing session, no matches | shown | shown | omitted |
+
+### Why three sections?
+
+| Section | Source | When shown | Purpose |
+|---|---|---|---|
+| Context building refs | Static text | If any list exists | Set expectations, explain tools |
+| Recency List | Causal chain (in-memory) | If session has prior rounds | Resolve references within the session |
+| Relevance List | Semantic vector search | If matches found | Surface cross-session context — pre-made search |
+
+The architecture is intentionally sectioned: new types of context (pinned rounds, compaction summaries, excluded rounds) can be added as additional sections without changing the existing logic. Each section is independently gated by its own condition.
 
 ## Cost
 
@@ -186,10 +267,10 @@ Each round produces two rows: one for the user prompt embedding, one for the ass
 
 ## Known Problems
 
-### Most-recent-round context loss (collapsed mode, being tested)
-In collapsed mode (the default), every retrieved round — including the immediately preceding conversation turn — appears as a compact numbered entry. The LLM cannot directly resolve "those changes" or "it" from the previous round without calling `get_round_details()`. We are experimenting with a **recency buffer** (keeping the last 3–5 rounds in full) as the solution. To isolate its effect, we currently set `DROP_LAST_ROUND = true`, which removes the special-case last-round injection.
+### Most-recent-round context loss (addressed by Recency List)
+In collapsed mode, the Recency List (see [Injected Context Structure](#injected-context-structure)) shows the most recent rounds from the current session with clear instructions for the model to expand them when resolving references like "those changes" or "it". The special-case last-round injection (`DROP_LAST_ROUND`) is disabled to isolate the Recency List's effect.
 
-**Ongoing experiment:** Does a recency buffer completely eliminate referential ambiguity? Or do we still need the special-case last-round injection? We'll gather data and decide.
+**Ongoing experiment:** Does the Recency List bridge the referential gap for backreferences within a session? Early data suggests yes — the Recency List's trigger cases and expand-on-demand instructions replace the need for a standalone last-round injection.
 
 ### Embedding API dependency
 Semblr requires a working OpenRouter API key (or an alternative embedding endpoint) to function. If the API is unreachable, context assembly falls back to a no-op (no historical context injected). The extension degrades gracefully but silently.
