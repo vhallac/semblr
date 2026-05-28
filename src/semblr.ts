@@ -633,9 +633,12 @@ export default function (pi: ExtensionAPI) {
       }
 
       // ── Build the three-section context block ──
-        const relevanceList = buildRelevanceList(
-          selectedRounds.map(r => ({ fileName: r.fileName, bestScore: r.bestScore, data: r.data }))
-        );
+        const dropRelevance = process.env.DROP_RELEVANCE_LIST === "1" || process.env.DROP_RELEVANCE_LIST === "true";
+        const relevanceList = dropRelevance
+          ? null
+          : buildRelevanceList(
+              selectedRounds.map(r => ({ fileName: r.fileName, bestScore: r.bestScore, data: r.data }))
+            );
         const recencyList = buildRecencyList(causalChain);
         const preamble = buildContextPreamble(!!recencyList, !!relevanceList);
 
