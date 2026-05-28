@@ -31,13 +31,11 @@ npm install
 
 ### Loading the extension
 
-The extension lives at `src` (not `.pi/extensions/`), so pi does **not** auto-load it. Two ways to activate:
+The extension lives at `src/semblr.ts` (not `.pi/extensions/`), so pi does **not** auto-load it. Two ways to activate:
 
 **Temporarily (per session):**
 ```bash
-pi -e ./src
-# or via the re-export entry point:
-pi -e ./index.ts
+pi -e ./src/semblr.ts
 ```
 
 **Permanently (installed as a local pi package):**
@@ -268,9 +266,7 @@ Each round produces two rows: one for the user prompt embedding, one for the ass
 ## Known Problems
 
 ### Most-recent-round context loss (addressed by Recency List)
-In collapsed mode, the Recency List (see [Injected Context Structure](#injected-context-structure)) shows the most recent rounds from the current session with clear instructions for the model to expand them when resolving references like "those changes" or "it". The special-case last-round injection (`DROP_LAST_ROUND`) is disabled to isolate the Recency List's effect.
-
-**Ongoing experiment:** Does the Recency List bridge the referential gap for backreferences within a session? Early data suggests yes — the Recency List's trigger cases and expand-on-demand instructions replace the need for a standalone last-round injection.
+The Recency List (see [Injected Context Structure](#injected-context-structure)) shows the most recent rounds from the current session with instructions for the model to expand them when resolving references like "those changes" or "it". The list covers all prior rounds in the session, so the special-case last-round injection is no longer needed.
 
 ### Embedding API dependency
 Semblr requires a working OpenRouter API key (or an alternative embedding endpoint) to function. If the API is unreachable, context assembly falls back to a no-op (no historical context injected). The extension degrades gracefully but silently.
@@ -284,7 +280,7 @@ Semblr runs when the extension is loaded:
 
 ```bash
 # Verify it's working
-pi -e ./src
+pi -e ./src/semblr.ts
 ```
 
 Check that the status bar shows `🧠 semblr loaded — N rounds indexed`.
@@ -308,7 +304,8 @@ just query "what did we discuss about caching"
 ## Project Structure
 
 ```
-├── src                         # The extension (~1240 lines)
+├── src                         # The extension directory
+│   └── semblr.ts                 # Main extension file (~1240 lines)
 ├── scripts/
 │   ├── digest-all.ts             # Bulk-embed all historical sessions
 │   ├── digest-session.ts         # Embed a single session file

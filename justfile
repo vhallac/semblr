@@ -29,4 +29,4 @@ uninstall:
 # Query the index with a natural language query (via pi + semblr extension)
 # Usage: just query "<your question>"
 query query *args:
-    echo "search interactions for '{{query}}'" | pi --print --no-builtin-tools -e ./src
+    echo "search interactions for '{{query}}'" | pi --print --no-builtin-tools -e ./src/semblr.ts

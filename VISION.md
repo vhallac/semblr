@@ -48,28 +48,21 @@ Within a session, as context grows past the window, summarization compresses it.
 - Dynamic interpolation: at `MIN_SIMILARITY=0.30` the budget is 2,000 tokens; at 1.0 it's 50% of the context window
 - Room reserved for system prompt, current prompt, and model response
 
-### Causal Chain Buffer
-In addition to semantic retrieval, the system maintains an in-memory buffer of chronologically consecutive rounds within the current session. This buffer is injected into context as a structured block:
+### Three-Section Context Injection
+The context block is assembled from three independently gated sections:
 
-**Injection format (collapsed mode):**
-```
-[Causal Chain — recent rounds in chronological order]
-The following list shows the most recent rounds in this session. When the current
-prompt contains references to recent events ("it", "those changes", "the fix", etc.),
-review this chain to discover the referent. A proper prompt establishes context,
-specifies goals, and defines expected outputs. If any of the three is missing,
-look through the chain below to find the relevant information.
+1. **Context Building References** (preamble) — explains the entry format, the expansion tools, and names the two lists below.
+2. **Recency List** — rounds from the current session's in-memory causal chain. Context building: the model expands entries to resolve references like "that fix", "the plan", "where we left off". Trigger cases and expand-on-demand rules are embedded in the section heading.
+3. **Relevance List** — semantically similar rounds from all past sessions. Immediate recall: the extension pre-runs `search_interactions`. Scan for a bell, or ignore.
 
-1. <user-prompt-preview> (score: n/a)
-2. <user-prompt-preview> (score: n/a)
-...
-```
+Each section is gated independently: the preamble only shows if any list exists, the recency list only if the current session has prior rounds, the relevance list only if semantic search returned matches.
 
 **Design decisions:**
 - **Simple recency:** No causality detection. Rounds are added in temporal order as they occur. Pending a future mechanism to trace parallel/divergent chains.
 - **No deduplication with semantic index:** Rounds that also appear in the semantic retrieval index are included in both sections. The duplication is intentional — the score contrast (`n/a` vs a number) is a signal the LLM can leverage.
 - **No truncation:** All consecutive rounds in the session are included. No limit on buffer size for now.
 - **Flush on session start:** The buffer is cleared at `session_start`. No attempt is made to re-establish chains across session boundaries. This is consistent with the simple-recency approach — chain persistence would require causality metadata.
+- **Collapsed-only:** Full mode was removed. All injection uses the compact numbered-list format. Use `get_round_details()` to expand.
 
 ### Debug/Quality Logging
 - Each context construction is logged to the TUI status bar: which files selected, token usage, indexed count
@@ -77,14 +70,12 @@ look through the chain below to find the relevant information.
 
 ## Known Problems
 
-### 1. Most-recent-round context loss
-In collapsed mode, the immediate predecessor round gets a compact numbered entry alongside all historical rounds. The model's ability to resolve "it", "that", "those changes" from the immediately preceding user message is impaired — a round that happened 30 seconds ago is treated the same as one from three weeks ago.
-
-**Current mitigation:** A "causal chain block" replaces the simple `lastRoundFull` hack. Consecutive rounds (temporally adjacent within a session) are collected into an in-memory buffer and injected as a structured block: a fixed instruction telling the model to use the chain to discover missing context/goals/outputs, followed by the collapsed-index format with scores shown as `n/a`. This handles multi-turn chains where prompts reference work spread across several rounds.
+### 1. Most-recent-round context loss (addressed)
+The Recency List (see [Three-Section Context Injection](#three-section-context-injection)) contains all prior rounds from the current session with trigger-case instructions and expand-on-demand rules. The model resolves "it", "that", "those changes" by expanding the relevant recency entry.
 
 **Known limitation — causality vs recency:** Not all consecutive rounds form a causal chain. The current implementation uses simple recency. True causality discovery (distinguishing parallel vs sequential chains, detecting topic boundaries) is deferred to future research.
 
-**Future direction:** See [Causal Chain Buffer](#causal-chain-buffer) in Architecture. The buffer is non-persistent — flushed on `session_start` with no attempt to re-establish chains on session resume.
+**Future direction:** The buffer is non-persistent — flushed on `session_start` with no attempt to re-establish chains on session resume.
 
 ### 2. Embedding cost
 Every round saved costs 2 embedding API calls (prompt + response). Every context assembly costs 1 embedding call. Embedding costs are the main operational expense.
@@ -133,7 +124,7 @@ Because context is assembled dynamically, every prompt is a fresh embedding API 
 - [x] Query index by distance
 - [x] Assemble context from closest rounds up to token budget
 - [x] Inject into the agent as replaced messages
-- [ ] Experiment with Recency buffer — implemented as the [Causal Chain Buffer](#causal-chain-buffer). Flushed on session start. No truncation. No causality detection yet.
+- [x] Recency buffer — implemented as the [Recency List](#three-section-context-injection). Flushed on session start. No truncation. No causality detection yet.
 
 ### Phase 4 — Quality & Iteration
 - [x] Log context construction decisions (status bar)
