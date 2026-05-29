@@ -1234,15 +1234,17 @@ export default function (pi: ExtensionAPI) {
     pi.registerTool({
       name: "get_round_details",
       label: "Get Round Details",
-      description: "Retrieve the full content of a past conversation round by its filename hash. Unlike the truncated previews injected into context (which show only the first portion of the user prompt and assistant response), this returns the complete userPrompt and responseSequence for that round, plus all tool call metadata. Use this when you need to see the full conversation from a historical round.\n\nParameters:\n- round: the round filename (e.g., 'abc123.json')\n- from_line: optional 1-based line offset into the assistant response (default: 1). When specified, the response sequence is paginated on line boundaries.\n- line_count: optional max lines of the assistant response to return (default: 200 when from_line is specified). Omit for full response (when from_line is also omitted).",
+      description: "Retrieve the full content of a past conversation round by its filename hash. Unlike the truncated previews injected into context (which show only the first portion of the user prompt and assistant response), this returns the complete userPrompt and responseSequence for that round, plus all tool call metadata. Use this when you need to see the full conversation from a historical round.\n\nParameters:\n- round: the round filename (e.g., 'abc123.json')\n- from_line: optional 1-based line offset into the assistant response (default: 1). When specified, the response sequence is paginated on line boundaries. Mutually exclusive with match.\n- line_count: optional max lines of assistant response to return. Default: 200 when from_line is specified, 0 when match is specified (just the matched line). Omit both for full response.\n- match: optional regexp pattern to find within the round (user prompt + assistant response). Mutually exclusive with from_line. When present, line_count specifies lines of context after each match (default: 0). Use with max_matches to control how many matches to return.\n- max_matches: max matches to return (default: 1). Has no effect without match.",
       promptSnippet: "Get full details of a past conversation round",
       parameters: Type.Object({
         round: Type.String({ description: "The round filename to look up (e.g., 'abc123def456.json')" }),
-        from_line: Type.Optional(Type.Number({ description: "1-based line offset into the assistant response. Default: 1 (start). When specified, the response is paginated on line boundaries." })),
-        line_count: Type.Optional(Type.Number({ description: "Max lines of assistant response to return. Default: 200 when from_line is specified. Omit both for full response." })),
+        from_line: Type.Optional(Type.Number({ description: "1-based line offset into the assistant response. Default: 1 (start). When specified, the response is paginated on line boundaries. Mutually exclusive with match." })),
+        line_count: Type.Optional(Type.Number({ description: "Max lines of assistant response to return. Default: 200 when from_line is specified, 0 when match is specified. Omit both for full response." })),
+        match: Type.Optional(Type.String({ description: "A regexp pattern to search within the round (user prompt + assistant response). Mutually exclusive with from_line. When provided, line_count specifies lines of context after each match (default: 0). Use with max_matches to control how many matches to return." })),
+        max_matches: Type.Optional(Type.Number({ description: "Max number of matches to return (default: 1). Has no effect without match." })),
       }),
       async execute(toolCallId, params, signal, onUpdate, ctx2) {
-        const p = params as { round: string; from_line?: number; line_count?: number };
+        const p = params as { round: string; from_line?: number; line_count?: number; match?: string; max_matches?: number };
 
         // ◈ Stats: check if this hash matches any presented position
         recordRead(p.round);
@@ -1293,17 +1295,27 @@ export default function (pi: ExtensionAPI) {
           assistantOutput = (roundData.responseSequence as string) ?? "(empty)";
         }
 
-        // ── Pagination ──
-        // When pagination is active, paginate on responseSequence (flat text by lines).
-        // Override assistantOutput with the sliced sequence. The user prompt and tool
-        // metadata are always included. If responseSequence is unavailable, fall back
-        // to assistantOutput.
-        const isPaginated = p.from_line !== undefined || p.line_count !== undefined;
+        // ── Pagination or Regexp Matching ──
+        // Three modes:
+        // 1. from_line (+ optional line_count) — position-based line slicing
+        // 2. match (+ optional line_count, max_matches) — regexp-based context windows
+        // 3. Neither — full response
+        // If match is provided, it's mutually exclusive with from_line.
+        const useMatch = p.match !== undefined && p.match.length > 0;
+        const useFromLine = p.from_line !== undefined;
         let responseTotalLines = 0;
         let paginationMarker = "";
+        let matchHeader = "";
 
-        if (isPaginated) {
-          // Use responseSequence for line-based slicing (flat, clean to slice)
+        if (useMatch && useFromLine) {
+          return {
+            content: [{ type: "text", text: `Error: match and from_line are mutually exclusive. Use one or the other, not both.` }],
+            details: {},
+          };
+        }
+
+        if (useFromLine) {
+          // Position-based pagination
           const flatText = (roundData.responseSequence as string) ?? "";
           const allLines = flatText.split("\n");
           responseTotalLines = allLines.length;
@@ -1320,6 +1332,92 @@ export default function (pi: ExtensionAPI) {
 
           if (remaining > 0) {
             paginationMarker = `[Truncated — use from_line=${endIdx + 1}, line_count=${lineCount} to continue]`;
+          }
+        } else if (useMatch) {
+          // Regexp-based matching
+          try {
+            const regex = new RegExp(p.match!, "gm");
+            const flatText = (roundData.responseSequence as string) ?? "";
+            const allLines = flatText.split("\n");
+            responseTotalLines = allLines.length;
+            const lineCount = p.line_count ?? 0; // default: just the matched line
+            const maxMatches = p.max_matches ?? 1;
+
+            // Search both user prompt lines and assistant response lines
+            // Build combined array with source markers
+            const userLines = ((roundData.userPrompt as string) ?? "").split("\n");
+            const searchLines: Array<{ text: string; source: "user" | "assistant"; originalIndex: number }> = [];
+            for (let i = 0; i < userLines.length; i++) {
+              searchLines.push({ text: userLines[i], source: "user", originalIndex: i });
+            }
+            // separator between user and assistant
+            searchLines.push({ text: "", source: "assistant", originalIndex: -1 });
+            for (let i = 0; i < allLines.length; i++) {
+              searchLines.push({ text: allLines[i], source: "assistant", originalIndex: i });
+            }
+
+            // Find matches
+            const matchResults: Array<{ lineIdx: number; source: "user" | "assistant"; text: string }> = [];
+            for (let i = 0; i < searchLines.length; i++) {
+              if (regex.test(searchLines[i].text)) {
+                matchResults.push({
+                  lineIdx: searchLines[i].originalIndex,
+                  source: searchLines[i].source,
+                  text: searchLines[i].text,
+                });
+                // Reset lastIndex for 'g' flag
+                regex.lastIndex = 0;
+              }
+            }
+
+            // Clip: if a match is in the user section, only show that one (cheapest)
+            const userMatchCount = matchResults.filter(m => m.source === "user").length;
+            let shownMatches = matchResults.slice(0, maxMatches);
+            if (userMatchCount > 0) {
+              // Only the first user match; clip early
+              shownMatches = [matchResults[0]];
+            }
+
+            const totalMatches = matchResults.length;
+            const matchCount = shownMatches.length;
+
+            // Build output with matched lines and context windows
+            const matchParts: string[] = [];
+            for (let mi = 0; mi < matchCount; mi++) {
+              const m = shownMatches[mi];
+              if (m.source === "user") {
+                // Show user prompt line
+                matchParts.push(`[M ${mi + 1}/${matchCount} in user prompt] ${m.text}`);
+              } else {
+                // In assistant response: show matched line + lineCount lines after
+                const startIdx = m.lineIdx;
+                const endIdx = Math.min(responseTotalLines, startIdx + 1 + lineCount);
+                const ctxLines = allLines.slice(startIdx, endIdx);
+                const context = ctxLines.join("\n");
+                if (lineCount > 0) {
+                  matchParts.push(`[M ${mi + 1}/${matchCount} at assistant line ${m.lineIdx + 1} (${lineCount} lines of context)]\n${context}`);
+                } else {
+                  matchParts.push(`[M ${mi + 1}/${matchCount} at assistant line ${m.lineIdx + 1}] ${m.text}`);
+                }
+              }
+            }
+
+            const remainingMatches = totalMatches - matchCount;
+            assistantOutput = matchParts.length > 0
+              ? matchParts.join("\n\n")
+              : "(no matches)";
+
+            if (remainingMatches > 0) {
+              matchHeader = ` (${matchCount} match${matchCount !== 1 ? "es" : ""} shown of ${totalMatches} total)`;
+            } else if (totalMatches > 0) {
+              const mLabel = totalMatches === 1 ? "match" : "matches";
+              matchHeader = ` (${totalMatches} ${mLabel})`;
+            }
+          } catch (err) {
+            return {
+              content: [{ type: "text", text: `Invalid regexp pattern: ${(err as Error).message}. Provide a valid JavaScript regexp string.` }],
+              details: {},
+            };
           }
         }
 
@@ -1342,10 +1440,18 @@ export default function (pi: ExtensionAPI) {
           });
         }
 
+        // Build header with position or match info
+        let headerSuffix = "";
+        if (useFromLine) {
+          headerSuffix = ` (lines ${p.from_line ?? 1}–${Math.min((p.from_line ?? 1) - 1 + (p.line_count ?? 200), responseTotalLines)} of ${responseTotalLines})`;
+        } else if (useMatch) {
+          headerSuffix = matchHeader;
+        }
+
         return {
           content: [{
             type: "text",
-            text: `=== Round: ${p.round}${isPaginated ? ` (lines ${p.from_line ?? 1}–${Math.min((p.from_line ?? 1) - 1 + (p.line_count ?? 200), responseTotalLines)} of ${responseTotalLines})` : ""} ===\n` +
+            text: `=== Round: ${p.round}${headerSuffix} ===\n` +
               `User: ${roundData.userPrompt ?? "(empty)"}\n` +
               `Assistant: ${assistantOutput}` +
               `${paginationMarker ? `\n${paginationMarker}` : ""}` +
@@ -1360,16 +1466,18 @@ export default function (pi: ExtensionAPI) {
     pi.registerTool({
       name: "get_tool_details",
       label: "Get Tool Details",
-      description: "Retrieve the full arguments and result of a specific tool call from a past conversation round. When you see historical rounds injected into context with TOOLS USED markers, you can call this tool to inspect what a specific tool did — its full arguments and the complete output (not just the preview stored in the round file).\n\nParameters:\n- round: the round filename (e.g., 'abc123.json')\n- index: the 0-based index of the tool call within that round's toolCalls array\n- out__from_line: optional 1-based line offset into the result (default: 1)\n- out_line_count: optional max lines to return (default: all, up to 200 when pagination is active)",
+      description: "Retrieve the full arguments and result of a specific tool call from a past conversation round. When you see historical rounds injected into context with TOOLS USED markers, you can call this tool to inspect what a specific tool did — its full arguments and the complete output (not just the preview stored in the round file).\n\nParameters:\n- round: the round filename (e.g., 'abc123.json')\n- index: the 0-based index of the tool call within that round's toolCalls array\n- out__from_line: optional 1-based line offset into the result (default: 1). Mutually exclusive with match.\n- out_line_count: optional max lines to return (default: all, up to 200 when pagination is active)\n- match: optional regexp pattern to find within the tool result. Mutually exclusive with out__from_line. When present, out_line_count specifies lines of context after each match (default: 0). Use with max_matches to control how many matches to return.\n- max_matches: max matches to return (default: 1). Has no effect without match.",
       promptSnippet: "Get details of a specific tool call from a past round",
       parameters: Type.Object({
         round: Type.String({ description: "The round filename to look up (e.g., 'abc123def456.json')" }),
         index: Type.Number({ description: "The 0-based index of the tool call within the round" }),
-        out__from_line: Type.Optional(Type.Number({ description: "1-based line offset into the result (default: 1)" })),
-        out_line_count: Type.Optional(Type.Number({ description: "Max lines to return (default: all, up to 200 when pagination is active)" })),
+        out__from_line: Type.Optional(Type.Number({ description: "1-based line offset into the result (default: 1). Mutually exclusive with match." })),
+        out_line_count: Type.Optional(Type.Number({ description: "Max lines to return (default: all, up to 200 when pagination is active, or 0 when match is specified)" })),
+        match: Type.Optional(Type.String({ description: "A regexp pattern to search within the tool result text. Mutually exclusive with out__from_line. When provided, out_line_count specifies lines of context after each match (default: 0). Use with max_matches to control how many matches to return." })),
+        max_matches: Type.Optional(Type.Number({ description: "Max number of matches to return (default: 1). Has no effect without match." })),
       }),
       async execute(toolCallId, params, signal, onUpdate, ctx2) {
-        const p = params as { round: string; index: number; out__from_line?: number; out_line_count?: number };
+        const p = params as { round: string; index: number; out__from_line?: number; out_line_count?: number; match?: string; max_matches?: number };
 
         const fullPath = `${ROUNDS_DIR}/${p.round}`;
         if (!fs.existsSync(fullPath)) {
@@ -1413,10 +1521,18 @@ export default function (pi: ExtensionAPI) {
 
         // Determine the result text (prefer result_full, fall back to result_summary)
         const resultText = tc.result_full ?? tc.result_summary ?? "";
-        const isPaginated = p.out__from_line !== undefined || p.out_line_count !== undefined;
+        const useMatch = p.match !== undefined && p.match.length > 0;
+        const useFromLine = p.out__from_line !== undefined;
 
-        if (isPaginated) {
-          // Slice by lines
+        if (useMatch && useFromLine) {
+          return {
+            content: [{ type: "text", text: `Error: match and out__from_line are mutually exclusive. Use one or the other, not both.` }],
+            details: {},
+          };
+        }
+
+        if (useFromLine) {
+          // Position-based pagination
           const allLines = resultText.split("\n");
           const totalLines = allLines.length;
           const fromLine = p.out__from_line ?? 1;
@@ -1445,6 +1561,75 @@ export default function (pi: ExtensionAPI) {
             }],
             details: { name: tc.name, arguments: tc.arguments, lines_shown: { from: fromLine, to: endIdx, of: totalLines } },
           };
+        }
+
+        if (useMatch) {
+          // Regexp-based matching in tool result
+          try {
+            const regex = new RegExp(p.match!, "gm");
+            const allLines = resultText.split("\n");
+            const totalLines = allLines.length;
+            const lineCount = p.out_line_count ?? 0;
+            const maxMatches = p.max_matches ?? 1;
+
+            // Find matching lines
+            const matchResults: number[] = [];
+            for (let i = 0; i < allLines.length; i++) {
+              if (regex.test(allLines[i])) {
+                matchResults.push(i);
+                regex.lastIndex = 0;
+              }
+            }
+
+            const totalMatches = matchResults.length;
+            const shownIndices = matchResults.slice(0, maxMatches);
+            const matchCount = shownIndices.length;
+
+            // Build output with context windows
+            const matchParts: string[] = [];
+            for (let mi = 0; mi < matchCount; mi++) {
+              const lineIdx = shownIndices[mi];
+              const startIdx = lineIdx;
+              const endIdx = Math.min(totalLines, startIdx + 1 + lineCount);
+              const ctxLines = allLines.slice(startIdx, endIdx);
+              const context = ctxLines.join("\n");
+              if (lineCount > 0) {
+                matchParts.push(`[M ${mi + 1}/${matchCount} at line ${lineIdx + 1} (${lineCount} lines of context)]\n${context}`);
+              } else {
+                matchParts.push(`[M ${mi + 1}/${matchCount} at line ${lineIdx + 1}] ${allLines[lineIdx]}`);
+              }
+            }
+
+            const resultBlock = matchParts.length > 0
+              ? matchParts.join("\n\n")
+              : "(no matches)";
+
+            let matchSummary = "";
+            const remainingMatches = totalMatches - matchCount;
+            if (remainingMatches > 0) {
+              matchSummary = ` (${matchCount} match${matchCount !== 1 ? "es" : ""} shown of ${totalMatches} total)`;
+            } else if (totalMatches > 0) {
+              const mLabel = totalMatches === 1 ? "match" : "matches";
+              matchSummary = ` (${totalMatches} ${mLabel})`;
+            }
+
+            return {
+              content: [{
+                type: "text",
+                text: `[Match results for tool call #${tc.index} (${tc.name})${matchSummary}]\n` +
+                  `Tool name: ${tc.name}\n` +
+                  `Arguments: ${JSON.stringify(argsParsed, null, 2)}\n` +
+                  `Result:\n` +
+                  `  ${resultBlock}`,
+              }],
+              details: { name: tc.name, arguments: tc.arguments, matches: { shown: matchCount, total: totalMatches } },
+            };
+          } catch (err) {
+            return {
+              content: [{ type: "text", text: `Invalid regexp pattern: ${(err as Error).message}. Provide a valid JavaScript regexp string.` }],
+              details: {},
+            };
+          }
         }
 
         // Unpaginated — show full result
