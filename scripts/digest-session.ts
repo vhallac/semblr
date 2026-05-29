@@ -23,6 +23,8 @@ interface ToolCallDetail {
   name: string;
   arguments: string;
   result_summary: string;
+  result_full?: string;
+  result_truncated?: boolean;
 }
 
 interface ResponseSegment {
@@ -142,6 +144,8 @@ function parseSession(filePath: string): Round[] {
           const resultContent = entry.message.content;
           const resultText = resultContent ? extractText(resultContent) : "";
           toolCalls[i].result_summary = resultText.slice(0, 300);
+            toolCalls[i].result_full = resultText;
+            toolCalls[i].result_truncated = false;
           break;
         }
       }
