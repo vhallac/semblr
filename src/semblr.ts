@@ -171,12 +171,14 @@ function formatRoundEntry(
   score: string,
   toolSummary: string,
   userPrompt: string,
+  sizeStr?: string,
 ): string[] {
   const promptLines = userPrompt
     .split("\n")
     .map((line, i) => i === 0 ? `  user: ${line}` : `  ${line}`);
+  const sizePart = sizeStr ? ` | ${sizeStr}` : "";
   return [
-    `${idx}. ${fileName} [${score} | ${toolSummary}]:`,
+    `${idx}. ${fileName} [${score} | ${toolSummary}${sizePart}]:`,
     ...promptLines,
     "  ---",
   ];
@@ -226,12 +228,14 @@ answer.`;
   let idx = 0;
   for (const entry of reversed) {
     idx++;
+    const sizeStr = getRoundSize(entry.fileName) ?? undefined;
     lines.push(...formatRoundEntry(
       idx,
       entry.fileName,
       "n/a",
       entry.toolSummary,
       entry.userPrompt,
+      sizeStr,
     ));
   }
   return lines.join("\n");
@@ -257,12 +261,14 @@ If nothing rings a bell, ignore this list — it's a pre-filter, not a map.`;
   for (const round of rounds) {
     idx++;
     const toolCount = round.data.toolCallCount ?? 0;
+    const sizeStr = getRoundSize(round.fileName) ?? undefined;
     lines.push(...formatRoundEntry(
       idx,
       round.fileName,
       round.bestScore.toFixed(2),
       `${toolCount} tools`,
       round.data.userPrompt,
+      sizeStr,
     ));
   }
   return lines.join("\n");
@@ -279,7 +285,7 @@ The lists below show past conversation rounds. Each entry contains only the user
 Use get_round_details("hash.json") to expand a round's full conversation.
 Use get_tool_details("hash.json", N) to inspect tool call N within a round.
 
-Format: N. hash.json [score | N tools]: followed by the full user prompt (indented).
+Format: N. hash.json [score | N tools | size]: followed by the full user prompt (indented).
 Number 1 in the list is the most recent round.`;
 }
 
@@ -307,6 +313,24 @@ function extractText(content: Array<{ type: string; text?: string }>): string {
     .filter((c) => c.type === "text" && c.text)
     .map((c) => c.text!)
     .join(" ");
+}
+
+/** Format a byte count into human-readable KB/MB. */
+function formatFileSize(bytes: number): string {
+  if (bytes < 1024) return `${Math.round(bytes / 10.24) / 100}KB`;       // 0.5KB
+  if (bytes < 10240) return `${Math.round(bytes / 1024)}KB`;             // 5KB
+  if (bytes < 1048576) return `${Math.round(bytes / 1024)}KB`;           // 54KB
+  return `${Math.round(bytes / 10485.76) / 100}MB`;                      // 1.1MB
+}
+
+/** Stat a round file and return its formatted size string, or null on failure. */
+function getRoundSize(fileName: string): string | null {
+  try {
+    const stat = fs.statSync(`${ROUNDS_DIR}/${fileName}`);
+    return formatFileSize(stat.size);
+  } catch {
+    return null;
+  }
 }
 
 // formatCollapsedIndex removed — replaced by buildRecencyList / buildRelevanceList / buildContextPreamble
@@ -1151,7 +1175,9 @@ export default function (pi: ExtensionAPI) {
             : (round.data.toolCallCount === 0 ? " | 0 tools (discussion only)" : "");
 
           // search_interactions always shows full round content.
-          lines.push(`--- Round ${round.fileName} (score: ${round.bestScore.toFixed(3)}${toolStr}) ---`);
+          const roundSizeStr = getRoundSize(round.fileName);
+          const sizeTag = roundSizeStr ? ` | ${roundSizeStr}` : "";
+          lines.push(`--- Round ${round.fileName} (score: ${round.bestScore.toFixed(3)}${toolStr}${sizeTag}) ---`);
           lines.push(`User: ${round.data.userPrompt}`);
 
           if (round.data.toolCallCount != null && round.data.toolCallCount > 0 && round.data.toolCalls && round.data.toolCalls.length > 0) {
