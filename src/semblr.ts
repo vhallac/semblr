@@ -1234,13 +1234,15 @@ export default function (pi: ExtensionAPI) {
     pi.registerTool({
       name: "get_round_details",
       label: "Get Round Details",
-      description: "Retrieve the full content of a past conversation round by its filename hash. Unlike the truncated previews injected into context (which show only the first portion of the user prompt and assistant response), this returns the complete userPrompt and responseSequence for that round, plus all tool call metadata. Use this when you need to see the full conversation from a historical round.\n\nParameters:\n- round: the round filename (e.g., 'abc123.json')",
+      description: "Retrieve the full content of a past conversation round by its filename hash. Unlike the truncated previews injected into context (which show only the first portion of the user prompt and assistant response), this returns the complete userPrompt and responseSequence for that round, plus all tool call metadata. Use this when you need to see the full conversation from a historical round.\n\nParameters:\n- round: the round filename (e.g., 'abc123.json')\n- from_line: optional 1-based line offset into the assistant response (default: 1). When specified, the response sequence is paginated on line boundaries.\n- line_count: optional max lines of the assistant response to return (default: 200 when from_line is specified). Omit for full response (when from_line is also omitted).",
       promptSnippet: "Get full details of a past conversation round",
       parameters: Type.Object({
         round: Type.String({ description: "The round filename to look up (e.g., 'abc123def456.json')" }),
+        from_line: Type.Optional(Type.Number({ description: "1-based line offset into the assistant response. Default: 1 (start). When specified, the response is paginated on line boundaries." })),
+        line_count: Type.Optional(Type.Number({ description: "Max lines of assistant response to return. Default: 200 when from_line is specified. Omit both for full response." })),
       }),
       async execute(toolCallId, params, signal, onUpdate, ctx2) {
-        const p = params as { round: string };
+        const p = params as { round: string; from_line?: number; line_count?: number };
 
         // ◈ Stats: check if this hash matches any presented position
         recordRead(p.round);
@@ -1291,6 +1293,36 @@ export default function (pi: ExtensionAPI) {
           assistantOutput = (roundData.responseSequence as string) ?? "(empty)";
         }
 
+        // ── Pagination ──
+        // When pagination is active, paginate on responseSequence (flat text by lines).
+        // Override assistantOutput with the sliced sequence. The user prompt and tool
+        // metadata are always included. If responseSequence is unavailable, fall back
+        // to assistantOutput.
+        const isPaginated = p.from_line !== undefined || p.line_count !== undefined;
+        let responseTotalLines = 0;
+        let paginationMarker = "";
+
+        if (isPaginated) {
+          // Use responseSequence for line-based slicing (flat, clean to slice)
+          const flatText = (roundData.responseSequence as string) ?? "";
+          const allLines = flatText.split("\n");
+          responseTotalLines = allLines.length;
+          const fromLine = p.from_line ?? 1;
+          const lineCount = p.line_count ?? 200;
+          const startIdx = Math.max(0, fromLine - 1);
+          const endIdx = Math.min(responseTotalLines, startIdx + lineCount);
+          const pageLines = allLines.slice(startIdx, endIdx);
+          const remaining = responseTotalLines - endIdx;
+
+          assistantOutput = pageLines.length > 0
+            ? pageLines.join("\n")
+            : "(empty)";
+
+          if (remaining > 0) {
+            paginationMarker = `[Truncated — use from_line=${endIdx + 1}, line_count=${lineCount} to continue]`;
+          }
+        }
+
         // Collapse tool call arguments and results in the details object.
         // Even when a round is "expanded" via get_round_details, the tool call
         // internals stay redacted — you must drill in with get_tool_details().
@@ -1313,9 +1345,11 @@ export default function (pi: ExtensionAPI) {
         return {
           content: [{
             type: "text",
-            text: `=== Round: ${p.round} ===\n` +
+            text: `=== Round: ${p.round}${isPaginated ? ` (lines ${p.from_line ?? 1}–${Math.min((p.from_line ?? 1) - 1 + (p.line_count ?? 200), responseTotalLines)} of ${responseTotalLines})` : ""} ===\n` +
               `User: ${roundData.userPrompt ?? "(empty)"}\n` +
-              `Assistant: ${assistantOutput}${toolMeta}`,
+              `Assistant: ${assistantOutput}` +
+              `${paginationMarker ? `\n${paginationMarker}` : ""}` +
+              `${toolMeta}`,
           }],
           details: collapsedDetails,
         };
