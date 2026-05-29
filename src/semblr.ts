@@ -437,6 +437,15 @@ let lastContextVec: number[] = [];
 let agentPromptVec: number[] | null = null; // cached from context hook, reused in agent_end to avoid redundant embed
 let roundPresentedRecorded = false; // dedup: recordPresented only once per agent cycle
 
+// Full-message cache — the envPreamble plus context-building-reference sections
+// (recency list, relevance list, preamble) are computed once per agent cycle on
+// the first context hook invocation and reused for subsequent tool turns.
+// This fixes a prompt-cache-busting bug where new Date() timestamps in the
+// envPreamble changed on every inner LLM call.
+let cachedEnvPreamble: string | null = null;
+let cachedContextMessages: Array<{ role: string; content: Array<{ type: string; text: string }> }> | null = null;
+let cachedUserPromptForContext: string | null = null; // the extracted user prompt used to build cachedContextMessages
+
 async function getApiKey(ctx?: { modelRegistry?: { getApiKeyForProvider(provider: string): Promise<string | undefined> } }): Promise<string | null> {
   // 1. Environment variable
   const envKey = process.env.OPENROUTER_API_KEY;
@@ -627,7 +636,10 @@ export default function (pi: ExtensionAPI) {
       m.role === "user" ? i : last, -1);
 
     // --- Prepend environment info to the current user prompt ---
-    const envPreamble = `[ENVIRONMENT]\nHost: ${os.hostname()}\nCWD: ${process.cwd()}\nCurrent date/time: ${new Date().toISOString().replace(/[-:]/g, "").replace(/\.\d+/, "")}`;
+    // Computed once per agent cycle (cachedEnvPreamble) so the timestamp is
+    // stable across tool turns — avoids busting the LLM prompt cache.
+    const envPreamble = cachedEnvPreamble ??
+      `[ENVIRONMENT]\nHost: ${os.hostname()}\nCWD: ${process.cwd()}\nCurrent date/time: ${new Date().toISOString().replace(/[-:]/g, "").replace(/\.\d+/, "")}`;
 
     const augmentedMessages = [...messages];
     if (lastUserIdx >= 0) {
@@ -662,6 +674,16 @@ export default function (pi: ExtensionAPI) {
       return { messages: augmentedMessages };
     }
 
+    // --- Reuse cached context blocks if this is a subsequent context call within
+    //     the same agent cycle. The recency list, relevance list, and preamble
+    //     are stable across tool turns; only the currentMessages section changes.
+    if (cachedContextMessages && cachedEnvPreamble && userPrompt === cachedUserPromptForContext) {
+      // Compose: system + preamble + recency + relevance + current turn messages
+      const finalMessages = [...cachedContextMessages];
+      finalMessages.push(...currentMessages);
+      return { messages: finalMessages };
+    }
+
     // agentPromptVec is stashed after embedding below for agent_end to reuse
 
 
@@ -685,7 +707,13 @@ export default function (pi: ExtensionAPI) {
 
       // Load and score the index
       const index = loadIndex();
-      if (index.length === 0) return { messages: augmentedMessages };
+      if (index.length === 0) {
+        // Env preamble + current messages only (no context lists)
+        cachedEnvPreamble = envPreamble;
+        cachedUserPromptForContext = userPrompt;
+        cachedContextMessages = systemMsg ? [systemMsg] : [];
+        return { messages: augmentedMessages };
+      }
 
       const scored = index
         .map((entry) => ({
@@ -770,6 +798,10 @@ export default function (pi: ExtensionAPI) {
           "semblr",
           `🧠 no relevant context (best: ${bestScore.toFixed(3)})`,
         );
+        // Cache the empty-context result so subsequent turns reuse it
+        cachedEnvPreamble = envPreamble;
+        cachedUserPromptForContext = userPrompt;
+        cachedContextMessages = systemMsg ? [systemMsg] : [];
         return { messages: augmentedMessages };
       }
 
@@ -825,6 +857,13 @@ export default function (pi: ExtensionAPI) {
           });
         }
 
+        // Cache the stable prefix (system + preamble + recency + relevance) for
+        // subsequent context calls within this agent cycle. currentMessages is
+        // appended fresh each time.
+        cachedEnvPreamble = envPreamble;
+        cachedUserPromptForContext = userPrompt;
+        cachedContextMessages = finalMessages; // finalMessages at this point = system + lists, no currentMessages yet
+
         finalMessages.push(...currentMessages);
 
         return { messages: finalMessages };
@@ -863,6 +902,11 @@ export default function (pi: ExtensionAPI) {
     lastContextVec = [];
     agentPromptVec = null;
     roundPresentedRecorded = false;
+
+    // Reset full-message cache — env preamble and context blocks rebuilt on first context call
+    cachedEnvPreamble = null;
+    cachedContextMessages = null;
+    cachedUserPromptForContext = null;
   });
 
   pi.on("message_end", async (event, _ctx) => {
