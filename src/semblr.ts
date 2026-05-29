@@ -873,7 +873,7 @@ export default function (pi: ExtensionAPI) {
         // appended fresh each time.
         cachedEnvPreamble = envPreamble;
         cachedUserPromptForContext = userPrompt;
-        cachedContextMessages = finalMessages; // finalMessages at this point = system + lists, no currentMessages yet
+        cachedContextMessages = [...finalMessages]; // snapshot before mutation below
 
         finalMessages.push(...currentMessages);
 
