@@ -262,11 +262,24 @@ If nothing rings a bell, ignore this list — it's a pre-filter, not a map.`;
     idx++;
     const toolCount = round.data.toolCallCount ?? 0;
     const sizeStr = getRoundSize(round.fileName) ?? undefined;
+
+    // Build per-tool size tags where data is available
+    let toolSummary = `${toolCount} tools`;
+    if (round.data.toolCalls && round.data.toolCalls.length > 0) {
+      const toolSizes = round.data.toolCalls.map((tc: ToolCallDetail) => {
+        const sourceText = tc.result_full ?? tc.result_summary ?? "";
+        return sourceText.length > 0
+          ? `${tc.name} (${formatFileSize(Buffer.byteLength(sourceText, "utf-8"))})`
+          : tc.name;
+      });
+      toolSummary = `${toolCount} tools (${toolSizes.join(", ")})`;
+    }
+
     lines.push(...formatRoundEntry(
       idx,
       round.fileName,
       round.bestScore.toFixed(2),
-      `${toolCount} tools`,
+      toolSummary,
       round.data.userPrompt,
       sizeStr,
     ));
@@ -364,7 +377,9 @@ interface ToolCallDetail {
   index: number;
   name: string;
   arguments: string;    // JSON string of arguments (abbreviated if >500 chars)
-  result_summary: string; // first 300 chars of result text
+  result_summary: string; // first 300 chars of result text (legacy field, kept for backward compat)
+  result_full?: string;   // full tool output (no cap, for post-step-2 rounds)
+  result_truncated?: boolean; // true if result exceeds cap (only false for post-step-2 rounds since no cap)
 }
 
 interface RoundData {
@@ -899,6 +914,8 @@ export default function (pi: ExtensionAPI) {
             const resultContent = msg.content as Array<{ type: string; text?: string }> | undefined;
             const resultText = resultContent ? extractText(resultContent) : "";
             agentToolCalls[i].result_summary = resultText.slice(0, 300);
+            agentToolCalls[i].result_full = resultText;
+            agentToolCalls[i].result_truncated = false;
             break;
           }
         }
@@ -1181,9 +1198,13 @@ export default function (pi: ExtensionAPI) {
           lines.push(`User: ${round.data.userPrompt}`);
 
           if (round.data.toolCallCount != null && round.data.toolCallCount > 0 && round.data.toolCalls && round.data.toolCalls.length > 0) {
-            const turnLines = round.data.toolCalls.map((tc: ToolCallDetail) =>
-              `  Turn ${tc.index}: ${tc.name} — [REDACTED: arguments and result collapsed. Use get_tool_details("${round.fileName}", ${tc.index}) to expand.]`
-            );
+            const turnLines = round.data.toolCalls.map((tc: ToolCallDetail) => {
+              // Calculate tool output size from result_full or result_summary
+              const sourceText = tc.result_full ?? tc.result_summary ?? "";
+              const sizeLabel = sourceText.length > 0 ? formatFileSize(Buffer.byteLength(sourceText, "utf-8")) : null;
+              const sizeTag = sizeLabel ? ` (${sizeLabel})` : "";
+              return `  Turn ${tc.index}: ${tc.name}${sizeTag} — [REDACTED: use get_tool_details("${round.fileName}", ${tc.index}) to expand.]`;
+            });
             lines.push("--- Agent turns (all tool calls redacted — use get_tool_details to expand) ---");
             lines.push(...turnLines);
           } else if (round.data.toolCallCount === 0) {
@@ -1273,13 +1294,20 @@ export default function (pi: ExtensionAPI) {
         // Collapse tool call arguments and results in the details object.
         // Even when a round is "expanded" via get_round_details, the tool call
         // internals stay redacted — you must drill in with get_tool_details().
+        // Include per-tool output sizes so the agent knows which call is expensive.
         const collapsedDetails = { ...roundData };
         if (collapsedDetails.toolCalls && Array.isArray(collapsedDetails.toolCalls)) {
-          collapsedDetails.toolCalls = (collapsedDetails.toolCalls as any[]).map((tc: any) => ({
-            ...tc,
-            arguments: `[REDACTED — use get_tool_details("${p.round}", ${tc.index}) to expand]`,
-            result_summary: `[REDACTED — use get_tool_details("${p.round}", ${tc.index}) to expand]`,
-          }));
+          collapsedDetails.toolCalls = (collapsedDetails.toolCalls as any[]).map((tc: any) => {
+            // Calculate tool output size from result_full or result_summary
+            const sourceText = tc.result_full ?? tc.result_summary ?? "";
+            const sizeLabel = formatFileSize(Buffer.byteLength(sourceText, "utf-8"));
+            return {
+              ...tc,
+              arguments: `[REDACTED — use get_tool_details("${p.round}", ${tc.index}) to expand]`,
+              result_summary: `[REDACTED — size: ${sizeLabel}; use get_tool_details("${p.round}", ${tc.index}) to expand]`,
+              result_full: undefined, // strip inline to keep details compact
+            };
+          });
         }
 
         return {
@@ -1298,14 +1326,16 @@ export default function (pi: ExtensionAPI) {
     pi.registerTool({
       name: "get_tool_details",
       label: "Get Tool Details",
-      description: "Retrieve the full arguments and result of a specific tool call from a past conversation round. When you see historical rounds injected into context with TOOLS USED markers, you can call this tool to inspect what a specific tool did — its full arguments and the complete output (not just the preview stored in the round file).\n\nParameters:\n- round: the round filename (e.g., 'abc123.json')\n- index: the 0-based index of the tool call within that round's toolCalls array",
+      description: "Retrieve the full arguments and result of a specific tool call from a past conversation round. When you see historical rounds injected into context with TOOLS USED markers, you can call this tool to inspect what a specific tool did — its full arguments and the complete output (not just the preview stored in the round file).\n\nParameters:\n- round: the round filename (e.g., 'abc123.json')\n- index: the 0-based index of the tool call within that round's toolCalls array\n- out__from_line: optional 1-based line offset into the result (default: 1)\n- out_line_count: optional max lines to return (default: all, up to 200 when pagination is active)",
       promptSnippet: "Get details of a specific tool call from a past round",
       parameters: Type.Object({
         round: Type.String({ description: "The round filename to look up (e.g., 'abc123def456.json')" }),
         index: Type.Number({ description: "The 0-based index of the tool call within the round" }),
+        out__from_line: Type.Optional(Type.Number({ description: "1-based line offset into the result (default: 1)" })),
+        out_line_count: Type.Optional(Type.Number({ description: "Max lines to return (default: all, up to 200 when pagination is active)" })),
       }),
       async execute(toolCallId, params, signal, onUpdate, ctx2) {
-        const p = params as { round: string; index: number };
+        const p = params as { round: string; index: number; out__from_line?: number; out_line_count?: number };
 
         const fullPath = `${ROUNDS_DIR}/${p.round}`;
         if (!fs.existsSync(fullPath)) {
@@ -1347,15 +1377,60 @@ export default function (pi: ExtensionAPI) {
           argsParsed = JSON.parse(tc.arguments);
         } catch { /* keep as string */ }
 
+        // Determine the result text (prefer result_full, fall back to result_summary)
+        const resultText = tc.result_full ?? tc.result_summary ?? "";
+        const isPaginated = p.out__from_line !== undefined || p.out_line_count !== undefined;
+
+        if (isPaginated) {
+          // Slice by lines
+          const allLines = resultText.split("\n");
+          const totalLines = allLines.length;
+          const fromLine = p.out__from_line ?? 1;
+          const lineCount = p.out_line_count ?? 200;
+          const startIdx = Math.max(0, fromLine - 1);
+          const endIdx = Math.min(totalLines, startIdx + lineCount);
+          const pageLines = allLines.slice(startIdx, endIdx);
+          const remaining = totalLines - endIdx;
+
+          const resultBlock = pageLines.length > 0
+            ? pageLines.join("\n")
+            : "(empty)";
+
+          const footer = remaining > 0
+            ? `\n\n[Truncated — lines remaining: ${remaining}. Use out__from_line=${endIdx + 1} and out_line_count=${lineCount} to continue.]`
+            : "";
+
+          return {
+            content: [{
+              type: "text",
+              text: `[Showing lines ${fromLine}–${endIdx} of ${totalLines} for tool call #${tc.index} (${tc.name})]\n` +
+                `Tool name: ${tc.name}\n` +
+                `Arguments: ${JSON.stringify(argsParsed, null, 2)}\n` +
+                `Result:\n` +
+                `  ${resultBlock}${footer}`,
+            }],
+            details: { name: tc.name, arguments: tc.arguments, lines_shown: { from: fromLine, to: endIdx, of: totalLines } },
+          };
+        }
+
+        // Unpaginated — show full result
+        const resultBlock = resultText.length > 0
+          ? `  ${resultText}`
+          : "  (empty)";
+
+        const truncatedFlag = tc.result_truncated
+          ? "\n\n[Output exceeds storage cap — showing entire stored result]"
+          : "";
+
         return {
           content: [{
             type: "text",
             text: `Tool call #${tc.index} in round ${p.round}\n` +
               `  Name: ${tc.name}\n` +
               `  Arguments: ${JSON.stringify(argsParsed, null, 2)}\n` +
-              `  Result (preview): ${tc.result_summary || "(empty)"}`,
+              `  Result:\n${resultBlock}${truncatedFlag}`,
           }],
-          details: { name: tc.name, arguments: tc.arguments, result_preview: tc.result_summary },
+          details: { name: tc.name, arguments: tc.arguments, result_full: tc.result_full ?? tc.result_summary },
         };
       },
     });

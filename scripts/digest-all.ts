@@ -145,6 +145,8 @@ function parseSessionFile(filePath: string, sessionLabel: string): Round[] {
           const resultContent = msg.content as Array<{ type: string; text?: string }> | undefined;
           const resultText = resultContent ? extractText(resultContent) : "";
           toolCalls[i].result_summary = resultText.slice(0, 300);
+            toolCalls[i].result_full = resultText;
+            toolCalls[i].result_truncated = false;
           break;
         }
       }
