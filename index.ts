@@ -1,1 +1,1 @@
-export { default } from "./.pi/extensions/semblr";
+export { default } from "./src/semblr";
