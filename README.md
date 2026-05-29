@@ -47,6 +47,16 @@ This registers the extension in your pi settings and loads it on every startup. 
 just uninstall      # runs pi remove ./src/semblr.ts
 ```
 
+### Commands
+
+When the extension is loaded, pi exposes:
+
+```text
+/semblr:import-claude [--dry-run] [--include-sidechains] [--limit N]
+```
+
+This imports Claude Code JSONL history from `~/.claude/projects` into the shared Semblr round repository and vector index.
+
 ## Premise
 
 Current AI agent sessions degrade as they accumulate context. Pi's compaction mechanism summarises past rounds to free memory, but the summaries lose detail. Semblr replaces this with a different approach:

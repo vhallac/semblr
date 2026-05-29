@@ -18,6 +18,15 @@ digest-session path:
     SEMBLR_ROUNDS_DIR="{{SEMBLR_ROUNDS_DIR}}" \
         npx tsx scripts/digest-session.ts {{path}}
 
+# Import Claude Code history from ~/.claude/projects into the same Semblr index
+# Usage: just import-claude
+#        just import-claude --dry-run
+#        just import-claude --include-sidechains --limit 100
+import-claude *args:
+    OPENROUTER_API_KEY="${OPENROUTER_API_KEY:-$(pass show ai/openrouter 2>/dev/null || true)}" \
+        SEMBLR_ROUNDS_DIR="{{SEMBLR_ROUNDS_DIR}}" \
+        npx tsx scripts/import-claude-code.ts {{args}}
+
 # Install the extension as a local pi package (loads on every startup)
 install:
     pi install ./src/semblr.ts

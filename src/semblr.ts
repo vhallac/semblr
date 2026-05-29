@@ -13,7 +13,8 @@ import { Type } from "@sinclair/typebox";
 import * as fs from "node:fs";
 import * as crypto from "node:crypto";
 import * as os from "node:os";
-import { spawnSync } from "node:child_process";
+import * as path from "node:path";
+import { spawn, spawnSync } from "node:child_process";
 
 // ─────────────────────────────────────────────
 // Config
@@ -463,11 +464,112 @@ function appendToIndex(filePath: string, vector: number[]) {
   fs.appendFileSync(INDEX_PATH, `${b64},${filePath}\n`);
 }
 
+function splitCommandArgs(args: string): string[] {
+  const out: string[] = [];
+  let current = "";
+  let quote: '"' | "'" | null = null;
+  let escaping = false;
+
+  for (const ch of args) {
+    if (escaping) {
+      current += ch;
+      escaping = false;
+      continue;
+    }
+    if (ch === "\\") {
+      escaping = true;
+      continue;
+    }
+    if (quote) {
+      if (ch === quote) quote = null;
+      else current += ch;
+      continue;
+    }
+    if (ch === '"' || ch === "'") {
+      quote = ch;
+      continue;
+    }
+    if (/\s/.test(ch)) {
+      if (current) {
+        out.push(current);
+        current = "";
+      }
+      continue;
+    }
+    current += ch;
+  }
+  if (escaping) current += "\\";
+  if (current) out.push(current);
+  return out;
+}
+
+function extensionRoot(): string {
+  // src/semblr.ts -> project root. __dirname is available in pi's jiti runtime.
+  return path.resolve(__dirname, "..");
+}
+
 // ─────────────────────────────────────────────
 // Extension
 // ─────────────────────────────────────────────
 
 export default function (pi: ExtensionAPI) {
+  pi.registerCommand("semblr:import-claude", {
+    description: "Import Claude Code history into Semblr (/semblr:import-claude --dry-run, --limit N, --include-sidechains)",
+    getArgumentCompletions: (prefix: string) => {
+      const options = ["--dry-run", "--include-sidechains", "--limit"];
+      const matches = options.filter((opt) => opt.startsWith(prefix));
+      return matches.length ? matches.map((value) => ({ value, label: value })) : null;
+    },
+    handler: async (args, ctx) => {
+      const root = extensionRoot();
+      const script = path.resolve(root, "scripts", "import-claude-code.ts");
+      if (!fs.existsSync(script)) {
+        ctx.ui.notify(`Semblr import script not found: ${script}`, "error");
+        return;
+      }
+
+      const parsedArgs = splitCommandArgs(args);
+      ctx.ui.setStatus("semblr", `🧠 importing Claude Code history ${parsedArgs.join(" ")}`.trim());
+      ctx.ui.notify(`Starting Claude Code import${parsedArgs.length ? ` (${parsedArgs.join(" ")})` : ""}...`, "info");
+
+      const apiKey = await getApiKey(ctx as Parameters<typeof getApiKey>[0]);
+      const child = spawn("npx", ["tsx", script, ...parsedArgs], {
+        cwd: root,
+        env: {
+          ...process.env,
+          ...(apiKey ? { OPENROUTER_API_KEY: apiKey } : {}),
+          SEMBLR_ROUNDS_DIR: ROUNDS_DIR,
+        },
+        stdio: ["ignore", "pipe", "pipe"],
+      });
+
+      let stdout = "";
+      let stderr = "";
+      const keepTail = (s: string) => s.length > 4000 ? s.slice(-4000) : s;
+      child.stdout.on("data", (chunk) => { stdout = keepTail(stdout + chunk.toString()); });
+      child.stderr.on("data", (chunk) => {
+        const text = chunk.toString();
+        stderr = keepTail(stderr + text);
+        const lastLine = text.trim().split("\n").filter(Boolean).pop();
+        if (lastLine) ctx.ui.setStatus("semblr", `🧠 ${lastLine.slice(0, 120)}`);
+      });
+
+      const code = await new Promise<number | null>((resolve) => {
+        child.on("close", resolve);
+      });
+
+      const output = [stdout.trim(), stderr.trim()].filter(Boolean).join("\n");
+      const tail = output.split("\n").slice(-8).join("\n");
+      if (code === 0) {
+        ctx.ui.setStatus("semblr", "🧠 Claude Code import complete");
+        ctx.ui.notify(`Claude Code import complete${tail ? `:\n${tail}` : ""}`, "info");
+      } else {
+        ctx.ui.setStatus("semblr", `🧠 Claude Code import failed (${code})`);
+        ctx.ui.notify(`Claude Code import failed (${code})${tail ? `:\n${tail}` : ""}`, "error");
+      }
+    },
+  });
+
   // ────────────────────────────────────────────
   // 1. context — assemble context from round repository
   // ────────────────────────────────────────────
