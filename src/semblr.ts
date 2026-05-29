@@ -640,17 +640,28 @@ export default function (pi: ExtensionAPI) {
     // stable across tool turns — avoids busting the LLM prompt cache.
     const envPreamble = cachedEnvPreamble ??
       `[ENVIRONMENT]\nHost: ${os.hostname()}\nCWD: ${process.cwd()}\nCurrent date/time: ${new Date().toISOString().replace(/[-:]/g, "").replace(/\.\d+/, "")}`;
+    cachedEnvPreamble = envPreamble; // pin early so guard below can use it
 
     const augmentedMessages = [...messages];
     if (lastUserIdx >= 0) {
       const userMsg = augmentedMessages[lastUserIdx];
+      // Guard: pi replays the augmented messages from the previous cycle,
+      // so the user message content may already start with [ENVIRONMENT].
+      // Skip prepending to avoid accumulating duplicates across cycles.
+      const startsWithEnv = (content: string): boolean =>
+        content.trimStart().startsWith("[ENVIRONMENT]");
       if (typeof userMsg.content === "string") {
-        augmentedMessages[lastUserIdx] = { ...userMsg, content: `${envPreamble}\n\n${userMsg.content}` };
+        if (!startsWithEnv(userMsg.content)) {
+          augmentedMessages[lastUserIdx] = { ...userMsg, content: `${envPreamble}\n\n${userMsg.content}` };
+        }
       } else if (Array.isArray(userMsg.content) && userMsg.content.length > 0 && userMsg.content[0].type === "text") {
-        const newContent = [...userMsg.content];
-        newContent[0] = { ...newContent[0], text: `${envPreamble}\n\n${newContent[0].text}` };
-        augmentedMessages[lastUserIdx] = { ...userMsg, content: newContent };
+        if (!startsWithEnv(userMsg.content[0].text)) {
+          const newContent = [...userMsg.content];
+          newContent[0] = { ...newContent[0], text: `${envPreamble}\n\n${newContent[0].text}` };
+          augmentedMessages[lastUserIdx] = { ...userMsg, content: newContent };
+        }
       } else if (Array.isArray(userMsg.content)) {
+        // Non-text first block — always prepend (no existing ENVIRONMENT possible)
         augmentedMessages[lastUserIdx] = { ...userMsg, content: [{ type: "text", text: `${envPreamble}\n\n` }, ...userMsg.content] };
       }
     }
@@ -862,7 +873,7 @@ export default function (pi: ExtensionAPI) {
         // appended fresh each time.
         cachedEnvPreamble = envPreamble;
         cachedUserPromptForContext = userPrompt;
-        cachedContextMessages = finalMessages; // finalMessages at this point = system + lists, no currentMessages yet
+        cachedContextMessages = [...finalMessages]; // snapshot before mutation below
 
         finalMessages.push(...currentMessages);
 
