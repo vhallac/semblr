@@ -53,9 +53,11 @@ When the extension is loaded, pi exposes:
 
 ```text
 /semblr:import-claude [--dry-run] [--include-sidechains] [--limit N]
+/semblr:recent-read-stats
 ```
 
-This imports Claude Code JSONL history from `~/.claude/projects` into the shared Semblr round repository and vector index.
+- `/semblr:import-claude` — imports Claude Code JSONL history from `~/.claude/projects` into the shared Semblr round repository and vector index.
+- `/semblr:recent-read-stats` — displays detailed grouping and chain-read statistics for the current session.
 
 ## Premise
 
@@ -84,8 +86,7 @@ The lists below show past conversation rounds. Each entry contains only the user
 Use get_round_details("hash.json") to expand a round's full conversation.
 Use get_tool_details("hash.json", N) to inspect tool call N within a round.
 
-Format: N. hash.json [score | N tools]: followed by the full user prompt (indented).
-Number 1 in the list is the most recent round.
+Format: [index: N] hash.json [score | N tools | size]: followed by the full user prompt (indented).
 ```
 
 ### Recency List
@@ -95,13 +96,16 @@ This section appears when the **current session has prior rounds**. It contains 
 *Exact prompt:*
 
 ```
---- RECENCY LIST (current session, newest first) ---
+--- RECENCY LIST (current session, by topic) ---
 These rounds have n/a scores because they are presented by recency — they form
 the immediate conversational context from this session.
 
 IMPORTANT: This list shows ONLY the user's questions from past rounds.
 You do NOT have the assistant responses or tool results unless you expand a
 round. If you answer based on these prompts alone, you are hallucinating.
+
+The groups below are recent messages that are likely to be related to the same
+topic. Lower numbered indices in groups are more recent conversations.
 
 Use this list when the current prompt ...:
 - ... asks about past work, decisions, code, or findings from prior sessions
@@ -128,12 +132,19 @@ When NOT to expand:
 Rule: When in doubt, expand. A verification tool call is cheaper than a wrong
 answer.
 
-1. abc123.json [n/a | 0 tools]:
+**Group 1**
+
+- [index: 1] abc123.json [n/a | 0 tools]:
   user: Find a budget hotel in Hong Kong under $100/night near Causeway Bay.
+  ---
+
 ---
-2. def456.json [n/a | 3 tools]:
+
+**Group 2**
+
+- [index: 2] def456.json [n/a | 3 tools]:
   user: Tell me more about the Harbour View Hotel, is it within budget?
----
+  ---
 ```
 
 ### Relevance List
@@ -151,10 +162,10 @@ The extension has pre-run a semantic search against your prompt. The results
 are below. If something here rings a bell, expand it via get_round_details.
 If nothing rings a bell, ignore this list — it's a pre-filter, not a map.
 
-1. ghi789.json [0.37 | 2 tools]:
+- [index: 1] ghi789.json [0.37 | 2 tools]:
   user: Look up boutique hotels in the 7th arrondissement of Paris for
   under €150/night.
----
+  ---
 ```
 
 ### Section presence matrix
@@ -165,6 +176,8 @@ If nothing rings a bell, ignore this list — it's a pre-filter, not a map.
 | First message, has semantic matches | shown | omitted | shown |
 | Ongoing session, has matches | shown | shown | shown |
 | Ongoing session, no matches | shown | shown | omitted |
+| Short prompt (< 20 words) | shown (if any list) | shown (if prior rounds) | omitted |
+| `DROP_RELEVANCE_LIST=true` | shown (if any list) | shown (if prior rounds) | omitted |
 
 ### Why three sections?
 
@@ -190,13 +203,21 @@ All embeddings go to OpenRouter → `text-embedding-3-small`. At current pricing
 
 The ongoing cost is ~1 embedding per user prompt.
 
-### Caching tradeoff
+### Caching
+
+#### Cross-round vs cross-turn tradeoff
 
 Every user prompt is a **separate LLM call** with freshly assembled context. Even though the prompt looks similar to the last round's, the LLM provider sees each as an independent request — so there's **no KV/prompt cache carryover from round to round**. Each round pays full attention-computation cost on the newly injected rounds.
 
 **Within a round**, however, tool calls (like `get_round_details()` or `search_interactions()`) happen in the same LLM invocation — a single streaming conversation with back-and-forth tool turns. The provider's cache persists across those turns, so the cost of repeatedly expanding retrieved rounds from collapsed stubs is mostly in latency, not in re-processing the full context from scratch.
 
 The asymmetry: you pay for full re-processing between rounds, but within a round the tool-based drill-down is comparatively cheap.
+
+#### Context stability fix
+
+Previously, every tool turn within a cycle would re-construct the `[ENVIRONMENT]` preamble and context-building blocks. This meant timestamps changed between turns, **busting the LLM prompt cache** on every tool call — eliminating the cross-turn caching benefit entirely.
+
+This was fixed by caching the assembled preamble and context blocks once per invocation cycle. The timestamps are frozen at the start of the round, so all tool turns within it see identical prompt text. The cache is snapshot-copied with spread to prevent cross-turn contamination from accidental mutation.
 
 ## Index & Session Management
 
@@ -211,16 +232,26 @@ Semblr stores conversation data in two areas, both outside the project tree so t
 
 Round IDs are content-addressed (MD5 of `userPrompt + responseSequence`), so re-indexing is idempotent — same content produces the same file.
 
+### Environment Variables
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `SEMBLR_GROUP_THRESHOLD` | `0.77` | Minimum cosine similarity for grouping rounds into topics. Higher = more groups |
+| `RELEVANCE_LIST_MIN_WORDS` | `20` | Raw word count threshold. Prompts shorter than this skip the relevance list entirely |
+| `DROP_RELEVANCE_LIST` | not set | If `1` or `true`, the relevance list section is always suppressed regardless of matches |
+| `SEMBLR_ROUNDS_DIR` | (pi defaults) | Override the round repository directory |
+
 ### Digest Scripts
 
-Two scripts parse historical pi session files (JSONL format) into semblr rounds:
+Three scripts parse historical conversation data into semblr rounds:
 
 | Script | What it does |
 |---|---|
 | `scripts/digest-all.ts` | Iterates all pi session files, deduplicates against already-indexed rounds, embeds new ones in parallel (concurrency: 5) |
 | `scripts/digest-session.ts` | Parses a single session file, embeds each round, appends to the vector index |
+| `scripts/import-claude-code.ts` | Imports Claude Code JSONL history from `~/.claude/projects` into the shared index |
 
-Both parse the pi session JSONL into `Round` objects containing:
+`digest-all.ts` and `digest-session.ts` parse the pi session JSONL into `Round` objects containing:
 - `userPrompt` — the user's text
 - `responseSequence` — the assistant's full text response
 - `toolCalls` — structured list of tool invocations (name, arguments, result summary)
@@ -249,6 +280,13 @@ just index
 
 # Index a single session file
 just digest-session path/to/session.jsonl
+
+# Import Claude Code JSONL history into the shared index
+just import-claude
+#   --dry-run, --include-sidechains, --limit N
+
+# Run all pending round migrations (idempotent)
+just migrate
 
 # Search the index from the command line
 just query "what did we discuss about caching"
@@ -307,11 +345,14 @@ just query "what did we discuss about caching"
 
 ```
 ├── src                         # The extension directory
-│   └── semblr.ts                 # Main extension file (~1240 lines)
+│   └── semblr.ts                 # Main extension file (~1926 lines)
 ├── scripts/
-│   ├── digest-all.ts             # Bulk-embed all historical sessions
-│   ├── digest-session.ts         # Embed a single session file
-│   └── test-register-tool.ts     # Tool registration test harness
+│   ├── digest-all.ts               # Bulk-embed all historical sessions
+│   ├── digest-session.ts           # Embed a single session file
+│   ├── import-claude-code.ts       # Import Claude Code JSONL history
+│   ├── migrate-content-hash.ts     # Content-hash-based round migration
+│   ├── migrate-rounds.ts           # Old round migration (pre-content-hash)
+│   └── test-register-tool.ts       # Tool registration test harness
 ├── docs/                         # (empty — extended docs not yet written)
 ├── VISION.md                     # Full project vision, architecture, roadmap
 ├── AGENTS.md                     # Project context for AI agents
