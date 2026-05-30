@@ -176,7 +176,7 @@ const SEMBLR_GROUP_THRESHOLD = (() => {
     const n = parseFloat(v);
     if (!isNaN(n) && n >= 0 && n <= 1) return n;
   }
-  return 0.7;
+  return 0.77;
 })();
 
 /**
