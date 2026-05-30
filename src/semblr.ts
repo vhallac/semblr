@@ -500,9 +500,19 @@ async function embedText(text: string, apiKey: string): Promise<number[]> {
   return data.data[0].embedding;
 }
 
-function createRoundFilePath(userPrompt: string, responseText: string): string {
-  const content = userPrompt + responseText;
-  const hash = crypto.createHash("md5").update(content).digest("hex");
+function computeContentHash(userPrompt: string, responseText: string, toolCalls?: ToolCallDetail[]): string {
+  const parts: string[] = [userPrompt, responseText];
+  if (toolCalls) {
+    for (const tc of toolCalls) {
+      parts.push(tc.arguments);
+      parts.push(tc.result_full ?? tc.result_summary ?? "");
+    }
+  }
+  return crypto.createHash("md5").update(parts.join("")).digest("hex");
+}
+
+function createRoundFilePath(userPrompt: string, responseText: string, toolCalls?: ToolCallDetail[]): string {
+  const hash = computeContentHash(userPrompt, responseText, toolCalls);
   return `${hash}.json`;
 }
 
@@ -1022,7 +1032,7 @@ export default function (pi: ExtensionAPI) {
 
     fs.mkdirSync(ROUNDS_DIR, { recursive: true });
 
-    const roundFileName = createRoundFilePath(userPrompt, responseText);
+    const roundFileName = createRoundFilePath(userPrompt, responseText, agentToolCalls);
     const roundPath = `${ROUNDS_DIR}/${roundFileName}`;
 
     // Push to causal chain — even on dedup, this ensures the in-memory buffer
@@ -1054,7 +1064,7 @@ export default function (pi: ExtensionAPI) {
 
     // Write round file
     const roundData = {
-      id: crypto.createHash("md5").update(userPrompt + responseText).digest("hex"),
+      id: computeContentHash(userPrompt, responseText, agentToolCalls),
       userPrompt,
       responseSequence: responseText,
       turnIndex: agentTurnIndex ?? 0,
