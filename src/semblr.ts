@@ -117,17 +117,35 @@ function recordPresented(chainEntries: { fileName: string }[]) {
 }
 
 /**
- * Format the chain-read statistics for TUI display as percentages.
- * Example: "🧠 chain-read: p1→2/16(13%) p2→0/0 p3→0/0 p4→0/0 p5→0/0"
+ * Format the grouping statistics for TUI display.
+ * Example: "THR: 77%; #groups: 3, #topics: {1,12,5}"
  */
-function formatChainStats(): string {
-  const parts = statsState.positionScores.map((ps, i) => {
+function formatGroupStats(): string {
+  const thr = Math.round(SEMBLR_GROUP_THRESHOLD * 100);
+  const groupCount = roundGroups.length;
+  const topicCounts = roundGroups.map(g => g.rounds.length).join(",");
+  return `THR: ${thr}%; #groups: ${groupCount}, #topics: {${topicCounts}}`;
+}
+
+/**
+ * Format a detailed chain-read statistics report for the /semblr-recent-read-stats command.
+ * Example:
+ *   Recent lookups to build context:
+ *   - immediate parent: 55% (120/217)
+ *   - 2nd: 32% (56/177)
+ *   ...
+ */
+function formatChainReadStatsReport(): string {
+  const lines: string[] = ["Recent lookups to build context:"];
+  const labels = ["immediate parent", "2nd", "3rd", "4th", "5th"];
+  for (let i = 0; i < TRACK_POSITIONS; i++) {
+    const ps = statsState.positionScores[i];
     const pct = ps.presentedCount > 0
-      ? `(${Math.round((ps.readCount / ps.presentedCount) * 100)}%)`
-      : "(—%)";
-    return `p${i + 1}→${ps.readCount}/${ps.presentedCount}${pct}`;
-  });
-  return `chain-read: ${parts.join(" ")}`;
+      ? `${Math.round((ps.readCount / ps.presentedCount) * 100)}%`
+      : "—";
+    lines.push(`- ${labels[i]}: ${pct} (${ps.readCount}/${ps.presentedCount})`);
+  }
+  return lines.join("\n");
 }
 
 const EMBEDDING_MODEL = "openai/text-embedding-3-small";
@@ -960,7 +978,7 @@ export default function (pi: ExtensionAPI) {
           ).size;
           ctx.ui.setStatus(
             "semblr",
-            `🧠 collapsed: ${selectedRounds.length} matched / ${uniqueRounds} total | ${formatChainStats()}`,
+            `🧠 collapsed: ${selectedRounds.length} matched / ${uniqueRounds} total | ${formatGroupStats()}`,
           );
         }
 
@@ -1277,7 +1295,7 @@ export default function (pi: ExtensionAPI) {
     const totalRounds = new Set(
       idx.map((e: { filePath: string }) => e.filePath.replace(/:prompt$|:response$/, ""))
     ).size;
-    ctx.ui.setStatus("semblr", `🧠 ${totalRounds} total indexed | ${formatChainStats()}`);
+    ctx.ui.setStatus("semblr", `🧠 ${totalRounds} total indexed | ${formatGroupStats()}`);
   });
 
   // ────────────────────────────────────────────
@@ -1877,6 +1895,15 @@ export default function (pi: ExtensionAPI) {
           }],
           details: { name: tc.name, arguments: tc.arguments, result_full: tc.result_full ?? tc.result_summary },
         };
+      },
+    });
+
+    // Register the /semblr-recent-read-stats command
+    pi.registerCommand("semblr:recent-read-stats", {
+      description: "Display chain-read statistics (how often the agent read rounds from each display position)",
+      handler: async (_args, commandCtx) => {
+        const report = formatChainReadStatsReport();
+        commandCtx.ui.notify(report, "info");
       },
     });
   });
