@@ -157,6 +157,28 @@ interface ChainEntry {
  *  without needing to search the vector index. */
 let causalChain: ChainEntry[] = [];
 
+// ─────────────────────────────────────────────
+// Round Groups — centroid-based semantic grouping
+// ─────────────────────────────────────────────
+
+interface RoundGroup {
+  centroid: number[];  // mean of member prompt embeddings
+  rounds: ChainEntry[];
+}
+
+/** In-memory groups of semantically similar rounds. Not persisted across sessions.
+ *  Reset on session_start. Built incrementally at agent_end after each round save. */
+let roundGroups: RoundGroup[] = [];
+
+const SEMBLR_GROUP_THRESHOLD = (() => {
+  const v = process.env.SEMBLR_GROUP_THRESHOLD;
+  if (v !== undefined) {
+    const n = parseFloat(v);
+    if (!isNaN(n) && n >= 0 && n <= 1) return n;
+  }
+  return 0.7;
+})();
+
 /**
  * Format a single round entry — identical structure for both Recency and Relevance lists.
  * Produces:
@@ -390,6 +412,9 @@ interface RoundData {
   toolCallCount?: number;
   toolCallNames?: string[];
   toolCalls?: ToolCallDetail[];
+  promptEmbedding?: number[];
+  parentId?: string | null;
+  relatedParentId?: string | null;
 }
 
 function readRoundFile(
@@ -498,6 +523,37 @@ async function embedText(text: string, apiKey: string): Promise<number[]> {
     data: Array<{ embedding: number[] }>;
   };
   return data.data[0].embedding;
+}
+
+/** Assign the given round to a semantic group based on centroid similarity.
+ *  Updates roundGroups in-place. Returns the group index the round was assigned to. */
+function assignToGroup(roundEntry: ChainEntry, promptVec: number[]): number {
+  // Find the best matching group by cosine similarity to centroid
+  let bestIdx = -1;
+  let bestSim = 0;
+  for (let i = 0; i < roundGroups.length; i++) {
+    const sim = cosineSimilarity(promptVec, roundGroups[i].centroid);
+    if (sim >= SEMBLR_GROUP_THRESHOLD && sim > bestSim) {
+      bestSim = sim;
+      bestIdx = i;
+    }
+  }
+  if (bestIdx >= 0) {
+    // Add round to existing group and recompute centroid
+    const group = roundGroups[bestIdx];
+    group.rounds.push(roundEntry);
+    const n = group.rounds.length;
+    group.centroid = group.centroid.map((c, i) =>
+      c + (promptVec[i] - c) / n,
+    );
+    return bestIdx;
+  }
+  // Create new group
+  roundGroups.push({
+    centroid: [...promptVec],
+    rounds: [roundEntry],
+  });
+  return roundGroups.length - 1;
 }
 
 function computeContentHash(userPrompt: string, responseText: string, toolCalls?: ToolCallDetail[]): string {
@@ -1053,6 +1109,10 @@ export default function (pi: ExtensionAPI) {
 
     // Skip if already saved (deduplication by content hash)
     if (fs.existsSync(roundPath)) {
+      // Even on dedup, run grouping if we have the embedding
+      if (agentPromptVec) {
+        assignToGroup(causalChain[causalChain.length - 1], agentPromptVec);
+      }
       ctx.ui.setStatus("semblr", `\u{1f9e0} round already saved (${roundFileName})`);
       lastRoundFileName = roundFileName;
       agentAccumulatedText = [];
@@ -1062,8 +1122,13 @@ export default function (pi: ExtensionAPI) {
       return;
     }
 
+    // Compute parentId from causalChain
+    const parentId = causalChain.length >= 2
+      ? causalChain[causalChain.length - 2].fileName
+      : null;
+
     // Write round file
-    const roundData = {
+    const roundData: Record<string, unknown> = {
       id: computeContentHash(userPrompt, responseText, agentToolCalls),
       userPrompt,
       responseSequence: responseText,
@@ -1073,6 +1138,9 @@ export default function (pi: ExtensionAPI) {
       toolCallNames: agentToolCallNames,
       toolCalls: agentToolCalls,
       responseSegments: agentResponseSegments,
+      promptEmbedding: agentPromptVec ?? undefined,
+      parentId,
+      relatedParentId: null, // set after grouping below
     };
 
     try {
@@ -1109,6 +1177,31 @@ export default function (pi: ExtensionAPI) {
         "semblr",
         `\u{1f9e0} saved + embedded round (${roundFileName})`,
       );
+
+      // — Grouping + metadata update —
+      // Assign to a semantic group using the prompt embedding, then update
+      // relatedParentId in the round JSON file.
+      const roundEntry = causalChain[causalChain.length - 1];
+      const groupIdx = assignToGroup(roundEntry, promptVec);
+      const group = roundGroups[groupIdx];
+      // Find the most recent round in the same group *before* this round
+      let relatedParentId: string | null = null;
+      if (group.rounds.length > 1) {
+        // group.rounds is in insertion order; the new round is the last element
+        const groupRoundIdx = group.rounds.indexOf(roundEntry);
+        if (groupRoundIdx > 0) {
+          relatedParentId = group.rounds[groupRoundIdx - 1].fileName;
+        }
+      }
+      if (relatedParentId) {
+        // Re-read, update, re-write atomically
+        try {
+          const existing = JSON.parse(fs.readFileSync(roundPath, "utf-8"));
+          existing.relatedParentId = relatedParentId;
+          fs.writeFileSync(roundPath + ".tmp." + process.pid, JSON.stringify(existing, null, 2));
+          fs.renameSync(roundPath + ".tmp." + process.pid, roundPath);
+        } catch { /* best-effort */ }
+      }
     } catch (err) {
       ctx.ui.setStatus("semblr", `\u{1f9e0} embedding error: ${(err as Error).message}`);
     }
@@ -1146,8 +1239,9 @@ export default function (pi: ExtensionAPI) {
   // registerTool is called inside session_start because factory-level
   // registration doesn't reliably make tools visible to the LLM.
   pi.on("session_start", async (_event, ctx) => {
-    // Clear causal chain — new session starts fresh
+    // Clear causal chain and round groups — new session starts fresh
     causalChain = [];
+    roundGroups = [];
 
     const indexExists = fs.existsSync(INDEX_PATH);
     const index = indexExists ? loadIndex() : [];
@@ -1513,6 +1607,15 @@ export default function (pi: ExtensionAPI) {
           headerSuffix = matchHeader;
         }
 
+        // ── Parent & group metadata ──
+        let parentMeta = "";
+        if (roundData.parentId != null) {
+          parentMeta += `\nParent round: ${roundData.parentId}`;
+        }
+        if (roundData.relatedParentId != null) {
+          parentMeta += `\nRelated to:   ${roundData.relatedParentId} (same topic group)`;
+        }
+
         return {
           content: [{
             type: "text",
@@ -1520,7 +1623,8 @@ export default function (pi: ExtensionAPI) {
               `User: ${roundData.userPrompt ?? "(empty)"}\n` +
               `Assistant: ${assistantOutput}` +
               `${paginationMarker ? `\n${paginationMarker}` : ""}` +
-              `${toolMeta}`,
+              `${toolMeta}` +
+              `${parentMeta}`,
           }],
           details: collapsedDetails,
         };
