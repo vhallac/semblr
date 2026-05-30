@@ -776,6 +776,18 @@ export default function (pi: ExtensionAPI) {
     const lastUserIdx = messages.reduce((last, m, i) =>
       m.role === "user" ? i : last, -1);
 
+    // --- Raw word count from the original (un-augmented) user prompt ---
+    // Used below to skip the relevance list for very short prompts.
+    let rawPromptWordCount = 0;
+    if (lastUserIdx >= 0) {
+      const rawContent = messages[lastUserIdx].content;
+      if (typeof rawContent === "string") {
+        rawPromptWordCount = rawContent.split(/\s+/).filter(w => w.length > 0).length;
+      } else if (Array.isArray(rawContent)) {
+        rawPromptWordCount = extractText(rawContent).split(/\s+/).filter(w => w.length > 0).length;
+      }
+    }
+
     // --- Prepend environment info to the current user prompt ---
     // Computed once per agent cycle (cachedEnvPreamble) so the timestamp is
     // stable across tool turns — avoids busting the LLM prompt cache.
@@ -958,7 +970,9 @@ export default function (pi: ExtensionAPI) {
       }
 
       // ── Build the three-section context block ──
-        const dropRelevance = process.env.DROP_RELEVANCE_LIST === "1" || process.env.DROP_RELEVANCE_LIST === "true";
+        const minWords = parseInt(process.env.RELEVANCE_LIST_MIN_WORDS ?? "20", 10);
+        const dropRelevance = process.env.DROP_RELEVANCE_LIST === "1" || process.env.DROP_RELEVANCE_LIST === "true"
+          || rawPromptWordCount < minWords;
         const relevanceList = dropRelevance
           ? null
           : buildRelevanceList(
