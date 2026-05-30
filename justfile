@@ -35,6 +35,14 @@ install:
 uninstall:
     pi remove ./src/semblr.ts
 
+# Run all pending round migrations (idempotent — safe to re-run)
+# Old migration first (migrate-rounds), then new migration (migrate-content-hash)
+migrate *args:
+    SEMBLR_ROUNDS_DIR="{{SEMBLR_ROUNDS_DIR}}" \
+        npx tsx scripts/migrate-rounds.ts
+    SEMBLR_ROUNDS_DIR="{{SEMBLR_ROUNDS_DIR}}" \
+        npx tsx scripts/migrate-content-hash.ts {{args}}
+
 # Query the index with a natural language query (via pi + semblr extension)
 # Usage: just query "<your question>"
 query query *args:
