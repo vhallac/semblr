@@ -180,7 +180,8 @@ const SEMBLR_GROUP_THRESHOLD = (() => {
 })();
 
 /**
- * Format a single round entry — identical structure for both Recency and Relevance lists.
+ * Format a single round entry for the Relevance List.
+ * Uses the flat `N. ` prefix.
  * Produces:
  *   N. hash.json [score | N tools]:
  *     user: first line of prompt
@@ -206,17 +207,42 @@ function formatRoundEntry(
   ];
 }
 
-/** Build the Recency List section from the in-memory causal chain. */
-function buildRecencyList(chain: ChainEntry[]): string | null {
-  if (chain.length === 0) return null;
+/**
+ * Format a single round entry for the grouped recency list.
+ * Uses `- [index: N]` prefix instead of `N. ` prefix.
+ */
+function formatGroupedRoundEntry(
+  index: number,
+  fileName: string,
+  toolSummary: string,
+  userPrompt: string,
+  sizeStr?: string,
+): string[] {
+  const promptLines = userPrompt
+    .split("\n")
+    .map((line, i) => i === 0 ? `  user: ${line}` : `  ${line}`);
+  const sizePart = sizeStr ? ` | ${sizeStr}` : "";
+  return [
+    `- [index: ${index}] ${fileName} [n/a | ${toolSummary}${sizePart}]:`,
+    ...promptLines,
+    "  ---",
+  ];
+}
+
+/** Build the grouped Recency List section from round groups. */
+function buildGroupedRecencyList(groups: RoundGroup[]): string | null {
+  if (groups.length === 0) return null;
   const lines: string[] = [];
-  const header = `--- RECENCY LIST (current session, newest first) ---
+  const header = `--- RECENCY LIST (current session, by topic) ---
 These rounds have n/a scores because they are presented by recency — they form
 the immediate conversational context from this session.
 
 IMPORTANT: This list shows ONLY the user's questions from past rounds.
 You do NOT have the assistant responses or tool results unless you expand a
 round. If you answer based on these prompts alone, you are hallucinating.
+
+The groups below are recent messages that are likely to be related to the same
+topic. Lower numbered indices in groups are more recent conversations.
 
 Use this list when the current prompt ...:
 - ... asks about past work, decisions, code, or findings from prior sessions
@@ -245,21 +271,53 @@ answer.`;
   lines.push(header);
   lines.push("");
 
-  // Show newest first (reverse chronological)
-  const reversed = [...chain].reverse();
-  let idx = 0;
-  for (const entry of reversed) {
-    idx++;
-    const sizeStr = getRoundSize(entry.fileName) ?? undefined;
-    lines.push(...formatRoundEntry(
-      idx,
-      entry.fileName,
-      "n/a",
-      entry.toolSummary,
-      entry.userPrompt,
-      sizeStr,
-    ));
+  // Sort groups by their most recent round (newest topic first)
+  const sortedGroups = [...groups].sort((a, b) => {
+    const aLast = a.rounds[a.rounds.length - 1];
+    const bLast = b.rounds[b.rounds.length - 1];
+    return causalChain.indexOf(bLast) - causalChain.indexOf(aLast);
+  });
+
+  // Build a global index counter in reverse-chronological order across all rounds
+  // to assign stable index numbers for the `[index: N]` display.
+  // We iterate groups in display order, then rounds within each group in
+  // reverse-chronological order, and assign incrementing indices.
+  const globalIndices = new Map<ChainEntry, number>();
+  let globalIdx = 0;
+  for (const group of sortedGroups) {
+    const reversed = [...group.rounds].reverse();
+    for (const entry of reversed) {
+      globalIdx++;
+      globalIndices.set(entry, globalIdx);
+    }
   }
+
+  let groupNumber = 0;
+  for (const group of sortedGroups) {
+    groupNumber++;
+    if (groupNumber > 1) {
+      lines.push("");
+      lines.push("---");
+      lines.push("");
+    }
+    lines.push(`**Group ${groupNumber}**`);
+    lines.push("");
+
+    // Show newest first within group
+    const reversed = [...group.rounds].reverse();
+    for (const entry of reversed) {
+      const idx = globalIndices.get(entry) ?? 0;
+      const sizeStr = getRoundSize(entry.fileName) ?? undefined;
+      lines.push(...formatGroupedRoundEntry(
+        idx,
+        entry.fileName,
+        entry.toolSummary,
+        entry.userPrompt,
+        sizeStr,
+      ));
+    }
+  }
+
   return lines.join("\n");
 }
 
@@ -320,8 +378,7 @@ The lists below show past conversation rounds. Each entry contains only the user
 Use get_round_details("hash.json") to expand a round's full conversation.
 Use get_tool_details("hash.json", N) to inspect tool call N within a round.
 
-Format: N. hash.json [score | N tools | size]: followed by the full user prompt (indented).
-Number 1 in the list is the most recent round.`;
+Format: [index: N] hash.json [score | N tools | size]: followed by the full user prompt (indented).`;
 }
 
 // ─────────────────────────────────────────────
@@ -368,7 +425,7 @@ function getRoundSize(fileName: string): string | null {
   }
 }
 
-// formatCollapsedIndex removed — replaced by buildRecencyList / buildRelevanceList / buildContextPreamble
+// formatCollapsedIndex removed — replaced by buildGroupedRecencyList / buildRelevanceList / buildContextPreamble
 
 // ─────────────────────────────────────────────
 // Index CSV format:
@@ -889,7 +946,7 @@ export default function (pi: ExtensionAPI) {
           : buildRelevanceList(
               selectedRounds.map(r => ({ fileName: r.fileName, bestScore: r.bestScore, data: r.data }))
             );
-        const recencyList = buildRecencyList(causalChain);
+        const recencyList = buildGroupedRecencyList(roundGroups);
         const preamble = buildContextPreamble(!!recencyList, !!relevanceList);
 
         // ══ Stats: record all 5 positions presented ══
