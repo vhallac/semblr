@@ -25,3 +25,21 @@ The extension lives at `src/semblr.ts` (~1240 lines, moved from `.pi/extensions/
 - `scripts/digest-session.ts` — embed a single session JSONL file
 - `justfile` — command recipes (index, digest-session, query)
 - `rounds/` — round repository (stored outside the project tree, survives moves and clones)
+
+## Attributions
+
+- When committing code that is entirely written by you, add
+
+🤖 LLM authored
+
+- When committing code that is partially written by you (50% or less), and the rest is written by a human, add
+
+🤖 LLM assisted
+
+- When writing code forge pull requests, comments, issues, or contributing to discussions, add
+
+🤖 Content created by LLM
+
+as the last line of the text.
+
+When only creating commit messages to code fully written by a human; do not add an LLM attibution.
