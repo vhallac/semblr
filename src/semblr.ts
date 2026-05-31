@@ -14,7 +14,7 @@ import * as fs from "node:fs";
 import * as crypto from "node:crypto";
 import * as os from "node:os";
 import * as path from "node:path";
-import { spawn, spawnSync } from "node:child_process";
+import { spawn } from "node:child_process";
 
 // ─────────────────────────────────────────────
 // Config
@@ -559,16 +559,26 @@ async function getApiKey(ctx?: { modelRegistry?: { getApiKeyForProvider(provider
     // Pi auth lookup failed, fall through
   }
 
-  // 3. Pass store
+  // 3. Pass store (async to avoid blocking the event loop)
   try {
-    const result = spawnSync("pass", ["show", "ai/openrouter"], {
-      timeout: 5000,
-      stdio: ["pipe", "pipe", "pipe"],
+    const key = await new Promise<string | null>((resolve) => {
+      const child = spawn("pass", ["show", "ai/openrouter"], {
+        timeout: 1000,
+        stdio: ["pipe", "pipe", "pipe"],
+      });
+      let stdout = "";
+      child.stdout?.on("data", (chunk: Buffer) => { stdout += chunk.toString(); });
+      child.on("close", (code) => {
+        if (code === 0) {
+          const trimmed = stdout.trim();
+          resolve(trimmed || null);
+        } else {
+          resolve(null);
+        }
+      });
+      child.on("error", () => resolve(null));
     });
-    if (result.status === 0) {
-      const key = result.stdout.toString().trim();
-      if (key) return key;
-    }
+    if (key) return key;
   } catch {
     // pass not available, fall through
   }
