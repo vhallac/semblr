@@ -586,28 +586,65 @@ async function getApiKey(ctx?: { modelRegistry?: { getApiKeyForProvider(provider
   return null;
 }
 
-async function embedText(text: string, apiKey: string): Promise<number[]> {
-  const response = await fetch(OPENROUTER_URL, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${apiKey}`,
-    },
-    body: JSON.stringify({
-      model: EMBEDDING_MODEL,
-      input: text,
-    }),
-  });
+const EMBED_TIMEOUT_MS = 15_000;       // AbortController timeout (#43)
+const EMBED_MAX_RETRIES = 3;          // max attempts including first (#42)
+const EMBED_BACKOFF_MS = 1000;        // base backoff for retry #1
 
-  if (!response.ok) {
-    const errText = await response.text();
-    throw new Error(`Embedding API error ${response.status}: ${errText}`);
+async function embedText(text: string, apiKey: string): Promise<number[]> {
+  let lastError: Error | undefined;
+
+  for (let attempt = 0; attempt < EMBED_MAX_RETRIES; attempt++) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), EMBED_TIMEOUT_MS);
+
+    try {
+      const response = await fetch(OPENROUTER_URL, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${apiKey}`,
+        },
+        body: JSON.stringify({
+          model: EMBEDDING_MODEL,
+          input: text,
+        }),
+        signal: controller.signal,
+      });
+
+      if (!response.ok) {
+        const errText = await response.text();
+        const err = new Error(`Embedding API error ${response.status}: ${errText}`);
+        // Don't retry on 4xx (except 429 rate-limit)
+        if (response.status >= 400 && response.status < 500 && response.status !== 429) {
+          throw err; // fatal — no retry
+        }
+        lastError = err;
+        // fall through to retry for 5xx / 429
+      } else {
+        const data = (await response.json()) as {
+          data: Array<{ embedding: number[] }>;
+        };
+        return data.data[0].embedding;
+      }
+    } catch (e) {
+      if (e instanceof DOMException && e.name === "AbortError") {
+        lastError = new Error(`Embedding API timeout after ${EMBED_TIMEOUT_MS}ms`);
+      } else if (e instanceof Error && e.message.startsWith("Embedding API error 4") && !e.message.includes("429")) {
+        throw e; // 4xx (non-429) is fatal — no retry
+      } else {
+        lastError = e instanceof Error ? e : new Error(String(e));
+      }
+    } finally {
+      clearTimeout(timer);
+    }
+
+    // Backoff before retry (not after last attempt)
+    if (attempt < EMBED_MAX_RETRIES - 1) {
+      await new Promise((r) => setTimeout(r, EMBED_BACKOFF_MS * Math.pow(2, attempt)));
+    }
   }
 
-  const data = (await response.json()) as {
-    data: Array<{ embedding: number[] }>;
-  };
-  return data.data[0].embedding;
+  throw lastError ?? new Error("Embedding API failed after retries");
 }
 
 /** Assign the given round to a semantic group based on centroid similarity.
