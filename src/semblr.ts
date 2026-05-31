@@ -449,7 +449,7 @@ function getRoundSize(fileName: string): string | null {
 // Index CSV format:
 //   base64url(vector_json),filePath
 //   (no header row)
-//   filePath includes :prompt or :response suffix
+//   filePath includes :prompt, :response, or :round suffix
 // ─────────────────────────────────────────────
 
 interface IndexEntry {
@@ -495,9 +495,9 @@ interface RoundData {
 function readRoundFile(
   filePath: string,
 ): RoundData | null {
-  // filePath may be "xxx.json:prompt" or "xxx.json:response"
-  // strip the :prompt/:response suffix to get the actual file
-  const actualFile = filePath.replace(/:prompt$|:response$/, "");
+  // filePath may be "xxx.json:prompt", "xxx.json:response", or "xxx.json:round"
+  // strip the suffix to get the actual file
+  const actualFile = filePath.replace(/(:prompt|:response|:round)$/, "");
   const fullPath = `${ROUNDS_DIR}/${actualFile}`;
   if (!fs.existsSync(fullPath)) return null;
   try {
@@ -602,12 +602,12 @@ async function embedText(text: string, apiKey: string): Promise<number[]> {
 
 /** Assign the given round to a semantic group based on centroid similarity.
  *  Updates roundGroups in-place. Returns the group index the round was assigned to. */
-function assignToGroup(roundEntry: ChainEntry, promptVec: number[]): number {
+function assignToGroup(roundEntry: ChainEntry, vec: number[]): number {
   // Find the best matching group by cosine similarity to centroid
   let bestIdx = -1;
   let bestSim = 0;
   for (let i = 0; i < roundGroups.length; i++) {
-    const sim = cosineSimilarity(promptVec, roundGroups[i].centroid);
+    const sim = cosineSimilarity(vec, roundGroups[i].centroid);
     if (sim >= SEMBLR_GROUP_THRESHOLD && sim > bestSim) {
       bestSim = sim;
       bestIdx = i;
@@ -619,13 +619,13 @@ function assignToGroup(roundEntry: ChainEntry, promptVec: number[]): number {
     group.rounds.push(roundEntry);
     const n = group.rounds.length;
     group.centroid = group.centroid.map((c, i) =>
-      c + (promptVec[i] - c) / n,
+      c + (vec[i] - c) / n,
     );
     return bestIdx;
   }
   // Create new group
   roundGroups.push({
-    centroid: [...promptVec],
+    centroid: [...vec],
     rounds: [roundEntry],
   });
   return roundGroups.length - 1;
@@ -911,7 +911,7 @@ export default function (pi: ExtensionAPI) {
       }
       const roundScores = new Map<string, RoundScore>();
       for (const entry of scored) {
-        const roundFile = entry.filePath.replace(/:prompt$|:response$/, "");
+        const roundFile = entry.filePath.replace(/(:prompt|:response|:round)$/, "");
         if (!roundFile.endsWith(".json")) continue;
         if (roundScores.has(roundFile)) continue;
         const roundData = readRoundFile(entry.filePath);
@@ -924,7 +924,7 @@ export default function (pi: ExtensionAPI) {
       }
 
       const uniqueRounds = new Set(
-        index.map((e: { filePath: string }) => e.filePath.replace(/:prompt$|:response$/, ""))
+        index.map((e: { filePath: string }) => e.filePath.replace(/(:prompt|:response|:round)$/, ""))
       ).size;
 
       const scoredRounds = Array.from(roundScores.values()).sort(
@@ -988,7 +988,7 @@ export default function (pi: ExtensionAPI) {
             roundPresentedRecorded = true;
           }
           const uniqueRounds = new Set(
-            index.map((e: { filePath: string }) => e.filePath.replace(/:prompt$|:response$/, ""))
+            index.map((e: { filePath: string }) => e.filePath.replace(/(:prompt|:response|:round)$/, ""))
           ).size;
           ctx.ui.setStatus(
             "semblr",
@@ -1198,10 +1198,13 @@ export default function (pi: ExtensionAPI) {
 
     // Skip if already saved (deduplication by content hash)
     if (fs.existsSync(roundPath)) {
-      // Even on dedup, run grouping if we have the embedding
-      if (agentPromptVec) {
-        assignToGroup(causalChain[causalChain.length - 1], agentPromptVec);
-      }
+      // Even on dedup, run grouping if the round has a combined embedding
+      try {
+        const existing = JSON.parse(fs.readFileSync(roundPath, "utf-8"));
+        if (existing.promptEmbedding) {
+          assignToGroup(causalChain[causalChain.length - 1], existing.promptEmbedding);
+        }
+      } catch { /* best-effort */ }
       ctx.ui.setStatus("semblr", `\u{1f9e0} round already saved (${roundFileName})`);
       lastRoundFileName = roundFileName;
       agentAccumulatedText = [];
@@ -1227,7 +1230,7 @@ export default function (pi: ExtensionAPI) {
       toolCallNames: agentToolCallNames,
       toolCalls: agentToolCalls,
       responseSegments: agentResponseSegments,
-      promptEmbedding: agentPromptVec ?? undefined,
+      promptEmbedding: undefined, // set after embedding below (#3)
       parentId,
       relatedParentId: null, // set after grouping below
     };
@@ -1242,7 +1245,15 @@ export default function (pi: ExtensionAPI) {
       return;
     }
 
-    // Embed prompt and response separately
+    // Three embeddings for each round:
+    //   1. prompt embedding → index.csv as :prompt
+    //   2. response (truncated, REDACTED dropped) embedding → index.csv as :response
+    //   3. concat(prompt, truncated+dropped response) embedding → round.json (for grouping)
+    // text-embedding-3-small silently truncates at 8K tokens (~24KB), so we clip
+    // the response explicitly to control what gets included.
+    // Embedding a single concatenated text (rather than averaging separate prompt
+    // and response vectors) preserves the semantic relationship between them.
+    // See https://github.com/vhallac/semblr/issues/36
     const apiKey = await getApiKey(ctx);
     if (!apiKey) {
       ctx.ui.setStatus("semblr", "\u{1f9e0} saved but not embedded (no API key)");
@@ -1254,24 +1265,46 @@ export default function (pi: ExtensionAPI) {
     }
 
     try {
-      const [promptVec, responseVec] = await Promise.all([
-        agentPromptVec
-          ? Promise.resolve(agentPromptVec)
-          : embedText(userPrompt, apiKey),
-        embedText(responseText, apiKey),
+      // Strip context-injection REDACTED markers and clip to ~24KB (8K tokens)
+      const strippedResponse = responseText.replace(
+        /\[(?:Tool call )?REDACTED[^\]]*\]\n?/g,
+        "",
+      );
+      const responseBuf = Buffer.from(strippedResponse, "utf-8");
+      const clippedResponse =
+        responseBuf.length > 24000
+          ? responseBuf.slice(0, 24000).toString("utf-8")
+          : strippedResponse;
+      const combinedText = userPrompt + "\n\n" + clippedResponse;
+
+      // Embedding #1: prompt (reuse cached agentPromptVec if available)
+      const promptVec = agentPromptVec ?? normalize(await embedText(userPrompt, apiKey));
+
+      // Embedding #2 + #3 in parallel
+      const [responseVec, combinedVec] = await Promise.all([
+        embedText(clippedResponse, apiKey),
+        embedText(combinedText, apiKey),
       ]);
-      appendToIndex(`${roundFileName}:prompt`, promptVec);
-      appendToIndex(`${roundFileName}:response`, responseVec);
+
+      // Save to index: :prompt and :response (normalized for cosine similarity)
+      appendToIndex(`${roundFileName}:prompt`, normalize(promptVec));
+      appendToIndex(`${roundFileName}:response`, normalize(responseVec));
+
+      // Update round.json with combined embedding
+      const existing = JSON.parse(fs.readFileSync(roundPath, "utf-8"));
+      existing.promptEmbedding = combinedVec;
+      fs.writeFileSync(roundPath + ".tmp." + process.pid, JSON.stringify(existing, null, 2));
+      fs.renameSync(roundPath + ".tmp." + process.pid, roundPath);
+
       ctx.ui.setStatus(
         "semblr",
         `\u{1f9e0} saved + embedded round (${roundFileName})`,
       );
 
       // — Grouping + metadata update —
-      // Assign to a semantic group using the prompt embedding, then update
-      // relatedParentId in the round JSON file.
+      // Assign to a semantic group using the combined embedding.
       const roundEntry = causalChain[causalChain.length - 1];
-      const groupIdx = assignToGroup(roundEntry, promptVec);
+      const groupIdx = assignToGroup(roundEntry, combinedVec);
       const group = roundGroups[groupIdx];
       // Find the most recent round in the same group *before* this round
       let relatedParentId: string | null = null;
@@ -1285,9 +1318,9 @@ export default function (pi: ExtensionAPI) {
       if (relatedParentId) {
         // Re-read, update, re-write atomically
         try {
-          const existing = JSON.parse(fs.readFileSync(roundPath, "utf-8"));
-          existing.relatedParentId = relatedParentId;
-          fs.writeFileSync(roundPath + ".tmp." + process.pid, JSON.stringify(existing, null, 2));
+          const updated = JSON.parse(fs.readFileSync(roundPath, "utf-8"));
+          updated.relatedParentId = relatedParentId;
+          fs.writeFileSync(roundPath + ".tmp." + process.pid, JSON.stringify(updated, null, 2));
           fs.renameSync(roundPath + ".tmp." + process.pid, roundPath);
         } catch { /* best-effort */ }
       }
@@ -1307,7 +1340,7 @@ export default function (pi: ExtensionAPI) {
     const indexExists = fs.existsSync(INDEX_PATH);
     const idx = indexExists ? loadIndex() : [];
     const totalRounds = new Set(
-      idx.map((e: { filePath: string }) => e.filePath.replace(/:prompt$|:response$/, ""))
+      idx.map((e: { filePath: string }) => e.filePath.replace(/(:prompt|:response|:round)$/, ""))
     ).size;
     ctx.ui.setStatus("semblr", `🧠 ${totalRounds} total indexed | ${formatGroupStats()}`);
   });
@@ -1335,7 +1368,7 @@ export default function (pi: ExtensionAPI) {
     const indexExists = fs.existsSync(INDEX_PATH);
     const index = indexExists ? loadIndex() : [];
     const uniqueRounds = new Set(
-      index.map((e: { filePath: string }) => e.filePath.replace(/:prompt$|:response$/, ""))
+      index.map((e: { filePath: string }) => e.filePath.replace(/(:prompt|:response|:round)$/, ""))
     ).size;
     ctx.ui.setStatus(
       "semblr",
@@ -1389,7 +1422,7 @@ export default function (pi: ExtensionAPI) {
         if (scopeRounds && scopeRounds.length > 0) {
           const scopeSet = new Set(scopeRounds);
           index = index.filter((entry) => {
-            const roundFile = entry.filePath.replace(/:prompt$|:response$/, "");
+            const roundFile = entry.filePath.replace(/(:prompt|:response|:round)$/, "");
             return scopeSet.has(roundFile);
           });
           if (index.length === 0) {
@@ -1407,7 +1440,7 @@ export default function (pi: ExtensionAPI) {
         // Group by round file, take best score per round
         const roundScores = new Map<string, { fileName: string; data: RoundData; bestScore: number }>();
         for (const entry of scored) {
-          const roundFile = entry.filePath.replace(/:prompt$|:response$/, "");
+          const roundFile = entry.filePath.replace(/(:prompt|:response|:round)$/, "");
           if (!roundFile.endsWith(".json")) continue;
           if (roundScores.has(roundFile)) continue;
           const roundData = readRoundFile(entry.filePath);

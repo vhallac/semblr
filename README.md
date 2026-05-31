@@ -64,7 +64,7 @@ When the extension is loaded, pi exposes:
 Current AI agent sessions degrade as they accumulate context. Pi's compaction mechanism summarises past rounds to free memory, but the summaries lose detail. Semblr replaces this with a different approach:
 
 1. **Save every round permanently.** Each user prompt + full assistant response sequence (tool calls, thinking, final answer) is saved as an individual JSON file.
-2. **Embed prompt and response.** Both are sent to an embedding API (`text-embedding-3-small`) and stored as vectors in an append-only CSV index.
+2. **Embed prompt, response, and combined text.** Three texts are sent to the embedding API (`text-embedding-3-small`, which has an 8K token limit): the user prompt, the clipped response (truncated to ~24KB, context-injection artifacts stripped), and the concatenation of both (`prompt + "\n\n" + clippedResponse`). The prompt and response vectors are stored in an append-only CSV index. The combined vector is stored in the round file for semantic grouping.
 3. **Retrieve by relevance.** On every user prompt, the prompt is embedded and compared against all stored vectors via cosine similarity. The closest rounds are injected into context — up to a dynamic token budget.
 4. **Drill-down via tools.** By default, rounds are shown as a compact numbered index. The LLM uses `get_round_details()` to expand a round and `get_tool_details()` to inspect individual tool calls within it.
 
@@ -195,13 +195,13 @@ Semblr has two sources of API cost:
 
 | Operation | Cost per invocation |
 |---|---|
-| **Saving a round** | 2 embedding API calls (prompt + response) |
+| **Saving a round** | 2–3 embedding API calls (prompt, clipped response, combined) |
 | **Context assembly** | 1 embedding API call (the current prompt) |
 | **Index search** (via `search_interactions` tool) | 1 embedding API call per search |
 
 All embeddings go to OpenRouter → `text-embedding-3-small`. At current pricing (~$0.13/1M tokens for input, ~0.26/1M for output for text-embedding-3-small, but OpenRouter may add a small markup), the cost per embedding is on the order of fractions of a cent.
 
-The ongoing cost is ~1 embedding per user prompt.
+The ongoing cost is ~2–3 embeddings per user prompt (the prompt embedding from context assembly is reused for saving, so the net cost is one response embedding plus one combined embedding).
 
 ### Caching
 
@@ -228,7 +228,7 @@ Semblr stores conversation data in two areas, both outside the project tree so t
 | File | Purpose |
 |---|---|
 | `<id>.json` | A single round: user prompt, full assistant response, tool call metadata |
-| `index.csv` | Append-only vector index — one line per embedding: `base64(vector),<filepath>:prompt\|response` |
+| `index.csv` | Append-only vector index — one line per embedding: `base64(vector),<filepath>:round` |
 
 Round IDs are content-addressed (MD5 of `userPrompt + responseSequence`), so re-indexing is idempotent — same content produces the same file.
 
@@ -301,7 +301,7 @@ The index is an append-only CSV with no schema header:
 <base64url(JSON vector)>,<round_id>.json:response
 ```
 
-Each round produces two rows: one for the user prompt embedding, one for the assistant response embedding. The vector dimensions match the embedding model (1536 for `text-embedding-3-small`). Cosine similarity is used for retrieval.
+Each round produces two rows: one for the prompt embedding and one for the clipped-response embedding. The combined prompt+response embedding is stored in the round JSON file for grouping, not in the index CSV. The vector dimensions match the embedding model (1536 for `text-embedding-3-small`). Cosine similarity is used for retrieval.
 
 ## Known Problems
 
@@ -345,7 +345,7 @@ just query "what did we discuss about caching"
 
 ```
 ├── src                         # The extension directory
-│   └── semblr.ts                 # Main extension file (~1926 lines)
+│   └── semblr.ts                 # Main extension file (~1959 lines)
 ├── scripts/
 │   ├── digest-all.ts               # Bulk-embed all historical sessions
 │   ├── digest-session.ts           # Embed a single session file
