@@ -694,10 +694,60 @@ function createRoundFilePath(userPrompt: string, responseText: string, toolCalls
   return `${hash}.json`;
 }
 
+// Lock constants for atomic index writes (#44)
+const INDEX_LOCK_RETRIES = 15;        // max lock attempts
+const INDEX_LOCK_BACKOFF_MS = 50;     // base backoff per retry
+
 function appendToIndex(filePath: string, vector: number[]) {
   const b64 = Buffer.from(JSON.stringify(vector)).toString("base64url");
+  const line = `${b64},${filePath}\n`;
   fs.mkdirSync(ROUNDS_DIR, { recursive: true });
-  fs.appendFileSync(INDEX_PATH, `${b64},${filePath}\n`);
+
+  const lockPath = `${INDEX_PATH}.lock`;
+
+  // Acquire lock with exponential backoff
+  let lockFd: number | null = null;
+  for (let attempt = 0; attempt < INDEX_LOCK_RETRIES; attempt++) {
+    try {
+      lockFd = fs.openSync(lockPath, "wx");
+      break;
+    } catch {
+      // Staleness check: if lockfile is older than 10s, assume dead process, take over
+      try {
+        const stat = fs.statSync(lockPath);
+        if (Date.now() - stat.mtimeMs > 10_000) {
+          fs.unlinkSync(lockPath);
+          lockFd = fs.openSync(lockPath, "wx");
+          break;
+        }
+      } catch { /* lock disappeared or unreadable — retry below */ }
+
+      if (attempt < INDEX_LOCK_RETRIES - 1) {
+        const waitMs = INDEX_LOCK_BACKOFF_MS * Math.pow(2, attempt);
+        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, waitMs);
+      } else {
+        // Last attempt failed — fall back to direct append (best-effort)
+        try { fs.appendFileSync(INDEX_PATH, line); } catch {}
+        return;
+      }
+    }
+  }
+
+  try {
+    // Read-modify-write under lock
+    const existing = fs.existsSync(INDEX_PATH)
+      ? fs.readFileSync(INDEX_PATH, "utf-8")
+      : "";
+    const newContent = existing + line;
+    const tmp = `${INDEX_PATH}.tmp.${process.pid}`;
+    fs.writeFileSync(tmp, newContent);
+    fs.renameSync(tmp, INDEX_PATH);
+  } finally {
+    if (lockFd !== null) {
+      fs.closeSync(lockFd);
+      try { fs.unlinkSync(lockPath); } catch {}
+    }
+  }
 }
 
 function splitCommandArgs(args: string): string[] {

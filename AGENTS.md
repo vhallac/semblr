@@ -4,7 +4,7 @@ Next-generation context management for AI agents. See [VISION.md](VISION.md) for
 
 ## The Extension
 
-The extension lives at `src/semblr.ts` (~1959 lines, moved from `.pi/extensions/semblr.ts` to avoid pi auto-loading). It:
+The extension lives at `src/semblr.ts` (moved from `.pi/extensions/semblr.ts` to avoid pi auto-loading). It:
 
 - Saves every completed conversation round to a persistent round repository (`rounds/<hash>.json`)
 - Embeds combined prompt+response vectors to `index.csv` (via OpenRouter, `text-embedding-3-small`, clipped to ~8K tokens)
@@ -20,7 +20,7 @@ The extension lives at `src/semblr.ts` (~1959 lines, moved from `.pi/extensions/
 - `VISION.md` — project vision, architecture, roadmap (with ✅ completion markers)
 - `README.md` — project overview, premise, cost, known problems
 - `AGENTS.md` — this file (project context for AI agents)
-- `src/semblr.ts` — the extension (single file, ~1959 lines)
+- `src/semblr.ts` — the extension (single file)
 - `scripts/digest-all.ts` — bulk-embed all historical pi sessions
 - `scripts/digest-session.ts` — embed a single session JSONL file
 - `scripts/import-claude-code.ts` — import Claude Code JSONL history
@@ -33,7 +33,6 @@ The extension lives at `src/semblr.ts` (~1959 lines, moved from `.pi/extensions/
 
 When adding a new feature or making a significant change, the README must be updated to reflect it. Before marking a task complete, verify the following are in sync:
 
-- **Line count** — `src/semblr.ts` line count in both `README.md` and `AGENTS.md`
 - **Commands** — any new `/semblr:*` commands must appear in the Commands section
 - **Environment variables** — any new env var must appear in the Environment Variables table
 - **Project structure** — any new script or directory must appear in the tree

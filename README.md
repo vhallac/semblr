@@ -345,7 +345,7 @@ just query "what did we discuss about caching"
 
 ```
 ├── src                         # The extension directory
-│   └── semblr.ts                 # Main extension file (~1959 lines)
+│   └── semblr.ts                 # Main extension file
 ├── scripts/
 │   ├── digest-all.ts               # Bulk-embed all historical sessions
 │   ├── digest-session.ts           # Embed a single session file
