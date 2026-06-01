@@ -11,16 +11,15 @@
  */
 
 import * as fs from "node:fs";
-import * as path from "node:path";
 import * as os from "node:os";
+import * as path from "node:path";
 
 // ─────────────────────────────────────────────
 // Config (matches digest-session.ts)
 // ─────────────────────────────────────────────
 
 const SESSIONS_DIR = path.resolve(os.homedir(), ".pi", "agent", "sessions");
-const ROUNDS_DIR = process.env.SEMBLR_ROUNDS_DIR ||
-  path.resolve(os.homedir(), ".pi", "agent", "semblr", "rounds");
+const ROUNDS_DIR = process.env.SEMBLR_ROUNDS_DIR || path.resolve(os.homedir(), ".pi", "agent", "semblr", "rounds");
 const INDEX_PATH = path.resolve(ROUNDS_DIR, "index.csv");
 
 const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY;
@@ -34,30 +33,30 @@ const MAX_RESPONSE_CHARS = 8000;
 // ─────────────────────────────────────────────
 
 interface ToolCallDetail {
-  index: number;
-  name: string;
-  arguments: string;
-  result_summary: string;
+	index: number;
+	name: string;
+	arguments: string;
+	result_summary: string;
 }
 
 interface ResponseSegment {
-  type: "text" | "toolCall";
-  text?: string;
-  toolCallIndex?: number;
+	type: "text" | "toolCall";
+	text?: string;
+	toolCallIndex?: number;
 }
 
 interface Round {
-  id: string;
-  userPrompt: string;
-  responseSequence: string;
-  responseSegments: ResponseSegment[];
-  userTimestamp: number;
-  responseEndTimestamp: number;
-  turnIndex: number; // serialized — keep name for backward compat
-  sessionLabel: string; // human-readable label for this session file
-  toolCallCount: number;
-  toolCallNames: string[];
-  toolCalls: ToolCallDetail[];
+	id: string;
+	userPrompt: string;
+	responseSequence: string;
+	responseSegments: ResponseSegment[];
+	userTimestamp: number;
+	responseEndTimestamp: number;
+	turnIndex: number; // serialized — keep name for backward compat
+	sessionLabel: string; // human-readable label for this session file
+	toolCallCount: number;
+	toolCallNames: string[];
+	toolCalls: ToolCallDetail[];
 }
 
 // ─────────────────────────────────────────────
@@ -65,128 +64,128 @@ interface Round {
 // ─────────────────────────────────────────────
 
 function parseSessionFile(filePath: string, sessionLabel: string): Round[] {
-  const content = fs.readFileSync(filePath, "utf-8");
-  const lines = content.trim().split("\n").filter(Boolean);
-  const entries: Array<Record<string, unknown>> = lines.map((l) => JSON.parse(l));
+	const content = fs.readFileSync(filePath, "utf-8");
+	const lines = content.trim().split("\n").filter(Boolean);
+	const entries: Array<Record<string, unknown>> = lines.map((l) => JSON.parse(l));
 
-  const rounds: Round[] = [];
-  let currentUserMsg: Record<string, unknown> | null = null;
-  let responseParts: string[] = [];
-  let responseSegments: ResponseSegment[] = [];
-  let toolNames: string[] = [];
-  let toolCallCount = 0;
-  let toolCalls: ToolCallDetail[] = [];
-  let roundIndex = 0;
+	const rounds: Round[] = [];
+	let currentUserMsg: Record<string, unknown> | null = null;
+	let responseParts: string[] = [];
+	let responseSegments: ResponseSegment[] = [];
+	let toolNames: string[] = [];
+	let toolCallCount = 0;
+	let toolCalls: ToolCallDetail[] = [];
+	let roundIndex = 0;
 
-  for (const entry of entries) {
-    if (entry.type !== "message") continue;
-    const msg = entry.message as Record<string, unknown> | undefined;
-    if (!msg) continue;
+	for (const entry of entries) {
+		if (entry.type !== "message") continue;
+		const msg = entry.message as Record<string, unknown> | undefined;
+		if (!msg) continue;
 
-    const role = msg.role as string;
-    const content = msg.content as Array<{ type: string; text?: string }> | undefined;
-    const timestamp = msg.timestamp as number | undefined;
+		const role = msg.role as string;
+		const content = msg.content as Array<{ type: string; text?: string }> | undefined;
+		const timestamp = msg.timestamp as number | undefined;
 
-    if (role === "user") {
-      // Save previous round if exists
-      if (currentUserMsg) {
-        rounds.push({
-          id: currentUserMsg.id as string,
-          userPrompt: extractText(
-            (currentUserMsg.message as Record<string, unknown>)?.content as
-              | Array<{ type: string; text?: string }>
-              | undefined,
-          ),
-          responseSequence: responseParts.join("\n\n").trim(),
-          responseSegments,
-          userTimestamp: (currentUserMsg.message as Record<string, unknown>)?.timestamp as number ?? 0,
-          responseEndTimestamp: timestamp ?? Date.now(),
-          turnIndex: roundIndex,
-          sessionLabel,
-          toolCallCount,
-          toolCallNames: [...new Set(toolNames)],
-          toolCalls,
-        });
-        roundIndex++;
-      }
-      currentUserMsg = entry;
-      responseParts = [];
-      responseSegments = [];
-      toolNames = [];
-      toolCallCount = 0;
-      toolCalls = [];
-    } else if (role === "assistant" && currentUserMsg && content) {
-      // Single ordered pass: interleave text and tool call blocks
-      for (const block of content) {
-        if (block.type === "text" && block.text) {
-          responseParts.push(block.text);
-          responseSegments.push({ type: "text", text: block.text });
-        } else if (block.type === "toolCall") {
-          toolCallCount++;
-          const blockRec = block as Record<string, unknown>;
-          const name = blockRec.name as string | undefined;
-          if (name) toolNames.push(name);
-          toolCalls.push({
-            index: toolCalls.length,
-            name: name ?? "unknown",
-            arguments: JSON.stringify(blockRec.arguments ?? {}),
-            result_summary: "",
-          });
-          responseSegments.push({ type: "toolCall", toolCallIndex: toolCalls.length - 1 });
-        }
-      }
-    } else if (role === "toolResult" && currentUserMsg) {
-      // Count tool results and pair with pending tool calls (sequential match)
-      const toolName = msg.toolName as string | undefined;
-      if (toolName) toolNames.push(toolName);
-      // Pair with the most recent tool call that lacks a result
-      for (let i = toolCalls.length - 1; i >= 0; i--) {
-        if (toolCalls[i].result_summary === "") {
-          const resultContent = msg.content as Array<{ type: string; text?: string }> | undefined;
-          const resultText = resultContent ? extractText(resultContent) : "";
-          toolCalls[i].result_summary = resultText.slice(0, 300);
-            toolCalls[i].result_full = resultText;
-            toolCalls[i].result_truncated = false;
-          break;
-        }
-      }
-    }
-  }
+		if (role === "user") {
+			// Save previous round if exists
+			if (currentUserMsg) {
+				rounds.push({
+					id: currentUserMsg.id as string,
+					userPrompt: extractText(
+						(currentUserMsg.message as Record<string, unknown>)?.content as
+							| Array<{ type: string; text?: string }>
+							| undefined,
+					),
+					responseSequence: responseParts.join("\n\n").trim(),
+					responseSegments,
+					userTimestamp: ((currentUserMsg.message as Record<string, unknown>)?.timestamp as number) ?? 0,
+					responseEndTimestamp: timestamp ?? Date.now(),
+					turnIndex: roundIndex,
+					sessionLabel,
+					toolCallCount,
+					toolCallNames: [...new Set(toolNames)],
+					toolCalls,
+				});
+				roundIndex++;
+			}
+			currentUserMsg = entry;
+			responseParts = [];
+			responseSegments = [];
+			toolNames = [];
+			toolCallCount = 0;
+			toolCalls = [];
+		} else if (role === "assistant" && currentUserMsg && content) {
+			// Single ordered pass: interleave text and tool call blocks
+			for (const block of content) {
+				if (block.type === "text" && block.text) {
+					responseParts.push(block.text);
+					responseSegments.push({ type: "text", text: block.text });
+				} else if (block.type === "toolCall") {
+					toolCallCount++;
+					const blockRec = block as Record<string, unknown>;
+					const name = blockRec.name as string | undefined;
+					if (name) toolNames.push(name);
+					toolCalls.push({
+						index: toolCalls.length,
+						name: name ?? "unknown",
+						arguments: JSON.stringify(blockRec.arguments ?? {}),
+						result_summary: "",
+					});
+					responseSegments.push({ type: "toolCall", toolCallIndex: toolCalls.length - 1 });
+				}
+			}
+		} else if (role === "toolResult" && currentUserMsg) {
+			// Count tool results and pair with pending tool calls (sequential match)
+			const toolName = msg.toolName as string | undefined;
+			if (toolName) toolNames.push(toolName);
+			// Pair with the most recent tool call that lacks a result
+			for (let i = toolCalls.length - 1; i >= 0; i--) {
+				if (toolCalls[i].result_summary === "") {
+					const resultContent = msg.content as Array<{ type: string; text?: string }> | undefined;
+					const resultText = resultContent ? extractText(resultContent) : "";
+					toolCalls[i].result_summary = resultText.slice(0, 300);
+					(toolCalls[i] as unknown as Record<string, unknown>).result_full = resultText;
+					(toolCalls[i] as unknown as Record<string, unknown>).result_truncated = false;
+					break;
+				}
+			}
+		}
+	}
 
-  // Save last round — only if it has a non-empty response or we have multiple rounds.
-  // Skip rounds whose response is trivially short (< 20 chars) — these are usually
-  // session files that ended mid-stream (truncated assistant response).
-  const finalResponse = responseParts.join("\n\n").trim();
-  if (currentUserMsg && (finalResponse.length >= 20 || roundIndex > 0)) {
-    rounds.push({
-      id: currentUserMsg.id as string,
-      userPrompt: extractText(
-        (currentUserMsg.message as Record<string, unknown>)?.content as
-          | Array<{ type: string; text?: string }>
-          | undefined,
-      ),
-      responseSequence: finalResponse,
-      responseSegments,
-      userTimestamp: (currentUserMsg.message as Record<string, unknown>)?.timestamp as number ?? 0,
-      responseEndTimestamp: Date.now(),
-      turnIndex: roundIndex,
-      sessionLabel,
-      toolCallCount,
-      toolCallNames: [...new Set(toolNames)],
-      toolCalls,
-    });
-  }
+	// Save last round — only if it has a non-empty response or we have multiple rounds.
+	// Skip rounds whose response is trivially short (< 20 chars) — these are usually
+	// session files that ended mid-stream (truncated assistant response).
+	const finalResponse = responseParts.join("\n\n").trim();
+	if (currentUserMsg && (finalResponse.length >= 20 || roundIndex > 0)) {
+		rounds.push({
+			id: currentUserMsg.id as string,
+			userPrompt: extractText(
+				(currentUserMsg.message as Record<string, unknown>)?.content as
+					| Array<{ type: string; text?: string }>
+					| undefined,
+			),
+			responseSequence: finalResponse,
+			responseSegments,
+			userTimestamp: ((currentUserMsg.message as Record<string, unknown>)?.timestamp as number) ?? 0,
+			responseEndTimestamp: Date.now(),
+			turnIndex: roundIndex,
+			sessionLabel,
+			toolCallCount,
+			toolCallNames: [...new Set(toolNames)],
+			toolCalls,
+		});
+	}
 
-  return rounds;
+	return rounds;
 }
 
 function extractText(content?: Array<{ type: string; text?: string }>): string {
-  if (!content || !Array.isArray(content)) return "";
-  return content
-    .filter((c): c is { type: string; text: string } => c.type === "text" && typeof c.text === "string")
-    .map((c) => c.text)
-    .join(" ")
-    .trim();
+	if (!content || !Array.isArray(content)) return "";
+	return content
+		.filter((c): c is { type: string; text: string } => c.type === "text" && typeof c.text === "string")
+		.map((c) => c.text)
+		.join(" ")
+		.trim();
 }
 
 // ─────────────────────────────────────────────
@@ -194,27 +193,27 @@ function extractText(content?: Array<{ type: string; text?: string }>): string {
 // ─────────────────────────────────────────────
 
 async function embed(text: string): Promise<number[]> {
-  const response = await fetch(OPENROUTER_URL, {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${OPENROUTER_API_KEY}`,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({
-      model: EMBEDDING_MODEL,
-      input: text,
-    }),
-  });
+	const response = await fetch(OPENROUTER_URL, {
+		method: "POST",
+		headers: {
+			Authorization: `Bearer ${OPENROUTER_API_KEY}`,
+			"Content-Type": "application/json",
+		},
+		body: JSON.stringify({
+			model: EMBEDDING_MODEL,
+			input: text,
+		}),
+	});
 
-  if (!response.ok) {
-    const err = await response.text();
-    throw new Error(`OpenRouter embedding error (${response.status}): ${err}`);
-  }
+	if (!response.ok) {
+		const err = await response.text();
+		throw new Error(`OpenRouter embedding error (${response.status}): ${err}`);
+	}
 
-  const data = (await response.json()) as {
-    data: Array<{ embedding: number[] }>;
-  };
-  return data.data[0].embedding;
+	const data = (await response.json()) as {
+		data: Array<{ embedding: number[] }>;
+	};
+	return data.data[0].embedding;
 }
 
 // ─────────────────────────────────────────────
@@ -222,8 +221,8 @@ async function embed(text: string): Promise<number[]> {
 // ─────────────────────────────────────────────
 
 function normalize(v: number[]): number[] {
-  const mag = Math.sqrt(v.reduce((sum, x) => sum + x * x, 0));
-  return mag === 0 ? v : v.map((x) => x / mag);
+	const mag = Math.sqrt(v.reduce((sum, x) => sum + x * x, 0));
+	return mag === 0 ? v : v.map((x) => x / mag);
 }
 
 // ─────────────────────────────────────────────
@@ -231,17 +230,19 @@ function normalize(v: number[]): number[] {
 // ─────────────────────────────────────────────
 
 function loadIndexFilePaths(): Set<string> {
-  if (!fs.existsSync(INDEX_PATH)) return new Set();
-  const lines = fs.readFileSync(INDEX_PATH, "utf-8").trim().split("\n").filter(Boolean);
-  return new Set(lines.map((line) => {
-    const [, filePath] = line.split(",", 2);
-    return filePath.replace(/:prompt$|:response$/, "");
-  }));
+	if (!fs.existsSync(INDEX_PATH)) return new Set();
+	const lines = fs.readFileSync(INDEX_PATH, "utf-8").trim().split("\n").filter(Boolean);
+	return new Set(
+		lines.map((line) => {
+			const [, filePath] = line.split(",", 2);
+			return filePath.replace(/:prompt$|:response$/, "");
+		}),
+	);
 }
 
 function appendToIndex(vector: number[], filePath: string): void {
-  const b64 = Buffer.from(JSON.stringify(vector)).toString("base64url");
-  fs.appendFileSync(INDEX_PATH, `${b64},${filePath}\n`);
+	const b64 = Buffer.from(JSON.stringify(vector)).toString("base64url");
+	fs.appendFileSync(INDEX_PATH, `${b64},${filePath}\n`);
 }
 
 // ─────────────────────────────────────────────
@@ -249,15 +250,15 @@ function appendToIndex(vector: number[], filePath: string): void {
 // ─────────────────────────────────────────────
 
 function countUserMessages(filePath: string): number {
-  const content = fs.readFileSync(filePath, "utf-8");
-  let count = 0;
-  for (const line of content.trim().split("\n").filter(Boolean)) {
-    try {
-      const obj = JSON.parse(line);
-      if (obj.type === "message" && obj.message?.role === "user") count++;
-    } catch {}
-  }
-  return count;
+	const content = fs.readFileSync(filePath, "utf-8");
+	let count = 0;
+	for (const line of content.trim().split("\n").filter(Boolean)) {
+		try {
+			const obj = JSON.parse(line);
+			if (obj.type === "message" && obj.message?.role === "user") count++;
+		} catch {}
+	}
+	return count;
 }
 
 // ─────────────────────────────────────────────
@@ -265,127 +266,131 @@ function countUserMessages(filePath: string): number {
 // ─────────────────────────────────────────────
 
 async function main() {
-  if (!OPENROUTER_API_KEY) {
-    console.error("❌ OPENROUTER_API_KEY environment variable required");
-    process.exit(1);
-  }
+	if (!OPENROUTER_API_KEY) {
+		console.error("❌ OPENROUTER_API_KEY environment variable required");
+		process.exit(1);
+	}
 
-  // Gather all session JSONL files
-  const sessionDirs = fs.readdirSync(SESSIONS_DIR)
-    .filter((d) => d.startsWith("--"))
-    .map((d) => path.join(SESSIONS_DIR, d));
+	// Gather all session JSONL files
+	const sessionDirs = fs
+		.readdirSync(SESSIONS_DIR)
+		.filter((d) => d.startsWith("--"))
+		.map((d) => path.join(SESSIONS_DIR, d));
 
-  const jsonlFiles: Array<{ filePath: string; label: string }> = [];
-  for (const dir of sessionDirs) {
-    const label = path.basename(dir);
-    const files = fs.readdirSync(dir).filter((f) => f.endsWith(".jsonl"));
-    for (const f of files) {
-      jsonlFiles.push({ filePath: path.join(dir, f), label });
-    }
-  }
+	const jsonlFiles: Array<{ filePath: string; label: string }> = [];
+	for (const dir of sessionDirs) {
+		const label = path.basename(dir);
+		const files = fs.readdirSync(dir).filter((f) => f.endsWith(".jsonl"));
+		for (const f of files) {
+			jsonlFiles.push({ filePath: path.join(dir, f), label });
+		}
+	}
 
-  jsonlFiles.sort((a, b) => a.filePath.localeCompare(b.filePath));
+	jsonlFiles.sort((a, b) => a.filePath.localeCompare(b.filePath));
 
-  console.log(`📂 Found ${jsonlFiles.length} session files across ${sessionDirs.length} directories\n`);
+	console.log(`📂 Found ${jsonlFiles.length} session files across ${sessionDirs.length} directories\n`);
 
-  // Ensure the .pi/rounds dir
-  fs.mkdirSync(ROUNDS_DIR, { recursive: true });
+	// Ensure the .pi/rounds dir
+	fs.mkdirSync(ROUNDS_DIR, { recursive: true });
 
-  // Load existing index dedup set
-  const existingRounds = loadIndexFilePaths();
-  console.log(`📊 Already indexed: ${existingRounds.size} rounds\n`);
+	// Load existing index dedup set
+	const existingRounds = loadIndexFilePaths();
+	console.log(`📊 Already indexed: ${existingRounds.size} rounds\n`);
 
-  // Parse all sessions into a flat list of rounds (skipping already-indexed)
-  const allRounds: Round[] = [];
-  let skippedTotal = 0;
+	// Parse all sessions into a flat list of rounds (skipping already-indexed)
+	const allRounds: Round[] = [];
+	let skippedTotal = 0;
 
-  for (const { filePath, label } of jsonlFiles) {
-    const rounds = parseSessionFile(filePath, label);
-    const newRounds = rounds.filter((t) => {
-      const key = `${require("node:crypto").createHash("md5").update(t.userPrompt + t.responseSequence).digest("hex")}.json`;
-      return !existingRounds.has(key);
-    });
-    skippedTotal += rounds.length - newRounds.length;
-    allRounds.push(...newRounds);
-  }
+	for (const { filePath, label } of jsonlFiles) {
+		const rounds = parseSessionFile(filePath, label);
+		const newRounds = rounds.filter((t) => {
+			const key = `${require("node:crypto")
+				.createHash("md5")
+				.update(t.userPrompt + t.responseSequence)
+				.digest("hex")}.json`;
+			return !existingRounds.has(key);
+		});
+		skippedTotal += rounds.length - newRounds.length;
+		allRounds.push(...newRounds);
+	}
 
-  const totalNew = allRounds.length;
-  console.log(`📊 New rounds to embed: ${totalNew} (${skippedTotal} already indexed)\n`);
+	const totalNew = allRounds.length;
+	console.log(`📊 New rounds to embed: ${totalNew} (${skippedTotal} already indexed)\n`);
 
-  if (totalNew === 0) {
-    console.log("✨ Nothing to do — all sessions already indexed!");
-    return;
-  }
+	if (totalNew === 0) {
+		console.log("✨ Nothing to do — all sessions already indexed!");
+		return;
+	}
 
-  // Parallel embedding with concurrency limit
-  let completed = 0;
-  let errors = 0;
+	// Parallel embedding with concurrency limit
+	let completed = 0;
+	let errors = 0;
 
-  async function processRound(round: Round): Promise<void> {
-    const crypto = require("node:crypto");
-    const roundFile = `${crypto.createHash("md5").update(round.userPrompt + round.responseSequence).digest("hex")}.json`;
-    const roundId = `${round.sessionLabel}/${roundFile}`;
+	async function processRound(round: Round): Promise<void> {
+		const crypto = require("node:crypto");
+		const roundFile = `${crypto
+			.createHash("md5")
+			.update(round.userPrompt + round.responseSequence)
+			.digest("hex")}.json`;
+		const roundId = `${round.sessionLabel}/${roundFile}`;
 
-    // Write round file (always)
-    fs.writeFileSync(
-      path.resolve(ROUNDS_DIR, roundFile),
-      JSON.stringify(round, null, 2),
-    );
+		// Write round file (always)
+		fs.writeFileSync(path.resolve(ROUNDS_DIR, roundFile), JSON.stringify(round, null, 2));
 
-    try {
-      const promptVector = await embed(round.userPrompt);
-      appendToIndex(normalize(promptVector), `${roundFile}:prompt`);
+		try {
+			const promptVector = await embed(round.userPrompt);
+			appendToIndex(normalize(promptVector), `${roundFile}:prompt`);
 
-      const respText = round.responseSequence.slice(0, MAX_RESPONSE_CHARS);
-      if (respText) {
-        const respVector = await embed(respText);
-        appendToIndex(normalize(respVector), `${roundFile}:response`);
-      }
+			const respText = round.responseSequence.slice(0, MAX_RESPONSE_CHARS);
+			if (respText) {
+				const respVector = await embed(respText);
+				appendToIndex(normalize(respVector), `${roundFile}:response`);
+			}
 
-      completed++;
-      const pct = ((completed / totalNew) * 100).toFixed(1);
-      process.stderr.write(
-        `  ✅ [${completed}/${totalNew} ${pct}%] ${roundId}\n`,
-      );
-    } catch (err) {
-      errors++;
-      process.stderr.write(`  ❌ [ERROR] ${roundId}: ${(err as Error).message}\n`);
-    }
-  }
+			completed++;
+			const pct = ((completed / totalNew) * 100).toFixed(1);
+			process.stderr.write(`  ✅ [${completed}/${totalNew} ${pct}%] ${roundId}\n`);
+		} catch (err) {
+			errors++;
+			process.stderr.write(`  ❌ [ERROR] ${roundId}: ${(err as Error).message}\n`);
+		}
+	}
 
-  // Run with concurrency limit
-  async function runQueue(): Promise<void> {
-    const queue = [...allRounds];
-    const workers: Promise<void>[] = [];
+	// Run with concurrency limit
+	async function runQueue(): Promise<void> {
+		const queue = [...allRounds];
+		const workers: Promise<void>[] = [];
 
-    for (let i = 0; i < CONCURRENCY; i++) {
-      workers.push(
-        (async () => {
-          while (queue.length > 0) {
-            const round = queue.shift()!;
-            await processRound(round);
-          }
-        })(),
-      );
-    }
+		for (let i = 0; i < CONCURRENCY; i++) {
+			workers.push(
+				(async () => {
+					while (queue.length > 0) {
+						const round = queue.shift();
+						if (round) await processRound(round);
+					}
+				})(),
+			);
+		}
 
-    await Promise.all(workers);
-  }
+		await Promise.all(workers);
+	}
 
-  const startTime = Date.now();
-  await runQueue();
-  const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
+	const startTime = Date.now();
+	await runQueue();
+	const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
 
-  const finalCount = fs.existsSync(INDEX_PATH)
-    ? fs.readFileSync(INDEX_PATH, "utf-8").trim().split("\n").filter(Boolean).length
-    : 0;
+	const finalCount = fs.existsSync(INDEX_PATH)
+		? fs.readFileSync(INDEX_PATH, "utf-8").trim().split("\n").filter(Boolean).length
+		: 0;
 
-  console.log(`\n✅ Done in ${elapsed}s. ${completed} rounds embedded, ${errors} errors.`);
-  console.log(`   Index: ${finalCount} vectors at ${INDEX_PATH}`);
-  console.log(`   Rounds: ${fs.readdirSync(ROUNDS_DIR).filter((f) => f.endsWith(".json") && !f.startsWith("index")).length} files`);
+	console.log(`\n✅ Done in ${elapsed}s. ${completed} rounds embedded, ${errors} errors.`);
+	console.log(`   Index: ${finalCount} vectors at ${INDEX_PATH}`);
+	console.log(
+		`   Rounds: ${fs.readdirSync(ROUNDS_DIR).filter((f) => f.endsWith(".json") && !f.startsWith("index")).length} files`,
+	);
 }
 
 main().catch((err) => {
-  console.error("❌ Fatal:", err);
-  process.exit(1);
+	console.error("❌ Fatal:", err);
+	process.exit(1);
 });

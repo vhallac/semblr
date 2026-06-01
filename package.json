@@ -1,11 +1,16 @@
 {
   "name": "semblr",
   "version": "1.0.0",
+  "type": "module",
   "main": "index.js",
   "directories": {
     "doc": "docs"
   },
   "scripts": {
+    "typecheck": "tsc --noEmit",
+    "lint": "biome check",
+    "lint:fix": "biome check --write",
+    "check": "npm run typecheck && npm run lint",
     "test": "echo \"Error: no test specified\" && exit 1"
   },
   "keywords": [],
@@ -16,6 +21,10 @@
     "@sinclair/typebox": "^0.34.49"
   },
   "devDependencies": {
-    "tsx": "^4.22.3"
+    "@biomejs/biome": "^2.4.16",
+    "@earendil-works/pi-coding-agent": "^0.74.2",
+    "@types/node": "^25.9.1",
+    "tsx": "^4.22.3",
+    "typescript": "^6.0.3"
   }
 }
