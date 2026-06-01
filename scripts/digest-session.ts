@@ -28,6 +28,21 @@ interface ToolCallDetail {
 	result_truncated?: boolean;
 }
 
+// ─────────────────────────────────────────────
+// Content hash (must match semblr.ts computeContentHash)
+// ─────────────────────────────────────────────
+
+function computeContentHash(userPrompt: string, responseText: string, toolCalls?: ToolCallDetail[]): string {
+	const parts: string[] = [userPrompt, responseText];
+	if (toolCalls) {
+		for (const tc of toolCalls) {
+			parts.push(tc.arguments);
+			parts.push(tc.result_full ?? tc.result_summary ?? "");
+		}
+	}
+	return crypto.createHash("md5").update(parts.join("")).digest("hex");
+}
+
 interface ResponseSegment {
 	type: "text" | "toolCall";
 	text?: string;
@@ -68,6 +83,8 @@ const EMBEDDING_MODEL = "openai/text-embedding-3-small";
 const _OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"; // actually embeddings endpoint
 const ROUNDS_DIR = process.env.SEMBLR_ROUNDS_DIR || path.resolve(os.homedir(), ".pi", "agent", "semblr", "rounds");
 const INDEX_PATH = path.resolve(ROUNDS_DIR, "index.csv");
+const MAX_PROMPT_CHARS = 8000;
+const MAX_RESPONSE_CHARS = 8000;
 
 // ─────────────────────────────────────────────
 // Parse session into rounds
@@ -243,9 +260,52 @@ function loadIndex(): Array<{ vector: number[]; filePath: string }> {
 	});
 }
 
+function loadIndexLines(): string[] {
+	if (!fs.existsSync(INDEX_PATH)) return [];
+	return fs.readFileSync(INDEX_PATH, "utf-8").trim().split("\n").filter(Boolean);
+}
+
 function appendToIndex(vector: number[], filePath: string): void {
 	const b64 = Buffer.from(JSON.stringify(vector)).toString("base64url");
 	fs.appendFileSync(INDEX_PATH, `${b64},${filePath}\n`);
+}
+
+/**
+ * Rewrite index entries from an old round filename to the new content-hash filename.
+ * This preserves accessibility even if re-embedding would fail or be skipped.
+ */
+function migrateIndexEntries(oldRoundFile: string, newRoundFile: string): void {
+	if (!fs.existsSync(INDEX_PATH)) return;
+	const lines = loadIndexLines();
+	const migrated = lines.map((line) => {
+		const comma = line.indexOf(",");
+		const fp = line.slice(comma + 1);
+		if (!fp.startsWith(oldRoundFile)) return line;
+		return `${line.slice(0, comma + 1)}${newRoundFile}${fp.slice(oldRoundFile.length)}`;
+	});
+	fs.writeFileSync(INDEX_PATH, migrated.join("\n") + (migrated.length > 0 ? "\n" : ""));
+}
+
+/**
+ * Scan the rounds directory for stale .json files whose stored content hashes to
+ * the given round filename. Returns matching filenames (without paths).
+ */
+function findStaleContentMatches(roundFile: string): string[] {
+	const files = fs.readdirSync(ROUNDS_DIR).filter((f) => f.endsWith(".json") && !f.startsWith("index"));
+	const matches: string[] = [];
+	for (const f of files) {
+		if (f === roundFile) continue;
+		try {
+			const data = JSON.parse(fs.readFileSync(path.join(ROUNDS_DIR, f), "utf-8")) as Partial<Round>;
+			const hash = `${computeContentHash(data.userPrompt ?? "", data.responseSequence ?? "", data.toolCalls)}.json`;
+			if (hash === roundFile) {
+				matches.push(f);
+			}
+		} catch {
+			// Corrupt file — skip
+		}
+	}
+	return matches;
 }
 
 // ─────────────────────────────────────────────
@@ -266,33 +326,43 @@ async function main() {
 	// Ensure rounds directory
 	fs.mkdirSync(ROUNDS_DIR, { recursive: true });
 
-	// Check existing index to skip already-processed rounds
-	const existing = new Set(loadIndex().map((e) => path.basename(e.filePath)));
-
 	let embedded = 0;
 	let skipped = 0;
 
 	for (const round of rounds) {
-		const roundFile = `${crypto
-			.createHash("md5")
-			.update(round.userPrompt + round.responseSequence)
-			.digest("hex")}.json`;
+		const roundFile = `${computeContentHash(round.userPrompt, round.responseSequence, round.toolCalls)}.json`;
 
-		// Always write the round file (idempotent)
+		// Check for stale files whose stored full hash material belongs under this
+		// content-hash filename. If found, migrate old index entries before deleting
+		// old files so the round remains retrievable even if embedding is unavailable.
+		const staleFiles = findStaleContentMatches(roundFile);
+		for (const staleFile of staleFiles) {
+			migrateIndexEntries(staleFile, roundFile);
+		}
+
+		// Always write the round file (idempotent) before deleting stale copies.
 		fs.writeFileSync(path.resolve(ROUNDS_DIR, roundFile), JSON.stringify(round, null, 2));
+		for (const staleFile of staleFiles) {
+			fs.unlinkSync(path.join(ROUNDS_DIR, staleFile));
+			console.log(`  ♻️  Migrated stale: ${staleFile} → ${roundFile}`);
+		}
 
-		if (existing.has(roundFile)) {
+		// Refresh existing set after potential deletions
+		const freshExisting = new Set(
+			loadIndex().map((e) => path.basename(e.filePath.replace(/(:prompt|:response|:round)$/, ""))),
+		);
+		if (freshExisting.has(roundFile)) {
 			skipped++;
 			continue;
 		}
 
 		// Embed prompt
 		console.log(`  🔄 Embedding round ${round.turnIndex + 1}/${rounds.length}...`);
-		const promptVector = await embed(round.userPrompt);
+		const promptVector = await embed(round.userPrompt.slice(0, MAX_PROMPT_CHARS));
 		appendToIndex(normalize(promptVector), `${roundFile}:prompt`);
 
 		// Embed response
-		const respVector = await embed(round.responseSequence.slice(0, 8000)); // conservative token limit
+		const respVector = await embed(round.responseSequence.slice(0, MAX_RESPONSE_CHARS));
 		appendToIndex(normalize(respVector), `${roundFile}:response`);
 
 		embedded++;
