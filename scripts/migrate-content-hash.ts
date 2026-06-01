@@ -17,7 +17,6 @@
 import * as crypto from "node:crypto";
 import * as fs from "node:fs";
 import * as os from "node:os";
-import * as path from "node:path";
 
 // ─────────────────────────────────────────────
 // Config
@@ -134,7 +133,7 @@ function main(): void {
 	// Process rounds
 	const indexUpdates: string[] = [];
 	let renamed = 0;
-	const skipped = 0;
+	const _skipped = 0;
 	let errors = 0;
 	let hashChanged = 0;
 	let hashUnchanged = 0;
@@ -156,7 +155,7 @@ function main(): void {
 		const toolCalls = data.toolCalls;
 
 		const newHash = computeContentHash(userPrompt, responseText, toolCalls);
-		const oldHash = filename.replace(/\.json$/, "");
+		const _oldHash = filename.replace(/\.json$/, "");
 		const newFilename = `${newHash}.json`;
 
 		if (newFilename === filename) {
