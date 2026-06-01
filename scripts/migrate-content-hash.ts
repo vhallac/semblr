@@ -17,6 +17,13 @@
 import * as fs from "node:fs";
 import * as os from "node:os";
 import { computeContentHash } from "../src/core/hash.ts";
+import {
+	filterIndexLinesExcludingFilenames,
+	readIndexByFilename,
+	readIndexLines,
+	replaceIndexLineFilename,
+	writeIndexLines,
+} from "../src/core/index-io.ts";
 
 // ─────────────────────────────────────────────
 // Config
@@ -52,37 +59,6 @@ interface RoundData {
 }
 
 // ─────────────────────────────────────────────
-// Index helpers
-// ─────────────────────────────────────────────
-
-function readIndex(): Map<string, string[]> {
-	// Returns: oldFilename → [indexLines...]
-	const index = new Map<string, string[]>();
-	if (!fs.existsSync(INDEX_PATH)) return index;
-	const lines = fs
-		.readFileSync(INDEX_PATH, "utf-8")
-		.split("\n")
-		.filter((l) => l.trim());
-	for (const line of lines) {
-		// Format: <b64vector>,<filename>:<type>
-		const commaIdx = line.indexOf(",");
-		if (commaIdx === -1) continue;
-		const entry = line.slice(commaIdx + 1);
-		// entry is like "abc123.json:prompt" or "abc123.json:response"
-		const colonIdx = entry.lastIndexOf(":");
-		if (colonIdx === -1) continue;
-		const oldFilename = entry.slice(0, colonIdx);
-		if (!index.has(oldFilename)) index.set(oldFilename, []);
-		index.get(oldFilename)?.push(line);
-	}
-	return index;
-}
-
-function writeIndex(entries: string[]): void {
-	fs.writeFileSync(INDEX_PATH, `${entries.join("\n")}\n`);
-}
-
-// ─────────────────────────────────────────────
 // Main
 // ─────────────────────────────────────────────
 
@@ -105,7 +81,7 @@ function main(): void {
 	console.log(`Found ${files.length} round files in ${ROUNDS_DIR}`);
 
 	// Read index
-	const indexMap = readIndex();
+	const indexMap = readIndexByFilename(INDEX_PATH);
 	console.log(`Found ${indexMap.size} unique filenames in index.csv`);
 
 	// Backup
@@ -185,13 +161,7 @@ function main(): void {
 
 		// Collect index updates for this file
 		const oldLines = indexMap.get(filename) ?? [];
-		const newLines = oldLines.map((line) => {
-			// Replace old filename prefix with new filename
-			const commaIdx = line.indexOf(",");
-			const rest = line.slice(commaIdx + 1);
-			const namePart = rest.replace(/^[^:]+/, newFilename);
-			return line.slice(0, commaIdx + 1) + namePart;
-		});
+		const newLines = oldLines.map((line) => replaceIndexLineFilename(line, newFilename));
 		indexUpdates.push(...newLines);
 	}
 
@@ -202,21 +172,8 @@ function main(): void {
 			// oldRenamedFilenames was populated in the rename loop above
 
 			// Read all entries, filter out old renamed ones, add new ones
-			const allLines = fs
-				.readFileSync(INDEX_PATH, "utf-8")
-				.split("\n")
-				.filter((l) => l.trim());
-			const retained = allLines.filter((line) => {
-				const commaIdx = line.indexOf(",");
-				if (commaIdx === -1) return true;
-				const entry = line.slice(commaIdx + 1);
-				const colonIdx = entry.lastIndexOf(":");
-				if (colonIdx === -1) return true;
-				const filename = entry.slice(0, colonIdx);
-				// Remove entries for renamed files; keep entries for unchanged files
-				return !oldRenamedFilenames.has(filename);
-			});
-			writeIndex([...retained, ...indexUpdates]);
+			const retained = filterIndexLinesExcludingFilenames(readIndexLines(INDEX_PATH), oldRenamedFilenames);
+			writeIndexLines(INDEX_PATH, [...retained, ...indexUpdates]);
 			console.log(`✓ Updated index.csv (${indexUpdates.length} entries rewritten)`);
 		} else {
 			console.log(`~ Would update index.csv (${indexUpdates.length} entries)`);

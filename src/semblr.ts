@@ -14,7 +14,23 @@ import * as os from "node:os";
 import * as path from "node:path";
 import type { ContextEvent, ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Type } from "@sinclair/typebox";
+import {
+	buildContextPreamble,
+	buildGroupedRecencyList,
+	buildRelevanceList,
+	formatFileSize,
+	splitCommandArgs,
+} from "./core/context-format.ts";
+import { selectRoundAssistantOutput, selectToolResultOutput } from "./core/detail-rendering.ts";
+import { assignToGroup, formatGroupStats, parseGroupThreshold, type SemanticGroup } from "./core/grouping.ts";
 import { computeContentHash, createRoundFilePath } from "./core/hash.ts";
+import {
+	flushStatsFile,
+	formatChainReadStatsReport,
+	loadStatsFile,
+	recordPresented,
+	recordRead,
+} from "./core/stats.ts";
 import { estimateTokens } from "./core/tokens.ts";
 import { cosineSimilarity, normalize } from "./core/vector.ts";
 
@@ -32,125 +48,13 @@ const STATS_PATH = `${SEMBLR_DIR}/chain-read-stats.json`;
 
 // ◈ Causal-chain read statistics — global, never injected into context
 //   Tracks all 5 causal-chain display positions (1-5, where 1 = most recent round).
-//   positionScores[i]: presentedCount vs readCount for display position i+1
-//   (i=0 = most recent round, i=4 = oldest in the 5-entry window)
 //   Flushed atomically at agent_end. NOT reset on /new.
 const TRACK_POSITIONS = 5; // hard-coded per user request — re-evaluate if readRate on any position > 50%
-const statsState = loadStats();
+const statsState = loadStatsFile(STATS_PATH);
 // Hashes presented at each display position (1-5) in the current context.
 // Set in context hook, consumed by recordRead / recordPresented.
 // Index 0 = display position 1 (most recent), index 4 = display position 5 (oldest).
 const statsPresentedHashes: (string | null)[] = [null, null, null, null, null];
-
-function loadStats() {
-	try {
-		if (fs.existsSync(STATS_PATH)) {
-			const loadedStats = JSON.parse(fs.readFileSync(STATS_PATH, "utf-8"));
-			// Migrate from v1 (position5 scalar) to v2 (positionScores array)
-			if (loadedStats.version === 1 && loadedStats.position5) {
-				const old = loadedStats.position5;
-				loadedStats.version = 2;
-				loadedStats.positionScores = [
-					{ presentedCount: 0, readCount: 0, presentedHash: null },
-					{ presentedCount: 0, readCount: 0, presentedHash: null },
-					{ presentedCount: 0, readCount: 0, presentedHash: null },
-					{ presentedCount: 0, readCount: 0, presentedHash: null },
-					{ presentedCount: old.presentedCount, readCount: old.readCount, presentedHash: null },
-				];
-				delete loadedStats.position5;
-				return loadedStats;
-			}
-			return loadedStats;
-		}
-	} catch {
-		/* corrupt file, reset */
-	}
-	return {
-		version: 2,
-		positionScores: [
-			{ presentedCount: 0, readCount: 0, presentedHash: null },
-			{ presentedCount: 0, readCount: 0, presentedHash: null },
-			{ presentedCount: 0, readCount: 0, presentedHash: null },
-			{ presentedCount: 0, readCount: 0, presentedHash: null },
-			{ presentedCount: 0, readCount: 0, presentedHash: null },
-		],
-		lastUpdated: new Date().toISOString(),
-	};
-}
-
-function flushStats() {
-	statsState.lastUpdated = new Date().toISOString();
-	const tmp = `${STATS_PATH}.tmp.${process.pid}`;
-	try {
-		fs.mkdirSync(SEMBLR_DIR, { recursive: true });
-		fs.writeFileSync(tmp, JSON.stringify(statsState, null, 2));
-		fs.renameSync(tmp, STATS_PATH); // atomic on POSIX
-	} catch (_e) {
-		// Best-effort; stats collection must never break the extension
-		try {
-			if (fs.existsSync(tmp)) fs.unlinkSync(tmp);
-		} catch {}
-	}
-}
-
-/** Record a read — increment readCount for any position whose hash matches. */
-function recordRead(hash: string) {
-	for (let i = 0; i < TRACK_POSITIONS; i++) {
-		if (statsPresentedHashes[i] && statsPresentedHashes[i] === hash) {
-			statsState.positionScores[i].readCount++;
-		}
-	}
-}
-
-/**
- * Record presentation for all 5 causal-chain positions; also bin the best score.
- * `chainEntries` is the chronological causal chain (oldest first, newest last).
- * Display positions (1-5 = index 0 to 4) map to reversed entries:
- *   index 0 = newest (last element of chain)
- *   index 4 = oldest in the 5-entry window (element at chain.length - 5, if available)
- */
-function recordPresented(chainEntries: { fileName: string }[]) {
-	// Build the reversed (newest-first) view
-	const reversed = [...chainEntries].reverse();
-	for (let i = 0; i < TRACK_POSITIONS; i++) {
-		const entry = i < reversed.length ? reversed[i] : null;
-		const hash = entry ? entry.fileName : null;
-		statsPresentedHashes[i] = hash;
-		if (hash) {
-			statsState.positionScores[i].presentedCount++;
-		}
-	}
-}
-
-/**
- * Format the grouping statistics for TUI display.
- * Example: "THR: 77%; #groups: 3, #topics: {1,12,5}"
- */
-function formatGroupStats(): string {
-	const thr = Math.round(SEMBLR_GROUP_THRESHOLD * 100);
-	const groupCount = roundGroups.length;
-	const topicCounts = roundGroups.map((g) => g.rounds.length).join(",");
-	return `THR: ${thr}%; #groups: ${groupCount}, #topics: {${topicCounts}}`;
-}
-
-/**
- * Format a detailed chain-read statistics report for the /semblr-recent-read-stats command.
- * Example:
- *   Recent lookups to build context:
- *   - immediate parent: 55% (120/217)
- *   - 2nd: 32% (56/177)
- *   ...
- */
-function formatChainReadStatsReport(): string {
-	const lines: string[] = ["Recent lookups to build context:"];
-	const labels = ["immediate parent", "2nd", "3rd", "4th", "5th"];
-	for (let i = 0; i < TRACK_POSITIONS; i++) {
-		const ps = statsState.positionScores[i];
-		const pct = ps.presentedCount > 0 ? `${Math.round((ps.readCount / ps.presentedCount) * 100)}%` : "—";
-		lines.push(`- ${labels[i]}: ${pct} (${ps.readCount}/${ps.presentedCount})`);
-	}
-	return lines.join("\n");
-}
 
 const EMBEDDING_MODEL = "openai/text-embedding-3-small";
 const OPENROUTER_URL = "https://openrouter.ai/api/v1/embeddings";
@@ -183,204 +87,15 @@ let causalChain: ChainEntry[] = [];
 // Round Groups — centroid-based semantic grouping
 // ─────────────────────────────────────────────
 
-interface RoundGroup {
-	centroid: number[]; // mean of member prompt embeddings
-	rounds: ChainEntry[];
-}
+type RoundGroup = SemanticGroup<ChainEntry>;
 
 /** In-memory groups of semantically similar rounds. Not persisted across sessions.
  *  Reset on session_start. Built incrementally at agent_end after each round save. */
 let roundGroups: RoundGroup[] = [];
 
-const SEMBLR_GROUP_THRESHOLD = (() => {
-	const v = process.env.SEMBLR_GROUP_THRESHOLD;
-	if (v !== undefined) {
-		const n = Number.parseFloat(v);
-		if (!Number.isNaN(n) && n >= 0 && n <= 1) return n;
-	}
-	return 0.77;
-})();
+const SEMBLR_GROUP_THRESHOLD = parseGroupThreshold(process.env.SEMBLR_GROUP_THRESHOLD);
 
-/**
- * Format a single round entry for the Relevance List.
- * Uses the flat `N. ` prefix.
- * Produces:
- *   N. hash.json [score | N tools]:
- *     user: first line of prompt
- *     subsequent lines indented
- *     ---
- */
-function formatRoundEntry(
-	idx: number,
-	fileName: string,
-	score: string,
-	toolSummary: string,
-	userPrompt: string,
-	sizeStr?: string,
-): string[] {
-	const promptLines = userPrompt.split("\n").map((line, i) => (i === 0 ? `  user: ${line}` : `  ${line}`));
-	const sizePart = sizeStr ? ` | ${sizeStr}` : "";
-	return [`${idx}. ${fileName} [${score} | ${toolSummary}${sizePart}]:`, ...promptLines, "  ---"];
-}
-
-/**
- * Format a single round entry for the grouped recency list.
- * Uses `- [index: N]` prefix instead of `N. ` prefix.
- */
-function formatGroupedRoundEntry(
-	index: number,
-	fileName: string,
-	toolSummary: string,
-	userPrompt: string,
-	sizeStr?: string,
-): string[] {
-	const promptLines = userPrompt.split("\n").map((line, i) => (i === 0 ? `  user: ${line}` : `  ${line}`));
-	const sizePart = sizeStr ? ` | ${sizeStr}` : "";
-	return [`- [index: ${index}] ${fileName} [n/a | ${toolSummary}${sizePart}]:`, ...promptLines, "  ---"];
-}
-
-/** Build the grouped Recency List section from round groups. */
-function buildGroupedRecencyList(groups: RoundGroup[]): string | null {
-	if (groups.length === 0) return null;
-	const lines: string[] = [];
-	const header = `--- RECENCY LIST (current session, by topic) ---
-These rounds have n/a scores because they are presented by recency — they form
-the immediate conversational context from this session.
-
-IMPORTANT: This list shows ONLY the user's questions from past rounds.
-You do NOT have the assistant responses or tool results unless you expand a
-round. If you answer based on these prompts alone, you are hallucinating.
-
-The groups below are recent messages that are likely to be related to the same
-topic. Lower numbered indices in groups are more recent conversations.
-
-Use this list when the current prompt ...:
-- ... asks about past work, decisions, code, or findings from prior sessions
-- ... is unusually short or lacks clear context/goals/outputs
-- ... uses references with no clear antecedent in the causal chain ("that fix",
-  "the plan", "where we left off")
-- ... asks you to remember, verify, continue, or build upon prior work
-- ... requires cross-session continuity (same project, recurring topic,
-  long-running task)
-- ... is ambiguous: lacks proper context or references, and seems to assume
-  knowledge was established
-
-When this happens:
-1. Scan the list prompts for relevance. Higher score = stronger match.
-2. If a round looks relevant, expand ONLY that round via get_round_details.
-3. Stop as soon as the expanded round gives you enough context to answer.
-4. If no round looks relevant but the query clearly needs past context,
-   use search_interactions.
-
-When NOT to expand:
-- The query is fully self-contained (clear context, goals, and outputs present).
-- The prompts in the context already provides sufficient information.
-
-Rule: When in doubt, expand. A verification tool call is cheaper than a wrong
-answer.`;
-	lines.push(header);
-	lines.push("");
-
-	// Sort groups by their most recent round (newest topic first)
-	const sortedGroups = [...groups].sort((a, b) => {
-		const aLast = a.rounds[a.rounds.length - 1];
-		const bLast = b.rounds[b.rounds.length - 1];
-		return causalChain.indexOf(bLast) - causalChain.indexOf(aLast);
-	});
-
-	// Build a global index counter in reverse-chronological order across all rounds
-	// to assign stable index numbers for the `[index: N]` display.
-	// We iterate groups in display order, then rounds within each group in
-	// reverse-chronological order, and assign incrementing indices.
-	const globalIndices = new Map<ChainEntry, number>();
-	let globalIdx = 0;
-	for (const group of sortedGroups) {
-		const reversed = [...group.rounds].reverse();
-		for (const entry of reversed) {
-			globalIdx++;
-			globalIndices.set(entry, globalIdx);
-		}
-	}
-
-	let groupNumber = 0;
-	for (const group of sortedGroups) {
-		groupNumber++;
-		if (groupNumber > 1) {
-			lines.push("");
-			lines.push("---");
-			lines.push("");
-		}
-		lines.push(`**Group ${groupNumber}**`);
-		lines.push("");
-
-		// Show newest first within group
-		const reversed = [...group.rounds].reverse();
-		for (const entry of reversed) {
-			const idx = globalIndices.get(entry) ?? 0;
-			const sizeStr = getRoundSize(entry.fileName) ?? undefined;
-			lines.push(...formatGroupedRoundEntry(idx, entry.fileName, entry.toolSummary, entry.userPrompt, sizeStr));
-		}
-	}
-
-	return lines.join("\n");
-}
-
-/** Build the Relevance List section from scored rounds. */
-function buildRelevanceList(rounds: Array<{ fileName: string; bestScore: number; data: RoundData }>): string | null {
-	if (rounds.length === 0) return null;
-	const lines: string[] = [];
-	const header = `--- RELEVANCE LIST (all sessions, by similarity) ---
-These rounds have numeric similarity scores (0.0–1.0). Higher = stronger
-semantic match. They come from ALL past sessions, not just the current one.
-
-The extension has pre-run a semantic search against your prompt. The results
-are below. If something here rings a bell, expand it via get_round_details.
-If nothing rings a bell, ignore this list — it's a pre-filter, not a map.`;
-	lines.push(header);
-	lines.push("");
-
-	let idx = 0;
-	for (const round of rounds) {
-		idx++;
-		const toolCount = round.data.toolCallCount ?? 0;
-		const sizeStr = getRoundSize(round.fileName) ?? undefined;
-
-		// Build per-tool size tags where data is available
-		let toolSummary = `${toolCount} tools`;
-		if (round.data.toolCalls && round.data.toolCalls.length > 0) {
-			const toolSizes = round.data.toolCalls.map((tc: ToolCallDetail) => {
-				const sourceText = tc.result_full ?? tc.result_summary ?? "";
-				return sourceText.length > 0
-					? `${tc.name} (${formatFileSize(Buffer.byteLength(sourceText, "utf-8"))})`
-					: tc.name;
-			});
-			toolSummary = `${toolCount} tools (${toolSizes.join(", ")})`;
-		}
-
-		lines.push(
-			...formatRoundEntry(
-				idx,
-				round.fileName,
-				round.bestScore.toFixed(2),
-				toolSummary,
-				round.data.userPrompt,
-				sizeStr,
-			),
-		);
-	}
-	return lines.join("\n");
-}
-
-/** Build the Context Building References preamble section. */
-function buildContextPreamble(hasRecency: boolean, hasRelevance: boolean): string | null {
-	if (!hasRecency && !hasRelevance) return null;
-	return `[CONTEXT BUILDING REFERENCES]
-The lists below show past conversation rounds. Each entry contains only the user prompt — responses and tool calls are collapsed.
-Use get_round_details("hash.json") to expand a round's full conversation.
-Use get_tool_details("hash.json", N) to inspect tool call N within a round.
-
-Format: [index: N] hash.json [score | N tools | size]: followed by the full user prompt (indented).`;
-}
+// Context formatting helpers live in src/core/context-format.ts.
 
 // ─────────────────────────────────────────────
 // Helpers
@@ -391,14 +106,6 @@ function extractText(content: Array<{ type: string; text?: string }>): string {
 		.filter((c) => c.type === "text" && c.text)
 		.map((c) => c.text ?? "")
 		.join(" ");
-}
-
-/** Format a byte count into human-readable KB/MB. */
-function formatFileSize(bytes: number): string {
-	if (bytes < 1024) return `${Math.round(bytes / 10.24) / 100}KB`; // 0.5KB
-	if (bytes < 10240) return `${Math.round(bytes / 1024)}KB`; // 5KB
-	if (bytes < 1048576) return `${Math.round(bytes / 1024)}KB`; // 54KB
-	return `${Math.round(bytes / 10485.76) / 100}MB`; // 1.1MB
 }
 
 /** Stat a round file and return its formatted size string, or null on failure. */
@@ -617,35 +324,6 @@ async function embedText(text: string, apiKey: string): Promise<number[]> {
 	throw lastError ?? new Error("Embedding API failed after retries");
 }
 
-/** Assign the given round to a semantic group based on centroid similarity.
- *  Updates roundGroups in-place. Returns the group index the round was assigned to. */
-function assignToGroup(roundEntry: ChainEntry, vec: number[]): number {
-	// Find the best matching group by cosine similarity to centroid
-	let bestIdx = -1;
-	let bestSim = 0;
-	for (let i = 0; i < roundGroups.length; i++) {
-		const sim = cosineSimilarity(vec, roundGroups[i].centroid);
-		if (sim >= SEMBLR_GROUP_THRESHOLD && sim > bestSim) {
-			bestSim = sim;
-			bestIdx = i;
-		}
-	}
-	if (bestIdx >= 0) {
-		// Add round to existing group and recompute centroid
-		const group = roundGroups[bestIdx];
-		group.rounds.push(roundEntry);
-		const n = group.rounds.length;
-		group.centroid = group.centroid.map((c, i) => c + (vec[i] - c) / n);
-		return bestIdx;
-	}
-	// Create new group
-	roundGroups.push({
-		centroid: [...vec],
-		rounds: [roundEntry],
-	});
-	return roundGroups.length - 1;
-}
-
 // Lock constants for atomic index writes (#44)
 const INDEX_LOCK_RETRIES = 15; // max lock attempts
 const INDEX_LOCK_BACKOFF_MS = 50; // base backoff per retry
@@ -704,45 +382,6 @@ function appendToIndex(filePath: string, vector: number[]) {
 			} catch {}
 		}
 	}
-}
-
-function splitCommandArgs(args: string): string[] {
-	const out: string[] = [];
-	let current = "";
-	let quote: '"' | "'" | null = null;
-	let escaping = false;
-
-	for (const ch of args) {
-		if (escaping) {
-			current += ch;
-			escaping = false;
-			continue;
-		}
-		if (ch === "\\") {
-			escaping = true;
-			continue;
-		}
-		if (quote) {
-			if (ch === quote) quote = null;
-			else current += ch;
-			continue;
-		}
-		if (ch === '"' || ch === "'") {
-			quote = ch;
-			continue;
-		}
-		if (/\s/.test(ch)) {
-			if (current) {
-				out.push(current);
-				current = "";
-			}
-			continue;
-		}
-		current += ch;
-	}
-	if (escaping) current += "\\";
-	if (current) out.push(current);
-	return out;
 }
 
 function extensionRoot(): string {
@@ -1039,14 +678,15 @@ export default function (pi: ExtensionAPI) {
 				? null
 				: buildRelevanceList(
 						selectedRounds.map((r) => ({ fileName: r.fileName, bestScore: r.bestScore, data: r.data })),
+						getRoundSize,
 					);
-			const recencyList = buildGroupedRecencyList(roundGroups);
+			const recencyList = buildGroupedRecencyList(roundGroups, causalChain, getRoundSize);
 			const preamble = buildContextPreamble(!!recencyList, !!relevanceList);
 
 			// ══ Stats: record all 5 positions presented ══
 			{
 				if (!roundPresentedRecorded) {
-					recordPresented(causalChain);
+					recordPresented(statsState, statsPresentedHashes, causalChain, TRACK_POSITIONS);
 					roundPresentedRecorded = true;
 				}
 				const uniqueRounds = new Set(
@@ -1054,7 +694,7 @@ export default function (pi: ExtensionAPI) {
 				).size;
 				ctx.ui.setStatus(
 					"semblr",
-					`🧠 collapsed: ${selectedRounds.length} matched / ${uniqueRounds} total | ${formatGroupStats()}`,
+					`🧠 collapsed: ${selectedRounds.length} matched / ${uniqueRounds} total | ${formatGroupStats(roundGroups, SEMBLR_GROUP_THRESHOLD)}`,
 				);
 			}
 
@@ -1255,7 +895,12 @@ export default function (pi: ExtensionAPI) {
 			try {
 				const existing = JSON.parse(fs.readFileSync(roundPath, "utf-8"));
 				if (existing.promptEmbedding) {
-					assignToGroup(causalChain[causalChain.length - 1], existing.promptEmbedding);
+					assignToGroup(
+						roundGroups,
+						causalChain[causalChain.length - 1],
+						existing.promptEmbedding,
+						SEMBLR_GROUP_THRESHOLD,
+					);
 				}
 			} catch {
 				/* best-effort */
@@ -1265,7 +910,7 @@ export default function (pi: ExtensionAPI) {
 			agentAccumulatedText = [];
 			agentUserPrompt = null;
 			agentTurnIndex = null;
-			flushStats(); // causal chain was pushed, so position scores may have changed
+			flushStatsFile(statsState, STATS_PATH, SEMBLR_DIR); // causal chain was pushed, so position scores may have changed
 			return;
 		}
 
@@ -1349,7 +994,7 @@ export default function (pi: ExtensionAPI) {
 			// — Grouping + metadata update —
 			// Assign to a semantic group using the combined embedding.
 			const roundEntry = causalChain[causalChain.length - 1];
-			const groupIdx = assignToGroup(roundEntry, combinedVec);
+			const groupIdx = assignToGroup(roundGroups, roundEntry, combinedVec, SEMBLR_GROUP_THRESHOLD);
 			const group = roundGroups[groupIdx];
 			// Find the most recent round in the same group *before* this round
 			let relatedParentId: string | null = null;
@@ -1381,7 +1026,7 @@ export default function (pi: ExtensionAPI) {
 		agentTurnIndex = null;
 
 		// ◈ Flush stats to disk (atomically) and show in TUI
-		flushStats();
+		flushStatsFile(statsState, STATS_PATH, SEMBLR_DIR);
 
 		// Combine chain-read stats with total indexed rounds count
 		const indexExists = fs.existsSync(INDEX_PATH);
@@ -1389,7 +1034,10 @@ export default function (pi: ExtensionAPI) {
 		const totalRounds = new Set(
 			idx.map((e: { filePath: string }) => e.filePath.replace(/(:prompt|:response|:round)$/, "")),
 		).size;
-		ctx.ui.setStatus("semblr", `🧠 ${totalRounds} total indexed | ${formatGroupStats()}`);
+		ctx.ui.setStatus(
+			"semblr",
+			`🧠 ${totalRounds} total indexed | ${formatGroupStats(roundGroups, SEMBLR_GROUP_THRESHOLD)}`,
+		);
 	});
 
 	// ────────────────────────────────────────────
@@ -1626,7 +1274,7 @@ export default function (pi: ExtensionAPI) {
 				};
 
 				// ◈ Stats: check if this hash matches any presented position
-				recordRead(p.round);
+				recordRead(statsState, statsPresentedHashes, p.round, TRACK_POSITIONS);
 
 				const fullPath = `${ROUNDS_DIR}/${p.round}`;
 				if (!fs.existsSync(fullPath)) {
@@ -1695,128 +1343,25 @@ export default function (pi: ExtensionAPI) {
 				let responseTotalLines = 0;
 				let paginationMarker = "";
 				let matchHeader = "";
-
-				if (useMatch && useFromLine) {
+				const roundSelection = selectRoundAssistantOutput({
+					userPrompt: (roundData.userPrompt as string) ?? "",
+					responseSequence: (roundData.responseSequence as string) ?? "",
+					assistantOutput,
+					fromLine: p.from_line,
+					lineCount: p.line_count,
+					match: p.match,
+					maxMatches: p.max_matches,
+				});
+				if (!roundSelection.ok) {
 					return {
-						content: [
-							{
-								type: "text",
-								text: "Error: match and from_line are mutually exclusive. Use one or the other, not both.",
-							},
-						],
+						content: [{ type: "text", text: roundSelection.error }],
 						details: {},
 					};
 				}
-
-				if (useFromLine) {
-					// Position-based pagination
-					const flatText = (roundData.responseSequence as string) ?? "";
-					const allLines = flatText.split("\n");
-					responseTotalLines = allLines.length;
-					const fromLine = p.from_line ?? 1;
-					const lineCount = p.line_count ?? 200;
-					const startIdx = Math.max(0, fromLine - 1);
-					const endIdx = Math.min(responseTotalLines, startIdx + lineCount);
-					const pageLines = allLines.slice(startIdx, endIdx);
-					const remaining = responseTotalLines - endIdx;
-
-					assistantOutput = pageLines.length > 0 ? pageLines.join("\n") : "(empty)";
-
-					if (remaining > 0) {
-						paginationMarker = `[Truncated — use from_line=${endIdx + 1}, line_count=${lineCount} to continue]`;
-					}
-				} else if (useMatch) {
-					// Regexp-based matching
-					try {
-						const regex = new RegExp(p.match!, "gm");
-						const flatText = (roundData.responseSequence as string) ?? "";
-						const allLines = flatText.split("\n");
-						responseTotalLines = allLines.length;
-						const lineCount = p.line_count ?? 0; // default: just the matched line
-						const maxMatches = p.max_matches ?? 1;
-
-						// Search both user prompt lines and assistant response lines
-						// Build combined array with source markers
-						const userLines = ((roundData.userPrompt as string) ?? "").split("\n");
-						const searchLines: Array<{ text: string; source: "user" | "assistant"; originalIndex: number }> = [];
-						for (let i = 0; i < userLines.length; i++) {
-							searchLines.push({ text: userLines[i], source: "user", originalIndex: i });
-						}
-						// separator between user and assistant
-						searchLines.push({ text: "", source: "assistant", originalIndex: -1 });
-						for (let i = 0; i < allLines.length; i++) {
-							searchLines.push({ text: allLines[i], source: "assistant", originalIndex: i });
-						}
-
-						// Find matches
-						const matchResults: Array<{ lineIdx: number; source: "user" | "assistant"; text: string }> = [];
-						for (let i = 0; i < searchLines.length; i++) {
-							if (regex.test(searchLines[i].text)) {
-								matchResults.push({
-									lineIdx: searchLines[i].originalIndex,
-									source: searchLines[i].source,
-									text: searchLines[i].text,
-								});
-								// Reset lastIndex for 'g' flag
-								regex.lastIndex = 0;
-							}
-						}
-
-						// Clip: if a match is in the user section, only show that one (cheapest)
-						const userMatchCount = matchResults.filter((m) => m.source === "user").length;
-						let shownMatches = matchResults.slice(0, maxMatches);
-						if (userMatchCount > 0) {
-							// Only the first user match; clip early
-							shownMatches = [matchResults[0]];
-						}
-
-						const totalMatches = matchResults.length;
-						const matchCount = shownMatches.length;
-
-						// Build output with matched lines and context windows
-						const matchParts: string[] = [];
-						for (let mi = 0; mi < matchCount; mi++) {
-							const m = shownMatches[mi];
-							if (m.source === "user") {
-								// Show user prompt line
-								matchParts.push(`[M ${mi + 1}/${matchCount} in user prompt] ${m.text}`);
-							} else {
-								// In assistant response: show matched line + lineCount lines after
-								const startIdx = m.lineIdx;
-								const endIdx = Math.min(responseTotalLines, startIdx + 1 + lineCount);
-								const ctxLines = allLines.slice(startIdx, endIdx);
-								const context = ctxLines.join("\n");
-								if (lineCount > 0) {
-									matchParts.push(
-										`[M ${mi + 1}/${matchCount} at assistant line ${m.lineIdx + 1} (${lineCount} lines of context)]\n${context}`,
-									);
-								} else {
-									matchParts.push(`[M ${mi + 1}/${matchCount} at assistant line ${m.lineIdx + 1}] ${m.text}`);
-								}
-							}
-						}
-
-						const remainingMatches = totalMatches - matchCount;
-						assistantOutput = matchParts.length > 0 ? matchParts.join("\n\n") : "(no matches)";
-
-						if (remainingMatches > 0) {
-							matchHeader = ` (${matchCount} match${matchCount !== 1 ? "es" : ""} shown of ${totalMatches} total)`;
-						} else if (totalMatches > 0) {
-							const mLabel = totalMatches === 1 ? "match" : "matches";
-							matchHeader = ` (${totalMatches} ${mLabel})`;
-						}
-					} catch (err) {
-						return {
-							content: [
-								{
-									type: "text",
-									text: `Invalid regexp pattern: ${(err as Error).message}. Provide a valid JavaScript regexp string.`,
-								},
-							],
-							details: {},
-						};
-					}
-				}
+				assistantOutput = roundSelection.assistantOutput;
+				responseTotalLines = roundSelection.responseTotalLines;
+				paginationMarker = roundSelection.paginationMarker;
+				matchHeader = roundSelection.matchHeader;
 
 				// Collapse tool call arguments and results in the details object.
 				// Even when a round is "expanded" via get_round_details, the tool call
@@ -1969,138 +1514,64 @@ export default function (pi: ExtensionAPI) {
 
 				// Determine the result text (prefer result_full, fall back to result_summary)
 				const resultText = tc.result_full ?? tc.result_summary ?? "";
-				const useMatch = p.match !== undefined && p.match.length > 0;
-				const useFromLine = p.out__from_line !== undefined;
-
-				if (useMatch && useFromLine) {
+				const toolSelection = selectToolResultOutput({
+					resultText,
+					fromLine: p.out__from_line,
+					lineCount: p.out_line_count,
+					match: p.match,
+					maxMatches: p.max_matches,
+				});
+				if (!toolSelection.ok) {
 					return {
-						content: [
-							{
-								type: "text",
-								text: "Error: match and out__from_line are mutually exclusive. Use one or the other, not both.",
-							},
-						],
+						content: [{ type: "text", text: toolSelection.error }],
 						details: {},
 					};
 				}
 
-				if (useFromLine) {
-					// Position-based pagination
-					const allLines = resultText.split("\n");
-					const totalLines = allLines.length;
-					const fromLine = p.out__from_line ?? 1;
-					const lineCount = p.out_line_count ?? 200;
-					const startIdx = Math.max(0, fromLine - 1);
-					const endIdx = Math.min(totalLines, startIdx + lineCount);
-					const pageLines = allLines.slice(startIdx, endIdx);
-					const remaining = totalLines - endIdx;
-
-					const resultBlock = pageLines.length > 0 ? pageLines.join("\n") : "(empty)";
-
-					const footer =
-						remaining > 0
-							? `\n\n[Truncated — lines remaining: ${remaining}. Use out__from_line=${endIdx + 1} and out_line_count=${lineCount} to continue.]`
-							: "";
-
+				if (toolSelection.mode === "page") {
 					return {
 						content: [
 							{
 								type: "text",
 								text:
-									`[Showing lines ${fromLine}–${endIdx} of ${totalLines} for tool call #${tc.index} (${tc.name})]\n` +
+									`[Showing lines ${toolSelection.fromLine}–${toolSelection.endLine} of ${toolSelection.totalLines} for tool call #${tc.index} (${tc.name})]\n` +
 									`Tool name: ${tc.name}\n` +
 									`Arguments: ${JSON.stringify(argsParsed, null, 2)}\n` +
 									"Result:\n" +
-									`  ${resultBlock}${footer}`,
+									`  ${toolSelection.resultBlock}${toolSelection.footer}`,
 							},
 						],
 						details: {
 							name: tc.name,
 							arguments: tc.arguments,
-							lines_shown: { from: fromLine, to: endIdx, of: totalLines },
+							lines_shown: {
+								from: toolSelection.fromLine,
+								to: toolSelection.endLine,
+								of: toolSelection.totalLines,
+							},
 						},
 					};
 				}
 
-				if (useMatch) {
-					// Regexp-based matching in tool result
-					try {
-						const regex = new RegExp(p.match!, "gm");
-						const allLines = resultText.split("\n");
-						const totalLines = allLines.length;
-						const lineCount = p.out_line_count ?? 0;
-						const maxMatches = p.max_matches ?? 1;
-
-						// Find matching lines
-						const matchResults: number[] = [];
-						for (let i = 0; i < allLines.length; i++) {
-							if (regex.test(allLines[i])) {
-								matchResults.push(i);
-								regex.lastIndex = 0;
-							}
-						}
-
-						const totalMatches = matchResults.length;
-						const shownIndices = matchResults.slice(0, maxMatches);
-						const matchCount = shownIndices.length;
-
-						// Build output with context windows
-						const matchParts: string[] = [];
-						for (let mi = 0; mi < matchCount; mi++) {
-							const lineIdx = shownIndices[mi];
-							const startIdx = lineIdx;
-							const endIdx = Math.min(totalLines, startIdx + 1 + lineCount);
-							const ctxLines = allLines.slice(startIdx, endIdx);
-							const context = ctxLines.join("\n");
-							if (lineCount > 0) {
-								matchParts.push(
-									`[M ${mi + 1}/${matchCount} at line ${lineIdx + 1} (${lineCount} lines of context)]\n${context}`,
-								);
-							} else {
-								matchParts.push(`[M ${mi + 1}/${matchCount} at line ${lineIdx + 1}] ${allLines[lineIdx]}`);
-							}
-						}
-
-						const resultBlock = matchParts.length > 0 ? matchParts.join("\n\n") : "(no matches)";
-
-						let matchSummary = "";
-						const remainingMatches = totalMatches - matchCount;
-						if (remainingMatches > 0) {
-							matchSummary = ` (${matchCount} match${matchCount !== 1 ? "es" : ""} shown of ${totalMatches} total)`;
-						} else if (totalMatches > 0) {
-							const mLabel = totalMatches === 1 ? "match" : "matches";
-							matchSummary = ` (${totalMatches} ${mLabel})`;
-						}
-
-						return {
-							content: [
-								{
-									type: "text",
-									text:
-										`[Match results for tool call #${tc.index} (${tc.name})${matchSummary}]\n` +
-										`Tool name: ${tc.name}\n` +
-										`Arguments: ${JSON.stringify(argsParsed, null, 2)}\n` +
-										"Result:\n" +
-										`  ${resultBlock}`,
-								},
-							],
-							details: {
-								name: tc.name,
-								arguments: tc.arguments,
-								matches: { shown: matchCount, total: totalMatches },
+				if (toolSelection.mode === "match") {
+					return {
+						content: [
+							{
+								type: "text",
+								text:
+									`[Match results for tool call #${tc.index} (${tc.name})${toolSelection.matchSummary}]\n` +
+									`Tool name: ${tc.name}\n` +
+									`Arguments: ${JSON.stringify(argsParsed, null, 2)}\n` +
+									"Result:\n" +
+									`  ${toolSelection.resultBlock}`,
 							},
-						};
-					} catch (err) {
-						return {
-							content: [
-								{
-									type: "text",
-									text: `Invalid regexp pattern: ${(err as Error).message}. Provide a valid JavaScript regexp string.`,
-								},
-							],
-							details: {},
-						};
-					}
+						],
+						details: {
+							name: tc.name,
+							arguments: tc.arguments,
+							matches: { shown: toolSelection.matchCount, total: toolSelection.totalMatches },
+						},
+					};
 				}
 
 				// Unpaginated — show full result
@@ -2130,7 +1601,7 @@ export default function (pi: ExtensionAPI) {
 		pi.registerCommand("semblr:recent-read-stats", {
 			description: "Display chain-read statistics (how often the agent read rounds from each display position)",
 			handler: async (_args, commandCtx) => {
-				const report = formatChainReadStatsReport();
+				const report = formatChainReadStatsReport(statsState, TRACK_POSITIONS);
 				commandCtx.ui.notify(report, "info");
 			},
 		});

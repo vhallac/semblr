@@ -14,50 +14,19 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { computeContentHash } from "../src/core/hash.ts";
+import {
+	appendVectorIndexEntry,
+	findStaleContentMatches as findStaleContentMatchesInDir,
+	loadVectorIndex,
+	migrateIndexEntries as migrateIndexEntriesFile,
+} from "../src/core/index-io.ts";
+import { type ParsedPiRound, parsePiSessionJsonl } from "../src/core/pi-session.ts";
 
 // ─────────────────────────────────────────────
 // Types
 // ─────────────────────────────────────────────
 
-interface ToolCallDetail {
-	index: number;
-	name: string;
-	arguments: string;
-	result_summary: string;
-	result_full?: string;
-	result_truncated?: boolean;
-}
-
-interface ResponseSegment {
-	type: "text" | "toolCall";
-	text?: string;
-	toolCallIndex?: number;
-}
-
-interface Round {
-	id: string;
-	userPrompt: string;
-	responseSequence: string;
-	responseSegments: ResponseSegment[];
-	userTimestamp: number;
-	responseEndTimestamp: number;
-	turnIndex: number; // serialized — keep name for backward compat
-	toolCallCount: number;
-	toolCallNames: string[];
-	toolCalls: ToolCallDetail[];
-}
-
-interface SessionEntry {
-	type: string;
-	id: string;
-	parentId: string | null;
-	timestamp?: string;
-	message?: {
-		role: string;
-		content: Array<{ type: string; text?: string }>;
-		timestamp?: number;
-	};
-}
+type Round = ParsedPiRound;
 
 // ─────────────────────────────────────────────
 // Config
@@ -76,110 +45,7 @@ const MAX_RESPONSE_CHARS = 8000;
 // ─────────────────────────────────────────────
 
 function parseSession(filePath: string): Round[] {
-	const content = fs.readFileSync(filePath, "utf-8");
-	const lines = content.trim().split("\n").filter(Boolean);
-	const entries: SessionEntry[] = lines.map((l) => JSON.parse(l));
-
-	const rounds: Round[] = [];
-	let currentUserMsg: SessionEntry | null = null;
-	let responseParts: string[] = [];
-	let responseSegments: ResponseSegment[] = [];
-	let toolNames: string[] = [];
-	let toolCallCount = 0;
-	let toolCalls: ToolCallDetail[] = [];
-	let roundIndex = 0;
-
-	for (const entry of entries) {
-		if (entry.type !== "message" || !entry.message) continue;
-		const { role, content } = entry.message;
-
-		if (role === "user") {
-			// Save previous round if exists
-			if (currentUserMsg) {
-				rounds.push({
-					id: currentUserMsg.id,
-					userPrompt: extractText(
-						(currentUserMsg.message?.content ?? []) as Array<{ type: string; text?: string }>,
-					),
-					responseSequence: responseParts.join("\n\n").trim(),
-					responseSegments,
-					userTimestamp: currentUserMsg.message?.timestamp ?? 0,
-					responseEndTimestamp: entry.message?.timestamp ?? 0,
-					turnIndex: roundIndex,
-					toolCallCount,
-					toolCallNames: [...new Set(toolNames)],
-					toolCalls,
-				});
-				roundIndex++;
-			}
-			currentUserMsg = entry;
-			responseParts = [];
-			responseSegments = [];
-			toolNames = [];
-			toolCallCount = 0;
-			toolCalls = [];
-		} else if (role === "assistant" && currentUserMsg) {
-			// Single ordered pass: interleave text and tool call blocks
-			for (const block of content) {
-				if (block.type === "text" && block.text) {
-					responseParts.push(block.text);
-					responseSegments.push({ type: "text", text: block.text });
-				} else if (block.type === "toolCall") {
-					toolCallCount++;
-					const blockRec = block as Record<string, unknown>;
-					const name = blockRec.name as string | undefined;
-					if (name) toolNames.push(name);
-					toolCalls.push({
-						index: toolCalls.length,
-						name: name ?? "unknown",
-						arguments: JSON.stringify(blockRec.arguments ?? {}),
-						result_summary: "",
-					});
-					responseSegments.push({ type: "toolCall", toolCallIndex: toolCalls.length - 1 });
-				}
-			}
-		} else if (role === "toolResult" && currentUserMsg) {
-			const toolName = (entry.message as Record<string, unknown>).toolName as string | undefined;
-			if (toolName) toolNames.push(toolName);
-			// Pair with the most recent tool call that lacks a result
-			for (let i = toolCalls.length - 1; i >= 0; i--) {
-				if (toolCalls[i].result_summary === "") {
-					const resultContent = entry.message.content;
-					const resultText = resultContent ? extractText(resultContent) : "";
-					toolCalls[i].result_summary = resultText.slice(0, 300);
-					toolCalls[i].result_full = resultText;
-					toolCalls[i].result_truncated = false;
-					break;
-				}
-			}
-		}
-	}
-
-	// Save last round
-	if (currentUserMsg) {
-		rounds.push({
-			id: currentUserMsg.id,
-			userPrompt: extractText((currentUserMsg.message?.content ?? []) as Array<{ type: string; text?: string }>),
-			responseSequence: responseParts.join("\n\n").trim(),
-			responseSegments,
-			userTimestamp: currentUserMsg.message?.timestamp ?? 0,
-			responseEndTimestamp: Date.now(),
-			turnIndex: roundIndex,
-			toolCallCount,
-			toolCallNames: [...new Set(toolNames)],
-			toolCalls,
-		});
-	}
-
-	return rounds;
-}
-
-function extractText(content: Array<{ type: string; text?: string }>): string {
-	return content
-		.filter((c) => c.type === "text" && c.text)
-		.map((c) => c.text ?? "")
-		.join(" ")
-		.trim();
+	return parsePiSessionJsonl(fs.readFileSync(filePath, "utf-8"));
 }
 
 // ─────────────────────────────────────────────
@@ -230,70 +96,6 @@ function _cosineSimilarity(a: number[], b: number[]): number {
 }
 
 // ─────────────────────────────────────────────
-// Index I/O
-// ─────────────────────────────────────────────
-
-function loadIndex(): Array<{ vector: number[]; filePath: string }> {
-	if (!fs.existsSync(INDEX_PATH)) return [];
-	const lines = fs.readFileSync(INDEX_PATH, "utf-8").trim().split("\n").filter(Boolean);
-	return lines.map((line) => {
-		const comma = line.indexOf(",");
-		const b64 = line.slice(0, comma);
-		const filePath = line.slice(comma + 1);
-		const vector = JSON.parse(Buffer.from(b64, "base64url").toString("utf-8"));
-		return { vector, filePath };
-	});
-}
-
-function loadIndexLines(): string[] {
-	if (!fs.existsSync(INDEX_PATH)) return [];
-	return fs.readFileSync(INDEX_PATH, "utf-8").trim().split("\n").filter(Boolean);
-}
-
-function appendToIndex(vector: number[], filePath: string): void {
-	const b64 = Buffer.from(JSON.stringify(vector)).toString("base64url");
-	fs.appendFileSync(INDEX_PATH, `${b64},${filePath}\n`);
-}
-
-/**
- * Rewrite index entries from an old round filename to the new content-hash filename.
- * This preserves accessibility even if re-embedding would fail or be skipped.
- */
-function migrateIndexEntries(oldRoundFile: string, newRoundFile: string): void {
-	if (!fs.existsSync(INDEX_PATH)) return;
-	const lines = loadIndexLines();
-	const migrated = lines.map((line) => {
-		const comma = line.indexOf(",");
-		const fp = line.slice(comma + 1);
-		if (!fp.startsWith(oldRoundFile)) return line;
-		return `${line.slice(0, comma + 1)}${newRoundFile}${fp.slice(oldRoundFile.length)}`;
-	});
-	fs.writeFileSync(INDEX_PATH, migrated.join("\n") + (migrated.length > 0 ? "\n" : ""));
-}
-
-/**
- * Scan the rounds directory for stale .json files whose stored content hashes to
- * the given round filename. Returns matching filenames (without paths).
- */
-function findStaleContentMatches(roundFile: string): string[] {
-	const files = fs.readdirSync(ROUNDS_DIR).filter((f) => f.endsWith(".json") && !f.startsWith("index"));
-	const matches: string[] = [];
-	for (const f of files) {
-		if (f === roundFile) continue;
-		try {
-			const data = JSON.parse(fs.readFileSync(path.join(ROUNDS_DIR, f), "utf-8")) as Partial<Round>;
-			const hash = `${computeContentHash(data.userPrompt ?? "", data.responseSequence ?? "", data.toolCalls)}.json`;
-			if (hash === roundFile) {
-				matches.push(f);
-			}
-		} catch {
-			// Corrupt file — skip
-		}
-	}
-	return matches;
-}
-
-// ─────────────────────────────────────────────
 // Main
 // ─────────────────────────────────────────────
 
@@ -320,9 +122,9 @@ async function main() {
 		// Check for stale files whose stored full hash material belongs under this
 		// content-hash filename. If found, migrate old index entries before deleting
 		// old files so the round remains retrievable even if embedding is unavailable.
-		const staleFiles = findStaleContentMatches(roundFile);
+		const staleFiles = findStaleContentMatchesInDir(ROUNDS_DIR, roundFile);
 		for (const staleFile of staleFiles) {
-			migrateIndexEntries(staleFile, roundFile);
+			migrateIndexEntriesFile(INDEX_PATH, staleFile, roundFile);
 		}
 
 		// Always write the round file (idempotent) before deleting stale copies.
@@ -334,7 +136,7 @@ async function main() {
 
 		// Refresh existing set after potential deletions
 		const freshExisting = new Set(
-			loadIndex().map((e) => path.basename(e.filePath.replace(/(:prompt|:response|:round)$/, ""))),
+			loadVectorIndex(INDEX_PATH).map((e) => path.basename(e.filePath.replace(/(:prompt|:response|:round)$/, ""))),
 		);
 		if (freshExisting.has(roundFile)) {
 			skipped++;
@@ -344,17 +146,17 @@ async function main() {
 		// Embed prompt
 		console.log(`  🔄 Embedding round ${round.turnIndex + 1}/${rounds.length}...`);
 		const promptVector = await embed(round.userPrompt.slice(0, MAX_PROMPT_CHARS));
-		appendToIndex(normalize(promptVector), `${roundFile}:prompt`);
+		appendVectorIndexEntry(INDEX_PATH, normalize(promptVector), `${roundFile}:prompt`);
 
 		// Embed response
 		const respVector = await embed(round.responseSequence.slice(0, MAX_RESPONSE_CHARS));
-		appendToIndex(normalize(respVector), `${roundFile}:response`);
+		appendVectorIndexEntry(INDEX_PATH, normalize(respVector), `${roundFile}:response`);
 
 		embedded++;
 	}
 
 	console.log(`\n✅ Done. ${embedded} new rounds embedded, ${skipped} already in index.`);
-	console.log(`   Index: ${INDEX_PATH} (${loadIndex().length} vectors)`);
+	console.log(`   Index: ${INDEX_PATH} (${loadVectorIndex(INDEX_PATH).length} vectors)`);
 }
 
 main().catch((err) => {
