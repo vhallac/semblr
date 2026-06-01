@@ -118,6 +118,119 @@ function getRoundSize(fileName: string): string | null {
 	}
 }
 
+export interface PreparedContextMessages {
+	systemMsg: unknown | null;
+	augmentedMessages: unknown[];
+	currentMessages: unknown[];
+	hasUserMessage: boolean;
+	userPrompt: string | null;
+	rawPromptWordCount: number;
+}
+
+export function startsWithEnvironmentPreamble(content: string): boolean {
+	return content.trimStart().startsWith("[ENVIRONMENT]");
+}
+
+export function countWordsInMessageContent(content: unknown): number {
+	const text = typeof content === "string" ? content : Array.isArray(content) ? extractText(content) : "";
+	return text.split(/\s+/).filter((word) => word.length > 0).length;
+}
+
+export function extractContextPrompt(content: unknown): string | null {
+	if (typeof content === "string") return content.split(" ").slice(0, 200).join(" ");
+	if (Array.isArray(content)) return extractText(content);
+	return null;
+}
+
+export function prepareContextMessages(messages: readonly unknown[], envPreamble: string): PreparedContextMessages {
+	const systemMsg =
+		messages.find(
+			(m) => (m as { role?: string }).role === "system" || (m as { role?: string }).role === "developer",
+		) ?? null;
+	const lastUserIdx = messages.reduce<number>(
+		(last, m, i) => ((m as { role?: string }).role === "user" ? i : last),
+		-1,
+	);
+
+	const rawPromptWordCount =
+		lastUserIdx >= 0 ? countWordsInMessageContent((messages[lastUserIdx] as { content?: unknown }).content) : 0;
+
+	const augmentedMessages = [...messages];
+	if (lastUserIdx >= 0) {
+		const userMsg = augmentedMessages[lastUserIdx];
+		const userContent = (userMsg as { content?: unknown }).content;
+		const userMsgAny = userMsg as Record<string, unknown>;
+		if (typeof userContent === "string") {
+			if (!startsWithEnvironmentPreamble(userContent)) {
+				augmentedMessages[lastUserIdx] = { ...userMsgAny, content: `${envPreamble}\n\n${userContent}` };
+			}
+		} else if (
+			Array.isArray(userContent) &&
+			userContent.length > 0 &&
+			(userContent[0] as Record<string, unknown>).type === "text"
+		) {
+			const firstBlock = userContent[0] as { type: string; text: string };
+			if (!startsWithEnvironmentPreamble(firstBlock.text)) {
+				const newContent = [...userContent];
+				newContent[0] = { ...firstBlock, text: `${envPreamble}\n\n${firstBlock.text}` };
+				augmentedMessages[lastUserIdx] = { ...userMsgAny, content: newContent };
+			}
+		} else if (Array.isArray(userContent)) {
+			augmentedMessages[lastUserIdx] = {
+				...userMsgAny,
+				content: [{ type: "text", text: `${envPreamble}\n\n` }, ...userContent],
+			};
+		}
+	}
+
+	const currentMessages = lastUserIdx >= 0 ? augmentedMessages.slice(lastUserIdx) : [...augmentedMessages];
+	const userMessages = currentMessages.filter((m) => (m as { role?: string }).role === "user");
+	if (userMessages.length === 0) {
+		return {
+			systemMsg,
+			augmentedMessages,
+			currentMessages,
+			hasUserMessage: false,
+			userPrompt: null,
+			rawPromptWordCount,
+		};
+	}
+
+	const lastUserContent = (userMessages[userMessages.length - 1] as { content?: unknown }).content;
+	return {
+		systemMsg,
+		augmentedMessages,
+		currentMessages,
+		hasUserMessage: true,
+		userPrompt: extractContextPrompt(lastUserContent),
+		rawPromptWordCount,
+	};
+}
+
+export function shouldDropRelevanceList(
+	rawPromptWordCount: number,
+	env: { DROP_RELEVANCE_LIST?: string; RELEVANCE_LIST_MIN_WORDS?: string } = process.env,
+): boolean {
+	const minWords = Number.parseInt(env.RELEVANCE_LIST_MIN_WORDS ?? "20", 10);
+	return env.DROP_RELEVANCE_LIST === "1" || env.DROP_RELEVANCE_LIST === "true" || rawPromptWordCount < minWords;
+}
+
+export function buildContextMessagePrefix(
+	systemMsg: unknown | null,
+	preamble: string | null,
+	recencyList: string | null,
+	relevanceList: string | null,
+): unknown[] {
+	const finalMessages: unknown[] = [];
+	if (systemMsg) finalMessages.push(systemMsg);
+	if (preamble) finalMessages.push({ role: "user" as const, content: [{ type: "text" as const, text: preamble }] });
+	if (recencyList)
+		finalMessages.push({ role: "user" as const, content: [{ type: "text" as const, text: recencyList }] });
+	if (relevanceList)
+		finalMessages.push({ role: "user" as const, content: [{ type: "text" as const, text: relevanceList }] });
+	return finalMessages;
+}
+
 // formatCollapsedIndex removed — replaced by buildGroupedRecencyList / buildRelevanceList / buildContextPreamble
 
 // ─────────────────────────────────────────────
@@ -463,31 +576,6 @@ export default function (pi: ExtensionAPI) {
 	pi.on("context", async (event: ContextEvent, ctx: ExtensionContext) => {
 		const { messages } = event;
 
-		// --- Extract system prompt + current round messages ---
-		// We strip all prior rounds to prevent conversation bloat.
-		// The retrieved historical context replaces the prior conversation.
-		// Current round = everything from the last user message onward
-		// (includes assistant responses, tool calls, tool results in-flight).
-		const systemMsg =
-			messages.find(
-				(m) => (m as { role: string }).role === "system" || (m as { role: string }).role === "developer",
-			) ?? null;
-		const lastUserIdx = messages.reduce((last, m, i) => ((m as { role: string }).role === "user" ? i : last), -1);
-
-		// --- Raw word count from the original (un-augmented) user prompt ---
-		// Used below to skip the relevance list for very short prompts.
-		let rawPromptWordCount = 0;
-		if (lastUserIdx >= 0) {
-			const rawContent = (messages[lastUserIdx] as { content: unknown }).content;
-			if (typeof rawContent === "string") {
-				rawPromptWordCount = rawContent.split(/\s+/).filter((w) => w.length > 0).length;
-			} else if (Array.isArray(rawContent)) {
-				rawPromptWordCount = extractText(rawContent)
-					.split(/\s+/)
-					.filter((w) => w.length > 0).length;
-			}
-		}
-
 		// --- Prepend environment info to the current user prompt ---
 		// Computed once per agent cycle (cachedEnvPreamble) so the timestamp is
 		// stable across tool turns — avoids busting the LLM prompt cache.
@@ -496,61 +584,17 @@ export default function (pi: ExtensionAPI) {
 			`[ENVIRONMENT]\nHost: ${os.hostname()}\nCWD: ${process.cwd()}\nCurrent date/time: ${new Date().toISOString().replace(/[-:]/g, "").replace(/\.\d+/, "")}`;
 		cachedEnvPreamble = envPreamble; // pin early so guard below can use it
 
-		const augmentedMessages = [...messages];
-		if (lastUserIdx >= 0) {
-			const userMsg = augmentedMessages[lastUserIdx];
-			// Guard: pi replays the augmented messages from the previous cycle,
-			// so the user message content may already start with [ENVIRONMENT].
-			// Skip prepending to avoid accumulating duplicates across cycles.
-			const startsWithEnv = (content: string): boolean => content.trimStart().startsWith("[ENVIRONMENT]");
-			const userContent = (userMsg as { content: unknown }).content;
-			const userMsgAny = userMsg as unknown as Record<string, unknown>;
-			if (typeof userContent === "string") {
-				if (!startsWithEnv(userContent)) {
-					augmentedMessages[lastUserIdx] = {
-						...userMsgAny,
-						content: `${envPreamble}\n\n${userContent}`,
-					} as unknown as (typeof augmentedMessages)[number];
-				}
-			} else if (
-				Array.isArray(userContent) &&
-				userContent.length > 0 &&
-				(userContent[0] as Record<string, unknown>).type === "text"
-			) {
-				const firstBlock = userContent[0] as { type: string; text: string };
-				if (!startsWithEnv(firstBlock.text)) {
-					const newContent = [...userContent];
-					newContent[0] = { ...firstBlock, text: `${envPreamble}\n\n${firstBlock.text}` };
-					augmentedMessages[lastUserIdx] = {
-						...userMsgAny,
-						content: newContent,
-					} as unknown as (typeof augmentedMessages)[number];
-				}
-			} else if (Array.isArray(userContent)) {
-				// Non-text first block — always prepend (no existing ENVIRONMENT possible)
-				augmentedMessages[lastUserIdx] = {
-					...userMsgAny,
-					content: [{ type: "text", text: `${envPreamble}\n\n` }, ...userContent],
-				} as unknown as (typeof augmentedMessages)[number];
-			}
-		}
-
-		const currentMessages = lastUserIdx >= 0 ? augmentedMessages.slice(lastUserIdx) : [...augmentedMessages];
-
-		// --- Get the current user prompt (last user message) ---
-		const userMessages = currentMessages.filter((m) => (m as { role: string }).role === "user");
-		if (userMessages.length === 0) return { messages } as any;
-
-		// Extract user prompt text — content may be a string or an array of content blocks
-		const lastUserContent = (userMessages[userMessages.length - 1] as { content: unknown }).content;
-		let userPrompt: string;
-		if (typeof lastUserContent === "string") {
-			userPrompt = lastUserContent.split(" ").slice(0, 200).join(" ");
-		} else if (Array.isArray(lastUserContent)) {
-			userPrompt = extractText(lastUserContent);
-		} else {
-			return { messages: augmentedMessages } as any;
-		}
+		// --- Extract system prompt + current round messages ---
+		// We strip all prior rounds to prevent conversation bloat.
+		// The retrieved historical context replaces the prior conversation.
+		// Current round = everything from the last user message onward
+		// (includes assistant responses, tool calls, tool results in-flight).
+		// Also compute raw word count from the original un-augmented user prompt;
+		// this is used below to skip the relevance list for very short prompts.
+		const { systemMsg, augmentedMessages, currentMessages, hasUserMessage, userPrompt, rawPromptWordCount } =
+			prepareContextMessages(messages, envPreamble);
+		if (!hasUserMessage) return { messages } as any;
+		if (userPrompt === null) return { messages: augmentedMessages } as any;
 
 		// --- Reuse cached context blocks if this is a subsequent context call within
 		//     the same agent cycle. The recency list, relevance list, and preamble
@@ -669,11 +713,7 @@ export default function (pi: ExtensionAPI) {
 			}
 
 			// ── Build the three-section context block ──
-			const minWords = Number.parseInt(process.env.RELEVANCE_LIST_MIN_WORDS ?? "20", 10);
-			const dropRelevance =
-				process.env.DROP_RELEVANCE_LIST === "1" ||
-				process.env.DROP_RELEVANCE_LIST === "true" ||
-				rawPromptWordCount < minWords;
+			const dropRelevance = shouldDropRelevanceList(rawPromptWordCount);
 			const relevanceList = dropRelevance
 				? null
 				: buildRelevanceList(
@@ -698,32 +738,7 @@ export default function (pi: ExtensionAPI) {
 				);
 			}
 
-			const finalMessages: unknown[] = [];
-			if (systemMsg) finalMessages.push(systemMsg);
-
-			// Section 1: Context Building References (explains format and names the two lists)
-			if (preamble) {
-				finalMessages.push({
-					role: "user" as const,
-					content: [{ type: "text" as const, text: preamble }],
-				});
-			}
-
-			// Section 2: Recency List (if current session has prior rounds)
-			if (recencyList) {
-				finalMessages.push({
-					role: "user" as const,
-					content: [{ type: "text" as const, text: recencyList }],
-				});
-			}
-
-			// Section 3: Relevance List (if semantic search returned matches)
-			if (relevanceList) {
-				finalMessages.push({
-					role: "user" as const,
-					content: [{ type: "text" as const, text: relevanceList }],
-				});
-			}
+			const finalMessages = buildContextMessagePrefix(systemMsg, preamble, recencyList, relevanceList);
 
 			// Cache the stable prefix (system + preamble + recency + relevance) for
 			// subsequent context calls within this agent cycle. currentMessages is
