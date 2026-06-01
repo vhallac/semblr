@@ -231,6 +231,112 @@ export function buildContextMessagePrefix(
 	return finalMessages;
 }
 
+export interface RoundDetailsParams {
+	round: string;
+	from_line?: number;
+	line_count?: number;
+	match?: string;
+	max_matches?: number;
+}
+
+export interface RoundDetailsToolResult {
+	content: Array<{ type: "text"; text: string }>;
+	details: Record<string, unknown>;
+}
+
+export function buildRoundAssistantOutput(roundName: string, roundData: Record<string, unknown>): string {
+	if (Array.isArray(roundData.responseSegments) && roundData.responseSegments.length > 0) {
+		const parts: string[] = [];
+		for (const seg of roundData.responseSegments as Array<{ type: string; text?: string; toolCallIndex?: number }>) {
+			if (seg.type === "text" && seg.text) {
+				parts.push(seg.text);
+			} else if (seg.type === "toolCall" && seg.toolCallIndex != null) {
+				parts.push(`[Tool call REDACTED: use get_tool_details("${roundName}", ${seg.toolCallIndex}) to expand]`);
+			}
+		}
+		return parts.join("\n");
+	}
+
+	return (roundData.responseSequence as string) ?? "(empty)";
+}
+
+export function formatRoundToolMeta(roundData: Record<string, unknown>): string {
+	if (roundData.toolCallCount != null && Number(roundData.toolCallCount) > 0) {
+		const names = Array.isArray(roundData.toolCallNames) ? roundData.toolCallNames.join(", ") : "unknown";
+		return `\n  Tools used: ${roundData.toolCallCount} (${names})`;
+	}
+	if (roundData.toolCallCount === 0) return "\n  Tools used: 0 (discussion only)";
+	return "";
+}
+
+export function collapseRoundDetails(roundName: string, roundData: Record<string, unknown>): Record<string, unknown> {
+	const collapsedDetails = { ...roundData };
+	if (Array.isArray(collapsedDetails.toolCalls)) {
+		collapsedDetails.toolCalls = collapsedDetails.toolCalls.map((tc: any) => {
+			const sourceText = tc.result_full ?? tc.result_summary ?? "";
+			const sizeLabel = formatFileSize(Buffer.byteLength(sourceText, "utf-8"));
+			return {
+				...tc,
+				arguments: `[REDACTED — use get_tool_details("${roundName}", ${tc.index}) to expand]`,
+				result_summary: `[REDACTED — size: ${sizeLabel}; use get_tool_details("${roundName}", ${tc.index}) to expand]`,
+				result_full: undefined,
+			};
+		});
+	}
+	return collapsedDetails;
+}
+
+export function renderRoundDetailsToolResult(
+	params: RoundDetailsParams,
+	roundData: Record<string, unknown>,
+): RoundDetailsToolResult {
+	const useMatch = params.match !== undefined && params.match.length > 0;
+	const useFromLine = params.from_line !== undefined;
+	const roundSelection = selectRoundAssistantOutput({
+		userPrompt: (roundData.userPrompt as string) ?? "",
+		responseSequence: (roundData.responseSequence as string) ?? "",
+		assistantOutput: buildRoundAssistantOutput(params.round, roundData),
+		fromLine: params.from_line,
+		lineCount: params.line_count,
+		match: params.match,
+		maxMatches: params.max_matches,
+	});
+	if (!roundSelection.ok) {
+		return { content: [{ type: "text", text: roundSelection.error }], details: {} };
+	}
+
+	let headerSuffix = "";
+	if (useFromLine) {
+		headerSuffix = ` (lines ${params.from_line ?? 1}–${Math.min(
+			(params.from_line ?? 1) - 1 + (params.line_count ?? 200),
+			roundSelection.responseTotalLines,
+		)} of ${roundSelection.responseTotalLines})`;
+	} else if (useMatch) {
+		headerSuffix = roundSelection.matchHeader;
+	}
+
+	let parentMeta = "";
+	if (roundData.parentId != null) parentMeta += `\nParent round: ${roundData.parentId}`;
+	if (roundData.relatedParentId != null)
+		parentMeta += `\nRelated to:   ${roundData.relatedParentId} (same topic group)`;
+
+	return {
+		content: [
+			{
+				type: "text",
+				text:
+					`=== Round: ${params.round}${headerSuffix} ===\n` +
+					`User: ${roundData.userPrompt ?? "(empty)"}\n` +
+					`Assistant: ${roundSelection.assistantOutput}` +
+					`${roundSelection.paginationMarker ? `\n${roundSelection.paginationMarker}` : ""}` +
+					`${formatRoundToolMeta(roundData)}` +
+					`${parentMeta}`,
+			},
+		],
+		details: collapseRoundDetails(params.round, roundData),
+	};
+}
+
 // formatCollapsedIndex removed — replaced by buildGroupedRecencyList / buildRelevanceList / buildContextPreamble
 
 // ─────────────────────────────────────────────
@@ -1309,126 +1415,7 @@ export default function (pi: ExtensionAPI) {
 					};
 				}
 
-				// Build a readable summary of the full round.
-				// If responseSegments exists (interleaved format), use it to produce
-				// tool-call-at-position output. Otherwise fall back to flat format.
-				let toolMeta = "";
-				if (roundData.toolCallCount != null && Number(roundData.toolCallCount) > 0) {
-					const names = (roundData.toolCallNames as string[])?.join(", ") ?? "unknown";
-					toolMeta = `\n  Tools used: ${roundData.toolCallCount} (${names})`;
-				} else if (roundData.toolCallCount === 0) {
-					toolMeta = "\n  Tools used: 0 (discussion only)";
-				}
-
-				// Build interleaved assistant output using responseSegments when available
-				let assistantOutput: string;
-				if (
-					roundData.responseSegments &&
-					Array.isArray(roundData.responseSegments) &&
-					(roundData.responseSegments as any[]).length > 0
-				) {
-					const parts: string[] = [];
-					for (const seg of roundData.responseSegments as Array<{
-						type: string;
-						text?: string;
-						toolCallIndex?: number;
-					}>) {
-						if (seg.type === "text" && seg.text) {
-							parts.push(seg.text);
-						} else if (seg.type === "toolCall" && seg.toolCallIndex != null) {
-							parts.push(
-								`[Tool call REDACTED: use get_tool_details("${p.round}", ${seg.toolCallIndex}) to expand]`,
-							);
-						}
-					}
-					assistantOutput = parts.join("\n");
-				} else {
-					// Fall back to flat responseSequence for old round files
-					assistantOutput = (roundData.responseSequence as string) ?? "(empty)";
-				}
-
-				// ── Pagination or Regexp Matching ──
-				// Three modes:
-				// 1. from_line (+ optional line_count) — position-based line slicing
-				// 2. match (+ optional line_count, max_matches) — regexp-based context windows
-				// 3. Neither — full response
-				// If match is provided, it's mutually exclusive with from_line.
-				const useMatch = p.match !== undefined && p.match.length > 0;
-				const useFromLine = p.from_line !== undefined;
-				let responseTotalLines = 0;
-				let paginationMarker = "";
-				let matchHeader = "";
-				const roundSelection = selectRoundAssistantOutput({
-					userPrompt: (roundData.userPrompt as string) ?? "",
-					responseSequence: (roundData.responseSequence as string) ?? "",
-					assistantOutput,
-					fromLine: p.from_line,
-					lineCount: p.line_count,
-					match: p.match,
-					maxMatches: p.max_matches,
-				});
-				if (!roundSelection.ok) {
-					return {
-						content: [{ type: "text", text: roundSelection.error }],
-						details: {},
-					};
-				}
-				assistantOutput = roundSelection.assistantOutput;
-				responseTotalLines = roundSelection.responseTotalLines;
-				paginationMarker = roundSelection.paginationMarker;
-				matchHeader = roundSelection.matchHeader;
-
-				// Collapse tool call arguments and results in the details object.
-				// Even when a round is "expanded" via get_round_details, the tool call
-				// internals stay redacted — you must drill in with get_tool_details().
-				// Include per-tool output sizes so the agent knows which call is expensive.
-				const collapsedDetails = { ...roundData };
-				if (collapsedDetails.toolCalls && Array.isArray(collapsedDetails.toolCalls)) {
-					collapsedDetails.toolCalls = (collapsedDetails.toolCalls as any[]).map((tc: any) => {
-						// Calculate tool output size from result_full or result_summary
-						const sourceText = tc.result_full ?? tc.result_summary ?? "";
-						const sizeLabel = formatFileSize(Buffer.byteLength(sourceText, "utf-8"));
-						return {
-							...tc,
-							arguments: `[REDACTED — use get_tool_details("${p.round}", ${tc.index}) to expand]`,
-							result_summary: `[REDACTED — size: ${sizeLabel}; use get_tool_details("${p.round}", ${tc.index}) to expand]`,
-							result_full: undefined, // strip inline to keep details compact
-						};
-					});
-				}
-
-				// Build header with position or match info
-				let headerSuffix = "";
-				if (useFromLine) {
-					headerSuffix = ` (lines ${p.from_line ?? 1}–${Math.min((p.from_line ?? 1) - 1 + (p.line_count ?? 200), responseTotalLines)} of ${responseTotalLines})`;
-				} else if (useMatch) {
-					headerSuffix = matchHeader;
-				}
-
-				// ── Parent & group metadata ──
-				let parentMeta = "";
-				if (roundData.parentId != null) {
-					parentMeta += `\nParent round: ${roundData.parentId}`;
-				}
-				if (roundData.relatedParentId != null) {
-					parentMeta += `\nRelated to:   ${roundData.relatedParentId} (same topic group)`;
-				}
-
-				return {
-					content: [
-						{
-							type: "text",
-							text:
-								`=== Round: ${p.round}${headerSuffix} ===\n` +
-								`User: ${roundData.userPrompt ?? "(empty)"}\n` +
-								`Assistant: ${assistantOutput}` +
-								`${paginationMarker ? `\n${paginationMarker}` : ""}` +
-								`${toolMeta}` +
-								`${parentMeta}`,
-						},
-					],
-					details: collapsedDetails,
-				};
+				return renderRoundDetailsToolResult(p, roundData);
 			},
 		});
 
