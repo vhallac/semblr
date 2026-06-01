@@ -14,7 +14,7 @@ import * as fs from "node:fs";
 import * as crypto from "node:crypto";
 import * as os from "node:os";
 import * as path from "node:path";
-import { spawn, spawnSync } from "node:child_process";
+import { spawn } from "node:child_process";
 
 // ─────────────────────────────────────────────
 // Config
@@ -559,16 +559,26 @@ async function getApiKey(ctx?: { modelRegistry?: { getApiKeyForProvider(provider
     // Pi auth lookup failed, fall through
   }
 
-  // 3. Pass store
+  // 3. Pass store (async to avoid blocking the event loop)
   try {
-    const result = spawnSync("pass", ["show", "ai/openrouter"], {
-      timeout: 5000,
-      stdio: ["pipe", "pipe", "pipe"],
+    const key = await new Promise<string | null>((resolve) => {
+      const child = spawn("pass", ["show", "ai/openrouter"], {
+        timeout: 1000,
+        stdio: ["pipe", "pipe", "pipe"],
+      });
+      let stdout = "";
+      child.stdout?.on("data", (chunk: Buffer) => { stdout += chunk.toString(); });
+      child.on("close", (code) => {
+        if (code === 0) {
+          const trimmed = stdout.trim();
+          resolve(trimmed || null);
+        } else {
+          resolve(null);
+        }
+      });
+      child.on("error", () => resolve(null));
     });
-    if (result.status === 0) {
-      const key = result.stdout.toString().trim();
-      if (key) return key;
-    }
+    if (key) return key;
   } catch {
     // pass not available, fall through
   }
@@ -576,28 +586,65 @@ async function getApiKey(ctx?: { modelRegistry?: { getApiKeyForProvider(provider
   return null;
 }
 
-async function embedText(text: string, apiKey: string): Promise<number[]> {
-  const response = await fetch(OPENROUTER_URL, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${apiKey}`,
-    },
-    body: JSON.stringify({
-      model: EMBEDDING_MODEL,
-      input: text,
-    }),
-  });
+const EMBED_TIMEOUT_MS = 15_000;       // AbortController timeout (#43)
+const EMBED_MAX_RETRIES = 3;          // max attempts including first (#42)
+const EMBED_BACKOFF_MS = 1000;        // base backoff for retry #1
 
-  if (!response.ok) {
-    const errText = await response.text();
-    throw new Error(`Embedding API error ${response.status}: ${errText}`);
+async function embedText(text: string, apiKey: string): Promise<number[]> {
+  let lastError: Error | undefined;
+
+  for (let attempt = 0; attempt < EMBED_MAX_RETRIES; attempt++) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), EMBED_TIMEOUT_MS);
+
+    try {
+      const response = await fetch(OPENROUTER_URL, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${apiKey}`,
+        },
+        body: JSON.stringify({
+          model: EMBEDDING_MODEL,
+          input: text,
+        }),
+        signal: controller.signal,
+      });
+
+      if (!response.ok) {
+        const errText = await response.text();
+        const err = new Error(`Embedding API error ${response.status}: ${errText}`);
+        // Don't retry on 4xx (except 429 rate-limit)
+        if (response.status >= 400 && response.status < 500 && response.status !== 429) {
+          throw err; // fatal — no retry
+        }
+        lastError = err;
+        // fall through to retry for 5xx / 429
+      } else {
+        const data = (await response.json()) as {
+          data: Array<{ embedding: number[] }>;
+        };
+        return data.data[0].embedding;
+      }
+    } catch (e) {
+      if (e instanceof DOMException && e.name === "AbortError") {
+        lastError = new Error(`Embedding API timeout after ${EMBED_TIMEOUT_MS}ms`);
+      } else if (e instanceof Error && e.message.startsWith("Embedding API error 4") && !e.message.includes("429")) {
+        throw e; // 4xx (non-429) is fatal — no retry
+      } else {
+        lastError = e instanceof Error ? e : new Error(String(e));
+      }
+    } finally {
+      clearTimeout(timer);
+    }
+
+    // Backoff before retry (not after last attempt)
+    if (attempt < EMBED_MAX_RETRIES - 1) {
+      await new Promise((r) => setTimeout(r, EMBED_BACKOFF_MS * Math.pow(2, attempt)));
+    }
   }
 
-  const data = (await response.json()) as {
-    data: Array<{ embedding: number[] }>;
-  };
-  return data.data[0].embedding;
+  throw lastError ?? new Error("Embedding API failed after retries");
 }
 
 /** Assign the given round to a semantic group based on centroid similarity.
@@ -647,10 +694,60 @@ function createRoundFilePath(userPrompt: string, responseText: string, toolCalls
   return `${hash}.json`;
 }
 
+// Lock constants for atomic index writes (#44)
+const INDEX_LOCK_RETRIES = 15;        // max lock attempts
+const INDEX_LOCK_BACKOFF_MS = 50;     // base backoff per retry
+
 function appendToIndex(filePath: string, vector: number[]) {
   const b64 = Buffer.from(JSON.stringify(vector)).toString("base64url");
+  const line = `${b64},${filePath}\n`;
   fs.mkdirSync(ROUNDS_DIR, { recursive: true });
-  fs.appendFileSync(INDEX_PATH, `${b64},${filePath}\n`);
+
+  const lockPath = `${INDEX_PATH}.lock`;
+
+  // Acquire lock with exponential backoff
+  let lockFd: number | null = null;
+  for (let attempt = 0; attempt < INDEX_LOCK_RETRIES; attempt++) {
+    try {
+      lockFd = fs.openSync(lockPath, "wx");
+      break;
+    } catch {
+      // Staleness check: if lockfile is older than 10s, assume dead process, take over
+      try {
+        const stat = fs.statSync(lockPath);
+        if (Date.now() - stat.mtimeMs > 10_000) {
+          fs.unlinkSync(lockPath);
+          lockFd = fs.openSync(lockPath, "wx");
+          break;
+        }
+      } catch { /* lock disappeared or unreadable — retry below */ }
+
+      if (attempt < INDEX_LOCK_RETRIES - 1) {
+        const waitMs = INDEX_LOCK_BACKOFF_MS * Math.pow(2, attempt);
+        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, waitMs);
+      } else {
+        // Last attempt failed — fall back to direct append (best-effort)
+        try { fs.appendFileSync(INDEX_PATH, line); } catch {}
+        return;
+      }
+    }
+  }
+
+  try {
+    // Read-modify-write under lock
+    const existing = fs.existsSync(INDEX_PATH)
+      ? fs.readFileSync(INDEX_PATH, "utf-8")
+      : "";
+    const newContent = existing + line;
+    const tmp = `${INDEX_PATH}.tmp.${process.pid}`;
+    fs.writeFileSync(tmp, newContent);
+    fs.renameSync(tmp, INDEX_PATH);
+  } finally {
+    if (lockFd !== null) {
+      fs.closeSync(lockFd);
+      try { fs.unlinkSync(lockPath); } catch {}
+    }
+  }
 }
 
 function splitCommandArgs(args: string): string[] {
