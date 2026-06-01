@@ -10,6 +10,7 @@
  * Safe to run while pi is using the extension — the index is append-only.
  */
 
+import * as crypto from "node:crypto";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -249,7 +250,7 @@ function appendToIndex(vector: number[], filePath: string): void {
 // Count user messages in a JSONL (for progress)
 // ─────────────────────────────────────────────
 
-function countUserMessages(filePath: string): number {
+function _countUserMessages(filePath: string): number {
 	const content = fs.readFileSync(filePath, "utf-8");
 	let count = 0;
 	for (const line of content.trim().split("\n").filter(Boolean)) {
@@ -304,7 +305,7 @@ async function main() {
 	for (const { filePath, label } of jsonlFiles) {
 		const rounds = parseSessionFile(filePath, label);
 		const newRounds = rounds.filter((t) => {
-			const key = `${require("node:crypto")
+			const key = `${crypto
 				.createHash("md5")
 				.update(t.userPrompt + t.responseSequence)
 				.digest("hex")}.json`;
@@ -327,7 +328,6 @@ async function main() {
 	let errors = 0;
 
 	async function processRound(round: Round): Promise<void> {
-		const crypto = require("node:crypto");
 		const roundFile = `${crypto
 			.createHash("md5")
 			.update(round.userPrompt + round.responseSequence)

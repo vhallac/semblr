@@ -83,7 +83,7 @@ function flushStats() {
 		fs.mkdirSync(SEMBLR_DIR, { recursive: true });
 		fs.writeFileSync(tmp, JSON.stringify(statsState, null, 2));
 		fs.renameSync(tmp, STATS_PATH); // atomic on POSIX
-	} catch (e) {
+	} catch (_e) {
 		// Best-effort; stats collection must never break the extension
 		try {
 			if (fs.existsSync(tmp)) fs.unlinkSync(tmp);
@@ -504,7 +504,7 @@ let agentAccumulatedText: string[] = [];
 let agentToolCallCount = 0;
 let agentToolCallNames: string[] = [];
 let agentToolCalls: ToolCallDetail[] = [];
-const agentPendingToolCallIds: Map<string, ToolCallDetail> = new Map(); // toolCallId → partial detail
+const _agentPendingToolCallIds: Map<string, ToolCallDetail> = new Map(); // toolCallId → partial detail
 
 // Interleaved response segments — preserves tool call positions within assistant text
 let agentResponseSegments: Array<{ type: "text" | "toolCall"; text?: string; toolCallIndex?: number }> = [];
@@ -1019,7 +1019,7 @@ export default function (pi: ExtensionAPI) {
 				});
 			}
 
-			const uniqueRounds = new Set(
+			const _uniqueRounds = new Set(
 				index.map((e: { filePath: string }) => e.filePath.replace(/(:prompt|:response|:round)$/, "")),
 			).size;
 
@@ -1469,7 +1469,7 @@ export default function (pi: ExtensionAPI) {
 					}),
 				),
 			}),
-			async execute(toolCallId, params, signal, onUpdate, ctx2) {
+			async execute(_toolCallId, params, _signal, _onUpdate, ctx2) {
 				const p = params as { query: string; minSimilarity?: number; rounds?: string[] };
 				const query = p.query;
 				if (!query) {
@@ -1645,7 +1645,7 @@ export default function (pi: ExtensionAPI) {
 					}),
 				),
 			}),
-			async execute(toolCallId, params, signal, onUpdate, ctx2) {
+			async execute(_toolCallId, params, _signal, _onUpdate, _ctx2) {
 				const p = params as {
 					round: string;
 					from_line?: number;
@@ -1934,7 +1934,7 @@ export default function (pi: ExtensionAPI) {
 					}),
 				),
 			}),
-			async execute(toolCallId, params, signal, onUpdate, ctx2) {
+			async execute(_toolCallId, params, _signal, _onUpdate, _ctx2) {
 				const p = params as {
 					round: string;
 					index: number;

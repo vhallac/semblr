@@ -10,6 +10,7 @@
  *   ~/.pi/agent/semblr/rounds/index.csv  — vector index (base64(vector),filepath)
  */
 
+import * as crypto from "node:crypto";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -64,7 +65,7 @@ interface SessionEntry {
 
 const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY;
 const EMBEDDING_MODEL = "openai/text-embedding-3-small";
-const OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"; // actually embeddings endpoint
+const _OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"; // actually embeddings endpoint
 const ROUNDS_DIR = process.env.SEMBLR_ROUNDS_DIR || path.resolve(os.homedir(), ".pi", "agent", "semblr", "rounds");
 const INDEX_PATH = path.resolve(ROUNDS_DIR, "index.csv");
 
@@ -220,7 +221,7 @@ function normalize(v: number[]): number[] {
 	return mag === 0 ? v : v.map((x) => x / mag);
 }
 
-function cosineSimilarity(a: number[], b: number[]): number {
+function _cosineSimilarity(a: number[], b: number[]): number {
 	let dot = 0;
 	for (let i = 0; i < a.length; i++) dot += a[i] * b[i];
 	return dot;
@@ -272,7 +273,6 @@ async function main() {
 	let skipped = 0;
 
 	for (const round of rounds) {
-		const crypto = require("node:crypto");
 		const roundFile = `${crypto
 			.createHash("md5")
 			.update(round.userPrompt + round.responseSequence)

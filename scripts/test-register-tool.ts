@@ -14,7 +14,7 @@ export default async function (pi: ExtensionAPI) {
 		parameters: Type.Object({
 			query: Type.String({ description: "Search query" }),
 		}),
-		async execute(toolCallId, params, _signal, _onUpdate, _ctx) {
+		async execute(_toolCallId, params, _signal, _onUpdate, _ctx) {
 			const q = (params as { query: string }).query;
 			return {
 				content: [{ type: "text", text: `Would search for: ${q}` }],
