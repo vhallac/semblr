@@ -9,12 +9,14 @@
  */
 
 import { spawn } from "node:child_process";
-import * as crypto from "node:crypto";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import type { ContextEvent, ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Type } from "@sinclair/typebox";
+import { computeContentHash, createRoundFilePath } from "./core/hash.ts";
+import { estimateTokens } from "./core/tokens.ts";
+import { cosineSimilarity, normalize } from "./core/vector.ts";
 
 // ─────────────────────────────────────────────
 // Config
@@ -384,21 +386,6 @@ Format: [index: N] hash.json [score | N tools | size]: followed by the full user
 // Helpers
 // ─────────────────────────────────────────────
 
-function normalize(v: number[]): number[] {
-	const mag = Math.sqrt(v.reduce((sum, x) => sum + x * x, 0));
-	return mag === 0 ? v : v.map((x) => x / mag);
-}
-
-function cosineSimilarity(a: number[], b: number[]): number {
-	let dot = 0;
-	for (let i = 0; i < a.length; i++) dot += a[i] * b[i];
-	return dot;
-}
-
-function estimateTokens(text: string): number {
-	return Math.ceil(text.length / 4);
-}
-
 function extractText(content: Array<{ type: string; text?: string }>): string {
 	return content
 		.filter((c) => c.type === "text" && c.text)
@@ -657,22 +644,6 @@ function assignToGroup(roundEntry: ChainEntry, vec: number[]): number {
 		rounds: [roundEntry],
 	});
 	return roundGroups.length - 1;
-}
-
-function computeContentHash(userPrompt: string, responseText: string, toolCalls?: ToolCallDetail[]): string {
-	const parts: string[] = [userPrompt, responseText];
-	if (toolCalls) {
-		for (const tc of toolCalls) {
-			parts.push(tc.arguments);
-			parts.push(tc.result_full ?? tc.result_summary ?? "");
-		}
-	}
-	return crypto.createHash("md5").update(parts.join("")).digest("hex");
-}
-
-function createRoundFilePath(userPrompt: string, responseText: string, toolCalls?: ToolCallDetail[]): string {
-	const hash = computeContentHash(userPrompt, responseText, toolCalls);
-	return `${hash}.json`;
 }
 
 // Lock constants for atomic index writes (#44)

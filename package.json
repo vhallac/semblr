@@ -2,7 +2,7 @@
   "name": "semblr",
   "version": "1.0.0",
   "type": "module",
-  "main": "index.js",
+  "main": "index.ts",
   "directories": {
     "doc": "docs"
   },
@@ -10,8 +10,11 @@
     "typecheck": "tsc --noEmit",
     "lint": "biome check",
     "lint:fix": "biome check --write",
+    "knip": "knip",
+    "test": "vitest run",
+    "test:coverage": "vitest run --coverage",
     "check": "npm run typecheck && npm run lint",
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "verify": "npm run typecheck && npm run lint && npm run knip && npm run test:coverage"
   },
   "keywords": [],
   "author": "",
@@ -24,7 +27,10 @@
     "@biomejs/biome": "^2.4.16",
     "@earendil-works/pi-coding-agent": "^0.74.2",
     "@types/node": "^25.9.1",
+    "@vitest/coverage-v8": "^4.1.8",
+    "knip": "^6.15.0",
     "tsx": "^4.22.3",
-    "typescript": "^6.0.3"
+    "typescript": "^6.0.3",
+    "vitest": "^4.1.8"
   }
 }

@@ -10,10 +10,10 @@
  * Safe to run while pi is using the extension — the index is append-only.
  */
 
-import * as crypto from "node:crypto";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { computeContentHash } from "../src/core/hash.ts";
 
 // ─────────────────────────────────────────────
 // Config (matches digest-session.ts)
@@ -229,21 +229,6 @@ async function embed(text: string): Promise<number[]> {
 function normalize(v: number[]): number[] {
 	const mag = Math.sqrt(v.reduce((sum, x) => sum + x * x, 0));
 	return mag === 0 ? v : v.map((x) => x / mag);
-}
-
-// ─────────────────────────────────────────────
-// Content hash (must match semblr.ts computeContentHash)
-// ─────────────────────────────────────────────
-
-function computeContentHash(userPrompt: string, responseText: string, toolCalls?: ToolCallDetail[]): string {
-	const parts: string[] = [userPrompt, responseText];
-	if (toolCalls) {
-		for (const tc of toolCalls) {
-			parts.push(tc.arguments);
-			parts.push(tc.result_full ?? tc.result_summary ?? "");
-		}
-	}
-	return crypto.createHash("md5").update(parts.join("")).digest("hex");
 }
 
 // ─────────────────────────────────────────────

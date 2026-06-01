@@ -14,9 +14,9 @@
  *   SEMBLR_ROUNDS_DIR=/custom/path npx tsx scripts/migrate-content-hash.ts
  */
 
-import * as crypto from "node:crypto";
 import * as fs from "node:fs";
 import * as os from "node:os";
+import { computeContentHash } from "../src/core/hash.ts";
 
 // ─────────────────────────────────────────────
 // Config
@@ -49,21 +49,6 @@ interface RoundData {
 	toolCallNames?: string[];
 	toolCalls?: ToolCallDetail[];
 	[key: string]: unknown; // allow other metadata
-}
-
-// ─────────────────────────────────────────────
-// Hash computation (mirrors src/semblr.ts)
-// ─────────────────────────────────────────────
-
-function computeContentHash(userPrompt: string, responseText: string, toolCalls?: ToolCallDetail[]): string {
-	const parts: string[] = [userPrompt, responseText];
-	if (toolCalls) {
-		for (const tc of toolCalls) {
-			parts.push(tc.arguments);
-			parts.push(tc.result_full ?? tc.result_summary ?? "");
-		}
-	}
-	return crypto.createHash("md5").update(parts.join("")).digest("hex");
 }
 
 // ─────────────────────────────────────────────

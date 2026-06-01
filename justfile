@@ -5,6 +5,10 @@
 # or set SEMBLR_ROUNDS_DIR in the environment.
 SEMBLR_ROUNDS_DIR := env_var_or_default("SEMBLR_ROUNDS_DIR", "")
 
+# Run the local verification suite
+verify:
+    npm run verify
+
 # Index all new turns from pi session files
 # Skips turns already indexed (by MD5 content hash)
 index:

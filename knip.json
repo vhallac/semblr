@@ -1,0 +1,5 @@
+{
+	"entry": ["src/semblr.ts", "scripts/*.ts"],
+	"project": ["src/**/*.ts", "scripts/**/*.ts", "*.ts"],
+	"ignoreDependencies": ["tsx"]
+}
