@@ -16,7 +16,25 @@ Semblr runs as a [pi coding agent](https://pi.dev) extension.
 
 ### Dependencies
 
-- **[pi coding agent](https://pi.dev/install)** — the prerequisite runtime. Install it first, then clone and use Semblr.
+#### Runtime
+
+- **[pi coding agent](https://pi.dev/install)** — the prerequisite runtime. Must be installed before using Semblr.
+- **[Node.js](https://nodejs.org/)** >= 22 — required by the extension runtime and scripts.
+- **[OpenRouter API key](https://openrouter.ai/keys)** — Semblr uses the `text-embedding-3-small` model via OpenRouter for embedding prompts and responses.
+
+#### Development
+
+- **[Node.js](https://nodejs.org/)** >= 22 with npm
+- **TypeScript** (`typescript`) — type checking the extension and scripts
+- **Biome** (`@biomejs/biome`) — linting and formatting (version 1.9.x; installed via npm or Nix)
+- **`@earendil-works/pi-coding-agent`** — pi SDK types for type checking
+- **`@types/node`** — Node.js type declarations
+
+Install dev dependencies:
+
+```bash
+npm install
+```
 
 ### Setup
 
@@ -362,6 +380,30 @@ just query "what did we discuss about caching"
 ```
 
 Rounds are stored in a global directory (outside the project tree) so they survive repository moves and clones.
+
+## Developer's Guide
+
+### Linting and type checking
+
+```bash
+# Type check (TypeScript strict mode)
+npm run typecheck
+
+# Lint + format check
+npm run lint
+
+# Auto-fix lint and format issues
+npm run lint:fix
+
+# Run both type check and lint
+npm run check
+```
+
+Configuration:
+- `tsconfig.json` — TypeScript with strict mode, ES2022 target, Node16 modules
+- `biome.json` — Biome linter and formatter (recommended rules, tabs, 120 char width)
+
+> **NixOS note:** The npm-installed Biome binary is dynamically linked and won't run. Use the nix-provided one via `nix-shell -p biome --command "biome check"` or add it to `shell.nix`.
 
 ## VISION.md
 
