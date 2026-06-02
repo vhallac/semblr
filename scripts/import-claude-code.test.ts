@@ -42,7 +42,9 @@ function validUserEntry(overrides: Record<string, any> = {}): Record<string, any
 }
 
 function RESPONSE(mm = false): string {
-	return mm ? "This is a sufficiently long assistant response. It has enough characters." : "Assistant response — long enough to pass the minimum length check.";
+	return mm
+		? "This is a sufficiently long assistant response. It has enough characters."
+		: "Assistant response — long enough to pass the minimum length check.";
 }
 
 function validAssistantEntry(overrides: Record<string, any> = {}): Record<string, any> {
@@ -70,10 +72,7 @@ describe("import-claude-code script", () => {
 	it("reports missing API key when not in dry-run mode", async () => {
 		const logs = logger();
 		const projectsDir = tmpDir();
-		writeClaudeJsonl(path.join(projectsDir, "test.jsonl"), [
-			validUserEntry(),
-			validAssistantEntry(),
-		]);
+		writeClaudeJsonl(path.join(projectsDir, "test.jsonl"), [validUserEntry(), validAssistantEntry()]);
 
 		const exitCode = await runImportClaudeCode({
 			projectsDir,
@@ -97,7 +96,10 @@ describe("import-claude-code script", () => {
 		writeClaudeJsonl(path.join(projectsDir, "session.jsonl"), [
 			validUserEntry({ cwd: "/home/user/project", gitBranch: "feature/x" }),
 			validAssistantEntry(),
-			validUserEntry({ cwd: "/home/user/project2", message: { role: "user", content: [{ type: "text", text: "A different user prompt" }] } }),
+			validUserEntry({
+				cwd: "/home/user/project2",
+				message: { role: "user", content: [{ type: "text", text: "A different user prompt" }] },
+			}),
 			validAssistantEntry(),
 		]);
 
@@ -217,7 +219,10 @@ describe("import-claude-code script", () => {
 					message: { role: "user", content: [{ type: "text", text: `Prompt ${i}` }] },
 				}),
 				validAssistantEntry({
-					message: { role: "assistant", content: [{ type: "text", text: `Response ${i} is long enough to pass the check.` }] },
+					message: {
+						role: "assistant",
+						content: [{ type: "text", text: `Response ${i} is long enough to pass the check.` }],
+					},
 				}),
 			);
 		}
@@ -264,7 +269,10 @@ describe("import-claude-code script", () => {
 				message: { role: "user", content: [{ type: "text", text: "Prompt A" }] },
 			}),
 			validAssistantEntry({
-				message: { role: "assistant", content: [{ type: "text", text: "Response A is the answer to Prompt A, long enough to pass." }] },
+				message: {
+					role: "assistant",
+					content: [{ type: "text", text: "Response A is the answer to Prompt A, long enough to pass." }],
+				},
 			}),
 		]);
 
@@ -320,8 +328,18 @@ describe("import-claude-code script", () => {
 				message: { role: "user", content: [{ type: "text", text: "Main prompt — what does this do?" }] },
 			}),
 			validAssistantEntry(),
-			{ type: "user", timestamp: 3000, isSidechain: true, message: { role: "user", content: [{ type: "text", text: "Sidechain prompt" }] } },
-			{ type: "assistant", timestamp: 4000, isSidechain: true, message: { role: "assistant", content: [{ type: "text", text: "Sidechain response" }] } },
+			{
+				type: "user",
+				timestamp: 3000,
+				isSidechain: true,
+				message: { role: "user", content: [{ type: "text", text: "Sidechain prompt" }] },
+			},
+			{
+				type: "assistant",
+				timestamp: 4000,
+				isSidechain: true,
+				message: { role: "assistant", content: [{ type: "text", text: "Sidechain response" }] },
+			},
 		]);
 
 		await expect(
@@ -349,7 +367,16 @@ describe("import-claude-code script", () => {
 			path.join(projectsDir, "good.jsonl"),
 			[
 				line(validUserEntry({ message: { role: "user", content: [{ type: "text", text: "Good prompt" }] } })),
-				line(validAssistantEntry({ message: { role: "assistant", content: [{ type: "text", text: "Good response — this is the helpful answer the assistant gave." }] } })),
+				line(
+					validAssistantEntry({
+						message: {
+							role: "assistant",
+							content: [
+								{ type: "text", text: "Good response — this is the helpful answer the assistant gave." },
+							],
+						},
+					}),
+				),
 			].join("\n"),
 		);
 		// Corrupt file — parseClaudeCodeJsonl throws on invalid JSON, caught at file level

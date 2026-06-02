@@ -13,7 +13,8 @@
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { embedText, normalize } from "../lib/embed.ts";
+import { pathToFileURL } from "node:url";
+import { embedText, getApiKey, normalize } from "../lib/embed.ts";
 import { computeContentHash } from "../lib/hash.ts";
 import {
 	appendVectorIndexEntry,
@@ -29,7 +30,6 @@ import { type ParsedPiRound, parsePiSessionJsonl } from "../src/core/pi-session.
 
 const SESSIONS_DIR = path.resolve(os.homedir(), ".pi", "agent", "sessions");
 const ROUNDS_DIR = process.env.SEMBLR_ROUNDS_DIR || path.resolve(os.homedir(), ".pi", "agent", "semblr", "rounds");
-const INDEX_PATH = path.resolve(ROUNDS_DIR, "index.csv");
 // Keep bulk digest single-worker: stale-hash migrations rewrite index.csv and delete
 // duplicate files, so concurrent duplicate-content rounds can race and leave stale refs.
 const CONCURRENCY = 1;
@@ -46,75 +46,94 @@ type Round = ParsedPiRound & { sessionLabel: string };
 // Parse a single JSONL file into rounds
 // ─────────────────────────────────────────────
 
-function parseSessionFile(filePath: string, sessionLabel: string): Round[] {
-	return parsePiSessionJsonl(fs.readFileSync(filePath, "utf-8"), {
+function parseSessionFile(filePath: string, sessionLabel: string, deps: { fsImpl?: typeof fs } = {}): Round[] {
+	const f = deps.fsImpl ?? fs;
+	return parsePiSessionJsonl(f.readFileSync(filePath, "utf-8"), {
 		sessionLabel,
 		skipShortFinalResponse: true,
 	});
 }
 
 // ─────────────────────────────────────────────
-// Count user messages in a JSONL (for progress)
+// Gather session JSONL files from a directory
 // ─────────────────────────────────────────────
 
-function _countUserMessages(filePath: string): number {
-	const content = fs.readFileSync(filePath, "utf-8");
-	let count = 0;
-	for (const line of content.trim().split("\n").filter(Boolean)) {
-		try {
-			const obj = JSON.parse(line);
-			if (obj.type === "message" && obj.message?.role === "user") count++;
-		} catch {}
+function gatherSessionFiles(
+	sessionsDir: string,
+	deps: { fsImpl?: typeof fs } = {},
+): Array<{ filePath: string; label: string }> {
+	const f = deps.fsImpl ?? fs;
+	if (!f.existsSync(sessionsDir)) return [];
+
+	const sessionDirs = f
+		.readdirSync(sessionsDir)
+		.filter((d) => d.startsWith("--"))
+		.map((d) => path.join(sessionsDir, d));
+
+	const jsonlFiles: Array<{ filePath: string; label: string }> = [];
+	for (const dir of sessionDirs) {
+		const label = path.basename(dir);
+		const files = f.readdirSync(dir).filter((fn) => fn.endsWith(".jsonl"));
+		for (const fn of files) {
+			jsonlFiles.push({ filePath: path.join(dir, fn), label });
+		}
 	}
-	return count;
+
+	jsonlFiles.sort((a, b) => a.filePath.localeCompare(b.filePath));
+	return jsonlFiles;
 }
 
 // ─────────────────────────────────────────────
 // Main
 // ─────────────────────────────────────────────
 
-async function main() {
-	const apiKey = process.env.OPENROUTER_API_KEY;
+export interface DigestAllOptions {
+	sessionsDir?: string;
+	roundsDir?: string;
+	indexPath?: string;
+	apiKey?: string;
+	fetchImpl?: typeof fetch;
+	concurrency?: number;
+	stdout?: Pick<typeof console, "log">;
+	stderr?: Pick<typeof console, "error">;
+	fsImpl?: typeof fs;
+}
+
+export async function runDigestAll(options: DigestAllOptions = {}): Promise<number> {
+	const sessionsDir = options.sessionsDir ?? SESSIONS_DIR;
+	const roundsDir = options.roundsDir ?? ROUNDS_DIR;
+	const indexPath = options.indexPath ?? path.resolve(roundsDir, "index.csv");
+	const concurrency = Math.max(1, options.concurrency ?? CONCURRENCY);
+	const out = options.stdout ?? console;
+	const err = options.stderr ?? console;
+	const f = options.fsImpl ?? fs;
+
+	const apiKey = options.apiKey ?? (await getApiKey());
 	if (!apiKey) {
-		console.error("❌ OPENROUTER_API_KEY environment variable required");
-		process.exit(1);
+		err.error("❌ OPENROUTER_API_KEY environment variable required");
+		return 1;
 	}
-	// TypeScript doesn't know process.exit never returns
-	// eslint-disable-next-line @typescript-eslint/no-non-null-assertion
-	const key: string = apiKey;
 
 	// Gather all session JSONL files
-	const sessionDirs = fs
-		.readdirSync(SESSIONS_DIR)
-		.filter((d) => d.startsWith("--"))
-		.map((d) => path.join(SESSIONS_DIR, d));
+	const jsonlFiles = gatherSessionFiles(sessionsDir, { fsImpl: f });
 
-	const jsonlFiles: Array<{ filePath: string; label: string }> = [];
-	for (const dir of sessionDirs) {
-		const label = path.basename(dir);
-		const files = fs.readdirSync(dir).filter((f) => f.endsWith(".jsonl"));
-		for (const f of files) {
-			jsonlFiles.push({ filePath: path.join(dir, f), label });
-		}
-	}
+	out.log(
+		`📂 Found ${jsonlFiles.length} session files across ${new Set(jsonlFiles.map((j) => j.label)).size} directories\n`,
+	);
 
-	jsonlFiles.sort((a, b) => a.filePath.localeCompare(b.filePath));
-
-	console.log(`📂 Found ${jsonlFiles.length} session files across ${sessionDirs.length} directories\n`);
-
-	// Ensure the .pi/rounds dir
-	fs.mkdirSync(ROUNDS_DIR, { recursive: true });
+	// Ensure rounds dir
+	f.mkdirSync(roundsDir, { recursive: true });
 
 	// Load existing index dedup set
-	const existingRounds = loadIndexedRoundFiles(INDEX_PATH);
-	console.log(`📊 Already indexed: ${existingRounds.size} rounds\n`);
+	const existingRounds = loadIndexedRoundFiles(indexPath);
+	out.log(`📊 Already indexed: ${existingRounds.size} rounds\n`);
 
 	// Parse all sessions into a flat list of rounds (skipping already-indexed)
 	const allRounds: Round[] = [];
 	let skippedTotal = 0;
 
 	for (const { filePath, label } of jsonlFiles) {
-		const rounds = parseSessionFile(filePath, label);
+		const rounds = parseSessionFile(filePath, label, { fsImpl: f });
 		const newRounds = rounds.filter((t) => {
 			const key = `${computeContentHash(t.userPrompt, t.responseSequence, t.toolCalls)}.json`;
 			return !existingRounds.has(key);
@@ -124,11 +143,11 @@ async function main() {
 	}
 
 	const totalNew = allRounds.length;
-	console.log(`📊 New rounds to embed: ${totalNew} (${skippedTotal} already indexed)\n`);
+	out.log(`📊 New rounds to embed: ${totalNew} (${skippedTotal} already indexed)\n`);
 
 	if (totalNew === 0) {
-		console.log("✨ Nothing to do — all sessions already indexed!");
-		return;
+		out.log("✨ Nothing to do — all sessions already indexed!");
+		return 0;
 	}
 
 	// Parallel embedding with concurrency limit
@@ -142,81 +161,97 @@ async function main() {
 		// Check for stale files whose stored full hash material belongs under this
 		// content-hash filename. If found, migrate old index entries before deleting
 		// old files so the round remains retrievable even if embedding is unavailable.
-		const staleFiles = findStaleContentMatchesInDir(ROUNDS_DIR, roundFile);
+		const staleFiles = findStaleContentMatchesInDir(roundsDir, roundFile);
 		for (const staleFile of staleFiles) {
-			migrateIndexEntriesFile(INDEX_PATH, staleFile, roundFile);
+			migrateIndexEntriesFile(indexPath, staleFile, roundFile);
 		}
 
 		// Write round file before deleting stale copies.
-		fs.writeFileSync(path.resolve(ROUNDS_DIR, roundFile), JSON.stringify(round, null, 2));
+		f.writeFileSync(path.resolve(roundsDir, roundFile), JSON.stringify(round, null, 2));
 		for (const staleFile of staleFiles) {
-			fs.unlinkSync(path.join(ROUNDS_DIR, staleFile));
-			process.stderr.write(`  ♻️  Migrated stale: ${staleFile} → ${roundFile}\n`);
+			f.unlinkSync(path.join(roundsDir, staleFile));
+			err.error(`  ♻️  Migrated stale: ${staleFile} → ${roundFile}`);
 		}
 
 		// Skip embedding if already indexed under the correct hash
 		// (must reload after potential deletions above)
-		const indexedAfterCleanup = loadIndexedRoundFiles(INDEX_PATH);
+		const indexedAfterCleanup = loadIndexedRoundFiles(indexPath);
 		if (indexedAfterCleanup.has(roundFile)) {
 			completed++;
-			process.stderr.write(`  ⏭  [${completed}/${totalNew}] ${roundId} (already indexed)\n`);
+			err.error(`  ⏭  [${completed}/${totalNew}] ${roundId} (already indexed)`);
 			return;
 		}
 
 		try {
-			const promptVector = await embedText(round.userPrompt.slice(0, MAX_PROMPT_CHARS), key);
-			appendVectorIndexEntry(INDEX_PATH, normalize(promptVector), `${roundFile}:prompt`);
+			const promptVector = await embedText(round.userPrompt.slice(0, MAX_PROMPT_CHARS), apiKey, {
+				fetchImpl: options.fetchImpl,
+			});
+			appendVectorIndexEntry(indexPath, normalize(promptVector), `${roundFile}:prompt`);
 
 			const respText = round.responseSequence.slice(0, MAX_RESPONSE_CHARS);
 			if (respText) {
-				const respVector = await embedText(respText, key);
-				appendVectorIndexEntry(INDEX_PATH, normalize(respVector), `${roundFile}:response`);
+				const respVector = await embedText(respText, apiKey, {
+					fetchImpl: options.fetchImpl,
+				});
+				appendVectorIndexEntry(indexPath, normalize(respVector), `${roundFile}:response`);
 			}
 
 			completed++;
 			const pct = ((completed / totalNew) * 100).toFixed(1);
-			process.stderr.write(`  ✅ [${completed}/${totalNew} ${pct}%] ${roundId}\n`);
-		} catch (err) {
+			err.error(`  ✅ [${completed}/${totalNew} ${pct}%] ${roundId}`);
+		} catch (e) {
 			errors++;
-			process.stderr.write(`  ❌ [ERROR] ${roundId}: ${(err as Error).message}\n`);
+			err.error(`  ❌ [ERROR] ${roundId}: ${(e as Error).message}`);
 		}
 	}
 
 	// Run with concurrency limit
-	async function runQueue(): Promise<void> {
-		const queue = [...allRounds];
-		const workers: Promise<void>[] = [];
+	const queue = [...allRounds];
+	const workers: Promise<void>[] = [];
 
-		for (let i = 0; i < CONCURRENCY; i++) {
-			workers.push(
-				(async () => {
-					while (queue.length > 0) {
-						const round = queue.shift();
-						if (round) await processRound(round);
-					}
-				})(),
-			);
-		}
-
-		await Promise.all(workers);
+	for (let i = 0; i < concurrency; i++) {
+		workers.push(
+			(async () => {
+				while (queue.length > 0) {
+					const round = queue.shift();
+					if (round) await processRound(round);
+				}
+			})(),
+		);
 	}
 
 	const startTime = Date.now();
-	await runQueue();
+	await Promise.all(workers);
 	const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
 
-	const finalCount = fs.existsSync(INDEX_PATH)
-		? fs.readFileSync(INDEX_PATH, "utf-8").trim().split("\n").filter(Boolean).length
+	const finalCount = f.existsSync(indexPath)
+		? f.readFileSync(indexPath, "utf-8").trim().split("\n").filter(Boolean).length
 		: 0;
 
-	console.log(`\n✅ Done in ${elapsed}s. ${completed} rounds embedded, ${errors} errors.`);
-	console.log(`   Index: ${finalCount} vectors at ${INDEX_PATH}`);
-	console.log(
-		`   Rounds: ${fs.readdirSync(ROUNDS_DIR).filter((f) => f.endsWith(".json") && !f.startsWith("index")).length} files`,
+	out.log(`\n✅ Done in ${elapsed}s. ${completed} rounds embedded, ${errors} errors.`);
+	out.log(`   Index: ${finalCount} vectors at ${indexPath}`);
+	out.log(
+		`   Rounds: ${f.readdirSync(roundsDir).filter((rf) => rf.endsWith(".json") && !rf.startsWith("index")).length} files`,
 	);
+	return 0;
 }
 
-main().catch((err) => {
-	console.error("❌ Fatal:", err);
-	process.exit(1);
-});
+// ─────────────────────────────────────────────
+// CLI entry point
+// ─────────────────────────────────────────────
+
+export function isMainModule(metaUrl: string, argv1 = process.argv[1]): boolean {
+	return argv1 ? pathToFileURL(argv1).href === metaUrl : false;
+}
+
+async function main() {
+	const exitCode = await runDigestAll();
+	if (exitCode !== 0) process.exit(exitCode);
+}
+
+if (isMainModule(import.meta.url)) {
+	main().catch((err) => {
+		console.error("❌ Fatal:", err);
+		process.exit(1);
+	});
+}

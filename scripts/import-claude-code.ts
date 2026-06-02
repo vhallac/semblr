@@ -167,9 +167,7 @@ export async function runImportClaudeCode(options: ImportClaudeCodeOptions = {})
 	const started = Date.now();
 	await Promise.all(workers);
 	const elapsed = ((Date.now() - started) / 1000).toFixed(1);
-	const vectors = f.existsSync(indexPath)
-		? f.readFileSync(indexPath, "utf-8").split("\n").filter(Boolean).length
-		: 0;
+	const vectors = f.existsSync(indexPath) ? f.readFileSync(indexPath, "utf-8").split("\n").filter(Boolean).length : 0;
 	const roundFiles = f.existsSync(roundsDir)
 		? f.readdirSync(roundsDir).filter((rf) => rf.endsWith(".json")).length
 		: 0;
