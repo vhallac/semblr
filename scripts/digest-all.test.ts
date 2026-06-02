@@ -309,7 +309,7 @@ describe("digest-all script", () => {
 		// Let's make the first call (first round prompt) succeed, second call (first round response) succeed,
 		// third call (second round prompt) fail.
 		const logs = logger();
-		const fetchImpl = vi.fn(async (input: unknown, init: any) => {
+		const fetchImpl = vi.fn(async (_input: unknown, init: any) => {
 			const body = JSON.parse(String((init as any).body));
 			if (body.input === userPrompt2) {
 				return new Response("server error", { status: 500 });
@@ -425,7 +425,7 @@ describe("digest-all script", () => {
 
 	it("uses environment and fetch defaults when options are not injected", async () => {
 		const root = tmpDir();
-		const sessionsDir = tmpDir();
+		const _sessionsDir = tmpDir();
 		const roundsDir = path.join(root, "rounds");
 		const indexPath = path.join(roundsDir, "index.csv");
 
