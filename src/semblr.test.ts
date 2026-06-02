@@ -52,7 +52,7 @@ import registerSemblr, {
 
 const env = "[ENVIRONMENT]\nHost: test\nCWD: /repo\nCurrent date/time: 20260101T000000Z";
 
-describe("semblr context hook join points", () => {
+describe("context message preparation", () => {
 	it("prepares current-round messages from the last user prompt and preserves the system message", () => {
 		const system = { role: "system", content: "rules" };
 		const prepared = prepareContextMessages(
@@ -173,7 +173,7 @@ describe("semblr context hook join points", () => {
 	});
 });
 
-describe("context retrieval and round selection join points", () => {
+describe("context retrieval and round selection", () => {
 	it("loads round files by stripping index suffixes and normalizing missing fields", () => {
 		const existsSync = vi.fn((filePath: fs.PathLike) => String(filePath) === "/rounds/a.json");
 		const readFileSync = vi.fn((_filePath: fs.PathLike, encoding?: BufferEncoding) => {
@@ -302,7 +302,7 @@ describe("context retrieval and round selection join points", () => {
 	});
 });
 
-describe("agent_end handler join points", () => {
+describe("agent_end round capture helpers", () => {
 	it("extracts the prompt from cached state, string messages, and text-array messages", () => {
 		expect(extractAgentEndUserPrompt("cached prompt", [{ role: "user", content: "message prompt" }])).toBe(
 			"cached prompt",
@@ -480,7 +480,7 @@ describe("agent_end handler join points", () => {
 	});
 });
 
-describe("extension lifecycle command join points", () => {
+describe("extension lifecycle commands", () => {
 	it("loads session-start index state and formats unique-round status", () => {
 		const duplicateIndex = [
 			{ filePath: "same.json:prompt", vector: [1, 0] },
@@ -563,7 +563,7 @@ describe("extension lifecycle command join points", () => {
 	});
 });
 
-describe("Claude import command join points", () => {
+describe("Claude import command helpers", () => {
 	it("filters command argument completions and builds the command plan", () => {
 		expect(getImportClaudeArgumentCompletions("--d")).toEqual([{ value: "--dry-run", label: "--dry-run" }]);
 		expect(getImportClaudeArgumentCompletions("--i")).toEqual([
@@ -643,7 +643,7 @@ describe("Claude import command join points", () => {
 	});
 });
 
-describe("OpenRouter API key resolution join points", () => {
+describe("OpenRouter API key resolution", () => {
 	const withoutEnv = { OPENROUTER_API_KEY: undefined };
 	const spawnPass = (options: { code?: number | null; chunks?: string[]; error?: boolean } = {}) => {
 		const spawnImpl = vi.fn(() => {
@@ -724,7 +724,7 @@ describe("OpenRouter API key resolution join points", () => {
 	});
 });
 
-describe("embedText join points", () => {
+describe("embedding client", () => {
 	const response = (extra: Partial<{ ok: boolean; status: number; text: string; embedding: number[] }> = {}) => ({
 		ok: extra.ok ?? true,
 		status: extra.status ?? 200,
@@ -802,7 +802,7 @@ describe("embedText join points", () => {
 	});
 });
 
-describe("index CSV storage join points", () => {
+describe("index CSV storage", () => {
 	const tmpDir = () => fs.mkdtempSync(path.join(os.tmpdir(), "semblr-index-test-"));
 	const encodedLine = (vector: unknown, filePath: string) =>
 		`${Buffer.from(JSON.stringify(vector)).toString("base64url")},${filePath}\n`;
@@ -913,7 +913,7 @@ describe("index CSV storage join points", () => {
 	});
 });
 
-describe("message_end handler join points", () => {
+describe("message_end response capture", () => {
 	const emptyState = (): MessageEndProcessingState => ({
 		accumulatedText: [],
 		toolCallCount: 0,
@@ -1001,7 +1001,7 @@ describe("message_end handler join points", () => {
 	});
 });
 
-describe("get_round_details join points", () => {
+describe("get_round_details rendering", () => {
 	const roundData = {
 		userPrompt: "user prompt",
 		responseSequence: "line one\nline two needle\nline three\nline four",
@@ -1102,7 +1102,7 @@ describe("get_round_details join points", () => {
 	});
 });
 
-describe("get_tool_details join points", () => {
+describe("get_tool_details rendering", () => {
 	const roundData = (extra: Partial<RoundData> = {}): RoundData => ({
 		userPrompt: "prompt",
 		responseSequence: "response",
@@ -1228,7 +1228,7 @@ describe("get_tool_details join points", () => {
 	});
 });
 
-describe("search_interactions join points", () => {
+describe("search_interactions scoring and rendering", () => {
 	const round = (userPrompt: string, responseSequence: string, extra = {}) => ({
 		userPrompt,
 		responseSequence,

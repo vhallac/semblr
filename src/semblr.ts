@@ -21,9 +21,44 @@ import {
 	formatFileSize,
 	splitCommandArgs,
 } from "./core/context-format.ts";
-import { selectRoundAssistantOutput, selectToolResultOutput } from "./core/detail-rendering.ts";
+import { buildContextMessagePrefix, prepareContextMessages, shouldDropRelevanceList } from "./core/context-messages.ts";
+import { embedText, getApiKey } from "./core/embedding-client.ts";
 import { assignToGroup, formatGroupStats, parseGroupThreshold, type SemanticGroup } from "./core/grouping.ts";
-import { computeContentHash, createRoundFilePath } from "./core/hash.ts";
+import { createRoundFilePath } from "./core/hash.ts";
+import {
+	appendToIndexPath,
+	buildSessionStartStatus,
+	type IndexEntry,
+	loadIndexFromPath as loadIndexFromPathCore,
+	loadSessionStartIndex as loadSessionStartIndexCore,
+} from "./core/index-storage.ts";
+import {
+	applyMessageEndToState,
+	buildAgentEndChainEntry,
+	buildAgentEndEmbeddingTexts,
+	buildAgentEndRoundData,
+	extractAgentEndResponseText,
+	extractAgentEndUserPrompt,
+	getAgentEndParentId,
+	getRelatedParentIdFromGroup,
+	type MessageEndProcessingState,
+} from "./core/round-capture.ts";
+import type { ChainEntry, ResponseSegment, RoundData, ToolCallDetail } from "./core/round-data.ts";
+import {
+	loadRoundDataForToolDetails,
+	renderRoundDetailsToolResult,
+	renderToolDetailsToolResult,
+	type ToolDetailsParams,
+} from "./core/round-tool-results.ts";
+import {
+	collectSearchRoundScores,
+	computeContextBudget,
+	filterSearchIndexByRounds,
+	normalizeSearchInteractionsParams,
+	renderSearchInteractionsToolResult,
+	type SearchInteractionsParams,
+	selectContextRounds,
+} from "./core/search-interactions.ts";
 import {
 	flushStatsFile,
 	formatChainReadStatsReport,
@@ -31,8 +66,47 @@ import {
 	recordPresented,
 	recordRead,
 } from "./core/stats.ts";
-import { estimateTokens } from "./core/tokens.ts";
-import { cosineSimilarity, normalize } from "./core/vector.ts";
+import { normalize } from "./core/vector.ts";
+
+export {
+	buildContextMessagePrefix,
+	countWordsInMessageContent,
+	extractContextPrompt,
+	prepareContextMessages,
+	shouldDropRelevanceList,
+	startsWithEnvironmentPreamble,
+} from "./core/context-messages.ts";
+export { embedText, getApiKey } from "./core/embedding-client.ts";
+export { appendToIndexPath, buildSessionStartStatus, countUniqueIndexedRounds } from "./core/index-storage.ts";
+export type { MessageEndProcessingState } from "./core/round-capture.ts";
+export {
+	applyMessageEndToState,
+	buildAgentEndChainEntry,
+	buildAgentEndEmbeddingTexts,
+	buildAgentEndRoundData,
+	buildAgentEndToolSummary,
+	extractAgentEndResponseText,
+	extractAgentEndUserPrompt,
+	getAgentEndParentId,
+	getRelatedParentIdFromGroup,
+} from "./core/round-capture.ts";
+export type { RoundData } from "./core/round-data.ts";
+export {
+	buildRoundAssistantOutput,
+	collapseRoundDetails,
+	formatRoundToolMeta,
+	loadRoundDataForToolDetails,
+	renderRoundDetailsToolResult,
+	renderToolDetailsToolResult,
+} from "./core/round-tool-results.ts";
+export {
+	collectSearchRoundScores,
+	computeContextBudget,
+	filterSearchIndexByRounds,
+	normalizeSearchInteractionsParams,
+	renderSearchInteractionsToolResult,
+	selectContextRounds,
+} from "./core/search-interactions.ts";
 
 // ─────────────────────────────────────────────
 // Config
@@ -56,11 +130,6 @@ const statsState = loadStatsFile(STATS_PATH);
 // Index 0 = display position 1 (most recent), index 4 = display position 5 (oldest).
 const statsPresentedHashes: (string | null)[] = [null, null, null, null, null];
 
-const EMBEDDING_MODEL = "openai/text-embedding-3-small";
-const OPENROUTER_URL = "https://openrouter.ai/api/v1/embeddings";
-
-const CONTEXT_BUDGET_RATIO = 0.5; // 50% of model context window for historical rounds
-
 // Collapsed-only mode. All rounds are injected via the Recency and Relevance Lists.
 // Use get_round_details() to expand. The Recency List contains the in-memory causal
 // chain from the current session; the Relevance List contains semantically similar
@@ -69,19 +138,6 @@ const CONTEXT_BUDGET_RATIO = 0.5; // 50% of model context window for historical 
 // ─────────────────────────────────────────────
 // Causal Chain — in-memory buffer of session rounds
 // ─────────────────────────────────────────────
-
-interface ChainEntry {
-	fileName: string;
-	userPrompt: string;
-	responseSequence: string;
-	toolSummary: string;
-}
-
-interface ResponseSegment {
-	type: "text" | "toolCall";
-	text?: string;
-	toolCallIndex?: number;
-}
 
 /** In-memory buffer of rounds from the current session, in chronological order.
  *  Survives between agent cycles within the same session. Cleared on session_start.
@@ -107,13 +163,6 @@ const SEMBLR_GROUP_THRESHOLD = parseGroupThreshold(process.env.SEMBLR_GROUP_THRE
 // Helpers
 // ─────────────────────────────────────────────
 
-function extractText(content: Array<{ type: string; text?: string }>): string {
-	return content
-		.filter((c) => c.type === "text" && c.text)
-		.map((c) => c.text ?? "")
-		.join(" ");
-}
-
 /** Stat a round file and return its formatted size string, or null on failure. */
 function getRoundSize(fileName: string): string | null {
 	try {
@@ -122,225 +171,6 @@ function getRoundSize(fileName: string): string | null {
 	} catch {
 		return null;
 	}
-}
-
-export interface PreparedContextMessages {
-	systemMsg: unknown | null;
-	augmentedMessages: unknown[];
-	currentMessages: unknown[];
-	hasUserMessage: boolean;
-	userPrompt: string | null;
-	rawPromptWordCount: number;
-}
-
-export function startsWithEnvironmentPreamble(content: string): boolean {
-	return content.trimStart().startsWith("[ENVIRONMENT]");
-}
-
-export function countWordsInMessageContent(content: unknown): number {
-	const text = typeof content === "string" ? content : Array.isArray(content) ? extractText(content) : "";
-	return text.split(/\s+/).filter((word) => word.length > 0).length;
-}
-
-export function extractContextPrompt(content: unknown): string | null {
-	if (typeof content === "string") return content.split(" ").slice(0, 200).join(" ");
-	if (Array.isArray(content)) return extractText(content);
-	return null;
-}
-
-export function prepareContextMessages(messages: readonly unknown[], envPreamble: string): PreparedContextMessages {
-	const systemMsg =
-		messages.find(
-			(m) => (m as { role?: string }).role === "system" || (m as { role?: string }).role === "developer",
-		) ?? null;
-	const lastUserIdx = messages.reduce<number>(
-		(last, m, i) => ((m as { role?: string }).role === "user" ? i : last),
-		-1,
-	);
-
-	const rawPromptWordCount =
-		lastUserIdx >= 0 ? countWordsInMessageContent((messages[lastUserIdx] as { content?: unknown }).content) : 0;
-
-	const augmentedMessages = [...messages];
-	if (lastUserIdx >= 0) {
-		const userMsg = augmentedMessages[lastUserIdx];
-		const userContent = (userMsg as { content?: unknown }).content;
-		const userMsgAny = userMsg as Record<string, unknown>;
-		if (typeof userContent === "string") {
-			if (!startsWithEnvironmentPreamble(userContent)) {
-				augmentedMessages[lastUserIdx] = { ...userMsgAny, content: `${envPreamble}\n\n${userContent}` };
-			}
-		} else if (
-			Array.isArray(userContent) &&
-			userContent.length > 0 &&
-			(userContent[0] as Record<string, unknown>).type === "text"
-		) {
-			const firstBlock = userContent[0] as { type: string; text: string };
-			if (!startsWithEnvironmentPreamble(firstBlock.text)) {
-				const newContent = [...userContent];
-				newContent[0] = { ...firstBlock, text: `${envPreamble}\n\n${firstBlock.text}` };
-				augmentedMessages[lastUserIdx] = { ...userMsgAny, content: newContent };
-			}
-		} else if (Array.isArray(userContent)) {
-			augmentedMessages[lastUserIdx] = {
-				...userMsgAny,
-				content: [{ type: "text", text: `${envPreamble}\n\n` }, ...userContent],
-			};
-		}
-	}
-
-	const currentMessages = lastUserIdx >= 0 ? augmentedMessages.slice(lastUserIdx) : [...augmentedMessages];
-	const userMessages = currentMessages.filter((m) => (m as { role?: string }).role === "user");
-	if (userMessages.length === 0) {
-		return {
-			systemMsg,
-			augmentedMessages,
-			currentMessages,
-			hasUserMessage: false,
-			userPrompt: null,
-			rawPromptWordCount,
-		};
-	}
-
-	const lastUserContent = (userMessages[userMessages.length - 1] as { content?: unknown }).content;
-	return {
-		systemMsg,
-		augmentedMessages,
-		currentMessages,
-		hasUserMessage: true,
-		userPrompt: extractContextPrompt(lastUserContent),
-		rawPromptWordCount,
-	};
-}
-
-export function shouldDropRelevanceList(
-	rawPromptWordCount: number,
-	env: { DROP_RELEVANCE_LIST?: string; RELEVANCE_LIST_MIN_WORDS?: string } = process.env,
-): boolean {
-	const minWords = Number.parseInt(env.RELEVANCE_LIST_MIN_WORDS ?? "20", 10);
-	return env.DROP_RELEVANCE_LIST === "1" || env.DROP_RELEVANCE_LIST === "true" || rawPromptWordCount < minWords;
-}
-
-export function buildContextMessagePrefix(
-	systemMsg: unknown | null,
-	preamble: string | null,
-	recencyList: string | null,
-	relevanceList: string | null,
-): unknown[] {
-	const finalMessages: unknown[] = [];
-	if (systemMsg) finalMessages.push(systemMsg);
-	if (preamble) finalMessages.push({ role: "user" as const, content: [{ type: "text" as const, text: preamble }] });
-	if (recencyList)
-		finalMessages.push({ role: "user" as const, content: [{ type: "text" as const, text: recencyList }] });
-	if (relevanceList)
-		finalMessages.push({ role: "user" as const, content: [{ type: "text" as const, text: relevanceList }] });
-	return finalMessages;
-}
-
-export interface RoundDetailsParams {
-	round: string;
-	from_line?: number;
-	line_count?: number;
-	match?: string;
-	max_matches?: number;
-}
-
-export interface RoundDetailsToolResult {
-	content: Array<{ type: "text"; text: string }>;
-	details: Record<string, unknown>;
-}
-
-export function buildRoundAssistantOutput(roundName: string, roundData: Record<string, unknown>): string {
-	if (Array.isArray(roundData.responseSegments) && roundData.responseSegments.length > 0) {
-		const parts: string[] = [];
-		for (const seg of roundData.responseSegments as Array<{ type: string; text?: string; toolCallIndex?: number }>) {
-			if (seg.type === "text" && seg.text) {
-				parts.push(seg.text);
-			} else if (seg.type === "toolCall" && seg.toolCallIndex != null) {
-				parts.push(`[Tool call REDACTED: use get_tool_details("${roundName}", ${seg.toolCallIndex}) to expand]`);
-			}
-		}
-		return parts.join("\n");
-	}
-
-	return (roundData.responseSequence as string) ?? "(empty)";
-}
-
-export function formatRoundToolMeta(roundData: Record<string, unknown>): string {
-	if (roundData.toolCallCount != null && Number(roundData.toolCallCount) > 0) {
-		const names = Array.isArray(roundData.toolCallNames) ? roundData.toolCallNames.join(", ") : "unknown";
-		return `\n  Tools used: ${roundData.toolCallCount} (${names})`;
-	}
-	if (roundData.toolCallCount === 0) return "\n  Tools used: 0 (discussion only)";
-	return "";
-}
-
-export function collapseRoundDetails(roundName: string, roundData: Record<string, unknown>): Record<string, unknown> {
-	const collapsedDetails = { ...roundData };
-	if (Array.isArray(collapsedDetails.toolCalls)) {
-		collapsedDetails.toolCalls = collapsedDetails.toolCalls.map((tc: any) => {
-			const sourceText = tc.result_full ?? tc.result_summary ?? "";
-			const sizeLabel = formatFileSize(Buffer.byteLength(sourceText, "utf-8"));
-			return {
-				...tc,
-				arguments: `[REDACTED — use get_tool_details("${roundName}", ${tc.index}) to expand]`,
-				result_summary: `[REDACTED — size: ${sizeLabel}; use get_tool_details("${roundName}", ${tc.index}) to expand]`,
-				result_full: undefined,
-			};
-		});
-	}
-	return collapsedDetails;
-}
-
-export function renderRoundDetailsToolResult(
-	params: RoundDetailsParams,
-	roundData: Record<string, unknown>,
-): RoundDetailsToolResult {
-	const useMatch = params.match !== undefined && params.match.length > 0;
-	const useFromLine = params.from_line !== undefined;
-	const roundSelection = selectRoundAssistantOutput({
-		userPrompt: (roundData.userPrompt as string) ?? "",
-		responseSequence: (roundData.responseSequence as string) ?? "",
-		assistantOutput: buildRoundAssistantOutput(params.round, roundData),
-		fromLine: params.from_line,
-		lineCount: params.line_count,
-		match: params.match,
-		maxMatches: params.max_matches,
-	});
-	if (!roundSelection.ok) {
-		return { content: [{ type: "text", text: roundSelection.error }], details: {} };
-	}
-
-	let headerSuffix = "";
-	if (useFromLine) {
-		headerSuffix = ` (lines ${params.from_line ?? 1}–${Math.min(
-			(params.from_line ?? 1) - 1 + (params.line_count ?? 200),
-			roundSelection.responseTotalLines,
-		)} of ${roundSelection.responseTotalLines})`;
-	} else if (useMatch) {
-		headerSuffix = roundSelection.matchHeader;
-	}
-
-	let parentMeta = "";
-	if (roundData.parentId != null) parentMeta += `\nParent round: ${roundData.parentId}`;
-	if (roundData.relatedParentId != null)
-		parentMeta += `\nRelated to:   ${roundData.relatedParentId} (same topic group)`;
-
-	return {
-		content: [
-			{
-				type: "text",
-				text:
-					`=== Round: ${params.round}${headerSuffix} ===\n` +
-					`User: ${roundData.userPrompt ?? "(empty)"}\n` +
-					`Assistant: ${roundSelection.assistantOutput}` +
-					`${roundSelection.paginationMarker ? `\n${roundSelection.paginationMarker}` : ""}` +
-					`${formatRoundToolMeta(roundData)}` +
-					`${parentMeta}`,
-			},
-		],
-		details: collapseRoundDetails(params.round, roundData),
-	};
 }
 
 // formatCollapsedIndex removed — replaced by buildGroupedRecencyList / buildRelevanceList / buildContextPreamble
@@ -352,586 +182,22 @@ export function renderRoundDetailsToolResult(
 //   filePath includes :prompt, :response, or :round suffix
 // ─────────────────────────────────────────────
 
-export interface IndexEntry {
-	filePath: string;
-	vector: number[];
-}
-
 export function loadIndexFromPath(
 	indexPath: string = INDEX_PATH,
 	fsImpl: Pick<typeof fs, "existsSync" | "readFileSync"> = fs,
 ): IndexEntry[] {
-	if (!fsImpl.existsSync(indexPath)) return [];
-	const raw = fsImpl.readFileSync(indexPath, "utf-8").trim();
-	if (!raw) return [];
-	return raw.split("\n").map((line) => {
-		const comma = line.indexOf(",");
-		const b64 = line.slice(0, comma);
-		const filePath = line.slice(comma + 1);
-		const decoded = JSON.parse(Buffer.from(b64, "base64url").toString("utf-8"));
-		return { filePath, vector: Array.isArray(decoded) ? decoded : [] };
-	});
+	return loadIndexFromPathCore(indexPath, fsImpl);
 }
 
 function loadIndex(): IndexEntry[] {
-	return loadIndexFromPath(INDEX_PATH);
+	return loadIndexFromPathCore(INDEX_PATH);
 }
 
 export function loadSessionStartIndex(
 	indexPath: string = INDEX_PATH,
 	deps: { existsSync?: (filePath: string) => boolean; loadIndex?: () => IndexEntry[] } = {},
 ): IndexEntry[] {
-	const existsSync = deps.existsSync ?? fs.existsSync;
-	const load = deps.loadIndex ?? loadIndex;
-	return existsSync(indexPath) ? load() : [];
-}
-
-export function countUniqueIndexedRounds(index: readonly { filePath: string }[]): number {
-	return new Set(index.map((e) => e.filePath.replace(/(:prompt|:response|:round)$/, ""))).size;
-}
-
-export function buildSessionStartStatus(index: readonly { filePath: string }[]): string {
-	return `🧠 semblr loaded — ${countUniqueIndexedRounds(index)} rounds indexed`;
-}
-
-interface ToolCallDetail {
-	index: number;
-	name: string;
-	arguments: string; // JSON string of arguments (abbreviated if >500 chars)
-	result_summary: string; // first 300 chars of result text (legacy field, kept for backward compat)
-	result_full?: string; // full tool output (no cap, for post-step-2 rounds)
-	result_truncated?: boolean; // true if result exceeds cap (only false for post-step-2 rounds since no cap)
-}
-
-export interface RoundData {
-	userPrompt: string;
-	responseSequence: string;
-	turnIndex: number;
-	userTimestamp?: number;
-	toolCallCount?: number;
-	toolCallNames?: string[];
-	toolCalls?: ToolCallDetail[];
-	promptEmbedding?: number[];
-	parentId?: string | null;
-	relatedParentId?: string | null;
-}
-
-export interface SearchInteractionsParams {
-	query?: string;
-	minSimilarity?: number;
-	rounds?: string[];
-}
-
-export interface NormalizedSearchInteractionsParams {
-	query: string | null;
-	threshold: number;
-	scopeRounds: string[] | null;
-}
-
-export interface SearchRoundScore {
-	fileName: string;
-	data: RoundData;
-	bestScore: number;
-}
-
-export interface SearchInteractionsToolResult {
-	content: Array<{ type: "text"; text: string }>;
-	details: Record<string, unknown>;
-}
-
-export interface ToolDetailsParams {
-	round: string;
-	index: number;
-	out__from_line?: number;
-	out_line_count?: number;
-	match?: string;
-	max_matches?: number;
-}
-
-export type ToolDetailsToolResult = SearchInteractionsToolResult;
-
-export function loadRoundDataForToolDetails(
-	fullPath: string,
-	roundName: string,
-): { ok: true; roundData: RoundData } | { ok: false; result: ToolDetailsToolResult } {
-	if (!fs.existsSync(fullPath)) {
-		return {
-			ok: false,
-			result: {
-				content: [{ type: "text", text: `Round file not found: ${roundName}` }],
-				details: {},
-			},
-		};
-	}
-
-	try {
-		return { ok: true, roundData: JSON.parse(fs.readFileSync(fullPath, "utf-8")) };
-	} catch {
-		return {
-			ok: false,
-			result: {
-				content: [{ type: "text", text: `Failed to parse round file: ${roundName}` }],
-				details: {},
-			},
-		};
-	}
-}
-
-export function renderToolDetailsToolResult(params: ToolDetailsParams, roundData: RoundData): ToolDetailsToolResult {
-	if (!roundData.toolCalls || roundData.toolCalls.length === 0) {
-		return {
-			content: [
-				{
-					type: "text",
-					text: "This round has no tool calls stored. It may have been indexed before tool call metadata was added. Consider re-indexing.",
-				},
-			],
-			details: {},
-		};
-	}
-
-	if (params.index < 0 || params.index >= roundData.toolCalls.length) {
-		return {
-			content: [
-				{
-					type: "text",
-					text: `Invalid index ${params.index}. This round has ${roundData.toolCalls.length} tool calls (indices 0–${roundData.toolCalls.length - 1}).`,
-				},
-			],
-			details: {},
-		};
-	}
-
-	const tc = roundData.toolCalls[params.index];
-
-	// Parse arguments back to object for display
-	let argsParsed: unknown = tc.arguments;
-	try {
-		argsParsed = JSON.parse(tc.arguments);
-	} catch {
-		/* keep as string */
-	}
-
-	// Determine the result text (prefer result_full, fall back to result_summary)
-	const resultText = tc.result_full ?? tc.result_summary ?? "";
-	const toolSelection = selectToolResultOutput({
-		resultText,
-		fromLine: params.out__from_line,
-		lineCount: params.out_line_count,
-		match: params.match,
-		maxMatches: params.max_matches,
-	});
-	if (!toolSelection.ok) {
-		return {
-			content: [{ type: "text", text: toolSelection.error }],
-			details: {},
-		};
-	}
-
-	if (toolSelection.mode === "page") {
-		return {
-			content: [
-				{
-					type: "text",
-					text:
-						`[Showing lines ${toolSelection.fromLine}–${toolSelection.endLine} of ${toolSelection.totalLines} for tool call #${tc.index} (${tc.name})]\n` +
-						`Tool name: ${tc.name}\n` +
-						`Arguments: ${JSON.stringify(argsParsed, null, 2)}\n` +
-						"Result:\n" +
-						`  ${toolSelection.resultBlock}${toolSelection.footer}`,
-				},
-			],
-			details: {
-				name: tc.name,
-				arguments: tc.arguments,
-				lines_shown: {
-					from: toolSelection.fromLine,
-					to: toolSelection.endLine,
-					of: toolSelection.totalLines,
-				},
-			},
-		};
-	}
-
-	if (toolSelection.mode === "match") {
-		return {
-			content: [
-				{
-					type: "text",
-					text:
-						`[Match results for tool call #${tc.index} (${tc.name})${toolSelection.matchSummary}]\n` +
-						`Tool name: ${tc.name}\n` +
-						`Arguments: ${JSON.stringify(argsParsed, null, 2)}\n` +
-						"Result:\n" +
-						`  ${toolSelection.resultBlock}`,
-				},
-			],
-			details: {
-				name: tc.name,
-				arguments: tc.arguments,
-				matches: { shown: toolSelection.matchCount, total: toolSelection.totalMatches },
-			},
-		};
-	}
-
-	// Unpaginated — show full result
-	const resultBlock = resultText.length > 0 ? `  ${resultText}` : "  (empty)";
-
-	const truncatedFlag = tc.result_truncated ? "\n\n[Output exceeds storage cap — showing entire stored result]" : "";
-
-	return {
-		content: [
-			{
-				type: "text",
-				text:
-					`Tool call #${tc.index} in round ${params.round}\n` +
-					`  Name: ${tc.name}\n` +
-					`  Arguments: ${JSON.stringify(argsParsed, null, 2)}\n` +
-					`  Result:\n${resultBlock}${truncatedFlag}`,
-			},
-		],
-		details: { name: tc.name, arguments: tc.arguments, result_full: tc.result_full ?? tc.result_summary },
-	};
-}
-
-export function normalizeSearchInteractionsParams(
-	params: SearchInteractionsParams,
-): NormalizedSearchInteractionsParams {
-	return {
-		query: params.query || null,
-		threshold: params.minSimilarity ?? 0.25,
-		scopeRounds: params.rounds ?? null,
-	};
-}
-
-export function filterSearchIndexByRounds(
-	index: readonly IndexEntry[],
-	scopeRounds: readonly string[] | null,
-): IndexEntry[] {
-	if (!scopeRounds || scopeRounds.length === 0) return [...index];
-	const scopeSet = new Set(scopeRounds);
-	return index.filter((entry) => {
-		const roundFile = entry.filePath.replace(/(:prompt|:response|:round)$/, "");
-		return scopeSet.has(roundFile);
-	});
-}
-
-export function collectSearchRoundScores(
-	index: readonly IndexEntry[],
-	queryVec: number[],
-	readRound: (filePath: string) => RoundData | null,
-): SearchRoundScore[] {
-	const scored = index
-		.map((entry) => ({ ...entry, similarity: cosineSimilarity(queryVec, entry.vector) }))
-		.sort((a, b) => b.similarity - a.similarity);
-
-	const roundScores = new Map<string, SearchRoundScore>();
-	for (const entry of scored) {
-		const roundFile = entry.filePath.replace(/(:prompt|:response|:round)$/, "");
-		if (!roundFile.endsWith(".json")) continue;
-		if (roundScores.has(roundFile)) continue;
-		const roundData = readRound(entry.filePath);
-		if (!roundData) continue;
-		roundScores.set(roundFile, { fileName: roundFile, data: roundData, bestScore: entry.similarity });
-	}
-
-	return Array.from(roundScores.values()).sort((a, b) => b.bestScore - a.bestScore);
-}
-
-export function computeContextBudget(
-	bestScore: number,
-	contextWindow: number = 128_000,
-	minSimilarity = 0.3,
-	minBudget = 2000,
-	budgetRatio = CONTEXT_BUDGET_RATIO,
-): number {
-	const maxBudget = Math.floor(budgetRatio * contextWindow);
-	const t = Math.max(0, Math.min(1, (bestScore - minSimilarity) / (1 - minSimilarity)));
-	return Math.floor(minBudget + t * (maxBudget - minBudget));
-}
-
-export function selectContextRounds(
-	scoredRounds: readonly SearchRoundScore[],
-	lastRoundFileName: string | null,
-	readRound: (filePath: string) => RoundData | null,
-	options: {
-		minSimilarity?: number;
-		budgetTokens: number;
-		estimateTokensFn?: (text: string) => number;
-	} = { budgetTokens: 2000 },
-): SearchRoundScore[] {
-	const minSimilarity = options.minSimilarity ?? 0.3;
-	const estimateTokensFn = options.estimateTokensFn ?? estimateTokens;
-	const selectedRounds: SearchRoundScore[] = [];
-	let usedTokens = 0;
-
-	for (const round of scoredRounds) {
-		if (round.bestScore < minSimilarity) break;
-		const roundTokens = estimateTokensFn(round.data.userPrompt + round.data.responseSequence);
-		if (usedTokens + roundTokens > options.budgetTokens) break;
-		selectedRounds.push(round);
-		usedTokens += roundTokens;
-	}
-
-	if (lastRoundFileName) {
-		const lastData = readRound(lastRoundFileName);
-		if (lastData) selectedRounds.push({ data: lastData, fileName: lastRoundFileName, bestScore: 0 });
-	}
-
-	return selectedRounds;
-}
-
-export function renderSearchInteractionsToolResult(
-	sorted: readonly SearchRoundScore[],
-	threshold: number,
-	getRoundSizeFn: (fileName: string) => string | null = getRoundSize,
-): SearchInteractionsToolResult {
-	if (sorted.length === 0) {
-		return {
-			content: [{ type: "text", text: "No matching turns found in the index." }],
-			details: {},
-		};
-	}
-
-	const lines: string[] = [];
-	let count = 0;
-	for (const round of sorted) {
-		if (round.bestScore < threshold) break;
-		if (count >= 5) break;
-		count++;
-		const toolStr =
-			round.data.toolCallCount != null && round.data.toolCallCount > 0
-				? ` | ${round.data.toolCallCount} tools (${(round.data.toolCallNames ?? []).join(", ")})`
-				: round.data.toolCallCount === 0
-					? " | 0 tools (discussion only)"
-					: "";
-
-		const roundSizeStr = getRoundSizeFn(round.fileName);
-		const sizeTag = roundSizeStr ? ` | ${roundSizeStr}` : "";
-		lines.push(`--- Round ${round.fileName} (score: ${round.bestScore.toFixed(3)}${toolStr}${sizeTag}) ---`);
-		lines.push(`User: ${round.data.userPrompt}`);
-
-		if (
-			round.data.toolCallCount != null &&
-			round.data.toolCallCount > 0 &&
-			round.data.toolCalls &&
-			round.data.toolCalls.length > 0
-		) {
-			const turnLines = round.data.toolCalls.map((tc: ToolCallDetail) => {
-				const sourceText = tc.result_full ?? tc.result_summary ?? "";
-				const sizeLabel = sourceText.length > 0 ? formatFileSize(Buffer.byteLength(sourceText, "utf-8")) : null;
-				const sizeTag = sizeLabel ? ` (${sizeLabel})` : "";
-				return `  Turn ${tc.index}: ${tc.name}${sizeTag} — [REDACTED: use get_tool_details("${round.fileName}", ${tc.index}) to expand.]`;
-			});
-			lines.push("--- Agent turns (all tool calls redacted — use get_tool_details to expand) ---");
-			lines.push(...turnLines);
-		} else if (round.data.toolCallCount === 0) {
-			lines.push("--- Agent turns ---");
-			lines.push("  (no tool calls — discussion only)");
-		}
-
-		lines.push(`Assistant: ${round.data.responseSequence}`);
-		lines.push("");
-	}
-
-	if (count === 0) {
-		return {
-			content: [
-				{
-					type: "text",
-					text: `No relevant rounds found (best score: ${sorted[0].bestScore.toFixed(3)}).`,
-				},
-			],
-			details: {},
-		};
-	}
-
-	return {
-		content: [{ type: "text", text: `Found ${count} relevant rounds:\n\n${lines.join("\n")}` }],
-		details: { matched: count, topScore: sorted[0].bestScore },
-	};
-}
-
-export function extractAgentEndUserPrompt(cachedPrompt: string | null, messages?: readonly unknown[]): string {
-	let userPrompt = cachedPrompt ?? "";
-	if (!userPrompt && messages) {
-		const lastUser = [...messages].reverse().find((m) => (m as { role: string }).role === "user");
-		if (lastUser) {
-			const content = (lastUser as { content: unknown }).content;
-			if (typeof content === "string") {
-				userPrompt = content;
-			} else if (Array.isArray(content)) {
-				userPrompt = extractText(content as Array<{ type: string; text?: string }>);
-			}
-		}
-	}
-	return userPrompt;
-}
-
-export function extractAgentEndResponseText(accumulatedText: readonly string[], messages?: readonly unknown[]): string {
-	let responseText = accumulatedText.join("\n\n").trim();
-	if (!responseText) {
-		const lastAssistant = messages
-			? [...messages].reverse().find((m) => (m as { role: string }).role === "assistant")
-			: null;
-		if (lastAssistant) {
-			const content = (lastAssistant as { content: unknown }).content;
-			if (typeof content === "string") {
-				responseText = content;
-			} else if (Array.isArray(content)) {
-				responseText = extractText(content as Array<{ type: string; text?: string }>);
-			}
-		}
-	}
-	return responseText;
-}
-
-export function buildAgentEndToolSummary(toolCallCount: number, toolCallNames: readonly string[]): string {
-	return toolCallCount > 0 ? `${toolCallCount} tools (${toolCallNames.join(", ")})` : "0 tools (discussion)";
-}
-
-export function buildAgentEndChainEntry(
-	fileName: string,
-	userPrompt: string,
-	responseText: string,
-	toolCallCount: number,
-	toolCallNames: readonly string[],
-): ChainEntry {
-	return {
-		fileName,
-		userPrompt,
-		responseSequence: responseText,
-		toolSummary: buildAgentEndToolSummary(toolCallCount, toolCallNames),
-	};
-}
-
-export function getAgentEndParentId(chain: readonly { fileName: string }[]): string | null {
-	return chain.length >= 2 ? chain[chain.length - 2].fileName : null;
-}
-
-export function buildAgentEndRoundData(args: {
-	userPrompt: string;
-	responseText: string;
-	turnIndex: number | null;
-	toolCallCount: number;
-	toolCallNames: string[];
-	toolCalls: ToolCallDetail[];
-	responseSegments: ResponseSegment[];
-	parentId: string | null;
-	userTimestamp?: number;
-}): Record<string, unknown> {
-	return {
-		id: computeContentHash(args.userPrompt, args.responseText, args.toolCalls),
-		userPrompt: args.userPrompt,
-		responseSequence: args.responseText,
-		turnIndex: args.turnIndex ?? 0,
-		userTimestamp: args.userTimestamp ?? Date.now(),
-		toolCallCount: args.toolCallCount,
-		toolCallNames: args.toolCallNames,
-		toolCalls: args.toolCalls,
-		responseSegments: args.responseSegments,
-		promptEmbedding: undefined,
-		parentId: args.parentId,
-		relatedParentId: null,
-	};
-}
-
-export function buildAgentEndEmbeddingTexts(
-	userPrompt: string,
-	responseText: string,
-	maxResponseBytes = 24000,
-): { clippedResponse: string; combinedText: string } {
-	const strippedResponse = responseText.replace(/\[(?:Tool call )?REDACTED[^\]]*\]\n?/g, "");
-	const responseBuf = Buffer.from(strippedResponse, "utf-8");
-	const clippedResponse =
-		responseBuf.length > maxResponseBytes
-			? responseBuf.slice(0, maxResponseBytes).toString("utf-8")
-			: strippedResponse;
-	return {
-		clippedResponse,
-		combinedText: `${userPrompt}\n\n${clippedResponse}`,
-	};
-}
-
-export function getRelatedParentIdFromGroup<T extends { fileName: string }>(
-	group: { rounds: readonly T[] },
-	roundEntry: T,
-): string | null {
-	if (group.rounds.length <= 1) return null;
-	const groupRoundIdx = group.rounds.indexOf(roundEntry);
-	return groupRoundIdx > 0 ? group.rounds[groupRoundIdx - 1].fileName : null;
-}
-
-export interface MessageEndProcessingState {
-	accumulatedText: string[];
-	toolCallCount: number;
-	toolCallNames: string[];
-	toolCalls: ToolCallDetail[];
-	responseSegments: ResponseSegment[];
-}
-
-export function applyMessageEndToState(message: unknown, state: MessageEndProcessingState): void {
-	if (!message) return;
-
-	const msg = message as { role?: string; content?: unknown; toolCallId?: string };
-	if (msg.role === "user") {
-		// User sent something -- don't reset the accumulator, this is a new agent
-		// cycle (agent_start will reset it). Keep safe.
-		return;
-	}
-
-	if (msg.role === "assistant") {
-		// Extract text from this assistant message
-		const content = msg.content as Array<{ type: string; text?: string }> | undefined;
-		if (Array.isArray(content)) {
-			for (const block of content) {
-				if (block.type === "text" && block.text) {
-					state.accumulatedText.push(block.text);
-					state.responseSegments.push({ type: "text", text: block.text });
-				} else if (block.type === "toolCall") {
-					state.toolCallCount++;
-					const blockRec = block as Record<string, unknown>;
-					const name = blockRec.name as string | undefined;
-					const id = blockRec.id as string | undefined;
-					if (name && !state.toolCallNames.includes(name)) {
-						state.toolCallNames.push(name);
-					}
-					if (id && name) {
-						const detail: ToolCallDetail = {
-							index: state.toolCalls.length,
-							name,
-							arguments: JSON.stringify(blockRec.arguments ?? {}),
-							result_summary: "",
-						};
-						state.toolCalls.push(detail);
-					}
-					// Record this tool call's position in the response stream
-					state.responseSegments.push({ type: "toolCall", toolCallIndex: state.toolCalls.length - 1 });
-				}
-			}
-		}
-		return;
-	}
-
-	if (msg.role === "toolResult") {
-		// Pair tool results with their calls
-		const toolCallId = msg.toolCallId;
-		if (toolCallId) {
-			// Find the matching ToolCallDetail by matching the last call without a result
-			// (pi sessions don't expose the toolCallId -> toolCall mapping directly, so
-			// we match sequentially — results arrive in order)
-			for (let i = state.toolCalls.length - 1; i >= 0; i--) {
-				if (state.toolCalls[i].result_summary === "") {
-					const resultContent = msg.content as Array<{ type: string; text?: string }> | undefined;
-					const resultText = resultContent ? extractText(resultContent) : "";
-					state.toolCalls[i].result_summary = resultText.slice(0, 300);
-					state.toolCalls[i].result_full = resultText;
-					state.toolCalls[i].result_truncated = false;
-					break;
-				}
-			}
-		}
-	}
+	return loadSessionStartIndexCore(indexPath, deps);
 }
 
 export function readRoundFileFromDir(
@@ -993,241 +259,6 @@ let roundPresentedRecorded = false; // dedup: recordPresented only once per agen
 let cachedEnvPreamble: string | null = null;
 let cachedContextMessages: unknown[] | null = null;
 let cachedUserPromptForContext: string | null = null; // the extracted user prompt used to build cachedContextMessages
-
-export interface ApiKeyContext {
-	modelRegistry?: { getApiKeyForProvider(provider: string): Promise<string | undefined> };
-}
-
-export interface ApiKeyLookupDeps {
-	env?: { OPENROUTER_API_KEY?: string };
-	spawnImpl?: typeof spawn;
-}
-
-export async function getApiKey(ctx?: ApiKeyContext, deps: ApiKeyLookupDeps = {}): Promise<string | null> {
-	// 1. Environment variable
-	const env = deps.env ?? process.env;
-	const envKey = env.OPENROUTER_API_KEY;
-	if (envKey) return envKey;
-
-	// 2. Pi's configured OpenRouter auth (e.g. /login, auth storage, models.json)
-	try {
-		const piKey = await ctx!.modelRegistry!.getApiKeyForProvider("openrouter");
-		if (piKey) return piKey;
-	} catch {
-		// Pi auth lookup failed, fall through
-	}
-
-	// 3. Pass store (async to avoid blocking the event loop)
-	try {
-		return await new Promise<string | null>((resolve) => {
-			const child = (deps.spawnImpl ?? spawn)("pass", ["show", "ai/openrouter"], {
-				timeout: 1000,
-				stdio: ["pipe", "pipe", "pipe"],
-			});
-			let stdout = "";
-			child.stdout!.on("data", (chunk: Buffer) => {
-				stdout += chunk.toString();
-			});
-			child.on("close", (code) => {
-				if (code === 0) {
-					const trimmed = stdout.trim();
-					resolve(trimmed || null);
-				} else {
-					resolve(null);
-				}
-			});
-			child.on("error", () => resolve(null));
-		});
-	} catch {
-		// pass not available, fall through
-	}
-
-	return null;
-}
-
-const EMBED_TIMEOUT_MS = 15_000; // AbortController timeout (#43)
-const EMBED_MAX_RETRIES = 3; // max attempts including first (#42)
-const EMBED_BACKOFF_MS = 1000; // base backoff for retry #1
-
-export interface EmbeddingResponseLike {
-	ok: boolean;
-	status: number;
-	text(): Promise<string>;
-	json(): Promise<unknown>;
-}
-
-export type EmbeddingFetch = (url: string, init: RequestInit) => Promise<EmbeddingResponseLike>;
-
-export interface EmbedTextDeps {
-	fetchImpl?: EmbeddingFetch;
-	sleep?: (ms: number) => Promise<void>;
-	timeoutMs?: number;
-	maxRetries?: number;
-	backoffMs?: number;
-}
-
-function sleep(ms: number): Promise<void> {
-	return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
-export async function embedText(text: string, apiKey: string, deps: EmbedTextDeps = {}): Promise<number[]> {
-	const fetchImpl: EmbeddingFetch = deps.fetchImpl ?? ((url, init) => fetch(url, init));
-	const sleepImpl = deps.sleep ?? sleep;
-	const timeoutMs = deps.timeoutMs ?? EMBED_TIMEOUT_MS;
-	const maxRetries = deps.maxRetries ?? EMBED_MAX_RETRIES;
-	const backoffMs = deps.backoffMs ?? EMBED_BACKOFF_MS;
-	let lastError: Error | undefined;
-
-	for (let attempt = 0; attempt < maxRetries; attempt++) {
-		const controller = new AbortController();
-		const timer = setTimeout(() => controller.abort(), timeoutMs);
-
-		try {
-			const response = await fetchImpl(OPENROUTER_URL, {
-				method: "POST",
-				headers: {
-					"Content-Type": "application/json",
-					Authorization: `Bearer ${apiKey}`,
-				},
-				body: JSON.stringify({
-					model: EMBEDDING_MODEL,
-					input: text,
-				}),
-				signal: controller.signal,
-			});
-
-			if (!response.ok) {
-				const errText = await response.text();
-				const err = new Error(`Embedding API error ${response.status}: ${errText}`);
-				// Don't retry on 4xx (except 429 rate-limit)
-				if (response.status >= 400 && response.status < 500 && response.status !== 429) {
-					throw err; // fatal — no retry
-				}
-				lastError = err;
-				// fall through to retry for 5xx / 429
-			} else {
-				const data = (await response.json()) as {
-					data: Array<{ embedding: number[] }>;
-				};
-				return data.data[0].embedding;
-			}
-		} catch (e) {
-			if (e instanceof DOMException && e.name === "AbortError") {
-				lastError = new Error(`Embedding API timeout after ${timeoutMs}ms`);
-			} else if (e instanceof Error && e.message.startsWith("Embedding API error 4") && !e.message.includes("429")) {
-				throw e; // 4xx (non-429) is fatal — no retry
-			} else {
-				lastError = e instanceof Error ? e : new Error(String(e));
-			}
-		} finally {
-			clearTimeout(timer);
-		}
-
-		// Backoff before retry (not after last attempt)
-		if (attempt < maxRetries - 1) {
-			await sleepImpl(backoffMs * 2 ** attempt);
-		}
-	}
-
-	throw lastError ?? new Error("Embedding API failed after retries");
-}
-
-// Lock constants for atomic index writes (#44)
-const INDEX_LOCK_RETRIES = 15; // max lock attempts
-const INDEX_LOCK_BACKOFF_MS = 50; // base backoff per retry
-
-type IndexStorageFs = Pick<
-	typeof fs,
-	| "appendFileSync"
-	| "closeSync"
-	| "existsSync"
-	| "mkdirSync"
-	| "openSync"
-	| "readFileSync"
-	| "renameSync"
-	| "statSync"
-	| "unlinkSync"
-	| "writeFileSync"
->;
-
-export interface AppendIndexDeps {
-	fsImpl?: IndexStorageFs;
-	lockRetries?: number;
-	lockBackoffMs?: number;
-	now?: () => number;
-	processId?: number;
-	staleLockMs?: number;
-	wait?: (ms: number) => void;
-}
-
-export function appendToIndexPath(
-	indexPath: string,
-	roundsDir: string,
-	filePath: string,
-	vector: number[],
-	deps: AppendIndexDeps = {},
-) {
-	const fsImpl = deps.fsImpl ?? fs;
-	const lockRetries = deps.lockRetries ?? INDEX_LOCK_RETRIES;
-	const lockBackoffMs = deps.lockBackoffMs ?? INDEX_LOCK_BACKOFF_MS;
-	const now = deps.now ?? Date.now;
-	const staleLockMs = deps.staleLockMs ?? 10_000;
-	const wait = deps.wait ?? ((ms: number) => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms));
-	const processId = deps.processId ?? process.pid;
-	const b64 = Buffer.from(JSON.stringify(vector)).toString("base64url");
-	const line = `${b64},${filePath}\n`;
-	fsImpl.mkdirSync(roundsDir, { recursive: true });
-
-	const lockPath = `${indexPath}.lock`;
-
-	// Acquire lock with exponential backoff
-	let lockFd: number | null = null;
-	for (let attempt = 0; attempt < lockRetries; attempt++) {
-		try {
-			lockFd = fsImpl.openSync(lockPath, "wx");
-			break;
-		} catch {
-			// Staleness check: if lockfile is older than 10s, assume dead process, take over
-			try {
-				const stat = fsImpl.statSync(lockPath);
-				if (now() - stat.mtimeMs > staleLockMs) {
-					fsImpl.unlinkSync(lockPath);
-					lockFd = fsImpl.openSync(lockPath, "wx");
-					break;
-				}
-			} catch {
-				/* lock disappeared or unreadable — retry below */
-			}
-
-			if (attempt < lockRetries - 1) {
-				const waitMs = lockBackoffMs * 2 ** attempt;
-				wait(waitMs);
-			} else {
-				// Last attempt failed — fall back to direct append (best-effort)
-				try {
-					fsImpl.appendFileSync(indexPath, line);
-				} catch {}
-				return;
-			}
-		}
-	}
-
-	try {
-		// Read-modify-write under lock
-		const existing = fsImpl.existsSync(indexPath) ? fsImpl.readFileSync(indexPath, "utf-8") : "";
-		const newContent = existing + line;
-		const tmp = `${indexPath}.tmp.${processId}`;
-		fsImpl.writeFileSync(tmp, newContent);
-		fsImpl.renameSync(tmp, indexPath);
-	} finally {
-		if (lockFd !== null) {
-			fsImpl.closeSync(lockFd);
-			try {
-				fsImpl.unlinkSync(lockPath);
-			} catch {}
-		}
-	}
-}
 
 function appendToIndex(filePath: string, vector: number[]) {
 	appendToIndexPath(INDEX_PATH, ROUNDS_DIR, filePath, vector);
@@ -1787,7 +818,7 @@ export default function (pi: ExtensionAPI) {
 				}
 
 				const sorted = collectSearchRoundScores(scopedIndex, queryVec, readRoundFile);
-				return renderSearchInteractionsToolResult(sorted, threshold);
+				return renderSearchInteractionsToolResult(sorted, threshold, getRoundSize);
 			},
 		});
 
