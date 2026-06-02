@@ -2,8 +2,8 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { describe, expect, it, vi } from "vitest";
-import { computeContentHash } from "../src/core/hash.ts";
-import { encodeVectorIndexLine, loadVectorIndex, readIndexLines } from "../src/core/index-io.ts";
+import { computeContentHash } from "../lib/hash.ts";
+import { encodeVectorIndexLine, loadVectorIndex, readIndexLines } from "../lib/index-io.ts";
 import { embed, isMainModule, normalize, runDigestSession } from "./digest-session.ts";
 
 function tmpDir(): string {

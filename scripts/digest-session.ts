@@ -21,8 +21,8 @@ import {
 	findStaleContentMatches as findStaleContentMatchesInDir,
 	loadVectorIndex,
 	migrateIndexEntries as migrateIndexEntriesFile,
-} from "../src/core/index-io.ts";
-import { type ParsedPiRound, parsePiSessionJsonl } from "../src/core/pi-session.ts";
+} from "../lib/index-io.ts";
+import { type ParsedPiRound, parsePiSessionJsonl } from "../lib/pi-session.ts";
 
 // ─────────────────────────────────────────────
 // Types

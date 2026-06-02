@@ -2,8 +2,8 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { describe, expect, it, vi } from "vitest";
-import { claudeRoundFileName } from "../src/core/claude-code.ts";
-import { loadVectorIndex } from "../src/core/index-io.ts";
+import { claudeRoundFileName } from "../lib/claude-code.ts";
+import { loadVectorIndex } from "../lib/index-io.ts";
 import { isMainModule, runImportClaudeCode } from "./import-claude-code.ts";
 
 function tmpDir(): string {

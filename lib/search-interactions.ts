@@ -72,7 +72,7 @@ export function collectSearchRoundScores(
 
 export function computeContextBudget(
 	bestScore: number,
-	contextWindow: number = 128_000,
+	contextWindow = 128_000,
 	minSimilarity = 0.3,
 	minBudget = 2000,
 	budgetRatio = DEFAULT_CONTEXT_BUDGET_RATIO,

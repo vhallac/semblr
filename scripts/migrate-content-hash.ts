@@ -17,14 +17,14 @@
 import * as fs from "node:fs";
 import * as os from "node:os";
 import { pathToFileURL } from "node:url";
-import { computeContentHash } from "../src/core/hash.ts";
+import { computeContentHash } from "../lib/hash.ts";
 import {
 	filterIndexLinesExcludingFilenames,
 	readIndexByFilename,
 	readIndexLines,
 	replaceIndexLineFilename,
 	writeIndexLines,
-} from "../src/core/index-io.ts";
+} from "../lib/index-io.ts";
 
 // ─────────────────────────────────────────────
 // Config

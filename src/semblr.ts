@@ -20,18 +20,18 @@ import {
 	buildRelevanceList,
 	formatFileSize,
 	splitCommandArgs,
-} from "./core/context-format.ts";
-import { buildContextMessagePrefix, prepareContextMessages, shouldDropRelevanceList } from "./core/context-messages.ts";
-import { embedText, getApiKey } from "./core/embedding-client.ts";
-import { assignToGroup, formatGroupStats, parseGroupThreshold, type SemanticGroup } from "./core/grouping.ts";
-import { createRoundFilePath } from "./core/hash.ts";
+} from "../lib/context-format.ts";
+import { buildContextMessagePrefix, prepareContextMessages, shouldDropRelevanceList } from "../lib/context-messages.ts";
+import { embedText, getApiKey } from "../lib/embedding-client.ts";
+import { assignToGroup, formatGroupStats, parseGroupThreshold, type SemanticGroup } from "../lib/grouping.ts";
+import { createRoundFilePath } from "../lib/hash.ts";
 import {
 	appendToIndexPath,
 	buildSessionStartStatus,
 	type IndexEntry,
 	loadIndexFromPath as loadIndexFromPathCore,
 	loadSessionStartIndex as loadSessionStartIndexCore,
-} from "./core/index-storage.ts";
+} from "../lib/index-storage.ts";
 import {
 	applyMessageEndToState,
 	buildAgentEndChainEntry,
@@ -42,14 +42,14 @@ import {
 	getAgentEndParentId,
 	getRelatedParentIdFromGroup,
 	type MessageEndProcessingState,
-} from "./core/round-capture.ts";
-import type { ChainEntry, ResponseSegment, RoundData, ToolCallDetail } from "./core/round-data.ts";
+} from "../lib/round-capture.ts";
+import type { ChainEntry, ResponseSegment, RoundData, ToolCallDetail } from "../lib/round-data.ts";
 import {
 	loadRoundDataForToolDetails,
 	renderRoundDetailsToolResult,
 	renderToolDetailsToolResult,
 	type ToolDetailsParams,
-} from "./core/round-tool-results.ts";
+} from "../lib/round-tool-results.ts";
 import {
 	collectSearchRoundScores,
 	computeContextBudget,
@@ -58,15 +58,15 @@ import {
 	renderSearchInteractionsToolResult,
 	type SearchInteractionsParams,
 	selectContextRounds,
-} from "./core/search-interactions.ts";
+} from "../lib/search-interactions.ts";
 import {
 	flushStatsFile,
 	formatChainReadStatsReport,
 	loadStatsFile,
 	recordPresented,
 	recordRead,
-} from "./core/stats.ts";
-import { normalize } from "./core/vector.ts";
+} from "../lib/stats.ts";
+import { normalize } from "../lib/vector.ts";
 
 export {
 	buildContextMessagePrefix,
@@ -75,10 +75,10 @@ export {
 	prepareContextMessages,
 	shouldDropRelevanceList,
 	startsWithEnvironmentPreamble,
-} from "./core/context-messages.ts";
-export { embedText, getApiKey } from "./core/embedding-client.ts";
-export { appendToIndexPath, buildSessionStartStatus, countUniqueIndexedRounds } from "./core/index-storage.ts";
-export type { MessageEndProcessingState } from "./core/round-capture.ts";
+} from "../lib/context-messages.ts";
+export { embedText, getApiKey } from "../lib/embedding-client.ts";
+export { appendToIndexPath, buildSessionStartStatus, countUniqueIndexedRounds } from "../lib/index-storage.ts";
+export type { MessageEndProcessingState } from "../lib/round-capture.ts";
 export {
 	applyMessageEndToState,
 	buildAgentEndChainEntry,
@@ -89,8 +89,8 @@ export {
 	extractAgentEndUserPrompt,
 	getAgentEndParentId,
 	getRelatedParentIdFromGroup,
-} from "./core/round-capture.ts";
-export type { RoundData } from "./core/round-data.ts";
+} from "../lib/round-capture.ts";
+export type { RoundData } from "../lib/round-data.ts";
 export {
 	buildRoundAssistantOutput,
 	collapseRoundDetails,
@@ -98,7 +98,7 @@ export {
 	loadRoundDataForToolDetails,
 	renderRoundDetailsToolResult,
 	renderToolDetailsToolResult,
-} from "./core/round-tool-results.ts";
+} from "../lib/round-tool-results.ts";
 export {
 	collectSearchRoundScores,
 	computeContextBudget,
@@ -106,7 +106,7 @@ export {
 	normalizeSearchInteractionsParams,
 	renderSearchInteractionsToolResult,
 	selectContextRounds,
-} from "./core/search-interactions.ts";
+} from "../lib/search-interactions.ts";
 
 // ─────────────────────────────────────────────
 // Config
@@ -157,7 +157,7 @@ let roundGroups: RoundGroup[] = [];
 
 const SEMBLR_GROUP_THRESHOLD = parseGroupThreshold(process.env.SEMBLR_GROUP_THRESHOLD);
 
-// Context formatting helpers live in src/core/context-format.ts.
+// Context formatting helpers live in lib/context-format.ts.
 
 // ─────────────────────────────────────────────
 // Helpers

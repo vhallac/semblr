@@ -17,12 +17,9 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { pathToFileURL } from "node:url";
+import { type ClaudeRound, claudeRoundFileName, parseClaudeCodeJsonl } from "../lib/claude-code.ts";
 import { embedText, getApiKey, normalize } from "../lib/embed.ts";
-import { type ClaudeRound, claudeRoundFileName, parseClaudeCodeJsonl } from "../src/core/claude-code.ts";
-import {
-	appendVectorIndexEntry,
-	loadIndexedRoundFiles as loadIndexedRoundFilesFromIndex,
-} from "../src/core/index-io.ts";
+import { appendVectorIndexEntry, loadIndexedRoundFiles as loadIndexedRoundFilesFromIndex } from "../lib/index-io.ts";
 
 const CLAUDE_PROJECTS_DIR = process.env.CLAUDE_PROJECTS_DIR || path.resolve(os.homedir(), ".claude", "projects");
 const ROUNDS_DIR = process.env.SEMBLR_ROUNDS_DIR || path.resolve(os.homedir(), ".pi", "agent", "semblr", "rounds");
