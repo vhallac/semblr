@@ -357,9 +357,12 @@ export interface IndexEntry {
 	vector: number[];
 }
 
-function loadIndex(): IndexEntry[] {
-	if (!fs.existsSync(INDEX_PATH)) return [];
-	const raw = fs.readFileSync(INDEX_PATH, "utf-8").trim();
+export function loadIndexFromPath(
+	indexPath: string = INDEX_PATH,
+	fsImpl: Pick<typeof fs, "existsSync" | "readFileSync"> = fs,
+): IndexEntry[] {
+	if (!fsImpl.existsSync(indexPath)) return [];
+	const raw = fsImpl.readFileSync(indexPath, "utf-8").trim();
 	if (!raw) return [];
 	return raw.split("\n").map((line) => {
 		const comma = line.indexOf(",");
@@ -368,6 +371,10 @@ function loadIndex(): IndexEntry[] {
 		const decoded = JSON.parse(Buffer.from(b64, "base64url").toString("utf-8"));
 		return { filePath, vector: Array.isArray(decoded) ? decoded : [] };
 	});
+}
+
+function loadIndex(): IndexEntry[] {
+	return loadIndexFromPath(INDEX_PATH);
 }
 
 interface ToolCallDetail {
@@ -1054,39 +1061,76 @@ export async function embedText(text: string, apiKey: string, deps: EmbedTextDep
 const INDEX_LOCK_RETRIES = 15; // max lock attempts
 const INDEX_LOCK_BACKOFF_MS = 50; // base backoff per retry
 
-function appendToIndex(filePath: string, vector: number[]) {
+type IndexStorageFs = Pick<
+	typeof fs,
+	| "appendFileSync"
+	| "closeSync"
+	| "existsSync"
+	| "mkdirSync"
+	| "openSync"
+	| "readFileSync"
+	| "renameSync"
+	| "statSync"
+	| "unlinkSync"
+	| "writeFileSync"
+>;
+
+export interface AppendIndexDeps {
+	fsImpl?: IndexStorageFs;
+	lockRetries?: number;
+	lockBackoffMs?: number;
+	now?: () => number;
+	processId?: number;
+	staleLockMs?: number;
+	wait?: (ms: number) => void;
+}
+
+export function appendToIndexPath(
+	indexPath: string,
+	roundsDir: string,
+	filePath: string,
+	vector: number[],
+	deps: AppendIndexDeps = {},
+) {
+	const fsImpl = deps.fsImpl ?? fs;
+	const lockRetries = deps.lockRetries ?? INDEX_LOCK_RETRIES;
+	const lockBackoffMs = deps.lockBackoffMs ?? INDEX_LOCK_BACKOFF_MS;
+	const now = deps.now ?? Date.now;
+	const staleLockMs = deps.staleLockMs ?? 10_000;
+	const wait = deps.wait ?? ((ms: number) => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms));
+	const processId = deps.processId ?? process.pid;
 	const b64 = Buffer.from(JSON.stringify(vector)).toString("base64url");
 	const line = `${b64},${filePath}\n`;
-	fs.mkdirSync(ROUNDS_DIR, { recursive: true });
+	fsImpl.mkdirSync(roundsDir, { recursive: true });
 
-	const lockPath = `${INDEX_PATH}.lock`;
+	const lockPath = `${indexPath}.lock`;
 
 	// Acquire lock with exponential backoff
 	let lockFd: number | null = null;
-	for (let attempt = 0; attempt < INDEX_LOCK_RETRIES; attempt++) {
+	for (let attempt = 0; attempt < lockRetries; attempt++) {
 		try {
-			lockFd = fs.openSync(lockPath, "wx");
+			lockFd = fsImpl.openSync(lockPath, "wx");
 			break;
 		} catch {
 			// Staleness check: if lockfile is older than 10s, assume dead process, take over
 			try {
-				const stat = fs.statSync(lockPath);
-				if (Date.now() - stat.mtimeMs > 10_000) {
-					fs.unlinkSync(lockPath);
-					lockFd = fs.openSync(lockPath, "wx");
+				const stat = fsImpl.statSync(lockPath);
+				if (now() - stat.mtimeMs > staleLockMs) {
+					fsImpl.unlinkSync(lockPath);
+					lockFd = fsImpl.openSync(lockPath, "wx");
 					break;
 				}
 			} catch {
 				/* lock disappeared or unreadable — retry below */
 			}
 
-			if (attempt < INDEX_LOCK_RETRIES - 1) {
-				const waitMs = INDEX_LOCK_BACKOFF_MS * 2 ** attempt;
-				Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, waitMs);
+			if (attempt < lockRetries - 1) {
+				const waitMs = lockBackoffMs * 2 ** attempt;
+				wait(waitMs);
 			} else {
 				// Last attempt failed — fall back to direct append (best-effort)
 				try {
-					fs.appendFileSync(INDEX_PATH, line);
+					fsImpl.appendFileSync(indexPath, line);
 				} catch {}
 				return;
 			}
@@ -1095,19 +1139,23 @@ function appendToIndex(filePath: string, vector: number[]) {
 
 	try {
 		// Read-modify-write under lock
-		const existing = fs.existsSync(INDEX_PATH) ? fs.readFileSync(INDEX_PATH, "utf-8") : "";
+		const existing = fsImpl.existsSync(indexPath) ? fsImpl.readFileSync(indexPath, "utf-8") : "";
 		const newContent = existing + line;
-		const tmp = `${INDEX_PATH}.tmp.${process.pid}`;
-		fs.writeFileSync(tmp, newContent);
-		fs.renameSync(tmp, INDEX_PATH);
+		const tmp = `${indexPath}.tmp.${processId}`;
+		fsImpl.writeFileSync(tmp, newContent);
+		fsImpl.renameSync(tmp, indexPath);
 	} finally {
 		if (lockFd !== null) {
-			fs.closeSync(lockFd);
+			fsImpl.closeSync(lockFd);
 			try {
-				fs.unlinkSync(lockPath);
+				fsImpl.unlinkSync(lockPath);
 			} catch {}
 		}
 	}
+}
+
+function appendToIndex(filePath: string, vector: number[]) {
+	appendToIndexPath(INDEX_PATH, ROUNDS_DIR, filePath, vector);
 }
 
 function extensionRoot(): string {

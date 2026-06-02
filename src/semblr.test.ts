@@ -3,6 +3,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { describe, expect, it, vi } from "vitest";
 import registerSemblr, {
+	appendToIndexPath,
 	applyMessageEndToState,
 	buildAgentEndChainEntry,
 	buildAgentEndEmbeddingTexts,
@@ -21,6 +22,7 @@ import registerSemblr, {
 	formatRoundToolMeta,
 	getAgentEndParentId,
 	getRelatedParentIdFromGroup,
+	loadIndexFromPath,
 	loadRoundDataForToolDetails,
 	type MessageEndProcessingState,
 	normalizeSearchInteractionsParams,
@@ -409,6 +411,117 @@ describe("embedText join points", () => {
 		);
 		expect(networkFetch).toHaveBeenCalledTimes(2);
 		expect(sleep).toHaveBeenCalledTimes(1);
+	});
+});
+
+describe("index CSV storage join points", () => {
+	const tmpDir = () => fs.mkdtempSync(path.join(os.tmpdir(), "semblr-index-test-"));
+	const encodedLine = (vector: unknown, filePath: string) =>
+		`${Buffer.from(JSON.stringify(vector)).toString("base64url")},${filePath}\n`;
+
+	it("loads missing, empty, and valid index files", () => {
+		const dir = tmpDir();
+		const indexPath = path.join(dir, "index.csv");
+
+		expect(loadIndexFromPath(indexPath)).toEqual([]);
+		fs.writeFileSync(indexPath, "");
+		expect(loadIndexFromPath(indexPath)).toEqual([]);
+
+		fs.writeFileSync(
+			indexPath,
+			encodedLine([1, 2, 3], "round-a.json:prompt") + encodedLine({ not: "array" }, "round-b.json:response"),
+		);
+
+		expect(loadIndexFromPath(indexPath)).toEqual([
+			{ filePath: "round-a.json:prompt", vector: [1, 2, 3] },
+			{ filePath: "round-b.json:response", vector: [] },
+		]);
+	});
+
+	it("appends atomically under a new lock and preserves existing content", () => {
+		const dir = tmpDir();
+		const roundsDir = path.join(dir, "rounds");
+		const indexPath = path.join(roundsDir, "index.csv");
+		fs.mkdirSync(roundsDir, { recursive: true });
+		fs.writeFileSync(indexPath, encodedLine([0], "existing.json:round"));
+
+		appendToIndexPath(indexPath, roundsDir, "new.json:prompt", [4, 5], { processId: 123 });
+
+		expect(fs.readFileSync(indexPath, "utf-8")).toBe(
+			encodedLine([0], "existing.json:round") + encodedLine([4, 5], "new.json:prompt"),
+		);
+		expect(fs.existsSync(`${indexPath}.lock`)).toBe(false);
+		expect(fs.existsSync(`${indexPath}.tmp.123`)).toBe(false);
+	});
+
+	it("waits before retry and tolerates lock cleanup failure", () => {
+		const dir = tmpDir();
+		const roundsDir = path.join(dir, "rounds");
+		const indexPath = path.join(roundsDir, "index.csv");
+		let openCalls = 0;
+		const wait = vi.fn();
+		const fsImpl = {
+			...fs,
+			openSync: (target: fs.PathLike, flags: fs.OpenMode) => {
+				openCalls += 1;
+				if (openCalls === 1) throw new Error("busy once");
+				return fs.openSync(target, flags);
+			},
+			statSync: () => {
+				throw new Error("lock disappeared before stat");
+			},
+			unlinkSync: (target: fs.PathLike) => {
+				if (String(target).endsWith(".lock")) throw new Error("cleanup failed");
+				return fs.unlinkSync(target);
+			},
+		};
+
+		appendToIndexPath(indexPath, roundsDir, "retried.json:prompt", [6], {
+			fsImpl,
+			lockBackoffMs: 11,
+			lockRetries: 2,
+			processId: 789,
+			wait,
+		});
+
+		expect(wait).toHaveBeenCalledWith(11);
+		expect(fs.readFileSync(indexPath, "utf-8")).toBe(encodedLine([6], "retried.json:prompt"));
+		expect(fs.existsSync(`${indexPath}.lock`)).toBe(true);
+		fs.unlinkSync(`${indexPath}.lock`);
+	});
+
+	it("takes over stale locks and falls back to direct append when the lock remains busy", () => {
+		const staleDir = tmpDir();
+		const staleRoundsDir = path.join(staleDir, "rounds");
+		const staleIndexPath = path.join(staleRoundsDir, "index.csv");
+		fs.mkdirSync(staleRoundsDir, { recursive: true });
+		fs.writeFileSync(`${staleIndexPath}.lock`, "stale");
+
+		appendToIndexPath(staleIndexPath, staleRoundsDir, "stale.json:round", [7], {
+			now: () => Date.now() + 20_000,
+			processId: 456,
+			staleLockMs: 10_000,
+		});
+
+		expect(fs.readFileSync(staleIndexPath, "utf-8")).toBe(encodedLine([7], "stale.json:round"));
+		expect(fs.existsSync(`${staleIndexPath}.lock`)).toBe(false);
+
+		const busyDir = tmpDir();
+		const busyRoundsDir = path.join(busyDir, "rounds");
+		const busyIndexPath = path.join(busyRoundsDir, "index.csv");
+		fs.mkdirSync(busyRoundsDir, { recursive: true });
+		fs.writeFileSync(`${busyIndexPath}.lock`, "busy");
+		const wait = vi.fn();
+
+		appendToIndexPath(busyIndexPath, busyRoundsDir, "fallback.json:response", [8], {
+			lockRetries: 1,
+			wait,
+			now: () => 0,
+		});
+
+		expect(fs.readFileSync(busyIndexPath, "utf-8")).toBe(encodedLine([8], "fallback.json:response"));
+		expect(fs.existsSync(`${busyIndexPath}.lock`)).toBe(true);
+		expect(wait).not.toHaveBeenCalled();
 	});
 });
 
