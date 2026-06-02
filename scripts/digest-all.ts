@@ -108,11 +108,12 @@ export async function runDigestAll(options: DigestAllOptions = {}): Promise<numb
 	const err = options.stderr ?? console;
 	const f = options.fsImpl ?? fs;
 
-	const apiKey = options.apiKey ?? (await getApiKey());
-	if (!apiKey) {
+	const rawApiKey = options.apiKey ?? (await getApiKey());
+	if (!rawApiKey) {
 		err.error("❌ OPENROUTER_API_KEY environment variable required");
 		return 1;
 	}
+	const apiKey: string = rawApiKey;
 
 	// Gather all session JSONL files
 	const jsonlFiles = gatherSessionFiles(sessionsDir, { fsImpl: f });
