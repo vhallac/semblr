@@ -1,13 +1,34 @@
-import { describe, expect, it } from "vitest";
-import {
+import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
+import { describe, expect, it, vi } from "vitest";
+import registerSemblr, {
+	applyMessageEndToState,
+	buildAgentEndChainEntry,
+	buildAgentEndEmbeddingTexts,
+	buildAgentEndRoundData,
+	buildAgentEndToolSummary,
 	buildContextMessagePrefix,
 	buildRoundAssistantOutput,
 	collapseRoundDetails,
+	collectSearchRoundScores,
 	countWordsInMessageContent,
+	embedText,
+	extractAgentEndResponseText,
+	extractAgentEndUserPrompt,
 	extractContextPrompt,
+	filterSearchIndexByRounds,
 	formatRoundToolMeta,
+	getAgentEndParentId,
+	getRelatedParentIdFromGroup,
+	loadRoundDataForToolDetails,
+	type MessageEndProcessingState,
+	normalizeSearchInteractionsParams,
 	prepareContextMessages,
+	type RoundData,
 	renderRoundDetailsToolResult,
+	renderSearchInteractionsToolResult,
+	renderToolDetailsToolResult,
 	shouldDropRelevanceList,
 	startsWithEnvironmentPreamble,
 } from "./semblr.ts";
@@ -135,6 +156,350 @@ describe("semblr context hook join points", () => {
 	});
 });
 
+describe("agent_end handler join points", () => {
+	it("extracts the prompt from cached state, string messages, and text-array messages", () => {
+		expect(extractAgentEndUserPrompt("cached prompt", [{ role: "user", content: "message prompt" }])).toBe(
+			"cached prompt",
+		);
+		expect(
+			extractAgentEndUserPrompt(null, [
+				{ role: "user", content: "first prompt" },
+				{ role: "assistant", content: "answer" },
+				{ role: "user", content: "last prompt" },
+			]),
+		).toBe("last prompt");
+		expect(
+			extractAgentEndUserPrompt("", [
+				{
+					role: "user",
+					content: [{ type: "text", text: "array" }, { type: "image" }, { type: "text", text: "prompt" }],
+				},
+			]),
+		).toBe("array prompt");
+		expect(extractAgentEndUserPrompt(null, [{ role: "assistant", content: "answer" }])).toBe("");
+		expect(extractAgentEndUserPrompt(null, [{ role: "user", content: 42 }])).toBe("");
+	});
+
+	it("prefers accumulated assistant text and falls back to the last assistant message", () => {
+		expect(extractAgentEndResponseText([" first ", "second"])).toBe("first \n\nsecond");
+		expect(
+			extractAgentEndResponseText(
+				[],
+				[
+					{ role: "assistant", content: "old answer" },
+					{ role: "user", content: "prompt" },
+					{ role: "assistant", content: "new answer" },
+				],
+			),
+		).toBe("new answer");
+		expect(
+			extractAgentEndResponseText(
+				[],
+				[
+					{
+						role: "assistant",
+						content: [
+							{ type: "text", text: "array" },
+							{ type: "toolCall", name: "read" },
+							{ type: "text", text: "answer" },
+						],
+					},
+				],
+			),
+		).toBe("array answer");
+		expect(extractAgentEndResponseText([], [{ role: "user", content: "prompt" }])).toBe("");
+		expect(extractAgentEndResponseText([], [{ role: "assistant", content: 42 }])).toBe("");
+	});
+
+	it("builds causal chain entries and parent metadata from existing handler state", () => {
+		expect(buildAgentEndToolSummary(0, [])).toBe("0 tools (discussion)");
+		expect(buildAgentEndToolSummary(2, ["read", "bash"])).toBe("2 tools (read, bash)");
+
+		const entry = buildAgentEndChainEntry("round.json", "prompt", "answer", 1, ["read"]);
+		expect(entry).toEqual({
+			fileName: "round.json",
+			userPrompt: "prompt",
+			responseSequence: "answer",
+			toolSummary: "1 tools (read)",
+		});
+		expect(getAgentEndParentId([])).toBeNull();
+		expect(getAgentEndParentId([{ fileName: "one.json" }])).toBeNull();
+		expect(getAgentEndParentId([{ fileName: "one.json" }, { fileName: "two.json" }])).toBe("one.json");
+	});
+
+	it("builds the persisted round payload with default and explicit values", () => {
+		const toolCalls = [
+			{
+				index: 0,
+				name: "read",
+				arguments: "{}",
+				result_summary: "summary",
+				result_full: "full",
+				result_truncated: false,
+			},
+		];
+		const roundData = buildAgentEndRoundData({
+			userPrompt: "prompt",
+			responseText: "answer",
+			turnIndex: null,
+			toolCallCount: 1,
+			toolCallNames: ["read"],
+			toolCalls,
+			responseSegments: [{ type: "toolCall", toolCallIndex: 0 }],
+			parentId: "parent.json",
+			userTimestamp: 123,
+		});
+
+		expect(roundData).toMatchObject({
+			id: expect.any(String),
+			userPrompt: "prompt",
+			responseSequence: "answer",
+			turnIndex: 0,
+			userTimestamp: 123,
+			toolCallCount: 1,
+			toolCallNames: ["read"],
+			toolCalls,
+			responseSegments: [{ type: "toolCall", toolCallIndex: 0 }],
+			parentId: "parent.json",
+			relatedParentId: null,
+		});
+		expect(Object.hasOwn(roundData, "promptEmbedding")).toBe(true);
+		expect(roundData.promptEmbedding).toBeUndefined();
+
+		const explicitTurn = buildAgentEndRoundData({
+			userPrompt: "prompt",
+			responseText: "answer",
+			turnIndex: 7,
+			toolCallCount: 0,
+			toolCallNames: [],
+			toolCalls: [],
+			responseSegments: [],
+			parentId: null,
+			userTimestamp: 456,
+		});
+		expect(explicitTurn.turnIndex).toBe(7);
+	});
+
+	it("strips redacted markers and clips embedding response input by byte length", () => {
+		expect(buildAgentEndEmbeddingTexts("prompt", "keep\n[REDACTED secret]\nafter")).toEqual({
+			clippedResponse: "keep\nafter",
+			combinedText: "prompt\n\nkeep\nafter",
+		});
+		expect(buildAgentEndEmbeddingTexts("prompt", "before\n[Tool call REDACTED: hidden]\nafter")).toEqual({
+			clippedResponse: "before\nafter",
+			combinedText: "prompt\n\nbefore\nafter",
+		});
+
+		const clipped = buildAgentEndEmbeddingTexts("p", "abcdef", 3);
+		expect(clipped.clippedResponse).toBe("abc");
+		expect(clipped.combinedText).toBe("p\n\nabc");
+	});
+
+	it("finds the related parent inside a semantic group", () => {
+		const first = { fileName: "first.json" };
+		const second = { fileName: "second.json" };
+		const third = { fileName: "third.json" };
+
+		expect(getRelatedParentIdFromGroup({ rounds: [] }, first)).toBeNull();
+		expect(getRelatedParentIdFromGroup({ rounds: [first] }, first)).toBeNull();
+		expect(getRelatedParentIdFromGroup({ rounds: [first, second, third] }, third)).toBe("second.json");
+		expect(getRelatedParentIdFromGroup({ rounds: [first, second] }, { fileName: "missing.json" })).toBeNull();
+	});
+
+	it("agent_end hook reports early skip statuses for missing prompt or response", async () => {
+		const handlers = new Map<string, (event: unknown, ctx: unknown) => Promise<unknown>>();
+		const pi = {
+			on: vi.fn((name: string, handler: (event: unknown, ctx: unknown) => Promise<unknown>) => {
+				handlers.set(name, handler);
+			}),
+			registerCommand: vi.fn(),
+			registerTool: vi.fn(),
+		};
+		const statuses: string[] = [];
+		const ctx = {
+			ui: {
+				setStatus: vi.fn((_key: string, value: string) => statuses.push(value)),
+				notify: vi.fn(),
+			},
+		};
+
+		registerSemblr(pi as never);
+		await handlers.get("agent_start")?.({}, ctx);
+		await handlers.get("agent_end")?.({ messages: [{ role: "assistant", content: "answer" }] }, ctx);
+		await handlers.get("agent_start")?.({}, ctx);
+		await handlers.get("agent_end")?.({ messages: [{ role: "user", content: "prompt" }] }, ctx);
+
+		expect(statuses).toContain("🧠 agent_end: no user prompt to save");
+		expect(statuses).toContain("🧠 agent_end: no response text");
+	});
+});
+
+describe("embedText join points", () => {
+	const response = (extra: Partial<{ ok: boolean; status: number; text: string; embedding: number[] }> = {}) => ({
+		ok: extra.ok ?? true,
+		status: extra.status ?? 200,
+		text: async () => extra.text ?? "",
+		json: async () => ({ data: [{ embedding: extra.embedding ?? [1, 2, 3] }] }),
+	});
+
+	it("sends the OpenRouter embedding request and returns the response vector", async () => {
+		const fetchImpl = vi.fn(async (_url: string, _init: RequestInit) => response({ embedding: [0.1, 0.2] }));
+
+		const embedding = await embedText("hello world", "api-key", { fetchImpl });
+
+		expect(embedding).toEqual([0.1, 0.2]);
+		expect(fetchImpl).toHaveBeenCalledTimes(1);
+		const [url, init] = fetchImpl.mock.calls[0];
+		expect(url).toBe("https://openrouter.ai/api/v1/embeddings");
+		expect(init.method).toBe("POST");
+		expect(init.headers).toEqual({
+			"Content-Type": "application/json",
+			Authorization: "Bearer api-key",
+		});
+		expect(JSON.parse(init.body as string)).toEqual({
+			model: "openai/text-embedding-3-small",
+			input: "hello world",
+		});
+		expect(init.signal).toBeInstanceOf(AbortSignal);
+	});
+
+	it("retries rate-limit and server errors with exponential backoff", async () => {
+		const fetchImpl = vi
+			.fn()
+			.mockResolvedValueOnce(response({ ok: false, status: 429, text: "rate limited" }))
+			.mockResolvedValueOnce(response({ ok: false, status: 500, text: "server exploded" }))
+			.mockResolvedValueOnce(response({ embedding: [9, 8, 7] }));
+		const sleep = vi.fn(async (_ms: number) => {});
+
+		const embedding = await embedText("retry me", "api-key", { fetchImpl, sleep, backoffMs: 25 });
+
+		expect(embedding).toEqual([9, 8, 7]);
+		expect(fetchImpl).toHaveBeenCalledTimes(3);
+		expect(sleep).toHaveBeenNthCalledWith(1, 25);
+		expect(sleep).toHaveBeenNthCalledWith(2, 50);
+	});
+
+	it("does not retry fatal non-rate-limit client errors", async () => {
+		const fetchImpl = vi.fn(async (_url: string, _init: RequestInit) =>
+			response({ ok: false, status: 401, text: "bad key" }),
+		);
+		const sleep = vi.fn(async (_ms: number) => {});
+
+		await expect(embedText("fatal", "api-key", { fetchImpl, sleep })).rejects.toThrow(
+			"Embedding API error 401: bad key",
+		);
+		expect(fetchImpl).toHaveBeenCalledTimes(1);
+		expect(sleep).not.toHaveBeenCalled();
+	});
+
+	it("reports timeout and final retry errors", async () => {
+		const timeoutFetch = vi.fn(async () => {
+			throw new DOMException("aborted", "AbortError");
+		});
+		await expect(
+			embedText("slow", "api-key", { fetchImpl: timeoutFetch, maxRetries: 1, timeoutMs: 5 }),
+		).rejects.toThrow("Embedding API timeout after 5ms");
+
+		const networkFetch = vi.fn(async () => {
+			throw new Error("network down");
+		});
+		const sleep = vi.fn(async (_ms: number) => {});
+		await expect(embedText("offline", "api-key", { fetchImpl: networkFetch, sleep, maxRetries: 2 })).rejects.toThrow(
+			"network down",
+		);
+		expect(networkFetch).toHaveBeenCalledTimes(2);
+		expect(sleep).toHaveBeenCalledTimes(1);
+	});
+});
+
+describe("message_end handler join points", () => {
+	const emptyState = (): MessageEndProcessingState => ({
+		accumulatedText: [],
+		toolCallCount: 0,
+		toolCallNames: [],
+		toolCalls: [],
+		responseSegments: [],
+	});
+
+	it("ignores missing messages, user messages, unknown roles, and non-array assistant content", () => {
+		const state = emptyState();
+
+		applyMessageEndToState(undefined, state);
+		applyMessageEndToState({ role: "user", content: "prompt" }, state);
+		applyMessageEndToState({ role: "assistant", content: "plain answer" }, state);
+		applyMessageEndToState({ role: "other", content: [{ type: "text", text: "ignored" }] }, state);
+
+		expect(state).toEqual(emptyState());
+	});
+
+	it("captures assistant text, tool-call details, unique names, and response segment order", () => {
+		const state = emptyState();
+
+		applyMessageEndToState(
+			{
+				role: "assistant",
+				content: [
+					{ type: "text", text: "before" },
+					{ type: "text", text: "" },
+					{ type: "toolCall", id: "call-1", name: "read", arguments: { path: "a.txt" } },
+					{ type: "toolCall", id: "call-2", name: "read", arguments: { path: "b.txt" } },
+					{ type: "toolCall", name: "bash", arguments: { command: "pwd" } },
+					{ type: "toolCall", id: "call-4", arguments: { ignored: true } },
+					{ type: "text", text: "after" },
+				],
+			},
+			state,
+		);
+
+		expect(state.accumulatedText).toEqual(["before", "after"]);
+		expect(state.toolCallCount).toBe(4);
+		expect(state.toolCallNames).toEqual(["read", "bash"]);
+		expect(state.toolCalls).toEqual([
+			{ index: 0, name: "read", arguments: '{"path":"a.txt"}', result_summary: "" },
+			{ index: 1, name: "read", arguments: '{"path":"b.txt"}', result_summary: "" },
+		]);
+		expect(state.responseSegments).toEqual([
+			{ type: "text", text: "before" },
+			{ type: "toolCall", toolCallIndex: 0 },
+			{ type: "toolCall", toolCallIndex: 1 },
+			{ type: "toolCall", toolCallIndex: 1 },
+			{ type: "toolCall", toolCallIndex: 1 },
+			{ type: "text", text: "after" },
+		]);
+	});
+
+	it("attaches tool results to the latest unresolved call in result order", () => {
+		const state = emptyState();
+		state.toolCalls.push(
+			{ index: 0, name: "read", arguments: "{}", result_summary: "" },
+			{ index: 1, name: "bash", arguments: "{}", result_summary: "" },
+		);
+
+		applyMessageEndToState({ role: "toolResult", content: [{ type: "text", text: "ignored" }] }, state);
+		expect(state.toolCalls[1].result_summary).toBe("");
+
+		const longResult = "x".repeat(350);
+		applyMessageEndToState(
+			{
+				role: "toolResult",
+				toolCallId: "call-2",
+				content: [{ type: "text", text: longResult }, { type: "image" }, { type: "text", text: "tail" }],
+			},
+			state,
+		);
+		expect(state.toolCalls[1].result_summary).toBe(longResult.slice(0, 300));
+		expect(state.toolCalls[1].result_full).toBe(`${longResult} tail`);
+		expect(state.toolCalls[1].result_truncated).toBe(false);
+
+		applyMessageEndToState(
+			{ role: "toolResult", toolCallId: "call-1", content: [{ type: "text", text: "first result" }] },
+			state,
+		);
+		expect(state.toolCalls[0].result_summary).toBe("first result");
+		expect(state.toolCalls[0].result_full).toBe("first result");
+	});
+});
+
 describe("get_round_details join points", () => {
 	const roundData = {
 		userPrompt: "user prompt",
@@ -233,5 +598,258 @@ describe("get_round_details join points", () => {
 				result_full: undefined,
 			}),
 		]);
+	});
+});
+
+describe("get_tool_details join points", () => {
+	const roundData = (extra: Partial<RoundData> = {}): RoundData => ({
+		userPrompt: "prompt",
+		responseSequence: "response",
+		turnIndex: 0,
+		toolCalls: [
+			{
+				index: 0,
+				name: "bash",
+				arguments: '{"command":"printf"}',
+				result_summary: "summary",
+				result_full: "line one\nneedle line\nline three\nneedle again",
+			},
+		],
+		...extra,
+	});
+
+	it("loads missing, malformed, and valid round files", () => {
+		const dir = fs.mkdtempSync(path.join(os.tmpdir(), "semblr-tool-details-"));
+		try {
+			const missing = loadRoundDataForToolDetails(path.join(dir, "missing.json"), "missing.json");
+			expect(missing.ok).toBe(false);
+			if (!missing.ok) expect(missing.result.content[0].text).toBe("Round file not found: missing.json");
+
+			const malformedPath = path.join(dir, "bad.json");
+			fs.writeFileSync(malformedPath, "{not json", "utf-8");
+			const malformed = loadRoundDataForToolDetails(malformedPath, "bad.json");
+			expect(malformed.ok).toBe(false);
+			if (!malformed.ok) expect(malformed.result.content[0].text).toBe("Failed to parse round file: bad.json");
+
+			const validPath = path.join(dir, "good.json");
+			fs.writeFileSync(validPath, JSON.stringify(roundData()), "utf-8");
+			const valid = loadRoundDataForToolDetails(validPath, "good.json");
+			expect(valid.ok).toBe(true);
+			if (valid.ok) expect(valid.roundData.toolCalls?.[0].name).toBe("bash");
+		} finally {
+			fs.rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
+	it("renders no-tool and invalid-index errors", () => {
+		const noToolCalls = renderToolDetailsToolResult(
+			{ round: "empty.json", index: 0 },
+			roundData({ toolCalls: undefined }),
+		);
+		expect(noToolCalls.content[0].text).toContain("This round has no tool calls stored");
+		expect(noToolCalls.details).toEqual({});
+
+		const emptyToolCalls = renderToolDetailsToolResult(
+			{ round: "empty.json", index: 0 },
+			roundData({ toolCalls: [] }),
+		);
+		expect(emptyToolCalls.content[0].text).toContain("This round has no tool calls stored");
+
+		const negative = renderToolDetailsToolResult({ round: "round.json", index: -1 }, roundData());
+		expect(negative.content[0].text).toBe("Invalid index -1. This round has 1 tool calls (indices 0–0).");
+
+		const tooHigh = renderToolDetailsToolResult({ round: "round.json", index: 1 }, roundData());
+		expect(tooHigh.content[0].text).toBe("Invalid index 1. This round has 1 tool calls (indices 0–0).");
+	});
+
+	it("renders full output, parsed arguments, empty output, and truncation metadata", () => {
+		const full = renderToolDetailsToolResult(
+			{ round: "round.json", index: 0 },
+			roundData({ toolCalls: [{ ...roundData().toolCalls![0], result_truncated: true }] }),
+		);
+		expect(full.content[0].text).toContain("Tool call #0 in round round.json");
+		expect(full.content[0].text).toContain('  Arguments: {\n  "command": "printf"\n}');
+		expect(full.content[0].text).toContain("[Output exceeds storage cap — showing entire stored result]");
+		expect(full.details).toEqual({
+			name: "bash",
+			arguments: '{"command":"printf"}',
+			result_full: "line one\nneedle line\nline three\nneedle again",
+		});
+
+		const empty = renderToolDetailsToolResult(
+			{ round: "round.json", index: 0 },
+			roundData({ toolCalls: [{ index: 0, name: "read", arguments: "{}", result_summary: "" }] }),
+		);
+		expect(empty.content[0].text).toContain("  Result:\n  (empty)");
+	});
+
+	it("renders paginated output and selection errors", () => {
+		const page = renderToolDetailsToolResult(
+			{ round: "round.json", index: 0, out__from_line: 2, out_line_count: 2 },
+			roundData(),
+		);
+		expect(page.content[0].text).toContain("[Showing lines 2–3 of 4 for tool call #0 (bash)]");
+		expect(page.content[0].text).toContain("needle line\nline three");
+		expect(page.content[0].text).toContain("Use out__from_line=4 and out_line_count=2 to continue");
+		expect(page.details.lines_shown).toEqual({ from: 2, to: 3, of: 4 });
+
+		const conflict = renderToolDetailsToolResult(
+			{ round: "round.json", index: 0, out__from_line: 1, match: "needle" },
+			roundData(),
+		);
+		expect(conflict.content[0].text).toBe(
+			"Error: match and out__from_line are mutually exclusive. Use one or the other, not both.",
+		);
+
+		const invalidRegex = renderToolDetailsToolResult({ round: "round.json", index: 0, match: "(" }, roundData());
+		expect(invalidRegex.content[0].text).toContain("Invalid regexp pattern:");
+	});
+
+	it("renders regexp matches and falls back to summary with non-json arguments", () => {
+		const matches = renderToolDetailsToolResult(
+			{ round: "round.json", index: 0, match: "needle", out_line_count: 1, max_matches: 1 },
+			roundData({
+				toolCalls: [
+					{
+						index: 0,
+						name: "read",
+						arguments: "raw args",
+						result_summary: "first\nneedle summary\nafter",
+					},
+				],
+			}),
+		);
+
+		expect(matches.content[0].text).toContain("[Match results for tool call #0 (read) (1 match)]");
+		expect(matches.content[0].text).toContain('Arguments: "raw args"');
+		expect(matches.content[0].text).toContain("[M 1/1 at line 2 (1 lines of context)]\nneedle summary\nafter");
+		expect(matches.details).toEqual({ name: "read", arguments: "raw args", matches: { shown: 1, total: 1 } });
+	});
+});
+
+describe("search_interactions join points", () => {
+	const round = (userPrompt: string, responseSequence: string, extra = {}) => ({
+		userPrompt,
+		responseSequence,
+		turnIndex: 0,
+		...extra,
+	});
+
+	it("normalizes parameters and scopes index entries by round file", () => {
+		expect(normalizeSearchInteractionsParams({ query: "topic" })).toEqual({
+			query: "topic",
+			threshold: 0.25,
+			scopeRounds: null,
+		});
+		expect(normalizeSearchInteractionsParams({ query: "", minSimilarity: 0.7, rounds: ["a.json"] })).toEqual({
+			query: null,
+			threshold: 0.7,
+			scopeRounds: ["a.json"],
+		});
+
+		const index = [
+			{ filePath: "a.json:prompt", vector: [1, 0] },
+			{ filePath: "b.json:response", vector: [0, 1] },
+			{ filePath: "c.json:round", vector: [1, 1] },
+			{ filePath: "weird.json:prompt-extra", vector: [1, 0] },
+		];
+		expect(filterSearchIndexByRounds(index, null)).toEqual(index);
+		expect(filterSearchIndexByRounds(index, [])).toEqual(index);
+		expect(
+			filterSearchIndexByRounds(index, ["b.json", "c.json", "weird.json-extra"]).map((entry) => entry.filePath),
+		).toEqual(["b.json:response", "c.json:round"]);
+	});
+
+	it("collects best search scores per readable json round", () => {
+		const rounds = new Map([
+			["a.json", round("a user", "a answer")],
+			["b.json", round("b user", "b answer")],
+		]);
+		const scores = collectSearchRoundScores(
+			[
+				{ filePath: "a.json:prompt", vector: [0, 1] },
+				{ filePath: "a.json:response", vector: [1, 0] },
+				{ filePath: "missing.json:prompt", vector: [0.9, 0.1] },
+				{ filePath: "notes.txt:prompt", vector: [1, 0] },
+				{ filePath: "b.json:round", vector: [0, 1] },
+			],
+			[1, 0],
+			(filePath) => rounds.get(filePath.replace(/(:prompt|:response|:round)$/, "")) ?? null,
+		);
+
+		expect(scores).toHaveLength(2);
+		expect(scores[0].fileName).toBe("a.json");
+		expect(scores[0].bestScore).toBeCloseTo(1);
+		expect(scores[1].fileName).toBe("b.json");
+		expect(scores[1].bestScore).toBeCloseTo(0);
+	});
+
+	it("renders capped search results with tool-call redaction and discussion-only turns", () => {
+		const result = renderSearchInteractionsToolResult(
+			[
+				{
+					fileName: "tool.json",
+					bestScore: 0.9,
+					data: round("tool user", "tool answer", {
+						toolCallCount: 1,
+						toolCallNames: ["read"],
+						toolCalls: [
+							{
+								index: 0,
+								name: "read",
+								arguments: "{}",
+								result_summary: "short",
+								result_full: "x".repeat(2048),
+							},
+						],
+					}),
+				},
+				{
+					fileName: "discussion.json",
+					bestScore: 0.8,
+					data: round("discussion user", "discussion answer", { toolCallCount: 0 }),
+				},
+				{ fileName: "plain.json", bestScore: 0.7, data: round("plain user", "plain answer") },
+				{ fileName: "four.json", bestScore: 0.6, data: round("four user", "four answer") },
+				{ fileName: "threshold.json", bestScore: 0.25, data: round("threshold user", "threshold answer") },
+				{ fileName: "six.json", bestScore: 0.4, data: round("six user", "six answer") },
+			],
+			0.25,
+			(fileName) => (fileName === "tool.json" ? "99B" : null),
+		);
+
+		expect(result.details).toEqual({ matched: 5, topScore: 0.9 });
+		expect(result.content[0].type).toBe("text");
+		expect(result.content[0].text).toContain("Found 5 relevant rounds");
+		expect(result.content[0].text).toContain("--- Round tool.json (score: 0.900 | 1 tools (read) | 99B) ---");
+		expect(result.content[0].text).toContain(
+			"\n--- Round discussion.json (score: 0.800 | 0 tools (discussion only)) ---",
+		);
+		expect(result.content[0].text).toContain("\n--- Round plain.json (score: 0.700) ---");
+		expect(result.content[0].text).toContain(
+			'  Turn 0: read (2KB) — [REDACTED: use get_tool_details("tool.json", 0) to expand.]',
+		);
+		expect(result.content[0].text).toContain(
+			"--- Agent turns (all tool calls redacted — use get_tool_details to expand) ---",
+		);
+		expect(result.content[0].text).toContain("--- Agent turns ---\n  (no tool calls — discussion only)");
+		expect(result.content[0].text).toContain("Assistant: plain answer");
+		expect(result.content[0].text).toContain("threshold.json");
+		expect(result.content[0].text).not.toContain("six.json");
+		expect(result.content[0].text).not.toContain("Stryker was here");
+	});
+
+	it("renders no-match and below-threshold search outcomes", () => {
+		const noMatches = renderSearchInteractionsToolResult([], 0.25, () => null);
+		expect(noMatches.content[0]).toEqual({ type: "text", text: "No matching turns found in the index." });
+		expect(noMatches.details).toEqual({});
+
+		const belowThreshold = renderSearchInteractionsToolResult(
+			[{ fileName: "weak.json", bestScore: 0.1, data: round("weak user", "weak answer") }],
+			0.25,
+			() => null,
+		);
+		expect(belowThreshold.content[0].text).toBe("No relevant rounds found (best score: 0.100).");
+		expect(belowThreshold.details).toEqual({});
 	});
 });

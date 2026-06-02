@@ -77,6 +77,12 @@ interface ChainEntry {
 	toolSummary: string;
 }
 
+interface ResponseSegment {
+	type: "text" | "toolCall";
+	text?: string;
+	toolCallIndex?: number;
+}
+
 /** In-memory buffer of rounds from the current session, in chronological order.
  *  Survives between agent cycles within the same session. Cleared on session_start.
  *  Injected into context so the model can resolve "it", "those changes", "the fix", etc.
@@ -346,7 +352,7 @@ export function renderRoundDetailsToolResult(
 //   filePath includes :prompt, :response, or :round suffix
 // ─────────────────────────────────────────────
 
-interface IndexEntry {
+export interface IndexEntry {
 	filePath: string;
 	vector: number[];
 }
@@ -373,7 +379,7 @@ interface ToolCallDetail {
 	result_truncated?: boolean; // true if result exceeds cap (only false for post-step-2 rounds since no cap)
 }
 
-interface RoundData {
+export interface RoundData {
 	userPrompt: string;
 	responseSequence: string;
 	turnIndex: number;
@@ -384,6 +390,481 @@ interface RoundData {
 	promptEmbedding?: number[];
 	parentId?: string | null;
 	relatedParentId?: string | null;
+}
+
+export interface SearchInteractionsParams {
+	query?: string;
+	minSimilarity?: number;
+	rounds?: string[];
+}
+
+export interface NormalizedSearchInteractionsParams {
+	query: string | null;
+	threshold: number;
+	scopeRounds: string[] | null;
+}
+
+export interface SearchRoundScore {
+	fileName: string;
+	data: RoundData;
+	bestScore: number;
+}
+
+export interface SearchInteractionsToolResult {
+	content: Array<{ type: "text"; text: string }>;
+	details: Record<string, unknown>;
+}
+
+export interface ToolDetailsParams {
+	round: string;
+	index: number;
+	out__from_line?: number;
+	out_line_count?: number;
+	match?: string;
+	max_matches?: number;
+}
+
+export type ToolDetailsToolResult = SearchInteractionsToolResult;
+
+export function loadRoundDataForToolDetails(
+	fullPath: string,
+	roundName: string,
+): { ok: true; roundData: RoundData } | { ok: false; result: ToolDetailsToolResult } {
+	if (!fs.existsSync(fullPath)) {
+		return {
+			ok: false,
+			result: {
+				content: [{ type: "text", text: `Round file not found: ${roundName}` }],
+				details: {},
+			},
+		};
+	}
+
+	try {
+		return { ok: true, roundData: JSON.parse(fs.readFileSync(fullPath, "utf-8")) };
+	} catch {
+		return {
+			ok: false,
+			result: {
+				content: [{ type: "text", text: `Failed to parse round file: ${roundName}` }],
+				details: {},
+			},
+		};
+	}
+}
+
+export function renderToolDetailsToolResult(params: ToolDetailsParams, roundData: RoundData): ToolDetailsToolResult {
+	if (!roundData.toolCalls || roundData.toolCalls.length === 0) {
+		return {
+			content: [
+				{
+					type: "text",
+					text: "This round has no tool calls stored. It may have been indexed before tool call metadata was added. Consider re-indexing.",
+				},
+			],
+			details: {},
+		};
+	}
+
+	if (params.index < 0 || params.index >= roundData.toolCalls.length) {
+		return {
+			content: [
+				{
+					type: "text",
+					text: `Invalid index ${params.index}. This round has ${roundData.toolCalls.length} tool calls (indices 0–${roundData.toolCalls.length - 1}).`,
+				},
+			],
+			details: {},
+		};
+	}
+
+	const tc = roundData.toolCalls[params.index];
+
+	// Parse arguments back to object for display
+	let argsParsed: unknown = tc.arguments;
+	try {
+		argsParsed = JSON.parse(tc.arguments);
+	} catch {
+		/* keep as string */
+	}
+
+	// Determine the result text (prefer result_full, fall back to result_summary)
+	const resultText = tc.result_full ?? tc.result_summary ?? "";
+	const toolSelection = selectToolResultOutput({
+		resultText,
+		fromLine: params.out__from_line,
+		lineCount: params.out_line_count,
+		match: params.match,
+		maxMatches: params.max_matches,
+	});
+	if (!toolSelection.ok) {
+		return {
+			content: [{ type: "text", text: toolSelection.error }],
+			details: {},
+		};
+	}
+
+	if (toolSelection.mode === "page") {
+		return {
+			content: [
+				{
+					type: "text",
+					text:
+						`[Showing lines ${toolSelection.fromLine}–${toolSelection.endLine} of ${toolSelection.totalLines} for tool call #${tc.index} (${tc.name})]\n` +
+						`Tool name: ${tc.name}\n` +
+						`Arguments: ${JSON.stringify(argsParsed, null, 2)}\n` +
+						"Result:\n" +
+						`  ${toolSelection.resultBlock}${toolSelection.footer}`,
+				},
+			],
+			details: {
+				name: tc.name,
+				arguments: tc.arguments,
+				lines_shown: {
+					from: toolSelection.fromLine,
+					to: toolSelection.endLine,
+					of: toolSelection.totalLines,
+				},
+			},
+		};
+	}
+
+	if (toolSelection.mode === "match") {
+		return {
+			content: [
+				{
+					type: "text",
+					text:
+						`[Match results for tool call #${tc.index} (${tc.name})${toolSelection.matchSummary}]\n` +
+						`Tool name: ${tc.name}\n` +
+						`Arguments: ${JSON.stringify(argsParsed, null, 2)}\n` +
+						"Result:\n" +
+						`  ${toolSelection.resultBlock}`,
+				},
+			],
+			details: {
+				name: tc.name,
+				arguments: tc.arguments,
+				matches: { shown: toolSelection.matchCount, total: toolSelection.totalMatches },
+			},
+		};
+	}
+
+	// Unpaginated — show full result
+	const resultBlock = resultText.length > 0 ? `  ${resultText}` : "  (empty)";
+
+	const truncatedFlag = tc.result_truncated ? "\n\n[Output exceeds storage cap — showing entire stored result]" : "";
+
+	return {
+		content: [
+			{
+				type: "text",
+				text:
+					`Tool call #${tc.index} in round ${params.round}\n` +
+					`  Name: ${tc.name}\n` +
+					`  Arguments: ${JSON.stringify(argsParsed, null, 2)}\n` +
+					`  Result:\n${resultBlock}${truncatedFlag}`,
+			},
+		],
+		details: { name: tc.name, arguments: tc.arguments, result_full: tc.result_full ?? tc.result_summary },
+	};
+}
+
+export function normalizeSearchInteractionsParams(
+	params: SearchInteractionsParams,
+): NormalizedSearchInteractionsParams {
+	return {
+		query: params.query || null,
+		threshold: params.minSimilarity ?? 0.25,
+		scopeRounds: params.rounds ?? null,
+	};
+}
+
+export function filterSearchIndexByRounds(
+	index: readonly IndexEntry[],
+	scopeRounds: readonly string[] | null,
+): IndexEntry[] {
+	if (!scopeRounds || scopeRounds.length === 0) return [...index];
+	const scopeSet = new Set(scopeRounds);
+	return index.filter((entry) => {
+		const roundFile = entry.filePath.replace(/(:prompt|:response|:round)$/, "");
+		return scopeSet.has(roundFile);
+	});
+}
+
+export function collectSearchRoundScores(
+	index: readonly IndexEntry[],
+	queryVec: number[],
+	readRound: (filePath: string) => RoundData | null,
+): SearchRoundScore[] {
+	const scored = index
+		.map((entry) => ({ ...entry, similarity: cosineSimilarity(queryVec, entry.vector) }))
+		.sort((a, b) => b.similarity - a.similarity);
+
+	const roundScores = new Map<string, SearchRoundScore>();
+	for (const entry of scored) {
+		const roundFile = entry.filePath.replace(/(:prompt|:response|:round)$/, "");
+		if (!roundFile.endsWith(".json")) continue;
+		if (roundScores.has(roundFile)) continue;
+		const roundData = readRound(entry.filePath);
+		if (!roundData) continue;
+		roundScores.set(roundFile, { fileName: roundFile, data: roundData, bestScore: entry.similarity });
+	}
+
+	return Array.from(roundScores.values()).sort((a, b) => b.bestScore - a.bestScore);
+}
+
+export function renderSearchInteractionsToolResult(
+	sorted: readonly SearchRoundScore[],
+	threshold: number,
+	getRoundSizeFn: (fileName: string) => string | null = getRoundSize,
+): SearchInteractionsToolResult {
+	if (sorted.length === 0) {
+		return {
+			content: [{ type: "text", text: "No matching turns found in the index." }],
+			details: {},
+		};
+	}
+
+	const lines: string[] = [];
+	let count = 0;
+	for (const round of sorted) {
+		if (round.bestScore < threshold) break;
+		if (count >= 5) break;
+		count++;
+		const toolStr =
+			round.data.toolCallCount != null && round.data.toolCallCount > 0
+				? ` | ${round.data.toolCallCount} tools (${(round.data.toolCallNames ?? []).join(", ")})`
+				: round.data.toolCallCount === 0
+					? " | 0 tools (discussion only)"
+					: "";
+
+		const roundSizeStr = getRoundSizeFn(round.fileName);
+		const sizeTag = roundSizeStr ? ` | ${roundSizeStr}` : "";
+		lines.push(`--- Round ${round.fileName} (score: ${round.bestScore.toFixed(3)}${toolStr}${sizeTag}) ---`);
+		lines.push(`User: ${round.data.userPrompt}`);
+
+		if (
+			round.data.toolCallCount != null &&
+			round.data.toolCallCount > 0 &&
+			round.data.toolCalls &&
+			round.data.toolCalls.length > 0
+		) {
+			const turnLines = round.data.toolCalls.map((tc: ToolCallDetail) => {
+				const sourceText = tc.result_full ?? tc.result_summary ?? "";
+				const sizeLabel = sourceText.length > 0 ? formatFileSize(Buffer.byteLength(sourceText, "utf-8")) : null;
+				const sizeTag = sizeLabel ? ` (${sizeLabel})` : "";
+				return `  Turn ${tc.index}: ${tc.name}${sizeTag} — [REDACTED: use get_tool_details("${round.fileName}", ${tc.index}) to expand.]`;
+			});
+			lines.push("--- Agent turns (all tool calls redacted — use get_tool_details to expand) ---");
+			lines.push(...turnLines);
+		} else if (round.data.toolCallCount === 0) {
+			lines.push("--- Agent turns ---");
+			lines.push("  (no tool calls — discussion only)");
+		}
+
+		lines.push(`Assistant: ${round.data.responseSequence}`);
+		lines.push("");
+	}
+
+	if (count === 0) {
+		return {
+			content: [
+				{
+					type: "text",
+					text: `No relevant rounds found (best score: ${sorted[0].bestScore.toFixed(3)}).`,
+				},
+			],
+			details: {},
+		};
+	}
+
+	return {
+		content: [{ type: "text", text: `Found ${count} relevant rounds:\n\n${lines.join("\n")}` }],
+		details: { matched: count, topScore: sorted[0].bestScore },
+	};
+}
+
+export function extractAgentEndUserPrompt(cachedPrompt: string | null, messages?: readonly unknown[]): string {
+	let userPrompt = cachedPrompt ?? "";
+	if (!userPrompt && messages) {
+		const lastUser = [...messages].reverse().find((m) => (m as { role: string }).role === "user");
+		if (lastUser) {
+			const content = (lastUser as { content: unknown }).content;
+			if (typeof content === "string") {
+				userPrompt = content;
+			} else if (Array.isArray(content)) {
+				userPrompt = extractText(content as Array<{ type: string; text?: string }>);
+			}
+		}
+	}
+	return userPrompt;
+}
+
+export function extractAgentEndResponseText(accumulatedText: readonly string[], messages?: readonly unknown[]): string {
+	let responseText = accumulatedText.join("\n\n").trim();
+	if (!responseText) {
+		const lastAssistant = messages
+			? [...messages].reverse().find((m) => (m as { role: string }).role === "assistant")
+			: null;
+		if (lastAssistant) {
+			const content = (lastAssistant as { content: unknown }).content;
+			if (typeof content === "string") {
+				responseText = content;
+			} else if (Array.isArray(content)) {
+				responseText = extractText(content as Array<{ type: string; text?: string }>);
+			}
+		}
+	}
+	return responseText;
+}
+
+export function buildAgentEndToolSummary(toolCallCount: number, toolCallNames: readonly string[]): string {
+	return toolCallCount > 0 ? `${toolCallCount} tools (${toolCallNames.join(", ")})` : "0 tools (discussion)";
+}
+
+export function buildAgentEndChainEntry(
+	fileName: string,
+	userPrompt: string,
+	responseText: string,
+	toolCallCount: number,
+	toolCallNames: readonly string[],
+): ChainEntry {
+	return {
+		fileName,
+		userPrompt,
+		responseSequence: responseText,
+		toolSummary: buildAgentEndToolSummary(toolCallCount, toolCallNames),
+	};
+}
+
+export function getAgentEndParentId(chain: readonly { fileName: string }[]): string | null {
+	return chain.length >= 2 ? chain[chain.length - 2].fileName : null;
+}
+
+export function buildAgentEndRoundData(args: {
+	userPrompt: string;
+	responseText: string;
+	turnIndex: number | null;
+	toolCallCount: number;
+	toolCallNames: string[];
+	toolCalls: ToolCallDetail[];
+	responseSegments: ResponseSegment[];
+	parentId: string | null;
+	userTimestamp?: number;
+}): Record<string, unknown> {
+	return {
+		id: computeContentHash(args.userPrompt, args.responseText, args.toolCalls),
+		userPrompt: args.userPrompt,
+		responseSequence: args.responseText,
+		turnIndex: args.turnIndex ?? 0,
+		userTimestamp: args.userTimestamp ?? Date.now(),
+		toolCallCount: args.toolCallCount,
+		toolCallNames: args.toolCallNames,
+		toolCalls: args.toolCalls,
+		responseSegments: args.responseSegments,
+		promptEmbedding: undefined,
+		parentId: args.parentId,
+		relatedParentId: null,
+	};
+}
+
+export function buildAgentEndEmbeddingTexts(
+	userPrompt: string,
+	responseText: string,
+	maxResponseBytes = 24000,
+): { clippedResponse: string; combinedText: string } {
+	const strippedResponse = responseText.replace(/\[(?:Tool call )?REDACTED[^\]]*\]\n?/g, "");
+	const responseBuf = Buffer.from(strippedResponse, "utf-8");
+	const clippedResponse =
+		responseBuf.length > maxResponseBytes
+			? responseBuf.slice(0, maxResponseBytes).toString("utf-8")
+			: strippedResponse;
+	return {
+		clippedResponse,
+		combinedText: `${userPrompt}\n\n${clippedResponse}`,
+	};
+}
+
+export function getRelatedParentIdFromGroup<T extends { fileName: string }>(
+	group: { rounds: readonly T[] },
+	roundEntry: T,
+): string | null {
+	if (group.rounds.length <= 1) return null;
+	const groupRoundIdx = group.rounds.indexOf(roundEntry);
+	return groupRoundIdx > 0 ? group.rounds[groupRoundIdx - 1].fileName : null;
+}
+
+export interface MessageEndProcessingState {
+	accumulatedText: string[];
+	toolCallCount: number;
+	toolCallNames: string[];
+	toolCalls: ToolCallDetail[];
+	responseSegments: ResponseSegment[];
+}
+
+export function applyMessageEndToState(message: unknown, state: MessageEndProcessingState): void {
+	if (!message) return;
+
+	const msg = message as { role?: string; content?: unknown; toolCallId?: string };
+	if (msg.role === "user") {
+		// User sent something -- don't reset the accumulator, this is a new agent
+		// cycle (agent_start will reset it). Keep safe.
+		return;
+	}
+
+	if (msg.role === "assistant") {
+		// Extract text from this assistant message
+		const content = msg.content as Array<{ type: string; text?: string }> | undefined;
+		if (Array.isArray(content)) {
+			for (const block of content) {
+				if (block.type === "text" && block.text) {
+					state.accumulatedText.push(block.text);
+					state.responseSegments.push({ type: "text", text: block.text });
+				} else if (block.type === "toolCall") {
+					state.toolCallCount++;
+					const blockRec = block as Record<string, unknown>;
+					const name = blockRec.name as string | undefined;
+					const id = blockRec.id as string | undefined;
+					if (name && !state.toolCallNames.includes(name)) {
+						state.toolCallNames.push(name);
+					}
+					if (id && name) {
+						const detail: ToolCallDetail = {
+							index: state.toolCalls.length,
+							name,
+							arguments: JSON.stringify(blockRec.arguments ?? {}),
+							result_summary: "",
+						};
+						state.toolCalls.push(detail);
+					}
+					// Record this tool call's position in the response stream
+					state.responseSegments.push({ type: "toolCall", toolCallIndex: state.toolCalls.length - 1 });
+				}
+			}
+		}
+		return;
+	}
+
+	if (msg.role === "toolResult") {
+		// Pair tool results with their calls
+		const toolCallId = msg.toolCallId;
+		if (toolCallId) {
+			// Find the matching ToolCallDetail by matching the last call without a result
+			// (pi sessions don't expose the toolCallId -> toolCall mapping directly, so
+			// we match sequentially — results arrive in order)
+			for (let i = state.toolCalls.length - 1; i >= 0; i--) {
+				if (state.toolCalls[i].result_summary === "") {
+					const resultContent = msg.content as Array<{ type: string; text?: string }> | undefined;
+					const resultText = resultContent ? extractText(resultContent) : "";
+					state.toolCalls[i].result_summary = resultText.slice(0, 300);
+					state.toolCalls[i].result_full = resultText;
+					state.toolCalls[i].result_truncated = false;
+					break;
+				}
+			}
+		}
+	}
 }
 
 function readRoundFile(filePath: string): RoundData | null {
@@ -420,7 +901,7 @@ let agentToolCalls: ToolCallDetail[] = [];
 const _agentPendingToolCallIds: Map<string, ToolCallDetail> = new Map(); // toolCallId → partial detail
 
 // Interleaved response segments — preserves tool call positions within assistant text
-let agentResponseSegments: Array<{ type: "text" | "toolCall"; text?: string; toolCallIndex?: number }> = [];
+let agentResponseSegments: ResponseSegment[] = [];
 
 // Context embedding cache — avoids redundant embedding API calls across tool turns
 // within the same agent cycle. Reset in agent_start.
@@ -486,15 +967,41 @@ const EMBED_TIMEOUT_MS = 15_000; // AbortController timeout (#43)
 const EMBED_MAX_RETRIES = 3; // max attempts including first (#42)
 const EMBED_BACKOFF_MS = 1000; // base backoff for retry #1
 
-async function embedText(text: string, apiKey: string): Promise<number[]> {
+export interface EmbeddingResponseLike {
+	ok: boolean;
+	status: number;
+	text(): Promise<string>;
+	json(): Promise<unknown>;
+}
+
+export type EmbeddingFetch = (url: string, init: RequestInit) => Promise<EmbeddingResponseLike>;
+
+export interface EmbedTextDeps {
+	fetchImpl?: EmbeddingFetch;
+	sleep?: (ms: number) => Promise<void>;
+	timeoutMs?: number;
+	maxRetries?: number;
+	backoffMs?: number;
+}
+
+function sleep(ms: number): Promise<void> {
+	return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+export async function embedText(text: string, apiKey: string, deps: EmbedTextDeps = {}): Promise<number[]> {
+	const fetchImpl: EmbeddingFetch = deps.fetchImpl ?? ((url, init) => fetch(url, init));
+	const sleepImpl = deps.sleep ?? sleep;
+	const timeoutMs = deps.timeoutMs ?? EMBED_TIMEOUT_MS;
+	const maxRetries = deps.maxRetries ?? EMBED_MAX_RETRIES;
+	const backoffMs = deps.backoffMs ?? EMBED_BACKOFF_MS;
 	let lastError: Error | undefined;
 
-	for (let attempt = 0; attempt < EMBED_MAX_RETRIES; attempt++) {
+	for (let attempt = 0; attempt < maxRetries; attempt++) {
 		const controller = new AbortController();
-		const timer = setTimeout(() => controller.abort(), EMBED_TIMEOUT_MS);
+		const timer = setTimeout(() => controller.abort(), timeoutMs);
 
 		try {
-			const response = await fetch(OPENROUTER_URL, {
+			const response = await fetchImpl(OPENROUTER_URL, {
 				method: "POST",
 				headers: {
 					"Content-Type": "application/json",
@@ -524,7 +1031,7 @@ async function embedText(text: string, apiKey: string): Promise<number[]> {
 			}
 		} catch (e) {
 			if (e instanceof DOMException && e.name === "AbortError") {
-				lastError = new Error(`Embedding API timeout after ${EMBED_TIMEOUT_MS}ms`);
+				lastError = new Error(`Embedding API timeout after ${timeoutMs}ms`);
 			} else if (e instanceof Error && e.message.startsWith("Embedding API error 4") && !e.message.includes("429")) {
 				throw e; // 4xx (non-429) is fatal — no retry
 			} else {
@@ -535,8 +1042,8 @@ async function embedText(text: string, apiKey: string): Promise<number[]> {
 		}
 
 		// Backoff before retry (not after last attempt)
-		if (attempt < EMBED_MAX_RETRIES - 1) {
-			await new Promise((r) => setTimeout(r, EMBED_BACKOFF_MS * 2 ** attempt));
+		if (attempt < maxRetries - 1) {
+			await sleepImpl(backoffMs * 2 ** attempt);
 		}
 	}
 
@@ -890,79 +1397,26 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	pi.on("message_end", async (event, _ctx) => {
-		const msg = event.message;
-		if (!msg) return;
-
-		if (msg.role === "user") {
-			// User sent something -- don't reset the accumulator, this is a new agent
-			// cycle (agent_start will reset it). Keep safe.
-		} else if (msg.role === "assistant") {
-			// Extract text from this assistant message
-			const content = msg.content as Array<{ type: string; text?: string }> | undefined;
-			if (Array.isArray(content)) {
-				for (const block of content) {
-					if (block.type === "text" && block.text) {
-						agentAccumulatedText.push(block.text);
-						agentResponseSegments.push({ type: "text", text: block.text });
-					} else if (block.type === "toolCall") {
-						agentToolCallCount++;
-						const blockRec = block as Record<string, unknown>;
-						const name = blockRec.name as string | undefined;
-						const id = blockRec.id as string | undefined;
-						if (name && !agentToolCallNames.includes(name)) {
-							agentToolCallNames.push(name);
-						}
-						if (id && name) {
-							const detail: ToolCallDetail = {
-								index: agentToolCalls.length,
-								name,
-								arguments: JSON.stringify(blockRec.arguments ?? {}),
-								result_summary: "",
-							};
-							agentToolCalls.push(detail);
-						}
-						// Record this tool call's position in the response stream
-						agentResponseSegments.push({ type: "toolCall", toolCallIndex: agentToolCalls.length - 1 });
-					}
-				}
-			}
-		} else if (msg.role === "toolResult") {
-			// Pair tool results with their calls
-			const toolCallId = msg.toolCallId as string | undefined;
-			if (toolCallId) {
-				// Find the matching ToolCallDetail by matching the last call without a result
-				// (pi sessions don't expose the toolCallId -> toolCall mapping directly, so
-				// we match sequentially — results arrive in order)
-				for (let i = agentToolCalls.length - 1; i >= 0; i--) {
-					if (agentToolCalls[i].result_summary === "") {
-						const resultContent = msg.content as Array<{ type: string; text?: string }> | undefined;
-						const resultText = resultContent ? extractText(resultContent) : "";
-						agentToolCalls[i].result_summary = resultText.slice(0, 300);
-						agentToolCalls[i].result_full = resultText;
-						agentToolCalls[i].result_truncated = false;
-						break;
-					}
-				}
-			}
-		}
+		const state: MessageEndProcessingState = {
+			accumulatedText: agentAccumulatedText,
+			toolCallCount: agentToolCallCount,
+			toolCallNames: agentToolCallNames,
+			toolCalls: agentToolCalls,
+			responseSegments: agentResponseSegments,
+		};
+		applyMessageEndToState(event.message, state);
+		agentAccumulatedText = state.accumulatedText;
+		agentToolCallCount = state.toolCallCount;
+		agentToolCallNames = state.toolCallNames;
+		agentToolCalls = state.toolCalls;
+		agentResponseSegments = state.responseSegments;
 	});
 
 	pi.on("agent_end", async (event, ctx) => {
 		const { messages } = event;
 
 		// Get user prompt -- prefer agent_start cached value, fall back to messages
-		let userPrompt = agentUserPrompt ?? "";
-		if (!userPrompt && messages) {
-			const lastUser = [...messages].reverse().find((m) => (m as { role: string }).role === "user");
-			if (lastUser) {
-				const content = (lastUser as { content: unknown }).content;
-				if (typeof content === "string") {
-					userPrompt = content;
-				} else if (Array.isArray(content)) {
-					userPrompt = extractText(content as Array<{ type: string; text?: string }>);
-				}
-			}
-		}
+		const userPrompt = extractAgentEndUserPrompt(agentUserPrompt, messages);
 
 		if (!userPrompt) {
 			ctx.ui.setStatus("semblr", "\u{1f9e0} agent_end: no user prompt to save");
@@ -970,21 +1424,7 @@ export default function (pi: ExtensionAPI) {
 		}
 
 		// Build response text from accumulated assistant text across all tool iterations
-		let responseText = agentAccumulatedText.join("\n\n").trim();
-		if (!responseText) {
-			// Fallback: extract text from messages (last assistant message)
-			const lastAssistant = messages
-				? [...messages].reverse().find((m) => (m as { role: string }).role === "assistant")
-				: null;
-			if (lastAssistant) {
-				const content = (lastAssistant as { content: unknown }).content;
-				if (typeof content === "string") {
-					responseText = content;
-				} else if (Array.isArray(content)) {
-					responseText = extractText(content as Array<{ type: string; text?: string }>);
-				}
-			}
-		}
+		const responseText = extractAgentEndResponseText(agentAccumulatedText, messages);
 
 		if (!responseText) {
 			ctx.ui.setStatus("semblr", "\u{1f9e0} agent_end: no response text");
@@ -998,17 +1438,9 @@ export default function (pi: ExtensionAPI) {
 
 		// Push to causal chain — even on dedup, this ensures the in-memory buffer
 		// tracks every round seen in this session.
-		{
-			const toolCalls = agentToolCalls.length;
-			const names = agentToolCallNames;
-			const toolSummary = toolCalls > 0 ? `${toolCalls} tools (${names.join(", ")})` : "0 tools (discussion)";
-			causalChain.push({
-				fileName: roundFileName,
-				userPrompt,
-				responseSequence: responseText,
-				toolSummary,
-			});
-		}
+		causalChain.push(
+			buildAgentEndChainEntry(roundFileName, userPrompt, responseText, agentToolCalls.length, agentToolCallNames),
+		);
 
 		// Skip if already saved (deduplication by content hash)
 		if (fs.existsSync(roundPath)) {
@@ -1036,23 +1468,19 @@ export default function (pi: ExtensionAPI) {
 		}
 
 		// Compute parentId from causalChain
-		const parentId = causalChain.length >= 2 ? causalChain[causalChain.length - 2].fileName : null;
+		const parentId = getAgentEndParentId(causalChain);
 
 		// Write round file
-		const roundData: Record<string, unknown> = {
-			id: computeContentHash(userPrompt, responseText, agentToolCalls),
+		const roundData = buildAgentEndRoundData({
 			userPrompt,
-			responseSequence: responseText,
-			turnIndex: agentTurnIndex ?? 0,
-			userTimestamp: Date.now(),
+			responseText,
+			turnIndex: agentTurnIndex,
 			toolCallCount: agentToolCallCount,
 			toolCallNames: agentToolCallNames,
 			toolCalls: agentToolCalls,
 			responseSegments: agentResponseSegments,
-			promptEmbedding: undefined, // set after embedding below (#3)
 			parentId,
-			relatedParentId: null, // set after grouping below
-		};
+		});
 
 		try {
 			fs.writeFileSync(roundPath, JSON.stringify(roundData, null, 2));
@@ -1085,11 +1513,7 @@ export default function (pi: ExtensionAPI) {
 
 		try {
 			// Strip context-injection REDACTED markers and clip to ~24KB (8K tokens)
-			const strippedResponse = responseText.replace(/\[(?:Tool call )?REDACTED[^\]]*\]\n?/g, "");
-			const responseBuf = Buffer.from(strippedResponse, "utf-8");
-			const clippedResponse =
-				responseBuf.length > 24000 ? responseBuf.slice(0, 24000).toString("utf-8") : strippedResponse;
-			const combinedText = userPrompt + "\n\n" + clippedResponse;
+			const { clippedResponse, combinedText } = buildAgentEndEmbeddingTexts(userPrompt, responseText);
 
 			// Embedding #1: prompt (reuse cached agentPromptVec if available)
 			const promptVec = agentPromptVec ?? normalize(await embedText(userPrompt, apiKey));
@@ -1118,14 +1542,7 @@ export default function (pi: ExtensionAPI) {
 			const groupIdx = assignToGroup(roundGroups, roundEntry, combinedVec, SEMBLR_GROUP_THRESHOLD);
 			const group = roundGroups[groupIdx];
 			// Find the most recent round in the same group *before* this round
-			let relatedParentId: string | null = null;
-			if (group.rounds.length > 1) {
-				// group.rounds is in insertion order; the new round is the last element
-				const groupRoundIdx = group.rounds.indexOf(roundEntry);
-				if (groupRoundIdx > 0) {
-					relatedParentId = group.rounds[groupRoundIdx - 1].fileName;
-				}
-			}
+			const relatedParentId = getRelatedParentIdFromGroup(group, roundEntry);
 			if (relatedParentId) {
 				// Re-read, update, re-write atomically
 				try {
@@ -1210,16 +1627,15 @@ export default function (pi: ExtensionAPI) {
 				),
 			}),
 			async execute(_toolCallId, params, _signal, _onUpdate, ctx2) {
-				const p = params as { query: string; minSimilarity?: number; rounds?: string[] };
-				const query = p.query;
+				const { query, threshold, scopeRounds } = normalizeSearchInteractionsParams(
+					params as SearchInteractionsParams,
+				);
 				if (!query) {
 					return {
 						content: [{ type: "text", text: "No query provided." }],
 						details: {},
 					};
 				}
-				const threshold = p.minSimilarity ?? 0.25;
-				const scopeRounds = p.rounds ?? null;
 
 				const apiKey = await getApiKey(ctx2);
 				if (!apiKey) {
@@ -1233,7 +1649,7 @@ export default function (pi: ExtensionAPI) {
 				const queryVec = normalize(await embedText(query, apiKey));
 
 				// Load index and score
-				let index = loadIndex();
+				const index = loadIndex();
 				if (index.length === 0) {
 					return {
 						content: [{ type: "text", text: "The round index is empty. No conversations have been saved yet." }],
@@ -1242,113 +1658,21 @@ export default function (pi: ExtensionAPI) {
 				}
 
 				// If rounds[] is provided, scope the search to only those round files
-				if (scopeRounds && scopeRounds.length > 0) {
-					const scopeSet = new Set(scopeRounds);
-					index = index.filter((entry) => {
-						const roundFile = entry.filePath.replace(/(:prompt|:response|:round)$/, "");
-						return scopeSet.has(roundFile);
-					});
-					if (index.length === 0) {
-						return {
-							content: [
-								{
-									type: "text",
-									text: `No indexed vectors found for the specified rounds: ${scopeRounds.join(", ")}. They may not be embedded yet.`,
-								},
-							],
-							details: {},
-						};
-					}
-				}
-
-				const scored = index
-					.map((entry) => ({ ...entry, similarity: cosineSimilarity(queryVec, entry.vector) }))
-					.sort((a, b) => b.similarity - a.similarity);
-
-				// Group by round file, take best score per round
-				const roundScores = new Map<string, { fileName: string; data: RoundData; bestScore: number }>();
-				for (const entry of scored) {
-					const roundFile = entry.filePath.replace(/(:prompt|:response|:round)$/, "");
-					if (!roundFile.endsWith(".json")) continue;
-					if (roundScores.has(roundFile)) continue;
-					const roundData = readRoundFile(entry.filePath);
-					if (!roundData) continue;
-					roundScores.set(roundFile, { fileName: roundFile, data: roundData, bestScore: entry.similarity });
-				}
-
-				const sorted = Array.from(roundScores.values()).sort((a, b) => b.bestScore - a.bestScore);
-
-				if (sorted.length === 0) {
-					return {
-						content: [{ type: "text", text: "No matching turns found in the index." }],
-						details: {},
-					};
-				}
-
-				// Build result text — top 5 rounds with score.
-				// Branch: collapsed mode shows full prompt + tool turn index + full response;
-				// full mode keeps the existing truncated format.
-				const MIN_SIMILARITY = threshold;
-				const lines: string[] = [];
-				let count = 0;
-				for (const round of sorted) {
-					if (round.bestScore < MIN_SIMILARITY) break;
-					if (count >= 5) break;
-					count++;
-					const toolStr =
-						round.data.toolCallCount != null && round.data.toolCallCount > 0
-							? ` | ${round.data.toolCallCount} tools (${(round.data.toolCallNames ?? []).join(", ")})`
-							: round.data.toolCallCount === 0
-								? " | 0 tools (discussion only)"
-								: "";
-
-					// search_interactions always shows full round content.
-					const roundSizeStr = getRoundSize(round.fileName);
-					const sizeTag = roundSizeStr ? ` | ${roundSizeStr}` : "";
-					lines.push(`--- Round ${round.fileName} (score: ${round.bestScore.toFixed(3)}${toolStr}${sizeTag}) ---`);
-					lines.push(`User: ${round.data.userPrompt}`);
-
-					if (
-						round.data.toolCallCount != null &&
-						round.data.toolCallCount > 0 &&
-						round.data.toolCalls &&
-						round.data.toolCalls.length > 0
-					) {
-						const turnLines = round.data.toolCalls.map((tc: ToolCallDetail) => {
-							// Calculate tool output size from result_full or result_summary
-							const sourceText = tc.result_full ?? tc.result_summary ?? "";
-							const sizeLabel =
-								sourceText.length > 0 ? formatFileSize(Buffer.byteLength(sourceText, "utf-8")) : null;
-							const sizeTag = sizeLabel ? ` (${sizeLabel})` : "";
-							return `  Turn ${tc.index}: ${tc.name}${sizeTag} — [REDACTED: use get_tool_details("${round.fileName}", ${tc.index}) to expand.]`;
-						});
-						lines.push("--- Agent turns (all tool calls redacted — use get_tool_details to expand) ---");
-						lines.push(...turnLines);
-					} else if (round.data.toolCallCount === 0) {
-						lines.push("--- Agent turns ---");
-						lines.push("  (no tool calls — discussion only)");
-					}
-
-					lines.push(`Assistant: ${round.data.responseSequence}`);
-					lines.push("");
-				}
-
-				if (count === 0) {
+				const scopedIndex = filterSearchIndexByRounds(index, scopeRounds);
+				if (scopeRounds && scopeRounds.length > 0 && scopedIndex.length === 0) {
 					return {
 						content: [
 							{
 								type: "text",
-								text: `No relevant rounds found (best score: ${sorted[0].bestScore.toFixed(3)}).`,
+								text: `No indexed vectors found for the specified rounds: ${scopeRounds.join(", ")}. They may not be embedded yet.`,
 							},
 						],
 						details: {},
 					};
 				}
 
-				return {
-					content: [{ type: "text", text: `Found ${count} relevant rounds:\n\n${lines.join("\n")}` }],
-					details: { matched: count, topScore: sorted[0].bestScore },
-				};
+				const sorted = collectSearchRoundScores(scopedIndex, queryVec, readRoundFile);
+				return renderSearchInteractionsToolResult(sorted, threshold);
 			},
 		});
 
@@ -1453,149 +1777,10 @@ export default function (pi: ExtensionAPI) {
 				),
 			}),
 			async execute(_toolCallId, params, _signal, _onUpdate, _ctx2) {
-				const p = params as {
-					round: string;
-					index: number;
-					out__from_line?: number;
-					out_line_count?: number;
-					match?: string;
-					max_matches?: number;
-				};
-
-				const fullPath = `${ROUNDS_DIR}/${p.round}`;
-				if (!fs.existsSync(fullPath)) {
-					return {
-						content: [{ type: "text", text: `Round file not found: ${p.round}` }],
-						details: {},
-					};
-				}
-
-				let roundData: RoundData;
-				try {
-					roundData = JSON.parse(fs.readFileSync(fullPath, "utf-8"));
-				} catch {
-					return {
-						content: [{ type: "text", text: `Failed to parse round file: ${p.round}` }],
-						details: {},
-					};
-				}
-
-				if (!roundData.toolCalls || roundData.toolCalls.length === 0) {
-					return {
-						content: [
-							{
-								type: "text",
-								text: "This round has no tool calls stored. It may have been indexed before tool call metadata was added. Consider re-indexing.",
-							},
-						],
-						details: {},
-					};
-				}
-
-				if (p.index < 0 || p.index >= roundData.toolCalls.length) {
-					return {
-						content: [
-							{
-								type: "text",
-								text: `Invalid index ${p.index}. This round has ${roundData.toolCalls.length} tool calls (indices 0–${roundData.toolCalls.length - 1}).`,
-							},
-						],
-						details: {},
-					};
-				}
-
-				const tc = roundData.toolCalls[p.index];
-
-				// Parse arguments back to object for display
-				let argsParsed: unknown = tc.arguments;
-				try {
-					argsParsed = JSON.parse(tc.arguments);
-				} catch {
-					/* keep as string */
-				}
-
-				// Determine the result text (prefer result_full, fall back to result_summary)
-				const resultText = tc.result_full ?? tc.result_summary ?? "";
-				const toolSelection = selectToolResultOutput({
-					resultText,
-					fromLine: p.out__from_line,
-					lineCount: p.out_line_count,
-					match: p.match,
-					maxMatches: p.max_matches,
-				});
-				if (!toolSelection.ok) {
-					return {
-						content: [{ type: "text", text: toolSelection.error }],
-						details: {},
-					};
-				}
-
-				if (toolSelection.mode === "page") {
-					return {
-						content: [
-							{
-								type: "text",
-								text:
-									`[Showing lines ${toolSelection.fromLine}–${toolSelection.endLine} of ${toolSelection.totalLines} for tool call #${tc.index} (${tc.name})]\n` +
-									`Tool name: ${tc.name}\n` +
-									`Arguments: ${JSON.stringify(argsParsed, null, 2)}\n` +
-									"Result:\n" +
-									`  ${toolSelection.resultBlock}${toolSelection.footer}`,
-							},
-						],
-						details: {
-							name: tc.name,
-							arguments: tc.arguments,
-							lines_shown: {
-								from: toolSelection.fromLine,
-								to: toolSelection.endLine,
-								of: toolSelection.totalLines,
-							},
-						},
-					};
-				}
-
-				if (toolSelection.mode === "match") {
-					return {
-						content: [
-							{
-								type: "text",
-								text:
-									`[Match results for tool call #${tc.index} (${tc.name})${toolSelection.matchSummary}]\n` +
-									`Tool name: ${tc.name}\n` +
-									`Arguments: ${JSON.stringify(argsParsed, null, 2)}\n` +
-									"Result:\n" +
-									`  ${toolSelection.resultBlock}`,
-							},
-						],
-						details: {
-							name: tc.name,
-							arguments: tc.arguments,
-							matches: { shown: toolSelection.matchCount, total: toolSelection.totalMatches },
-						},
-					};
-				}
-
-				// Unpaginated — show full result
-				const resultBlock = resultText.length > 0 ? `  ${resultText}` : "  (empty)";
-
-				const truncatedFlag = tc.result_truncated
-					? "\n\n[Output exceeds storage cap — showing entire stored result]"
-					: "";
-
-				return {
-					content: [
-						{
-							type: "text",
-							text:
-								`Tool call #${tc.index} in round ${p.round}\n` +
-								`  Name: ${tc.name}\n` +
-								`  Arguments: ${JSON.stringify(argsParsed, null, 2)}\n` +
-								`  Result:\n${resultBlock}${truncatedFlag}`,
-						},
-					],
-					details: { name: tc.name, arguments: tc.arguments, result_full: tc.result_full ?? tc.result_summary },
-				};
+				const p = params as ToolDetailsParams;
+				const loaded = loadRoundDataForToolDetails(`${ROUNDS_DIR}/${p.round}`, p.round);
+				if (!loaded.ok) return loaded.result;
+				return renderToolDetailsToolResult(p, loaded.roundData);
 			},
 		});
 
