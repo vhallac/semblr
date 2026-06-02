@@ -377,6 +377,23 @@ function loadIndex(): IndexEntry[] {
 	return loadIndexFromPath(INDEX_PATH);
 }
 
+export function loadSessionStartIndex(
+	indexPath: string = INDEX_PATH,
+	deps: { existsSync?: (filePath: string) => boolean; loadIndex?: () => IndexEntry[] } = {},
+): IndexEntry[] {
+	const existsSync = deps.existsSync ?? fs.existsSync;
+	const load = deps.loadIndex ?? loadIndex;
+	return existsSync(indexPath) ? load() : [];
+}
+
+export function countUniqueIndexedRounds(index: readonly { filePath: string }[]): number {
+	return new Set(index.map((e) => e.filePath.replace(/(:prompt|:response|:round)$/, ""))).size;
+}
+
+export function buildSessionStartStatus(index: readonly { filePath: string }[]): string {
+	return `🧠 semblr loaded — ${countUniqueIndexedRounds(index)} rounds indexed`;
+}
+
 interface ToolCallDetail {
 	index: number;
 	name: string;
@@ -619,6 +636,49 @@ export function collectSearchRoundScores(
 	}
 
 	return Array.from(roundScores.values()).sort((a, b) => b.bestScore - a.bestScore);
+}
+
+export function computeContextBudget(
+	bestScore: number,
+	contextWindow: number = 128_000,
+	minSimilarity = 0.3,
+	minBudget = 2000,
+	budgetRatio = CONTEXT_BUDGET_RATIO,
+): number {
+	const maxBudget = Math.floor(budgetRatio * contextWindow);
+	const t = Math.max(0, Math.min(1, (bestScore - minSimilarity) / (1 - minSimilarity)));
+	return Math.floor(minBudget + t * (maxBudget - minBudget));
+}
+
+export function selectContextRounds(
+	scoredRounds: readonly SearchRoundScore[],
+	lastRoundFileName: string | null,
+	readRound: (filePath: string) => RoundData | null,
+	options: {
+		minSimilarity?: number;
+		budgetTokens: number;
+		estimateTokensFn?: (text: string) => number;
+	} = { budgetTokens: 2000 },
+): SearchRoundScore[] {
+	const minSimilarity = options.minSimilarity ?? 0.3;
+	const estimateTokensFn = options.estimateTokensFn ?? estimateTokens;
+	const selectedRounds: SearchRoundScore[] = [];
+	let usedTokens = 0;
+
+	for (const round of scoredRounds) {
+		if (round.bestScore < minSimilarity) break;
+		const roundTokens = estimateTokensFn(round.data.userPrompt + round.data.responseSequence);
+		if (usedTokens + roundTokens > options.budgetTokens) break;
+		selectedRounds.push(round);
+		usedTokens += roundTokens;
+	}
+
+	if (lastRoundFileName) {
+		const lastData = readRound(lastRoundFileName);
+		if (lastData) selectedRounds.push({ data: lastData, fileName: lastRoundFileName, bestScore: 0 });
+	}
+
+	return selectedRounds;
 }
 
 export function renderSearchInteractionsToolResult(
@@ -874,14 +934,18 @@ export function applyMessageEndToState(message: unknown, state: MessageEndProces
 	}
 }
 
-function readRoundFile(filePath: string): RoundData | null {
+export function readRoundFileFromDir(
+	filePath: string,
+	roundsDir: string = ROUNDS_DIR,
+	fsImpl: Pick<typeof fs, "existsSync" | "readFileSync"> = fs,
+): RoundData | null {
 	// filePath may be "xxx.json:prompt", "xxx.json:response", or "xxx.json:round"
 	// strip the suffix to get the actual file
 	const actualFile = filePath.replace(/(:prompt|:response|:round)$/, "");
-	const fullPath = `${ROUNDS_DIR}/${actualFile}`;
-	if (!fs.existsSync(fullPath)) return null;
+	const fullPath = `${roundsDir}/${actualFile}`;
+	if (!fsImpl.existsSync(fullPath)) return null;
 	try {
-		const data = JSON.parse(fs.readFileSync(fullPath, "utf-8"));
+		const data = JSON.parse(fsImpl.readFileSync(fullPath, "utf-8"));
 		return {
 			userPrompt: data.userPrompt ?? "",
 			responseSequence: data.responseSequence ?? "",
@@ -894,6 +958,10 @@ function readRoundFile(filePath: string): RoundData | null {
 	} catch {
 		return null;
 	}
+}
+
+function readRoundFile(filePath: string): RoundData | null {
+	return readRoundFileFromDir(filePath, ROUNDS_DIR);
 }
 
 let lastRoundFileName: string | null = null; // tracks the most recent saved round (process-local)
@@ -926,16 +994,24 @@ let cachedEnvPreamble: string | null = null;
 let cachedContextMessages: unknown[] | null = null;
 let cachedUserPromptForContext: string | null = null; // the extracted user prompt used to build cachedContextMessages
 
-async function getApiKey(ctx?: {
+export interface ApiKeyContext {
 	modelRegistry?: { getApiKeyForProvider(provider: string): Promise<string | undefined> };
-}): Promise<string | null> {
+}
+
+export interface ApiKeyLookupDeps {
+	env?: { OPENROUTER_API_KEY?: string };
+	spawnImpl?: typeof spawn;
+}
+
+export async function getApiKey(ctx?: ApiKeyContext, deps: ApiKeyLookupDeps = {}): Promise<string | null> {
 	// 1. Environment variable
-	const envKey = process.env.OPENROUTER_API_KEY;
+	const env = deps.env ?? process.env;
+	const envKey = env.OPENROUTER_API_KEY;
 	if (envKey) return envKey;
 
 	// 2. Pi's configured OpenRouter auth (e.g. /login, auth storage, models.json)
 	try {
-		const piKey = await ctx?.modelRegistry?.getApiKeyForProvider("openrouter");
+		const piKey = await ctx!.modelRegistry!.getApiKeyForProvider("openrouter");
 		if (piKey) return piKey;
 	} catch {
 		// Pi auth lookup failed, fall through
@@ -943,13 +1019,13 @@ async function getApiKey(ctx?: {
 
 	// 3. Pass store (async to avoid blocking the event loop)
 	try {
-		const key = await new Promise<string | null>((resolve) => {
-			const child = spawn("pass", ["show", "ai/openrouter"], {
+		return await new Promise<string | null>((resolve) => {
+			const child = (deps.spawnImpl ?? spawn)("pass", ["show", "ai/openrouter"], {
 				timeout: 1000,
 				stdio: ["pipe", "pipe", "pipe"],
 			});
 			let stdout = "";
-			child.stdout?.on("data", (chunk: Buffer) => {
+			child.stdout!.on("data", (chunk: Buffer) => {
 				stdout += chunk.toString();
 			});
 			child.on("close", (code) => {
@@ -962,7 +1038,6 @@ async function getApiKey(ctx?: {
 			});
 			child.on("error", () => resolve(null));
 		});
-		if (key) return key;
 	} catch {
 		// pass not available, fall through
 	}
@@ -1163,6 +1238,76 @@ function extensionRoot(): string {
 	return path.resolve(__dirname, "..");
 }
 
+export function getImportClaudeArgumentCompletions(prefix: string): Array<{ value: string; label: string }> | null {
+	const options = ["--dry-run", "--include-sidechains", "--limit"];
+	const matches = options.filter((opt) => opt.startsWith(prefix));
+	return matches.length ? matches.map((value) => ({ value, label: value })) : null;
+}
+
+export function buildImportClaudeCommandPlan(args: string, root: string) {
+	const parsedArgs = splitCommandArgs(args);
+	return {
+		root,
+		script: path.resolve(root, "scripts", "import-claude-code.ts"),
+		parsedArgs,
+		statusText: `🧠 importing Claude Code history ${parsedArgs.join(" ")}`.trim(),
+		startNotification: `Starting Claude Code import${parsedArgs.length ? ` (${parsedArgs.join(" ")})` : ""}...`,
+	};
+}
+
+export function buildImportClaudeSpawnRequest(
+	root: string,
+	script: string,
+	parsedArgs: readonly string[],
+	apiKey: string | null,
+	env: Record<string, string | undefined> = process.env,
+) {
+	const childEnv: Record<string, string | undefined> = {
+		...env,
+		...(apiKey ? { OPENROUTER_API_KEY: apiKey } : {}),
+		SEMBLR_ROUNDS_DIR: ROUNDS_DIR,
+	};
+	return {
+		command: "npx",
+		args: ["tsx", script, ...parsedArgs],
+		options: {
+			cwd: root,
+			env: childEnv,
+			stdio: ["ignore", "pipe", "pipe"] as ["ignore", "pipe", "pipe"],
+		},
+	};
+}
+
+export function appendImportClaudeOutputTail(current: string, chunk: unknown, limit = 4000): string {
+	const next = current + String(chunk);
+	return next.length > limit ? next.slice(-limit) : next;
+}
+
+export function extractImportClaudeStatusLine(chunk: unknown): string | null {
+	const lastLine = String(chunk).trim().split("\n").filter(Boolean).pop();
+	return lastLine ? lastLine.slice(0, 120) : null;
+}
+
+export function combineImportClaudeOutput(stdout: string, stderr: string): string {
+	return [stdout.trim(), stderr.trim()].filter(Boolean).join("\n");
+}
+
+export function buildImportClaudeCompletionReport(code: number | null, output: string) {
+	const tail = output.split("\n").slice(-8).join("\n");
+	if (code === 0) {
+		return {
+			statusText: "🧠 Claude Code import complete",
+			notification: `Claude Code import complete${tail ? `:\n${tail}` : ""}`,
+			level: "info" as const,
+		};
+	}
+	return {
+		statusText: `🧠 Claude Code import failed (${code})`,
+		notification: `Claude Code import failed (${code})${tail ? `:\n${tail}` : ""}`,
+		level: "error" as const,
+	};
+}
+
 // ─────────────────────────────────────────────
 // Extension
 // ─────────────────────────────────────────────
@@ -1171,63 +1316,41 @@ export default function (pi: ExtensionAPI) {
 	pi.registerCommand("semblr:import-claude", {
 		description:
 			"Import Claude Code history into Semblr (/semblr:import-claude --dry-run, --limit N, --include-sidechains)",
-		getArgumentCompletions: (prefix: string) => {
-			const options = ["--dry-run", "--include-sidechains", "--limit"];
-			const matches = options.filter((opt) => opt.startsWith(prefix));
-			return matches.length ? matches.map((value) => ({ value, label: value })) : null;
-		},
+		getArgumentCompletions: getImportClaudeArgumentCompletions,
 		handler: async (args, ctx) => {
 			const root = extensionRoot();
-			const script = path.resolve(root, "scripts", "import-claude-code.ts");
+			const { script, parsedArgs, statusText, startNotification } = buildImportClaudeCommandPlan(args, root);
 			if (!fs.existsSync(script)) {
 				ctx.ui.notify(`Semblr import script not found: ${script}`, "error");
 				return;
 			}
 
-			const parsedArgs = splitCommandArgs(args);
-			ctx.ui.setStatus("semblr", `🧠 importing Claude Code history ${parsedArgs.join(" ")}`.trim());
-			ctx.ui.notify(
-				`Starting Claude Code import${parsedArgs.length ? ` (${parsedArgs.join(" ")})` : ""}...`,
-				"info",
-			);
+			ctx.ui.setStatus("semblr", statusText);
+			ctx.ui.notify(startNotification, "info");
 
 			const apiKey = await getApiKey(ctx as Parameters<typeof getApiKey>[0]);
-			const child = spawn("npx", ["tsx", script, ...parsedArgs], {
-				cwd: root,
-				env: {
-					...process.env,
-					...(apiKey ? { OPENROUTER_API_KEY: apiKey } : {}),
-					SEMBLR_ROUNDS_DIR: ROUNDS_DIR,
-				},
-				stdio: ["ignore", "pipe", "pipe"],
-			});
+			const spawnRequest = buildImportClaudeSpawnRequest(root, script, parsedArgs, apiKey);
+			const child = spawn(spawnRequest.command, spawnRequest.args, spawnRequest.options);
 
 			let stdout = "";
 			let stderr = "";
-			const keepTail = (s: string) => (s.length > 4000 ? s.slice(-4000) : s);
 			child.stdout.on("data", (chunk) => {
-				stdout = keepTail(stdout + chunk.toString());
+				stdout = appendImportClaudeOutputTail(stdout, chunk);
 			});
 			child.stderr.on("data", (chunk) => {
-				const text = chunk.toString();
-				stderr = keepTail(stderr + text);
-				const lastLine = text.trim().split("\n").filter(Boolean).pop();
-				if (lastLine) ctx.ui.setStatus("semblr", `🧠 ${lastLine.slice(0, 120)}`);
+				stderr = appendImportClaudeOutputTail(stderr, chunk);
+				const lastLine = extractImportClaudeStatusLine(chunk);
+				if (lastLine) ctx.ui.setStatus("semblr", `🧠 ${lastLine}`);
 			});
 
 			const code = await new Promise<number | null>((resolve) => {
 				child.on("close", resolve);
 			});
 
-			const output = [stdout.trim(), stderr.trim()].filter(Boolean).join("\n");
-			const tail = output.split("\n").slice(-8).join("\n");
-			if (code === 0) {
-				ctx.ui.setStatus("semblr", "🧠 Claude Code import complete");
-				ctx.ui.notify(`Claude Code import complete${tail ? `:\n${tail}` : ""}`, "info");
-			} else {
-				ctx.ui.setStatus("semblr", `🧠 Claude Code import failed (${code})`);
-				ctx.ui.notify(`Claude Code import failed (${code})${tail ? `:\n${tail}` : ""}`, "error");
-			}
+			const output = combineImportClaudeOutput(stdout, stderr);
+			const report = buildImportClaudeCompletionReport(code, output);
+			ctx.ui.setStatus("semblr", report.statusText);
+			ctx.ui.notify(report.notification, report.level);
 		},
 	});
 
@@ -1296,73 +1419,21 @@ export default function (pi: ExtensionAPI) {
 				return { messages: augmentedMessages } as any;
 			}
 
-			const scored = index
-				.map((entry) => ({
-					...entry,
-					similarity: cosineSimilarity(queryVec, entry.vector),
-				}))
-				.sort((a, b) => b.similarity - a.similarity);
-			const bestScore = scored.length > 0 ? scored[0].similarity : 0;
+			const scoredRounds = collectSearchRoundScores(index, queryVec, readRoundFile);
+			const bestScore = scoredRounds.length > 0 ? scoredRounds[0].bestScore : 0;
 
 			// --- Dynamic budget ---
 			const MIN_SIMILARITY = 0.3;
-			const minBudget = 2000;
-			const MAX_BUDGET = Math.floor(
-				CONTEXT_BUDGET_RATIO * ((ctx as ExtensionContext).model?.contextWindow ?? 128_000),
+			const budgetTokens = computeContextBudget(
+				bestScore,
+				(ctx as ExtensionContext).model?.contextWindow ?? 128_000,
+				MIN_SIMILARITY,
 			);
-			// Linear interpolation: at MIN_SIMILARITY → minBudget, at 1.0 → MAX_BUDGET
-			const t = Math.max(0, Math.min(1, (bestScore - MIN_SIMILARITY) / (1 - MIN_SIMILARITY)));
-			const budgetTokens = Math.floor(minBudget + t * (MAX_BUDGET - minBudget));
 
-			// Group by round file, take best score per round
-			interface RoundScore {
-				data: RoundData;
-				fileName: string;
-				bestScore: number;
-			}
-			const roundScores = new Map<string, RoundScore>();
-			for (const entry of scored) {
-				const roundFile = entry.filePath.replace(/(:prompt|:response|:round)$/, "");
-				if (!roundFile.endsWith(".json")) continue;
-				if (roundScores.has(roundFile)) continue;
-				const roundData = readRoundFile(entry.filePath);
-				if (!roundData) continue;
-				roundScores.set(roundFile, {
-					data: roundData,
-					fileName: roundFile,
-					bestScore: entry.similarity,
-				});
-			}
-
-			const _uniqueRounds = new Set(
-				index.map((e: { filePath: string }) => e.filePath.replace(/(:prompt|:response|:round)$/, "")),
-			).size;
-
-			const scoredRounds = Array.from(roundScores.values()).sort((a, b) => b.bestScore - a.bestScore);
-
-			// Select rounds within budget
-			const selectedRounds: RoundScore[] = [];
-			let usedTokens = 0;
-			const addRound = (round: RoundScore) => {
-				selectedRounds.push(round);
-			};
-
-			// 1. Score-based selection (below threshold stops)
-			for (const round of scoredRounds) {
-				if (round.bestScore < MIN_SIMILARITY) break;
-				const roundTokens = estimateTokens(round.data.userPrompt + round.data.responseSequence);
-				if (usedTokens + roundTokens > budgetTokens) break;
-				addRound(round);
-				usedTokens += roundTokens;
-			}
-
-			// 2. Always add the last round (if not already there)
-			if (lastRoundFileName) {
-				const lastData = readRoundFile(lastRoundFileName);
-				if (lastData) {
-					addRound({ data: lastData, fileName: lastRoundFileName, bestScore: 0 });
-				}
-			}
+			const selectedRounds = selectContextRounds(scoredRounds, lastRoundFileName, readRoundFile, {
+				minSimilarity: MIN_SIMILARITY,
+				budgetTokens,
+			});
 
 			if (selectedRounds.length === 0) {
 				ctx.ui.setStatus("semblr", `🧠 no relevant context (best: ${bestScore.toFixed(3)})`);
@@ -1646,12 +1717,8 @@ export default function (pi: ExtensionAPI) {
 		causalChain = [];
 		roundGroups = [];
 
-		const indexExists = fs.existsSync(INDEX_PATH);
-		const index = indexExists ? loadIndex() : [];
-		const uniqueRounds = new Set(
-			index.map((e: { filePath: string }) => e.filePath.replace(/(:prompt|:response|:round)$/, "")),
-		).size;
-		ctx.ui.setStatus("semblr", `🧠 semblr loaded — ${uniqueRounds} rounds indexed`);
+		const index = loadSessionStartIndex();
+		ctx.ui.setStatus("semblr", buildSessionStartStatus(index));
 
 		// Register the search_interactions tool here, not at factory level
 		pi.registerTool({

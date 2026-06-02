@@ -1,8 +1,10 @@
+import { EventEmitter } from "node:events";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { describe, expect, it, vi } from "vitest";
 import registerSemblr, {
+	appendImportClaudeOutputTail,
 	appendToIndexPath,
 	applyMessageEndToState,
 	buildAgentEndChainEntry,
@@ -10,27 +12,40 @@ import registerSemblr, {
 	buildAgentEndRoundData,
 	buildAgentEndToolSummary,
 	buildContextMessagePrefix,
+	buildImportClaudeCommandPlan,
+	buildImportClaudeCompletionReport,
+	buildImportClaudeSpawnRequest,
 	buildRoundAssistantOutput,
+	buildSessionStartStatus,
 	collapseRoundDetails,
 	collectSearchRoundScores,
+	combineImportClaudeOutput,
+	computeContextBudget,
+	countUniqueIndexedRounds,
 	countWordsInMessageContent,
 	embedText,
 	extractAgentEndResponseText,
 	extractAgentEndUserPrompt,
 	extractContextPrompt,
+	extractImportClaudeStatusLine,
 	filterSearchIndexByRounds,
 	formatRoundToolMeta,
 	getAgentEndParentId,
+	getApiKey,
+	getImportClaudeArgumentCompletions,
 	getRelatedParentIdFromGroup,
 	loadIndexFromPath,
 	loadRoundDataForToolDetails,
+	loadSessionStartIndex,
 	type MessageEndProcessingState,
 	normalizeSearchInteractionsParams,
 	prepareContextMessages,
 	type RoundData,
+	readRoundFileFromDir,
 	renderRoundDetailsToolResult,
 	renderSearchInteractionsToolResult,
 	renderToolDetailsToolResult,
+	selectContextRounds,
 	shouldDropRelevanceList,
 	startsWithEnvironmentPreamble,
 } from "./semblr.ts";
@@ -155,6 +170,135 @@ describe("semblr context hook join points", () => {
 		expect((prefix[2] as { content: Array<{ text: string }> }).content[0].text).toBe("recency");
 		expect((prefix[3] as { content: Array<{ text: string }> }).content[0].text).toBe("relevance");
 		expect(buildContextMessagePrefix(null, null, null, null)).toEqual([]);
+	});
+});
+
+describe("context retrieval and round selection join points", () => {
+	it("loads round files by stripping index suffixes and normalizing missing fields", () => {
+		const existsSync = vi.fn((filePath: fs.PathLike) => String(filePath) === "/rounds/a.json");
+		const readFileSync = vi.fn((_filePath: fs.PathLike, encoding?: BufferEncoding) => {
+			if (encoding !== "utf-8") throw new Error("expected utf-8 read");
+			return JSON.stringify({ userPrompt: "prompt", responseSequence: "answer" });
+		});
+		const fsImpl = { existsSync, readFileSync } as unknown as Pick<typeof fs, "existsSync" | "readFileSync">;
+
+		expect(readRoundFileFromDir("a.json:response", "/rounds", fsImpl)).toEqual({
+			userPrompt: "prompt",
+			responseSequence: "answer",
+			turnIndex: 0,
+			userTimestamp: undefined,
+			toolCallCount: undefined,
+			toolCallNames: undefined,
+			toolCalls: undefined,
+		});
+		expect(existsSync).toHaveBeenCalledWith("/rounds/a.json");
+		expect(readFileSync).toHaveBeenCalledWith("/rounds/a.json", "utf-8");
+		expect(readRoundFileFromDir("missing.json:prompt", "/rounds", fsImpl)).toBeNull();
+		readRoundFileFromDir("nested:prompt.json:response", "/rounds", fsImpl);
+		expect(existsSync).toHaveBeenCalledWith("/rounds/nested:prompt.json");
+	});
+
+	it("returns null for malformed round files", () => {
+		const fsImpl = {
+			existsSync: vi.fn(() => true),
+			readFileSync: vi.fn(() => "not json"),
+		} as unknown as Pick<typeof fs, "existsSync" | "readFileSync">;
+
+		expect(readRoundFileFromDir("bad.json:round", "/rounds", fsImpl)).toBeNull();
+	});
+
+	it("computes the dynamic context budget with low, middle, and high score clamps", () => {
+		expect(computeContextBudget(0.1, 10_000, 0.3, 100, 0.5)).toBe(100);
+		expect(computeContextBudget(1.2, 10_000, 0.3, 100, 0.5)).toBe(5000);
+		expect(computeContextBudget(0.65, 10_000, 0.3, 100, 0.5)).toBe(2550);
+	});
+
+	it("selects context rounds until threshold or token budget stops selection", () => {
+		const rounds = [
+			{
+				fileName: "one.json",
+				bestScore: 0.9,
+				data: { userPrompt: "one", responseSequence: "answer", turnIndex: 0 },
+			},
+			{
+				fileName: "two.json",
+				bestScore: 0.8,
+				data: { userPrompt: "two", responseSequence: "answer", turnIndex: 0 },
+			},
+			{
+				fileName: "low.json",
+				bestScore: 0.2,
+				data: { userPrompt: "low", responseSequence: "answer", turnIndex: 0 },
+			},
+		];
+
+		const selected = selectContextRounds(
+			rounds,
+			"last.json",
+			(filePath) =>
+				filePath === "last.json" ? { userPrompt: "last", responseSequence: "answer", turnIndex: 0 } : null,
+			{
+				minSimilarity: 0.3,
+				budgetTokens: 2,
+				estimateTokensFn: (text) => (text.startsWith("one") ? 1 : 2),
+			},
+		);
+
+		expect(selected.map((round) => round.fileName)).toEqual(["one.json", "last.json"]);
+		expect(selected[1].bestScore).toBe(0);
+	});
+
+	it("includes rounds exactly at threshold and token budget boundaries", () => {
+		const selected = selectContextRounds(
+			[
+				{
+					fileName: "threshold.json",
+					bestScore: 0.3,
+					data: { userPrompt: "threshold", responseSequence: "answer", turnIndex: 0 },
+				},
+			],
+			null,
+			() => null,
+			{ minSimilarity: 0.3, budgetTokens: 2, estimateTokensFn: () => 2 },
+		);
+
+		expect(selected.map((round) => round.fileName)).toEqual(["threshold.json"]);
+	});
+
+	it("uses the default similarity threshold and skips last-round loading when absent", () => {
+		const readRound = vi.fn(() => ({ userPrompt: "unexpected", responseSequence: "answer", turnIndex: 0 }));
+		const selected = selectContextRounds(
+			[
+				{
+					fileName: "below-default.json",
+					bestScore: 0.29,
+					data: { userPrompt: "low", responseSequence: "answer", turnIndex: 0 },
+				},
+			],
+			null,
+			readRound,
+			{ budgetTokens: 100 },
+		);
+
+		expect(selected).toEqual([]);
+		expect(readRound).not.toHaveBeenCalled();
+	});
+
+	it("omits the last round when it cannot be loaded", () => {
+		const selected = selectContextRounds(
+			[
+				{
+					fileName: "low.json",
+					bestScore: 0.1,
+					data: { userPrompt: "low", responseSequence: "answer", turnIndex: 0 },
+				},
+			],
+			"missing.json",
+			() => null,
+			{ minSimilarity: 0.3, budgetTokens: 100 },
+		);
+
+		expect(selected).toEqual([]);
 	});
 });
 
@@ -333,6 +477,250 @@ describe("agent_end handler join points", () => {
 
 		expect(statuses).toContain("🧠 agent_end: no user prompt to save");
 		expect(statuses).toContain("🧠 agent_end: no response text");
+	});
+});
+
+describe("extension lifecycle command join points", () => {
+	it("loads session-start index state and formats unique-round status", () => {
+		const duplicateIndex = [
+			{ filePath: "same.json:prompt", vector: [1, 0] },
+			{ filePath: "same.json:response", vector: [0, 1] },
+			{ filePath: "other.json:round", vector: [1, 1] },
+		];
+
+		expect(
+			loadSessionStartIndex("/missing/index.csv", {
+				existsSync: () => false,
+				loadIndex: () => duplicateIndex,
+			}),
+		).toEqual([]);
+		expect(
+			loadSessionStartIndex("/rounds/index.csv", {
+				existsSync: () => true,
+				loadIndex: () => duplicateIndex,
+			}),
+		).toBe(duplicateIndex);
+		expect(countUniqueIndexedRounds(duplicateIndex)).toBe(2);
+		expect(
+			countUniqueIndexedRounds([{ filePath: "same.json:prompt" }, { filePath: "same.jsonStryker was here" }]),
+		).toBe(2);
+		expect(buildSessionStartStatus(duplicateIndex)).toBe("🧠 semblr loaded — 2 rounds indexed");
+		expect(buildSessionStartStatus([])).toBe("🧠 semblr loaded — 0 rounds indexed");
+	});
+
+	it("cancels compaction, initializes sessions, and notifies recent read stats", async () => {
+		const handlers = new Map<string, (event: unknown, ctx: unknown) => Promise<unknown>>();
+		const commands = new Map<string, { handler: (args: string, ctx: unknown) => Promise<void> }>();
+		const pi = {
+			on: vi.fn((name: string, handler: (event: unknown, ctx: unknown) => Promise<unknown>) => {
+				handlers.set(name, handler);
+			}),
+			registerCommand: vi.fn((name: string, command: { handler: (args: string, ctx: unknown) => Promise<void> }) => {
+				commands.set(name, command);
+			}),
+			registerTool: vi.fn(),
+		};
+		const ctx = {
+			ui: {
+				setStatus: vi.fn(),
+				notify: vi.fn(),
+			},
+		};
+
+		registerSemblr(pi as never);
+
+		expect([...handlers.keys()]).toEqual([
+			"context",
+			"agent_start",
+			"message_end",
+			"agent_end",
+			"session_before_compact",
+			"session_start",
+		]);
+		expect([...commands.keys()]).toEqual(["semblr:import-claude"]);
+		expect(await handlers.get("session_before_compact")?.({}, ctx)).toEqual({ cancel: true });
+		await handlers.get("session_start")?.({}, ctx);
+
+		expect(ctx.ui.setStatus).toHaveBeenCalledWith(
+			"semblr",
+			expect.stringMatching(/^🧠 semblr loaded — \d+ rounds indexed$/),
+		);
+		expect(pi.registerTool).toHaveBeenCalledTimes(3);
+		expect(pi.registerTool.mock.calls.map(([tool]) => tool.name)).toEqual([
+			"search_interactions",
+			"get_round_details",
+			"get_tool_details",
+		]);
+		expect(pi.registerTool.mock.calls.map(([tool]) => tool.promptSnippet)).toEqual([
+			"Search past interactions for relevant context",
+			"Get full details of a past conversation round",
+			"Get details of a specific tool call from a past round",
+		]);
+		expect([...commands.keys()]).toEqual(["semblr:import-claude", "semblr:recent-read-stats"]);
+
+		await commands.get("semblr:recent-read-stats")?.handler("", ctx);
+		expect(ctx.ui.notify).toHaveBeenCalledWith(expect.stringContaining("Recent lookups to build context"), "info");
+	});
+});
+
+describe("Claude import command join points", () => {
+	it("filters command argument completions and builds the command plan", () => {
+		expect(getImportClaudeArgumentCompletions("--d")).toEqual([{ value: "--dry-run", label: "--dry-run" }]);
+		expect(getImportClaudeArgumentCompletions("--i")).toEqual([
+			{ value: "--include-sidechains", label: "--include-sidechains" },
+		]);
+		expect(getImportClaudeArgumentCompletions("--l")).toEqual([{ value: "--limit", label: "--limit" }]);
+		expect(getImportClaudeArgumentCompletions("--missing")).toBeNull();
+
+		const plan = buildImportClaudeCommandPlan('--dry-run --limit "2"', "/repo");
+		expect(plan).toEqual({
+			root: "/repo",
+			script: path.resolve("/repo", "scripts", "import-claude-code.ts"),
+			parsedArgs: ["--dry-run", "--limit", "2"],
+			statusText: "🧠 importing Claude Code history --dry-run --limit 2",
+			startNotification: "Starting Claude Code import (--dry-run --limit 2)...",
+		});
+
+		const emptyPlan = buildImportClaudeCommandPlan("", "/repo");
+		expect(emptyPlan.statusText).toBe("🧠 importing Claude Code history");
+		expect(emptyPlan.startNotification).toBe("Starting Claude Code import...");
+	});
+
+	it("builds spawn requests with optional API-key injection", () => {
+		const withKey = buildImportClaudeSpawnRequest(
+			"/repo",
+			"/repo/scripts/import-claude-code.ts",
+			["--dry-run"],
+			"key",
+			{
+				PATH: "/bin",
+				OPENROUTER_API_KEY: "old-key",
+			},
+		);
+
+		expect(withKey.command).toBe("npx");
+		expect(withKey.args).toEqual(["tsx", "/repo/scripts/import-claude-code.ts", "--dry-run"]);
+		expect(withKey.options.cwd).toBe("/repo");
+		expect(withKey.options.stdio).toEqual(["ignore", "pipe", "pipe"]);
+		expect(withKey.options.env.PATH).toBe("/bin");
+		expect(withKey.options.env.OPENROUTER_API_KEY).toBe("key");
+		expect(withKey.options.env.SEMBLR_ROUNDS_DIR).toContain("/semblr/rounds");
+
+		const withoutKey = buildImportClaudeSpawnRequest("/repo", "/script.ts", [], null, {
+			OPENROUTER_API_KEY: "existing-env-key",
+		});
+		expect(withoutKey.options.env.OPENROUTER_API_KEY).toBe("existing-env-key");
+	});
+
+	it("keeps output tails, extracts stderr status lines, and combines trimmed output", () => {
+		expect(appendImportClaudeOutputTail("abc", Buffer.from("def"), 10)).toBe("abcdef");
+		expect(appendImportClaudeOutputTail("12345", "67890x", 10)).toBe("234567890x");
+		expect(extractImportClaudeStatusLine("\nfirst\nsecond\n")).toBe("second");
+		expect(extractImportClaudeStatusLine("  second  ")).toBe("second");
+		expect(extractImportClaudeStatusLine("\n\n")).toBeNull();
+		expect(extractImportClaudeStatusLine(`${"x".repeat(130)}\n`)).toHaveLength(120);
+		expect(combineImportClaudeOutput(" out \n", " err ")).toBe("out\nerr");
+		expect(combineImportClaudeOutput(" \n", " ")).toBe("");
+	});
+
+	it("formats success and failure completion reports with output tails", () => {
+		expect(buildImportClaudeCompletionReport(0, "")).toEqual({
+			statusText: "🧠 Claude Code import complete",
+			notification: "Claude Code import complete",
+			level: "info",
+		});
+		expect(buildImportClaudeCompletionReport(0, "done").notification).toBe("Claude Code import complete:\ndone");
+		expect(buildImportClaudeCompletionReport(null, "").notification).toBe("Claude Code import failed (null)");
+
+		const failure = buildImportClaudeCompletionReport(
+			1,
+			Array.from({ length: 10 }, (_, i) => `line-${i}`).join("\n"),
+		);
+		expect(failure.statusText).toBe("🧠 Claude Code import failed (1)");
+		expect(failure.level).toBe("error");
+		expect(failure.notification).toContain("line-2\nline-3");
+		expect(failure.notification).not.toContain("line-1");
+	});
+});
+
+describe("OpenRouter API key resolution join points", () => {
+	const withoutEnv = { OPENROUTER_API_KEY: undefined };
+	const spawnPass = (options: { code?: number | null; chunks?: string[]; error?: boolean } = {}) => {
+		const spawnImpl = vi.fn(() => {
+			const child = new EventEmitter() as EventEmitter & { stdout: EventEmitter };
+			child.stdout = new EventEmitter();
+			queueMicrotask(() => {
+				if (options.error) {
+					child.emit("error", new Error("pass missing"));
+					return;
+				}
+				for (const chunk of options.chunks ?? []) child.stdout.emit("data", Buffer.from(chunk));
+				child.emit("close", options.code ?? 0);
+			});
+			return child;
+		});
+		return spawnImpl as unknown as typeof import("node:child_process").spawn;
+	};
+
+	it("prefers OPENROUTER_API_KEY from the environment", async () => {
+		const spawnImpl = vi.fn() as unknown as typeof import("node:child_process").spawn;
+		const modelRegistry = { getApiKeyForProvider: vi.fn(async () => "registry-key") };
+
+		await expect(getApiKey({ modelRegistry }, { env: { OPENROUTER_API_KEY: "env-key" }, spawnImpl })).resolves.toBe(
+			"env-key",
+		);
+		expect(modelRegistry.getApiKeyForProvider).not.toHaveBeenCalled();
+		expect(spawnImpl).not.toHaveBeenCalled();
+	});
+
+	it("falls back to Pi model registry before pass", async () => {
+		const spawnImpl = vi.fn() as unknown as typeof import("node:child_process").spawn;
+		const modelRegistry = { getApiKeyForProvider: vi.fn(async () => "registry-key") };
+
+		await expect(getApiKey({ modelRegistry }, { env: withoutEnv, spawnImpl })).resolves.toBe("registry-key");
+		expect(modelRegistry.getApiKeyForProvider).toHaveBeenCalledWith("openrouter");
+		expect(spawnImpl).not.toHaveBeenCalled();
+	});
+
+	it("falls back to pass when registry lookup is missing or fails", async () => {
+		const spawnImpl = spawnPass({ chunks: [" pass-key\n"] });
+		const modelRegistry = { getApiKeyForProvider: vi.fn(async () => undefined) };
+
+		await expect(getApiKey({ modelRegistry }, { env: withoutEnv, spawnImpl })).resolves.toBe("pass-key");
+		expect(spawnImpl).toHaveBeenCalledWith("pass", ["show", "ai/openrouter"], {
+			timeout: 1000,
+			stdio: ["pipe", "pipe", "pipe"],
+		});
+
+		const throwingRegistry = {
+			getApiKeyForProvider: vi.fn(async () => {
+				throw new Error("registry down");
+			}),
+		};
+		await expect(
+			getApiKey(
+				{ modelRegistry: throwingRegistry },
+				{ env: withoutEnv, spawnImpl: spawnPass({ chunks: ["second"] }) },
+			),
+		).resolves.toBe("second");
+	});
+
+	it("returns null when pass is empty, exits nonzero, errors, or cannot spawn", async () => {
+		await expect(
+			getApiKey(undefined, { env: withoutEnv, spawnImpl: spawnPass({ chunks: ["\n"] }) }),
+		).resolves.toBeNull();
+		await expect(
+			getApiKey(undefined, { env: withoutEnv, spawnImpl: spawnPass({ code: 1, chunks: ["ignored"] }) }),
+		).resolves.toBeNull();
+		await expect(
+			getApiKey(undefined, { env: withoutEnv, spawnImpl: spawnPass({ error: true }) }),
+		).resolves.toBeNull();
+		const noStdoutSpawn = vi.fn(() => new EventEmitter()) as unknown as typeof import("node:child_process").spawn;
+		await expect(getApiKey(undefined, { env: withoutEnv, spawnImpl: noStdoutSpawn })).resolves.toBeNull();
+		const throwingSpawn = vi.fn(() => {
+			throw new Error("no pass binary");
+		}) as unknown as typeof import("node:child_process").spawn;
+		await expect(getApiKey(undefined, { env: withoutEnv, spawnImpl: throwingSpawn })).resolves.toBeNull();
 	});
 });
 

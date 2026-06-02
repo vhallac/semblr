@@ -13,6 +13,7 @@
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { pathToFileURL } from "node:url";
 import { computeContentHash } from "../src/core/hash.ts";
 import {
 	appendVectorIndexEntry,
@@ -32,11 +33,9 @@ type Round = ParsedPiRound;
 // Config
 // ─────────────────────────────────────────────
 
-const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY;
 const EMBEDDING_MODEL = "openai/text-embedding-3-small";
 const _OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"; // actually embeddings endpoint
 const ROUNDS_DIR = process.env.SEMBLR_ROUNDS_DIR || path.resolve(os.homedir(), ".pi", "agent", "semblr", "rounds");
-const INDEX_PATH = path.resolve(ROUNDS_DIR, "index.csv");
 const MAX_PROMPT_CHARS = 8000;
 const MAX_RESPONSE_CHARS = 8000;
 
@@ -44,7 +43,7 @@ const MAX_RESPONSE_CHARS = 8000;
 // Parse session into rounds
 // ─────────────────────────────────────────────
 
-function parseSession(filePath: string): Round[] {
+export function parseSession(filePath: string): Round[] {
 	return parsePiSessionJsonl(fs.readFileSync(filePath, "utf-8"));
 }
 
@@ -52,15 +51,22 @@ function parseSession(filePath: string): Round[] {
 // Embedding via OpenRouter
 // ─────────────────────────────────────────────
 
-async function embed(text: string): Promise<number[]> {
-	if (!OPENROUTER_API_KEY) {
+export interface EmbedOptions {
+	apiKey?: string;
+	fetchImpl?: typeof fetch;
+}
+
+export async function embed(text: string, options: EmbedOptions = {}): Promise<number[]> {
+	const apiKey = options.apiKey ?? process.env.OPENROUTER_API_KEY;
+	if (!apiKey) {
 		throw new Error("OPENROUTER_API_KEY environment variable required");
 	}
 
-	const response = await fetch("https://openrouter.ai/api/v1/embeddings", {
+	const fetchImpl = options.fetchImpl ?? fetch;
+	const response = await fetchImpl("https://openrouter.ai/api/v1/embeddings", {
 		method: "POST",
 		headers: {
-			Authorization: `Bearer ${OPENROUTER_API_KEY}`,
+			Authorization: `Bearer ${apiKey}`,
 			"Content-Type": "application/json",
 		},
 		body: JSON.stringify({
@@ -84,7 +90,7 @@ async function embed(text: string): Promise<number[]> {
 // Vector helpers
 // ─────────────────────────────────────────────
 
-function normalize(v: number[]): number[] {
+export function normalize(v: number[]): number[] {
 	const mag = Math.sqrt(v.reduce((sum, x) => sum + x * x, 0));
 	return mag === 0 ? v : v.map((x) => x / mag);
 }
@@ -99,19 +105,34 @@ function _cosineSimilarity(a: number[], b: number[]): number {
 // Main
 // ─────────────────────────────────────────────
 
-async function main() {
-	const sessionFile = process.argv[2];
+export interface DigestSessionOptions {
+	sessionFile?: string;
+	roundsDir?: string;
+	indexPath?: string;
+	apiKey?: string;
+	fetchImpl?: typeof fetch;
+	stdout?: Pick<typeof console, "log">;
+	stderr?: Pick<typeof console, "error">;
+}
+
+export async function runDigestSession(options: DigestSessionOptions = {}): Promise<number> {
+	const sessionFile = options.sessionFile;
+	const roundsDir = options.roundsDir ?? ROUNDS_DIR;
+	const indexPath = options.indexPath ?? path.resolve(roundsDir, "index.csv");
+	const out = options.stdout ?? console;
+	const err = options.stderr ?? console;
+
 	if (!sessionFile) {
-		console.error("Usage: npx tsx scripts/digest-session.ts <session-file>");
-		process.exit(1);
+		err.error("Usage: npx tsx scripts/digest-session.ts <session-file>");
+		return 1;
 	}
 
-	console.log(`📂 Session: ${sessionFile}`);
+	out.log(`📂 Session: ${sessionFile}`);
 	const rounds = parseSession(sessionFile);
-	console.log(`📊 Parsed ${rounds.length} rounds`);
+	out.log(`📊 Parsed ${rounds.length} rounds`);
 
 	// Ensure rounds directory
-	fs.mkdirSync(ROUNDS_DIR, { recursive: true });
+	fs.mkdirSync(roundsDir, { recursive: true });
 
 	let embedded = 0;
 	let skipped = 0;
@@ -122,21 +143,21 @@ async function main() {
 		// Check for stale files whose stored full hash material belongs under this
 		// content-hash filename. If found, migrate old index entries before deleting
 		// old files so the round remains retrievable even if embedding is unavailable.
-		const staleFiles = findStaleContentMatchesInDir(ROUNDS_DIR, roundFile);
+		const staleFiles = findStaleContentMatchesInDir(roundsDir, roundFile);
 		for (const staleFile of staleFiles) {
-			migrateIndexEntriesFile(INDEX_PATH, staleFile, roundFile);
+			migrateIndexEntriesFile(indexPath, staleFile, roundFile);
 		}
 
 		// Always write the round file (idempotent) before deleting stale copies.
-		fs.writeFileSync(path.resolve(ROUNDS_DIR, roundFile), JSON.stringify(round, null, 2));
+		fs.writeFileSync(path.resolve(roundsDir, roundFile), JSON.stringify(round, null, 2));
 		for (const staleFile of staleFiles) {
-			fs.unlinkSync(path.join(ROUNDS_DIR, staleFile));
-			console.log(`  ♻️  Migrated stale: ${staleFile} → ${roundFile}`);
+			fs.unlinkSync(path.join(roundsDir, staleFile));
+			out.log(`  ♻️  Migrated stale: ${staleFile} → ${roundFile}`);
 		}
 
 		// Refresh existing set after potential deletions
 		const freshExisting = new Set(
-			loadVectorIndex(INDEX_PATH).map((e) => path.basename(e.filePath.replace(/(:prompt|:response|:round)$/, ""))),
+			loadVectorIndex(indexPath).map((e) => path.basename(e.filePath.replace(/(:prompt|:response|:round)$/, ""))),
 		);
 		if (freshExisting.has(roundFile)) {
 			skipped++;
@@ -144,22 +165,40 @@ async function main() {
 		}
 
 		// Embed prompt
-		console.log(`  🔄 Embedding round ${round.turnIndex + 1}/${rounds.length}...`);
-		const promptVector = await embed(round.userPrompt.slice(0, MAX_PROMPT_CHARS));
-		appendVectorIndexEntry(INDEX_PATH, normalize(promptVector), `${roundFile}:prompt`);
+		out.log(`  🔄 Embedding round ${round.turnIndex + 1}/${rounds.length}...`);
+		const promptVector = await embed(round.userPrompt.slice(0, MAX_PROMPT_CHARS), {
+			apiKey: options.apiKey,
+			fetchImpl: options.fetchImpl,
+		});
+		appendVectorIndexEntry(indexPath, normalize(promptVector), `${roundFile}:prompt`);
 
 		// Embed response
-		const respVector = await embed(round.responseSequence.slice(0, MAX_RESPONSE_CHARS));
-		appendVectorIndexEntry(INDEX_PATH, normalize(respVector), `${roundFile}:response`);
+		const respVector = await embed(round.responseSequence.slice(0, MAX_RESPONSE_CHARS), {
+			apiKey: options.apiKey,
+			fetchImpl: options.fetchImpl,
+		});
+		appendVectorIndexEntry(indexPath, normalize(respVector), `${roundFile}:response`);
 
 		embedded++;
 	}
 
-	console.log(`\n✅ Done. ${embedded} new rounds embedded, ${skipped} already in index.`);
-	console.log(`   Index: ${INDEX_PATH} (${loadVectorIndex(INDEX_PATH).length} vectors)`);
+	out.log(`\n✅ Done. ${embedded} new rounds embedded, ${skipped} already in index.`);
+	out.log(`   Index: ${indexPath} (${loadVectorIndex(indexPath).length} vectors)`);
+	return 0;
 }
 
-main().catch((err) => {
-	console.error("❌ Error:", err);
-	process.exit(1);
-});
+export function isMainModule(metaUrl: string, argv1 = process.argv[1]): boolean {
+	return argv1 ? pathToFileURL(argv1).href === metaUrl : false;
+}
+
+async function main() {
+	const exitCode = await runDigestSession({ sessionFile: process.argv[2] });
+	if (exitCode !== 0) process.exit(exitCode);
+}
+
+if (isMainModule(import.meta.url)) {
+	main().catch((err) => {
+		console.error("❌ Error:", err);
+		process.exit(1);
+	});
+}
