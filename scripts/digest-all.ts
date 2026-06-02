@@ -13,7 +13,8 @@
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { computeContentHash } from "../src/core/hash.ts";
+import { embedText, normalize } from "../lib/embed.ts";
+import { computeContentHash } from "../lib/hash.ts";
 import {
 	appendVectorIndexEntry,
 	findStaleContentMatches as findStaleContentMatchesInDir,
@@ -29,10 +30,6 @@ import { type ParsedPiRound, parsePiSessionJsonl } from "../src/core/pi-session.
 const SESSIONS_DIR = path.resolve(os.homedir(), ".pi", "agent", "sessions");
 const ROUNDS_DIR = process.env.SEMBLR_ROUNDS_DIR || path.resolve(os.homedir(), ".pi", "agent", "semblr", "rounds");
 const INDEX_PATH = path.resolve(ROUNDS_DIR, "index.csv");
-
-const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY;
-const EMBEDDING_MODEL = "openai/text-embedding-3-small";
-const OPENROUTER_URL = "https://openrouter.ai/api/v1/embeddings";
 // Keep bulk digest single-worker: stale-hash migrations rewrite index.csv and delete
 // duplicate files, so concurrent duplicate-content rounds can race and leave stale refs.
 const CONCURRENCY = 1;
@@ -57,43 +54,6 @@ function parseSessionFile(filePath: string, sessionLabel: string): Round[] {
 }
 
 // ─────────────────────────────────────────────
-// Embedding (single call)
-// ─────────────────────────────────────────────
-
-async function embed(text: string): Promise<number[]> {
-	const response = await fetch(OPENROUTER_URL, {
-		method: "POST",
-		headers: {
-			Authorization: `Bearer ${OPENROUTER_API_KEY}`,
-			"Content-Type": "application/json",
-		},
-		body: JSON.stringify({
-			model: EMBEDDING_MODEL,
-			input: text,
-		}),
-	});
-
-	if (!response.ok) {
-		const err = await response.text();
-		throw new Error(`OpenRouter embedding error (${response.status}): ${err}`);
-	}
-
-	const data = (await response.json()) as {
-		data: Array<{ embedding: number[] }>;
-	};
-	return data.data[0].embedding;
-}
-
-// ─────────────────────────────────────────────
-// Vector helpers
-// ─────────────────────────────────────────────
-
-function normalize(v: number[]): number[] {
-	const mag = Math.sqrt(v.reduce((sum, x) => sum + x * x, 0));
-	return mag === 0 ? v : v.map((x) => x / mag);
-}
-
-// ─────────────────────────────────────────────
 // Count user messages in a JSONL (for progress)
 // ─────────────────────────────────────────────
 
@@ -114,10 +74,14 @@ function _countUserMessages(filePath: string): number {
 // ─────────────────────────────────────────────
 
 async function main() {
-	if (!OPENROUTER_API_KEY) {
+	const apiKey = process.env.OPENROUTER_API_KEY;
+	if (!apiKey) {
 		console.error("❌ OPENROUTER_API_KEY environment variable required");
 		process.exit(1);
 	}
+	// TypeScript doesn't know process.exit never returns
+	// eslint-disable-next-line @typescript-eslint/no-non-null-assertion
+	const key: string = apiKey;
 
 	// Gather all session JSONL files
 	const sessionDirs = fs
@@ -200,12 +164,12 @@ async function main() {
 		}
 
 		try {
-			const promptVector = await embed(round.userPrompt.slice(0, MAX_PROMPT_CHARS));
+			const promptVector = await embedText(round.userPrompt.slice(0, MAX_PROMPT_CHARS), key);
 			appendVectorIndexEntry(INDEX_PATH, normalize(promptVector), `${roundFile}:prompt`);
 
 			const respText = round.responseSequence.slice(0, MAX_RESPONSE_CHARS);
 			if (respText) {
-				const respVector = await embed(respText);
+				const respVector = await embedText(respText, key);
 				appendVectorIndexEntry(INDEX_PATH, normalize(respVector), `${roundFile}:response`);
 			}
 

@@ -164,9 +164,7 @@ describe("digest-session script", () => {
 		await expect(embed("text", { apiKey: "" })).rejects.toThrow("OPENROUTER_API_KEY");
 
 		const fetchImpl = vi.fn(async () => new Response("bad", { status: 500 })) as typeof fetch;
-		await expect(embed("text", { apiKey: "key", fetchImpl })).rejects.toThrow(
-			"OpenRouter embedding error (500): bad",
-		);
+		await expect(embed("text", { apiKey: "key", fetchImpl })).rejects.toThrow("Embedding API error 500: bad");
 	});
 
 	it("uses environment and fetch defaults for embedding", async () => {

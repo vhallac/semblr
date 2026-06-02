@@ -13,10 +13,10 @@
  *   --limit N             Import at most N new rounds (useful for testing)
  */
 
-import { spawnSync } from "node:child_process";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { embedText, getApiKey, normalize } from "../lib/embed.ts";
 import { type ClaudeRound, claudeRoundFileName, parseClaudeCodeJsonl } from "../src/core/claude-code.ts";
 import {
 	appendVectorIndexEntry,
@@ -26,9 +26,6 @@ import {
 const CLAUDE_PROJECTS_DIR = process.env.CLAUDE_PROJECTS_DIR || path.resolve(os.homedir(), ".claude", "projects");
 const ROUNDS_DIR = process.env.SEMBLR_ROUNDS_DIR || path.resolve(os.homedir(), ".pi", "agent", "semblr", "rounds");
 const INDEX_PATH = path.resolve(ROUNDS_DIR, "index.csv");
-
-const EMBEDDING_MODEL = "openai/text-embedding-3-small";
-const OPENROUTER_URL = "https://openrouter.ai/api/v1/embeddings";
 const CONCURRENCY = Number(process.env.SEMBLR_IMPORT_CONCURRENCY || "5");
 const MAX_RESPONSE_CHARS = 8000;
 
@@ -42,18 +39,6 @@ function argValue(name: string): string | null {
 const DRY_RUN = process.argv.includes("--dry-run");
 const INCLUDE_SIDECHAINS = process.argv.includes("--include-sidechains");
 const LIMIT = argValue("--limit") ? Number(argValue("--limit")) : null;
-
-function getApiKey(): string | null {
-	if (process.env.OPENROUTER_API_KEY) return process.env.OPENROUTER_API_KEY;
-	try {
-		const result = spawnSync("pass", ["show", "ai/openrouter"], {
-			timeout: 5000,
-			stdio: ["pipe", "pipe", "pipe"],
-		});
-		if (result.status === 0) return result.stdout.toString().trim() || null;
-	} catch {}
-	return null;
-}
 
 function walkJsonlFiles(dir: string): string[] {
 	if (!fs.existsSync(dir)) return [];
@@ -78,31 +63,12 @@ function parseClaudeFile(filePath: string): Round[] {
 	});
 }
 
-async function embed(text: string, apiKey: string): Promise<number[]> {
-	const response = await fetch(OPENROUTER_URL, {
-		method: "POST",
-		headers: {
-			Authorization: `Bearer ${apiKey}`,
-			"Content-Type": "application/json",
-		},
-		body: JSON.stringify({ model: EMBEDDING_MODEL, input: text }),
-	});
-	if (!response.ok) throw new Error(`OpenRouter embedding error (${response.status}): ${await response.text()}`);
-	const data = (await response.json()) as { data: Array<{ embedding: number[] }> };
-	return data.data[0].embedding;
-}
-
-function normalize(v: number[]): number[] {
-	const mag = Math.sqrt(v.reduce((sum, x) => sum + x * x, 0));
-	return mag === 0 ? v : v.map((x) => x / mag);
-}
-
 function loadIndexedRoundFiles(): Set<string> {
 	return loadIndexedRoundFilesFromIndex(INDEX_PATH);
 }
 
 async function main() {
-	const apiKey = getApiKey();
+	const apiKey = await getApiKey();
 	if (!DRY_RUN && !apiKey) {
 		console.error("❌ OPENROUTER_API_KEY required (or pass show ai/openrouter must work)");
 		process.exit(1);
@@ -157,11 +123,11 @@ async function main() {
 		const file = roundFileName(round);
 		fs.writeFileSync(path.resolve(ROUNDS_DIR, file), JSON.stringify(round, null, 2));
 		try {
-			const promptVec = await embed(round.userPrompt, apiKey!);
+			const promptVec = await embedText(round.userPrompt, apiKey!);
 			appendVectorIndexEntry(INDEX_PATH, normalize(promptVec), `${file}:prompt`);
 			const respText = round.responseSequence.slice(0, MAX_RESPONSE_CHARS);
 			if (respText) {
-				const respVec = await embed(respText, apiKey!);
+				const respVec = await embedText(respText, apiKey!);
 				appendVectorIndexEntry(INDEX_PATH, normalize(respVec), `${file}:response`);
 			}
 			completed++;

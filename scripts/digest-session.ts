@@ -14,7 +14,8 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { pathToFileURL } from "node:url";
-import { computeContentHash } from "../src/core/hash.ts";
+import { embedText, normalize } from "../lib/embed.ts";
+import { computeContentHash } from "../lib/hash.ts";
 import {
 	appendVectorIndexEntry,
 	findStaleContentMatches as findStaleContentMatchesInDir,
@@ -33,8 +34,6 @@ type Round = ParsedPiRound;
 // Config
 // ─────────────────────────────────────────────
 
-const EMBEDDING_MODEL = "openai/text-embedding-3-small";
-const _OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"; // actually embeddings endpoint
 const ROUNDS_DIR = process.env.SEMBLR_ROUNDS_DIR || path.resolve(os.homedir(), ".pi", "agent", "semblr", "rounds");
 const MAX_PROMPT_CHARS = 8000;
 const MAX_RESPONSE_CHARS = 8000;
@@ -48,8 +47,10 @@ export function parseSession(filePath: string): Round[] {
 }
 
 // ─────────────────────────────────────────────
-// Embedding via OpenRouter
+// Embedding via OpenRouter (wraps lib/embed for backward compat)
 // ─────────────────────────────────────────────
+
+export { normalize };
 
 export interface EmbedOptions {
 	apiKey?: string;
@@ -61,44 +62,8 @@ export async function embed(text: string, options: EmbedOptions = {}): Promise<n
 	if (!apiKey) {
 		throw new Error("OPENROUTER_API_KEY environment variable required");
 	}
-
-	const fetchImpl = options.fetchImpl ?? fetch;
-	const response = await fetchImpl("https://openrouter.ai/api/v1/embeddings", {
-		method: "POST",
-		headers: {
-			Authorization: `Bearer ${apiKey}`,
-			"Content-Type": "application/json",
-		},
-		body: JSON.stringify({
-			model: EMBEDDING_MODEL,
-			input: text,
-		}),
-	});
-
-	if (!response.ok) {
-		const err = await response.text();
-		throw new Error(`OpenRouter embedding error (${response.status}): ${err}`);
-	}
-
-	const data = (await response.json()) as {
-		data: Array<{ embedding: number[] }>;
-	};
-	return data.data[0].embedding;
-}
-
-// ─────────────────────────────────────────────
-// Vector helpers
-// ─────────────────────────────────────────────
-
-export function normalize(v: number[]): number[] {
-	const mag = Math.sqrt(v.reduce((sum, x) => sum + x * x, 0));
-	return mag === 0 ? v : v.map((x) => x / mag);
-}
-
-function _cosineSimilarity(a: number[], b: number[]): number {
-	let dot = 0;
-	for (let i = 0; i < a.length; i++) dot += a[i] * b[i];
-	return dot;
+	const { embedText } = await import("../lib/embed.ts");
+	return embedText(text, apiKey, { fetchImpl: options.fetchImpl });
 }
 
 // ─────────────────────────────────────────────
@@ -166,15 +131,17 @@ export async function runDigestSession(options: DigestSessionOptions = {}): Prom
 
 		// Embed prompt
 		out.log(`  🔄 Embedding round ${round.turnIndex + 1}/${rounds.length}...`);
-		const promptVector = await embed(round.userPrompt.slice(0, MAX_PROMPT_CHARS), {
-			apiKey: options.apiKey,
+		const apiKey = options.apiKey ?? process.env.OPENROUTER_API_KEY;
+		if (!apiKey) {
+			throw new Error("OPENROUTER_API_KEY environment variable required");
+		}
+		const promptVector = await embedText(round.userPrompt.slice(0, MAX_PROMPT_CHARS), apiKey, {
 			fetchImpl: options.fetchImpl,
 		});
 		appendVectorIndexEntry(indexPath, normalize(promptVector), `${roundFile}:prompt`);
 
 		// Embed response
-		const respVector = await embed(round.responseSequence.slice(0, MAX_RESPONSE_CHARS), {
-			apiKey: options.apiKey,
+		const respVector = await embedText(round.responseSequence.slice(0, MAX_RESPONSE_CHARS), apiKey, {
 			fetchImpl: options.fetchImpl,
 		});
 		appendVectorIndexEntry(indexPath, normalize(respVector), `${roundFile}:response`);
