@@ -29,17 +29,47 @@ The extension lives at `src/semblr.ts` (moved from `.pi/extensions/semblr.ts` to
 - `justfile` — command recipes (index, digest-session, query, import-claude, migrate)
 - `rounds/` — round repository (stored outside the project tree, survives moves and clones)
 
-## Keeping README up to date
+## Development Methodology
 
-When adding a new feature or making a significant change, the README must be updated to reflect it. Before marking a task complete, verify the following are in sync:
+For implementation tasks, use code-and-test-together development.
 
-- **Commands** — any new `/semblr:*` commands must appear in the Commands section
-- **Environment variables** — any new env var must appear in the Environment Variables table
-- **Project structure** — any new script or directory must appear in the tree
-- **Section presence matrix** — any new gating condition (e.g., short-prompt suppression) must be added
-- **Injected Context sections** — any change to the format of recency list, relevance list, or preamble must be reflected in the exact-prompt examples
+1. **Understand**
+   - Restate the required behavior.
+   - Identify behavioral anchors: docs, fixtures, CLI output, logs, existing behavior, user examples.
+   - Surface assumptions before changing code.
 
-This section exists next to the A in AGENTS.md so agents read it before making changes.
+2. **Plan code and tests together**
+   - Identify production changes.
+   - Identify tests that protect required and affected existing behavior.
+   - Refactor only as needed to expose test seams; preserve behavior.
+
+3. **Implement first pass**
+   - Write production code and matching tests together.
+   - Tests MUST check externally anchored behavior, not mirror implementation.
+   - Prefer focused regression tests.
+
+4. **Validate externally**
+   - Run relevant tests.
+   - Run lint, format, type, build, and focused behavioral checks as applicable.
+   - Passing tests alone are insufficient if the requirement was not checked against an anchor.
+
+5. **Diagnose failures before fixing**
+   - Classify each failure by source:
+     - **code:** wrong behavior, edge case, integration
+     - **test:** wrong expectation, setup, fixture, harness
+     - **mechanical:** syntax, type, lint, formatting
+     - **requirement:** ambiguous, contradicted by existing behavior
+   - Fix the diagnosed source.
+   - Mechanical fixes may be direct.
+   - NEVER weaken tests merely to pass; changed expectations need an anchor.
+
+6. **Harden**
+   - Add branch, edge-case, and regression tests after the main behavior works.
+   - For risky logic, use targeted mutation tests.
+
+7. **Update README.md if needed**
+   - Update it for changed commands, env vars, structure, context format, gating, or user-visible behavior.
+   - Verify sync before marking complete.
 
 ## Attributions
 
