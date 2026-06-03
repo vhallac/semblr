@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
 	buildContextPreamble,
+	buildFollowUpSectionContent,
 	buildGroupedRecencyList,
 	buildRelevanceList,
 	formatFileSize,
@@ -8,6 +9,24 @@ import {
 	formatRoundEntry,
 	splitCommandArgs,
 } from "./context-format.ts";
+
+describe("follow-up section", () => {
+	it("builds the follow-up section with round content", () => {
+		const result = buildFollowUpSectionContent("abc.json", "What is the capital of France?", "The capital is Paris.");
+		expect(result).toContain("--- PREVIOUS ROUND FOLLOW-UP ---");
+		expect(result).toContain("abc.json");
+		expect(result).toContain("What is the capital of France?");
+		expect(result).toContain("The capital is Paris.");
+	});
+
+	it("includes both user prompt and assistant response in the section", () => {
+		const result = buildFollowUpSectionContent("x.json", "multi\nline\nprompt", "multi\nline\nresponse");
+		expect(result).toContain("USER PROMPT:");
+		expect(result).toContain("ASSISTANT RESPONSE:");
+		expect(result).toContain("multi\nline\nprompt");
+		expect(result).toContain("multi\nline\nresponse");
+	});
+});
 
 describe("context formatting", () => {
 	it("formats relevance and grouped entries with multiline prompts and optional size", () => {

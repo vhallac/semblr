@@ -31,6 +31,7 @@ export interface RoundData {
 	promptEmbedding?: number[];
 	parentId?: string | null;
 	relatedParentId?: string | null;
+	needsFollowup?: boolean;
 }
 
 export interface ToolResult {

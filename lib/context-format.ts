@@ -200,6 +200,50 @@ export function formatFileSize(bytes: number): string {
 	return `${Math.round(bytes / 10485.76) / 100}MB`;
 }
 
+/**
+ * Build the follow-up injection section for the context.
+ * This is injected when the previous round had `needsFollowup: true` and
+ * contains the full previous round content so the LLM can see what question
+ * was asked.
+ */
+export function buildFollowUpSectionContent(fileName: string, userPrompt: string, responseSequence: string): string {
+	return `--- PREVIOUS ROUND FOLLOW-UP ---
+The previous round (${fileName}) was flagged for follow-up. Its full content is included below so you can see what question was asked:
+
+USER PROMPT:
+${userPrompt}
+
+ASSISTANT RESPONSE:
+${responseSequence}`;
+}
+
+/** Follow-up marker instruction — teaches the model about round_needs_followup. */
+export function buildFollowupSection(): string {
+	return `If this response requires a user follow-up — such as asking a question, requesting
+confirmation, or pausing for user input — add the following line, *exactly* as
+shown, as the very last line of your output:
+
+round_needs_followup`;
+}
+
+/**
+ * Final response contract — always injected immediately before the actionable prompt.
+ * Stronger than buildFollowupSection(): applies only to the ACTIONABLE PROMPT,
+ * not to quoted examples, historical rounds, or environment metadata.
+ */
+export function buildFinalResponseContract(): string {
+	return `[FINAL RESPONSE CONTRACT — REQUIRED]
+Before sending your final answer, check whether your response to the ACTIONABLE PROMPT below asks the user a question, requests confirmation, presents options for the user to choose from, or otherwise pauses for user input.
+
+If yes, the final line of your response MUST be exactly:
+
+round_needs_followup
+
+MUST NOT put any text after that line.
+MUST NOT wrap it in a code block.
+This contract applies only to your final response to the ACTIONABLE PROMPT, not to quoted examples, historical rounds, context references, or environment metadata.`;
+}
+
 export function splitCommandArgs(args: string): string[] {
 	const out: string[] = [];
 	let current = "";
