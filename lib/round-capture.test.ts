@@ -62,45 +62,22 @@ describe("readAndClearFollowupFlag", () => {
 		expect(readAndClearFollowupFlag("/file.json", fsMock)).toBeNull();
 	});
 
-	it("clears the needsFollowup flag and returns the data", () => {
-		let writtenData = "";
-		let renamedFrom = "";
-		let renamedTo = "";
-		const fsMock = {
-			existsSync: () => true,
-			readFileSync: () => JSON.stringify({ userPrompt: "hi", responseSequence: "hello", needsFollowup: true }),
-			writeFileSync: (_path: string, data: string) => {
-				writtenData = data;
-			},
-			renameSync: (from: string, to: string) => {
-				renamedFrom = from;
-				renamedTo = to;
-			},
-		};
-		const result = readAndClearFollowupFlag("/file.json", fsMock);
-		expect(result).not.toBeNull();
-		expect(result?.userPrompt).toBe("hi");
-		expect(result?.needsFollowup).toBe(true); // returns original flag value before clearing
-
-		// Verify the written data has needsFollowup=false
-		const written = JSON.parse(writtenData);
-		expect(written.needsFollowup).toBe(false);
-		expect(renamedFrom).toContain(".tmp.");
-		expect(renamedTo).toBe("/file.json");
-	});
-
-	it("returns data even when write fails (best-effort)", () => {
+	it("returns the round data without clearing the flag", () => {
+		let writeCalled = false;
 		const fsMock = {
 			existsSync: () => true,
 			readFileSync: () => JSON.stringify({ userPrompt: "hi", responseSequence: "hello", needsFollowup: true }),
 			writeFileSync: () => {
-				throw new Error("write failed");
+				writeCalled = true;
 			},
 			renameSync: () => {},
 		};
 		const result = readAndClearFollowupFlag("/file.json", fsMock);
 		expect(result).not.toBeNull();
 		expect(result?.userPrompt).toBe("hi");
+		expect(result?.responseSequence).toBe("hello");
+		expect(result?.needsFollowup).toBe(true); // flag preserved in return value
+		expect(writeCalled).toBe(false); // no file mutation anymore
 	});
 
 	it("returns null when file has invalid JSON", () => {

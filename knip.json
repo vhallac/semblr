@@ -1,5 +1,8 @@
 {
 	"entry": ["src/semblr.ts", "scripts/*.ts"],
 	"project": ["src/**/*.ts", "scripts/**/*.ts", "*.ts"],
-	"ignoreDependencies": ["tsx"]
+	"ignoreDependencies": ["tsx"],
+	"vitest": {
+		"config": ["vitest.config.ts"]
+	}
 }

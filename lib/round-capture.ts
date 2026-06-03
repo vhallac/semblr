@@ -125,8 +125,13 @@ export function extractAndStripFollowupMarker(responseText: string): {
 }
 
 /**
- * Read a round file and clear its needsFollowup flag atomically.
- * Returns the round data with needsFollowup=true, or null.
+ * Read a round file and check its needsFollowup flag.
+ * Returns the round data if needsFollowup is true, or null.
+ *
+ * NOTE: This function does NOT clear the flag anymore — the flag is preserved
+ * in the saved JSON as permanent metadata. Runtime injection gating is handled
+ * by an in-memory set (injectedFollowupRounds) in semblr.ts, not by mutating
+ * the file. See https://github.com/vhallac/semblr/issues/XX
  */
 export function readAndClearFollowupFlag(
 	fullPath: string,
@@ -149,15 +154,6 @@ export function readAndClearFollowupFlag(
 	}
 
 	if (!roundData.needsFollowup) return null;
-
-	// Clear the flag atomically so it's only injected once
-	try {
-		const updated = { ...roundData, needsFollowup: false };
-		fs_.writeFileSync(`${fullPath}.tmp.${process.pid}`, JSON.stringify(updated, null, 2));
-		fs_.renameSync(`${fullPath}.tmp.${process.pid}`, fullPath);
-	} catch {
-		// best-effort — if we can't clear the flag, still return the data
-	}
 
 	return roundData as unknown as RoundData;
 }

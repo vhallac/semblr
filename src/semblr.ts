@@ -45,7 +45,6 @@ import {
 	getAgentEndParentId,
 	getRelatedParentIdFromGroup,
 	type MessageEndProcessingState,
-	readAndClearFollowupFlag,
 } from "../lib/round-capture.ts";
 import type { ChainEntry, ResponseSegment, RoundData, ToolCallDetail } from "../lib/round-data.ts";
 import {
@@ -73,6 +72,7 @@ import {
 import { normalize } from "../lib/vector.ts";
 
 export {
+	buildContextMessagePrefix,
 	countWordsInMessageContent,
 	extractContextPrompt,
 	prepareContextMessages,
@@ -163,6 +163,11 @@ let roundGroups: RoundGroup[] = [];
  *  the group index to force-assign the next round to. Consumed once. */
 let lastFollowupGroupIdx: number | null = null;
 
+/** In-memory set of round filenames whose follow-up section has already been
+ *  injected into context. Prevents re-injection on subsequent tool turns or
+ *  across agent restarts within the same session. Never modifies saved JSON. */
+let injectedFollowupRounds: Set<string> = new Set();
+
 const SEMBLR_GROUP_THRESHOLD = parseGroupThreshold(process.env.SEMBLR_GROUP_THRESHOLD);
 
 // Context formatting helpers live in lib/context-format.ts.
@@ -190,7 +195,18 @@ function getRoundSize(fileName: string): string | null {
  */
 function buildFollowUpContext(fileName: string): string | null {
 	const fullPath = `${ROUNDS_DIR}/${fileName}`;
-	const roundData = readAndClearFollowupFlag(fullPath);
+	// Read needsFollowup from file without mutating it
+	let roundData: RoundData | null = null;
+	try {
+		if (fs.existsSync(fullPath)) {
+			const parsed = JSON.parse(fs.readFileSync(fullPath, "utf-8"));
+			if (parsed.needsFollowup) {
+				roundData = parsed as RoundData;
+			}
+		}
+	} catch {
+		// best-effort
+	}
 	if (!roundData) return null;
 	return buildFollowUpSectionContent(fileName, roundData.userPrompt, roundData.responseSequence);
 }
@@ -251,6 +267,17 @@ function readRoundFile(filePath: string): RoundData | null {
 }
 
 let lastRoundFileName: string | null = null; // tracks the most recent saved round (process-local)
+// Used in context hook to gate follow-up injection: checks metadata + in-memory state
+function needsFollowupInjection(fileName: string): boolean {
+	const fullPath = `${ROUNDS_DIR}/${fileName}`;
+	try {
+		if (!fs.existsSync(fullPath)) return false;
+		const parsed = JSON.parse(fs.readFileSync(fullPath, "utf-8"));
+		return parsed.needsFollowup === true && !injectedFollowupRounds.has(fileName);
+	} catch {
+		return false;
+	}
+}
 
 // Per-agent accumulation (reset in agent_start, saved in agent_end)
 let agentUserPrompt: string | null = null;
@@ -542,14 +569,17 @@ export default function (pi: ExtensionAPI) {
 
 			// ── Follow-up injection: if previous round was flagged, include its ──
 			// full text so the LLM can see what question was asked.
+			// Gated by in-memory set to prevent re-injection on subsequent tool turns.
 			let followUpMsg: unknown | null = null;
-			if (lastRoundFileName) {
+			if (lastRoundFileName && needsFollowupInjection(lastRoundFileName)) {
 				const followUpSection = buildFollowUpContext(lastRoundFileName);
 				if (followUpSection) {
 					followUpMsg = {
 						role: "user" as const,
 						content: [{ type: "text" as const, text: followUpSection }],
 					};
+					// Mark as injected so subsequent tool turns don't re-inject
+					injectedFollowupRounds.add(lastRoundFileName);
 				}
 			}
 
@@ -832,6 +862,7 @@ export default function (pi: ExtensionAPI) {
 		causalChain = [];
 		roundGroups = [];
 		lastFollowupGroupIdx = null;
+		injectedFollowupRounds = new Set();
 
 		const index = loadSessionStartIndex();
 		ctx.ui.setStatus("semblr", buildSessionStartStatus(index));

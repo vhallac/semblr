@@ -49,8 +49,7 @@ For implementation tasks, use code-and-test-together development.
    - Prefer focused regression tests.
 
 4. **Validate externally**
-   - Run `npm run check` (typecheck + lint + format via Biome + tsc).
-   - Run relevant tests (`npm run test:coverage` if tests are affected).
+   - Run `npm run verify` (typecheck + lint + knip + test:coverage with 80% threshold).
    - Passing tests alone are insufficient if the requirement was not checked against an anchor.
 
 5. **Diagnose failures before fixing**
