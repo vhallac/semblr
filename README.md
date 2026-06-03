@@ -363,7 +363,16 @@ just query "what did we discuss about caching"
 
 ```
 ├── src                         # The extension directory
-│   └── semblr.ts                 # Main extension file
+│   ├── semblr.ts                 # Main extension orchestration / pi lifecycle glue
+│   └── core/                     # Domain helpers used by the extension and tests
+│       ├── context-messages.ts     # User-message preparation and context prefix assembly
+│       ├── embedding-client.ts     # OpenRouter API-key lookup and embedding client
+│       ├── index-storage.ts        # Runtime vector-index loading and locked appends
+│       ├── message-content.ts      # Shared text extraction from message content blocks
+│       ├── round-capture.ts        # agent_end/message_end round capture helpers
+│       ├── round-data.ts           # Shared round/tool-call data contracts
+│       ├── round-tool-results.ts   # get_round_details/get_tool_details result rendering
+│       └── search-interactions.ts  # search_interactions scoring, selection, and rendering
 ├── scripts/
 │   ├── digest-all.ts               # Bulk-embed all historical sessions
 │   ├── digest-session.ts           # Embed a single session file

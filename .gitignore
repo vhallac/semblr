@@ -12,3 +12,4 @@ node_modules/
 shell.nix
 
 temp/
+coverage/

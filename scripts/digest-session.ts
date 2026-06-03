@@ -10,79 +10,31 @@
  *   ~/.pi/agent/semblr/rounds/index.csv  — vector index (base64(vector),filepath)
  */
 
-import * as crypto from "node:crypto";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { pathToFileURL } from "node:url";
+import { embedText, normalize } from "../lib/embed.ts";
+import { computeContentHash } from "../lib/hash.ts";
+import {
+	appendVectorIndexEntry,
+	findStaleContentMatches as findStaleContentMatchesInDir,
+	loadVectorIndex,
+	migrateIndexEntries as migrateIndexEntriesFile,
+} from "../lib/index-io.ts";
+import { type ParsedPiRound, parsePiSessionJsonl } from "../lib/pi-session.ts";
 
 // ─────────────────────────────────────────────
 // Types
 // ─────────────────────────────────────────────
 
-interface ToolCallDetail {
-	index: number;
-	name: string;
-	arguments: string;
-	result_summary: string;
-	result_full?: string;
-	result_truncated?: boolean;
-}
-
-// ─────────────────────────────────────────────
-// Content hash (must match semblr.ts computeContentHash)
-// ─────────────────────────────────────────────
-
-function computeContentHash(userPrompt: string, responseText: string, toolCalls?: ToolCallDetail[]): string {
-	const parts: string[] = [userPrompt, responseText];
-	if (toolCalls) {
-		for (const tc of toolCalls) {
-			parts.push(tc.arguments);
-			parts.push(tc.result_full ?? tc.result_summary ?? "");
-		}
-	}
-	return crypto.createHash("md5").update(parts.join("")).digest("hex");
-}
-
-interface ResponseSegment {
-	type: "text" | "toolCall";
-	text?: string;
-	toolCallIndex?: number;
-}
-
-interface Round {
-	id: string;
-	userPrompt: string;
-	responseSequence: string;
-	responseSegments: ResponseSegment[];
-	userTimestamp: number;
-	responseEndTimestamp: number;
-	turnIndex: number; // serialized — keep name for backward compat
-	toolCallCount: number;
-	toolCallNames: string[];
-	toolCalls: ToolCallDetail[];
-}
-
-interface SessionEntry {
-	type: string;
-	id: string;
-	parentId: string | null;
-	timestamp?: string;
-	message?: {
-		role: string;
-		content: Array<{ type: string; text?: string }>;
-		timestamp?: number;
-	};
-}
+type Round = ParsedPiRound;
 
 // ─────────────────────────────────────────────
 // Config
 // ─────────────────────────────────────────────
 
-const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY;
-const EMBEDDING_MODEL = "openai/text-embedding-3-small";
-const _OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"; // actually embeddings endpoint
 const ROUNDS_DIR = process.env.SEMBLR_ROUNDS_DIR || path.resolve(os.homedir(), ".pi", "agent", "semblr", "rounds");
-const INDEX_PATH = path.resolve(ROUNDS_DIR, "index.csv");
 const MAX_PROMPT_CHARS = 8000;
 const MAX_RESPONSE_CHARS = 8000;
 
@@ -90,241 +42,62 @@ const MAX_RESPONSE_CHARS = 8000;
 // Parse session into rounds
 // ─────────────────────────────────────────────
 
-function parseSession(filePath: string): Round[] {
-	const content = fs.readFileSync(filePath, "utf-8");
-	const lines = content.trim().split("\n").filter(Boolean);
-	const entries: SessionEntry[] = lines.map((l) => JSON.parse(l));
-
-	const rounds: Round[] = [];
-	let currentUserMsg: SessionEntry | null = null;
-	let responseParts: string[] = [];
-	let responseSegments: ResponseSegment[] = [];
-	let toolNames: string[] = [];
-	let toolCallCount = 0;
-	let toolCalls: ToolCallDetail[] = [];
-	let roundIndex = 0;
-
-	for (const entry of entries) {
-		if (entry.type !== "message" || !entry.message) continue;
-		const { role, content } = entry.message;
-
-		if (role === "user") {
-			// Save previous round if exists
-			if (currentUserMsg) {
-				rounds.push({
-					id: currentUserMsg.id,
-					userPrompt: extractText(
-						(currentUserMsg.message?.content ?? []) as Array<{ type: string; text?: string }>,
-					),
-					responseSequence: responseParts.join("\n\n").trim(),
-					responseSegments,
-					userTimestamp: currentUserMsg.message?.timestamp ?? 0,
-					responseEndTimestamp: entry.message?.timestamp ?? 0,
-					turnIndex: roundIndex,
-					toolCallCount,
-					toolCallNames: [...new Set(toolNames)],
-					toolCalls,
-				});
-				roundIndex++;
-			}
-			currentUserMsg = entry;
-			responseParts = [];
-			responseSegments = [];
-			toolNames = [];
-			toolCallCount = 0;
-			toolCalls = [];
-		} else if (role === "assistant" && currentUserMsg) {
-			// Single ordered pass: interleave text and tool call blocks
-			for (const block of content) {
-				if (block.type === "text" && block.text) {
-					responseParts.push(block.text);
-					responseSegments.push({ type: "text", text: block.text });
-				} else if (block.type === "toolCall") {
-					toolCallCount++;
-					const blockRec = block as Record<string, unknown>;
-					const name = blockRec.name as string | undefined;
-					if (name) toolNames.push(name);
-					toolCalls.push({
-						index: toolCalls.length,
-						name: name ?? "unknown",
-						arguments: JSON.stringify(blockRec.arguments ?? {}),
-						result_summary: "",
-					});
-					responseSegments.push({ type: "toolCall", toolCallIndex: toolCalls.length - 1 });
-				}
-			}
-		} else if (role === "toolResult" && currentUserMsg) {
-			const toolName = (entry.message as Record<string, unknown>).toolName as string | undefined;
-			if (toolName) toolNames.push(toolName);
-			// Pair with the most recent tool call that lacks a result
-			for (let i = toolCalls.length - 1; i >= 0; i--) {
-				if (toolCalls[i].result_summary === "") {
-					const resultContent = entry.message.content;
-					const resultText = resultContent ? extractText(resultContent) : "";
-					toolCalls[i].result_summary = resultText.slice(0, 300);
-					toolCalls[i].result_full = resultText;
-					toolCalls[i].result_truncated = false;
-					break;
-				}
-			}
-		}
-	}
-
-	// Save last round
-	if (currentUserMsg) {
-		rounds.push({
-			id: currentUserMsg.id,
-			userPrompt: extractText((currentUserMsg.message?.content ?? []) as Array<{ type: string; text?: string }>),
-			responseSequence: responseParts.join("\n\n").trim(),
-			responseSegments,
-			userTimestamp: currentUserMsg.message?.timestamp ?? 0,
-			responseEndTimestamp: Date.now(),
-			turnIndex: roundIndex,
-			toolCallCount,
-			toolCallNames: [...new Set(toolNames)],
-			toolCalls,
-		});
-	}
-
-	return rounds;
-}
-
-function extractText(content: Array<{ type: string; text?: string }>): string {
-	return content
-		.filter((c) => c.type === "text" && c.text)
-		.map((c) => c.text ?? "")
-		.join(" ")
-		.trim();
+export function parseSession(filePath: string): Round[] {
+	return parsePiSessionJsonl(fs.readFileSync(filePath, "utf-8"));
 }
 
 // ─────────────────────────────────────────────
-// Embedding via OpenRouter
+// Embedding via OpenRouter (wraps lib/embed for backward compat)
 // ─────────────────────────────────────────────
 
-async function embed(text: string): Promise<number[]> {
-	if (!OPENROUTER_API_KEY) {
+export { normalize };
+
+export interface EmbedOptions {
+	apiKey?: string;
+	fetchImpl?: typeof fetch;
+}
+
+export async function embed(text: string, options: EmbedOptions = {}): Promise<number[]> {
+	const apiKey = options.apiKey ?? process.env.OPENROUTER_API_KEY;
+	if (!apiKey) {
 		throw new Error("OPENROUTER_API_KEY environment variable required");
 	}
-
-	const response = await fetch("https://openrouter.ai/api/v1/embeddings", {
-		method: "POST",
-		headers: {
-			Authorization: `Bearer ${OPENROUTER_API_KEY}`,
-			"Content-Type": "application/json",
-		},
-		body: JSON.stringify({
-			model: EMBEDDING_MODEL,
-			input: text,
-		}),
-	});
-
-	if (!response.ok) {
-		const err = await response.text();
-		throw new Error(`OpenRouter embedding error (${response.status}): ${err}`);
-	}
-
-	const data = (await response.json()) as {
-		data: Array<{ embedding: number[] }>;
-	};
-	return data.data[0].embedding;
-}
-
-// ─────────────────────────────────────────────
-// Vector helpers
-// ─────────────────────────────────────────────
-
-function normalize(v: number[]): number[] {
-	const mag = Math.sqrt(v.reduce((sum, x) => sum + x * x, 0));
-	return mag === 0 ? v : v.map((x) => x / mag);
-}
-
-function _cosineSimilarity(a: number[], b: number[]): number {
-	let dot = 0;
-	for (let i = 0; i < a.length; i++) dot += a[i] * b[i];
-	return dot;
-}
-
-// ─────────────────────────────────────────────
-// Index I/O
-// ─────────────────────────────────────────────
-
-function loadIndex(): Array<{ vector: number[]; filePath: string }> {
-	if (!fs.existsSync(INDEX_PATH)) return [];
-	const lines = fs.readFileSync(INDEX_PATH, "utf-8").trim().split("\n").filter(Boolean);
-	return lines.map((line) => {
-		const comma = line.indexOf(",");
-		const b64 = line.slice(0, comma);
-		const filePath = line.slice(comma + 1);
-		const vector = JSON.parse(Buffer.from(b64, "base64url").toString("utf-8"));
-		return { vector, filePath };
-	});
-}
-
-function loadIndexLines(): string[] {
-	if (!fs.existsSync(INDEX_PATH)) return [];
-	return fs.readFileSync(INDEX_PATH, "utf-8").trim().split("\n").filter(Boolean);
-}
-
-function appendToIndex(vector: number[], filePath: string): void {
-	const b64 = Buffer.from(JSON.stringify(vector)).toString("base64url");
-	fs.appendFileSync(INDEX_PATH, `${b64},${filePath}\n`);
-}
-
-/**
- * Rewrite index entries from an old round filename to the new content-hash filename.
- * This preserves accessibility even if re-embedding would fail or be skipped.
- */
-function migrateIndexEntries(oldRoundFile: string, newRoundFile: string): void {
-	if (!fs.existsSync(INDEX_PATH)) return;
-	const lines = loadIndexLines();
-	const migrated = lines.map((line) => {
-		const comma = line.indexOf(",");
-		const fp = line.slice(comma + 1);
-		if (!fp.startsWith(oldRoundFile)) return line;
-		return `${line.slice(0, comma + 1)}${newRoundFile}${fp.slice(oldRoundFile.length)}`;
-	});
-	fs.writeFileSync(INDEX_PATH, migrated.join("\n") + (migrated.length > 0 ? "\n" : ""));
-}
-
-/**
- * Scan the rounds directory for stale .json files whose stored content hashes to
- * the given round filename. Returns matching filenames (without paths).
- */
-function findStaleContentMatches(roundFile: string): string[] {
-	const files = fs.readdirSync(ROUNDS_DIR).filter((f) => f.endsWith(".json") && !f.startsWith("index"));
-	const matches: string[] = [];
-	for (const f of files) {
-		if (f === roundFile) continue;
-		try {
-			const data = JSON.parse(fs.readFileSync(path.join(ROUNDS_DIR, f), "utf-8")) as Partial<Round>;
-			const hash = `${computeContentHash(data.userPrompt ?? "", data.responseSequence ?? "", data.toolCalls)}.json`;
-			if (hash === roundFile) {
-				matches.push(f);
-			}
-		} catch {
-			// Corrupt file — skip
-		}
-	}
-	return matches;
+	const { embedText } = await import("../lib/embed.ts");
+	return embedText(text, apiKey, { fetchImpl: options.fetchImpl });
 }
 
 // ─────────────────────────────────────────────
 // Main
 // ─────────────────────────────────────────────
 
-async function main() {
-	const sessionFile = process.argv[2];
+export interface DigestSessionOptions {
+	sessionFile?: string;
+	roundsDir?: string;
+	indexPath?: string;
+	apiKey?: string;
+	fetchImpl?: typeof fetch;
+	stdout?: Pick<typeof console, "log">;
+	stderr?: Pick<typeof console, "error">;
+}
+
+export async function runDigestSession(options: DigestSessionOptions = {}): Promise<number> {
+	const sessionFile = options.sessionFile;
+	const roundsDir = options.roundsDir ?? ROUNDS_DIR;
+	const indexPath = options.indexPath ?? path.resolve(roundsDir, "index.csv");
+	const out = options.stdout ?? console;
+	const err = options.stderr ?? console;
+
 	if (!sessionFile) {
-		console.error("Usage: npx tsx scripts/digest-session.ts <session-file>");
-		process.exit(1);
+		err.error("Usage: npx tsx scripts/digest-session.ts <session-file>");
+		return 1;
 	}
 
-	console.log(`📂 Session: ${sessionFile}`);
+	out.log(`📂 Session: ${sessionFile}`);
 	const rounds = parseSession(sessionFile);
-	console.log(`📊 Parsed ${rounds.length} rounds`);
+	out.log(`📊 Parsed ${rounds.length} rounds`);
 
 	// Ensure rounds directory
-	fs.mkdirSync(ROUNDS_DIR, { recursive: true });
+	fs.mkdirSync(roundsDir, { recursive: true });
 
 	let embedded = 0;
 	let skipped = 0;
@@ -335,21 +108,21 @@ async function main() {
 		// Check for stale files whose stored full hash material belongs under this
 		// content-hash filename. If found, migrate old index entries before deleting
 		// old files so the round remains retrievable even if embedding is unavailable.
-		const staleFiles = findStaleContentMatches(roundFile);
+		const staleFiles = findStaleContentMatchesInDir(roundsDir, roundFile);
 		for (const staleFile of staleFiles) {
-			migrateIndexEntries(staleFile, roundFile);
+			migrateIndexEntriesFile(indexPath, staleFile, roundFile);
 		}
 
 		// Always write the round file (idempotent) before deleting stale copies.
-		fs.writeFileSync(path.resolve(ROUNDS_DIR, roundFile), JSON.stringify(round, null, 2));
+		fs.writeFileSync(path.resolve(roundsDir, roundFile), JSON.stringify(round, null, 2));
 		for (const staleFile of staleFiles) {
-			fs.unlinkSync(path.join(ROUNDS_DIR, staleFile));
-			console.log(`  ♻️  Migrated stale: ${staleFile} → ${roundFile}`);
+			fs.unlinkSync(path.join(roundsDir, staleFile));
+			out.log(`  ♻️  Migrated stale: ${staleFile} → ${roundFile}`);
 		}
 
 		// Refresh existing set after potential deletions
 		const freshExisting = new Set(
-			loadIndex().map((e) => path.basename(e.filePath.replace(/(:prompt|:response|:round)$/, ""))),
+			loadVectorIndex(indexPath).map((e) => path.basename(e.filePath.replace(/(:prompt|:response|:round)$/, ""))),
 		);
 		if (freshExisting.has(roundFile)) {
 			skipped++;
@@ -357,22 +130,42 @@ async function main() {
 		}
 
 		// Embed prompt
-		console.log(`  🔄 Embedding round ${round.turnIndex + 1}/${rounds.length}...`);
-		const promptVector = await embed(round.userPrompt.slice(0, MAX_PROMPT_CHARS));
-		appendToIndex(normalize(promptVector), `${roundFile}:prompt`);
+		out.log(`  🔄 Embedding round ${round.turnIndex + 1}/${rounds.length}...`);
+		const apiKey = options.apiKey ?? process.env.OPENROUTER_API_KEY;
+		if (!apiKey) {
+			throw new Error("OPENROUTER_API_KEY environment variable required");
+		}
+		const promptVector = await embedText(round.userPrompt.slice(0, MAX_PROMPT_CHARS), apiKey, {
+			fetchImpl: options.fetchImpl,
+		});
+		appendVectorIndexEntry(indexPath, normalize(promptVector), `${roundFile}:prompt`);
 
 		// Embed response
-		const respVector = await embed(round.responseSequence.slice(0, MAX_RESPONSE_CHARS));
-		appendToIndex(normalize(respVector), `${roundFile}:response`);
+		const respVector = await embedText(round.responseSequence.slice(0, MAX_RESPONSE_CHARS), apiKey, {
+			fetchImpl: options.fetchImpl,
+		});
+		appendVectorIndexEntry(indexPath, normalize(respVector), `${roundFile}:response`);
 
 		embedded++;
 	}
 
-	console.log(`\n✅ Done. ${embedded} new rounds embedded, ${skipped} already in index.`);
-	console.log(`   Index: ${INDEX_PATH} (${loadIndex().length} vectors)`);
+	out.log(`\n✅ Done. ${embedded} new rounds embedded, ${skipped} already in index.`);
+	out.log(`   Index: ${indexPath} (${loadVectorIndex(indexPath).length} vectors)`);
+	return 0;
 }
 
-main().catch((err) => {
-	console.error("❌ Error:", err);
-	process.exit(1);
-});
+export function isMainModule(metaUrl: string, argv1 = process.argv[1]): boolean {
+	return argv1 ? pathToFileURL(argv1).href === metaUrl : false;
+}
+
+async function main() {
+	const exitCode = await runDigestSession({ sessionFile: process.argv[2] });
+	if (exitCode !== 0) process.exit(exitCode);
+}
+
+if (isMainModule(import.meta.url)) {
+	main().catch((err) => {
+		console.error("❌ Error:", err);
+		process.exit(1);
+	});
+}

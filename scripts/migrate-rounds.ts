@@ -22,6 +22,7 @@
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { pathToFileURL } from "node:url";
 
 // ─────────────────────────────────────────────
 // Config
@@ -58,26 +59,36 @@ interface Round {
 // Main
 // ─────────────────────────────────────────────
 
-function main() {
-	if (!fs.existsSync(ROUNDS_DIR)) {
-		console.error(`❌ Rounds directory not found: ${ROUNDS_DIR}`);
-		process.exit(1);
+export interface MigrateRoundsOptions {
+	roundsDir?: string;
+	stdout?: Pick<typeof console, "log">;
+	stderr?: Pick<typeof console, "error" | "warn">;
+}
+
+export function runResponseSegmentsMigration(options: MigrateRoundsOptions = {}): number {
+	const roundsDir = options.roundsDir ?? ROUNDS_DIR;
+	const out = options.stdout ?? console;
+	const err = options.stderr ?? console;
+
+	if (!fs.existsSync(roundsDir)) {
+		err.error(`❌ Rounds directory not found: ${roundsDir}`);
+		return 1;
 	}
 
-	const files = fs.readdirSync(ROUNDS_DIR).filter((f) => f.endsWith(".json"));
+	const files = fs.readdirSync(roundsDir).filter((f) => f.endsWith(".json"));
 
 	let migrated = 0;
 	let skipped = 0;
 
 	for (const file of files) {
-		const filePath = path.resolve(ROUNDS_DIR, file);
+		const filePath = path.resolve(roundsDir, file);
 
 		let data: Round;
 		try {
 			const raw = fs.readFileSync(filePath, "utf-8");
 			data = JSON.parse(raw);
 		} catch {
-			console.warn(`⚠ Skipping unparseable: ${file}`);
+			err.warn(`⚠ Skipping unparseable: ${file}`);
 			continue;
 		}
 
@@ -104,7 +115,7 @@ function main() {
 
 		// Only write if we have something useful (skip empty rounds)
 		if (segments.length === 0) {
-			console.warn(`⚠ Skipping empty: ${file}`);
+			err.warn(`⚠ Skipping empty: ${file}`);
 			continue;
 		}
 
@@ -115,7 +126,15 @@ function main() {
 		migrated++;
 	}
 
-	console.log(`\n✅ Done. ${migrated} round files migrated, ${skipped} already had responseSegments.`);
+	out.log(`\n✅ Done. ${migrated} round files migrated, ${skipped} already had responseSegments.`);
+	return 0;
 }
 
-main();
+export function isMainModule(metaUrl: string, argv1 = process.argv[1]): boolean {
+	return argv1 ? pathToFileURL(argv1).href === metaUrl : false;
+}
+
+if (isMainModule(import.meta.url)) {
+	const exitCode = runResponseSegmentsMigration();
+	if (exitCode !== 0) process.exit(exitCode);
+}
