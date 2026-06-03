@@ -25,7 +25,19 @@ export function assignToGroup<T>(
 	roundEntry: T,
 	vec: number[],
 	threshold: number,
+	/** When set, skip semantic matching and force-assign to this group index instead. */
+	forceGroupIdx?: number | null,
 ): number {
+	// Auto-group: if a previous round was flagged needsFollowup, this round
+	// belongs to the same topic — skip semantic matching.
+	if (forceGroupIdx !== undefined && forceGroupIdx !== null && forceGroupIdx < groups.length) {
+		const group = groups[forceGroupIdx];
+		group.rounds.push(roundEntry);
+		const n = group.rounds.length;
+		group.centroid = group.centroid.map((c, i) => c + (vec[i] - c) / n);
+		return forceGroupIdx;
+	}
+
 	let bestIdx = -1;
 	let bestSim = 0;
 	for (let i = 0; i < groups.length; i++) {

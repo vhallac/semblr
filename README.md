@@ -188,24 +188,37 @@ If nothing rings a bell, ignore this list — it's a pre-filter, not a map.
 
 ### Section presence matrix
 
-| Scenario | Context building refs | Recency List | Relevance List |
-|---|---|---|---|
-| First message, no semantic matches | omitted | omitted | omitted |
-| First message, has semantic matches | shown | omitted | shown |
-| Ongoing session, has matches | shown | shown | shown |
-| Ongoing session, no matches | shown | shown | omitted |
-| Short prompt (< 20 words) | shown (if any list) | shown (if prior rounds) | omitted |
-| `DROP_RELEVANCE_LIST=true` | shown (if any list) | shown (if prior rounds) | omitted |
+| Scenario | Context building refs | Recency List | Relevance List | Final response contract | Actionable prompt marker |
+|---|---|---|---|---|---|
+| First message, no semantic matches | omitted | omitted | omitted | Always | Always |
+| First message, has semantic matches | shown | omitted | shown | Always | Always |
+| Ongoing session, has matches | shown | shown | shown | Always | Always |
+| Ongoing session, no matches | shown | shown | omitted | Always | Always |
+| Short prompt (< 20 words) | shown (if any list) | shown (if prior rounds) | omitted | Always | Always |
+| `DROP_RELEVANCE_LIST=true` | shown (if any list) | shown (if prior rounds) | omitted | Always | Always |
 
-### Why three sections?
+### Why these sections?
 
 | Section | Source | When shown | Purpose |
 |---|---|---|---|
 | Context building refs | Static text | If any list exists | Set expectations, explain tools |
 | Recency List | Causal chain (in-memory) | If session has prior rounds | Resolve references within the session |
 | Relevance List | Semantic vector search | If matches found | Surface cross-session context — pre-made search |
+| Previous Round Follow-up | Last round file | If last round was flagged | Show full previous round when the LLM asked a question |
+| Final response contract | Static text | Always | Tell the LLM when and how to emit `round_needs_followup` |
+| Actionable prompt marker | Current user message | Always | Mark the real prompt the contract applies to |
 
 The architecture is intentionally sectioned: new types of context (pinned rounds, compaction summaries, excluded rounds) can be added as additional sections without changing the existing logic. Each section is independently gated by its own condition.
+
+### Follow-up flagging
+
+When the LLM appends `round_needs_followup` as the very last line of its output (per the final response contract), the extension:
+
+1. **At agent_end**: Strips the marker from the saved response text, sets `needsFollowup: true` in the round JSON.
+2. **At context (next round)**: Checks the previous round for `needsFollowup: true`. If found, injects a `[PREVIOUS ROUND FOLLOW-UP]` section with the full round content, then clears the flag.
+3. **Auto-grouping**: When a round has `needsFollowup: true`, the next round is automatically assigned to the same topic group, bypassing semantic similarity matching. The rationale: if the LLM asked a question and the user responded, those two rounds are definitively the same topic.
+
+This gives the LLM explicit recall of what question was asked, without bloating context on every turn.
 
 ## Cost
 

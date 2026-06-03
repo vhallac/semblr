@@ -200,6 +200,23 @@ export function formatFileSize(bytes: number): string {
 	return `${Math.round(bytes / 10485.76) / 100}MB`;
 }
 
+/**
+ * Build the follow-up injection section for the context.
+ * This is injected when the previous round had `needsFollowup: true` and
+ * contains the full previous round content so the LLM can see what question
+ * was asked.
+ */
+export function buildFollowUpSectionContent(fileName: string, userPrompt: string, responseSequence: string): string {
+	return `--- PREVIOUS ROUND FOLLOW-UP ---
+The previous round (${fileName}) was flagged for follow-up. Its full content is included below so you can see what question was asked:
+
+USER PROMPT:
+${userPrompt}
+
+ASSISTANT RESPONSE:
+${responseSequence}`;
+}
+
 /** Follow-up marker instruction — teaches the model about round_needs_followup. */
 export function buildFollowupSection(): string {
 	return `If this response requires a user follow-up — such as asking a question, requesting

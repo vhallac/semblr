@@ -1,6 +1,7 @@
+import * as fs from "node:fs";
 import { computeContentHash } from "./hash.ts";
 import { extractText } from "./message-content.ts";
-import type { ChainEntry, ResponseSegment, ToolCallDetail } from "./round-data.ts";
+import type { ChainEntry, ResponseSegment, RoundData, ToolCallDetail } from "./round-data.ts";
 
 export function extractAgentEndUserPrompt(cachedPrompt: string | null, messages?: readonly unknown[]): string {
 	let userPrompt = cachedPrompt ?? "";
@@ -69,6 +70,7 @@ export function buildAgentEndRoundData(args: {
 	responseSegments: ResponseSegment[];
 	parentId: string | null;
 	userTimestamp?: number;
+	needsFollowup?: boolean;
 }): Record<string, unknown> {
 	return {
 		id: computeContentHash(args.userPrompt, args.responseText, args.toolCalls),
@@ -83,6 +85,7 @@ export function buildAgentEndRoundData(args: {
 		promptEmbedding: undefined,
 		parentId: args.parentId,
 		relatedParentId: null,
+		needsFollowup: args.needsFollowup ?? false,
 	};
 }
 
@@ -101,6 +104,62 @@ export function buildAgentEndEmbeddingTexts(
 		clippedResponse,
 		combinedText: `${userPrompt}\n\n${clippedResponse}`,
 	};
+}
+
+/**
+ * Detect and strip the round_needs_followup marker from the end of a response.
+ * Returns the stripped text and whether the marker was present.
+ */
+export function extractAndStripFollowupMarker(responseText: string): {
+	cleanedText: string;
+	needsFollowup: boolean;
+} {
+	const followupMarker = "\nround_needs_followup";
+	if (responseText.endsWith(followupMarker)) {
+		return {
+			cleanedText: responseText.slice(0, -followupMarker.length).trimEnd(),
+			needsFollowup: true,
+		};
+	}
+	return { cleanedText: responseText, needsFollowup: false };
+}
+
+/**
+ * Read a round file and clear its needsFollowup flag atomically.
+ * Returns the round data with needsFollowup=true, or null.
+ */
+export function readAndClearFollowupFlag(
+	fullPath: string,
+	fsImpl?: {
+		existsSync: (p: string) => boolean;
+		readFileSync: (p: string, encoding: "utf-8") => string;
+		writeFileSync: (p: string, data: string) => void;
+		renameSync: (oldP: string, newP: string) => void;
+	},
+): RoundData | null {
+	const fs_ = fsImpl ?? fs;
+
+	if (!fs_.existsSync(fullPath)) return null;
+
+	let roundData: Record<string, unknown>;
+	try {
+		roundData = JSON.parse(fs_.readFileSync(fullPath, "utf-8"));
+	} catch {
+		return null;
+	}
+
+	if (!roundData.needsFollowup) return null;
+
+	// Clear the flag atomically so it's only injected once
+	try {
+		const updated = { ...roundData, needsFollowup: false };
+		fs_.writeFileSync(`${fullPath}.tmp.${process.pid}`, JSON.stringify(updated, null, 2));
+		fs_.renameSync(`${fullPath}.tmp.${process.pid}`, fullPath);
+	} catch {
+		// best-effort — if we can't clear the flag, still return the data
+	}
+
+	return roundData as unknown as RoundData;
 }
 
 export function getRelatedParentIdFromGroup<T extends { fileName: string }>(

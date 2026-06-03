@@ -17,12 +17,13 @@ import { Type } from "@sinclair/typebox";
 import {
 	buildContextPreamble,
 	buildFinalResponseContract,
+	buildFollowUpSectionContent,
 	buildGroupedRecencyList,
 	buildRelevanceList,
 	formatFileSize,
 	splitCommandArgs,
 } from "../lib/context-format.ts";
-import { buildContextMessagePrefix, prepareContextMessages, shouldDropRelevanceList } from "../lib/context-messages.ts";
+import { prepareContextMessages, shouldDropRelevanceList } from "../lib/context-messages.ts";
 import { embedText, getApiKey } from "../lib/embedding-client.ts";
 import { assignToGroup, formatGroupStats, parseGroupThreshold, type SemanticGroup } from "../lib/grouping.ts";
 import { createRoundFilePath } from "../lib/hash.ts";
@@ -40,9 +41,11 @@ import {
 	buildAgentEndRoundData,
 	extractAgentEndResponseText,
 	extractAgentEndUserPrompt,
+	extractAndStripFollowupMarker,
 	getAgentEndParentId,
 	getRelatedParentIdFromGroup,
 	type MessageEndProcessingState,
+	readAndClearFollowupFlag,
 } from "../lib/round-capture.ts";
 import type { ChainEntry, ResponseSegment, RoundData, ToolCallDetail } from "../lib/round-data.ts";
 import {
@@ -70,7 +73,6 @@ import {
 import { normalize } from "../lib/vector.ts";
 
 export {
-	buildContextMessagePrefix,
 	countWordsInMessageContent,
 	extractContextPrompt,
 	prepareContextMessages,
@@ -156,6 +158,11 @@ type RoundGroup = SemanticGroup<ChainEntry>;
  *  Reset on session_start. Built incrementally at agent_end after each round save. */
 let roundGroups: RoundGroup[] = [];
 
+/** When a round has needsFollowup: true, the next round is automatically
+ *  assigned to the same group — no semantic matching needed. This holds
+ *  the group index to force-assign the next round to. Consumed once. */
+let lastFollowupGroupIdx: number | null = null;
+
 const SEMBLR_GROUP_THRESHOLD = parseGroupThreshold(process.env.SEMBLR_GROUP_THRESHOLD);
 
 // Context formatting helpers live in lib/context-format.ts.
@@ -175,6 +182,18 @@ function getRoundSize(fileName: string): string | null {
 }
 
 // formatCollapsedIndex removed — replaced by buildGroupedRecencyList / buildRelevanceList / buildContextPreamble
+
+/**
+ * Check if the last round has `needsFollowup: true`. If so, build a
+ * follow-up section and clear the flag atomically.
+ * Returns null if no follow-up is needed.
+ */
+function buildFollowUpContext(fileName: string): string | null {
+	const fullPath = `${ROUNDS_DIR}/${fileName}`;
+	const roundData = readAndClearFollowupFlag(fullPath);
+	if (!roundData) return null;
+	return buildFollowUpSectionContent(fileName, roundData.userPrompt, roundData.responseSequence);
+}
 
 // ─────────────────────────────────────────────
 // Index CSV format:
@@ -521,12 +540,35 @@ export default function (pi: ExtensionAPI) {
 				);
 			}
 
+			// ── Follow-up injection: if previous round was flagged, include its ──
+			// full text so the LLM can see what question was asked.
+			let followUpMsg: unknown | null = null;
+			if (lastRoundFileName) {
+				const followUpSection = buildFollowUpContext(lastRoundFileName);
+				if (followUpSection) {
+					followUpMsg = {
+						role: "user" as const,
+						content: [{ type: "text" as const, text: followUpSection }],
+					};
+				}
+			}
+
 			const contractMsg = {
 				role: "user" as const,
 				content: [{ type: "text" as const, text: buildFinalResponseContract() }],
 			};
 
-			const finalMessages = buildContextMessagePrefix(systemMsg, preamble, recencyList, relevanceList, contractMsg);
+			// Build prefix: system + preamble + recency + relevance [+ followUp] + contract
+			const prefixMsgs: unknown[] = [];
+			if (systemMsg) prefixMsgs.push(systemMsg);
+			if (preamble) prefixMsgs.push({ role: "user" as const, content: [{ type: "text" as const, text: preamble }] });
+			if (recencyList)
+				prefixMsgs.push({ role: "user" as const, content: [{ type: "text" as const, text: recencyList }] });
+			if (relevanceList)
+				prefixMsgs.push({ role: "user" as const, content: [{ type: "text" as const, text: relevanceList }] });
+			if (followUpMsg) prefixMsgs.push(followUpMsg);
+			if (contractMsg) prefixMsgs.push(contractMsg);
+			const finalMessages = prefixMsgs;
 
 			// Cache the stable prefix (system + context sections + final response contract) for
 			// subsequent context calls within this agent cycle. currentMessages is
@@ -599,12 +641,16 @@ export default function (pi: ExtensionAPI) {
 		}
 
 		// Build response text from accumulated assistant text across all tool iterations
-		const responseText = extractAgentEndResponseText(agentAccumulatedText, messages);
+		const rawResponseText = extractAgentEndResponseText(agentAccumulatedText, messages);
 
-		if (!responseText) {
+		if (!rawResponseText) {
 			ctx.ui.setStatus("semblr", "\u{1f9e0} agent_end: no response text");
 			return;
 		}
+
+		// Detect and strip the round_needs_followup marker, flagging for follow-up
+		// injection on the next context assembly.
+		const { cleanedText: responseText, needsFollowup } = extractAndStripFollowupMarker(rawResponseText);
 
 		fs.mkdirSync(ROUNDS_DIR, { recursive: true });
 
@@ -628,6 +674,7 @@ export default function (pi: ExtensionAPI) {
 						causalChain[causalChain.length - 1],
 						existing.promptEmbedding,
 						SEMBLR_GROUP_THRESHOLD,
+						needsFollowup ? lastFollowupGroupIdx : null,
 					);
 				}
 			} catch {
@@ -655,6 +702,7 @@ export default function (pi: ExtensionAPI) {
 			toolCalls: agentToolCalls,
 			responseSegments: agentResponseSegments,
 			parentId,
+			needsFollowup,
 		});
 
 		try {
@@ -713,8 +761,19 @@ export default function (pi: ExtensionAPI) {
 
 			// — Grouping + metadata update —
 			// Assign to a semantic group using the combined embedding.
+			// If this round is tagged needsFollowup, remember the group index so
+			// the next round is auto-assigned to the same group without semantic matching.
 			const roundEntry = causalChain[causalChain.length - 1];
-			const groupIdx = assignToGroup(roundGroups, roundEntry, combinedVec, SEMBLR_GROUP_THRESHOLD);
+			const groupIdx = assignToGroup(
+				roundGroups,
+				roundEntry,
+				combinedVec,
+				SEMBLR_GROUP_THRESHOLD,
+				needsFollowup ? lastFollowupGroupIdx : null,
+			);
+			if (needsFollowup) {
+				lastFollowupGroupIdx = groupIdx;
+			}
 			const group = roundGroups[groupIdx];
 			// Find the most recent round in the same group *before* this round
 			const relatedParentId = getRelatedParentIdFromGroup(group, roundEntry);
@@ -769,9 +828,10 @@ export default function (pi: ExtensionAPI) {
 	// registerTool is called inside session_start because factory-level
 	// registration doesn't reliably make tools visible to the LLM.
 	pi.on("session_start", async (_event, ctx) => {
-		// Clear causal chain and round groups — new session starts fresh
+		// Clear causal chain, round groups, and follow-up state — new session starts fresh
 		causalChain = [];
 		roundGroups = [];
+		lastFollowupGroupIdx = null;
 
 		const index = loadSessionStartIndex();
 		ctx.ui.setStatus("semblr", buildSessionStartStatus(index));
