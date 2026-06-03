@@ -16,6 +16,7 @@ import type { ContextEvent, ExtensionAPI, ExtensionContext } from "@earendil-wor
 import { Type } from "@sinclair/typebox";
 import {
 	buildContextPreamble,
+	buildFinalResponseContract,
 	buildGroupedRecencyList,
 	buildRelevanceList,
 	formatFileSize,
@@ -425,7 +426,16 @@ export default function (pi: ExtensionAPI) {
 
 		try {
 			const apiKey = await getApiKey(ctx);
-			if (!apiKey) return { messages: augmentedMessages } as any;
+			if (!apiKey) {
+				const contractMsg = {
+					role: "user" as const,
+					content: [{ type: "text" as const, text: buildFinalResponseContract() }],
+				};
+				const finalMessages: unknown[] = systemMsg
+					? [systemMsg, contractMsg, ...currentMessages]
+					: [contractMsg, ...currentMessages];
+				return { messages: finalMessages } as any;
+			}
 
 			// Embed the user prompt — cached per agent cycle to avoid redundant API calls
 			// across multiple tool turns within the same user prompt.
@@ -443,11 +453,16 @@ export default function (pi: ExtensionAPI) {
 			// Load and score the index
 			const index = loadIndex();
 			if (index.length === 0) {
-				// Env preamble + current messages only (no context lists)
+				// Final response contract + current messages (no context lists)
 				cachedEnvPreamble = envPreamble;
 				cachedUserPromptForContext = userPrompt;
-				cachedContextMessages = systemMsg ? [systemMsg] : [];
-				return { messages: augmentedMessages } as any;
+				const contractMsg = {
+					role: "user" as const,
+					content: [{ type: "text" as const, text: buildFinalResponseContract() }],
+				};
+				cachedContextMessages = systemMsg ? [systemMsg, contractMsg] : [contractMsg];
+				const finalMessages: unknown[] = [...cachedContextMessages, ...currentMessages];
+				return { messages: finalMessages } as any;
 			}
 
 			const scoredRounds = collectSearchRoundScores(index, queryVec, readRoundFile);
@@ -471,8 +486,13 @@ export default function (pi: ExtensionAPI) {
 				// Cache the empty-context result so subsequent turns reuse it
 				cachedEnvPreamble = envPreamble;
 				cachedUserPromptForContext = userPrompt;
-				cachedContextMessages = systemMsg ? [systemMsg] : [];
-				return { messages: augmentedMessages } as any;
+				const contractMsg = {
+					role: "user" as const,
+					content: [{ type: "text" as const, text: buildFinalResponseContract() }],
+				};
+				cachedContextMessages = systemMsg ? [systemMsg, contractMsg] : [contractMsg];
+				const finalMessages: unknown[] = [...cachedContextMessages, ...currentMessages];
+				return { messages: finalMessages } as any;
 			}
 
 			// ── Build the three-section context block ──
@@ -501,9 +521,14 @@ export default function (pi: ExtensionAPI) {
 				);
 			}
 
-			const finalMessages = buildContextMessagePrefix(systemMsg, preamble, recencyList, relevanceList);
+			const contractMsg = {
+				role: "user" as const,
+				content: [{ type: "text" as const, text: buildFinalResponseContract() }],
+			};
 
-			// Cache the stable prefix (system + preamble + recency + relevance) for
+			const finalMessages = buildContextMessagePrefix(systemMsg, preamble, recencyList, relevanceList, contractMsg);
+
+			// Cache the stable prefix (system + context sections + final response contract) for
 			// subsequent context calls within this agent cycle. currentMessages is
 			// appended fresh each time.
 			cachedEnvPreamble = envPreamble;

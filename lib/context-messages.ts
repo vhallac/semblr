@@ -44,7 +44,10 @@ export function prepareContextMessages(messages: readonly unknown[], envPreamble
 		const userMsgAny = userMsg as Record<string, unknown>;
 		if (typeof userContent === "string") {
 			if (!startsWithEnvironmentPreamble(userContent)) {
-				augmentedMessages[lastUserIdx] = { ...userMsgAny, content: `${envPreamble}\n\n${userContent}` };
+				augmentedMessages[lastUserIdx] = {
+					...userMsgAny,
+					content: `${envPreamble}\n\n[ACTIONABLE PROMPT]\n${userContent}`,
+				};
 			}
 		} else if (
 			Array.isArray(userContent) &&
@@ -54,13 +57,13 @@ export function prepareContextMessages(messages: readonly unknown[], envPreamble
 			const firstBlock = userContent[0] as { type: string; text: string };
 			if (!startsWithEnvironmentPreamble(firstBlock.text)) {
 				const newContent = [...userContent];
-				newContent[0] = { ...firstBlock, text: `${envPreamble}\n\n${firstBlock.text}` };
+				newContent[0] = { ...firstBlock, text: `${envPreamble}\n\n[ACTIONABLE PROMPT]\n${firstBlock.text}` };
 				augmentedMessages[lastUserIdx] = { ...userMsgAny, content: newContent };
 			}
 		} else if (Array.isArray(userContent)) {
 			augmentedMessages[lastUserIdx] = {
 				...userMsgAny,
-				content: [{ type: "text", text: `${envPreamble}\n\n` }, ...userContent],
+				content: [{ type: "text", text: `${envPreamble}\n\n[ACTIONABLE PROMPT]\n` }, ...userContent],
 			};
 		}
 	}
@@ -97,11 +100,16 @@ export function shouldDropRelevanceList(
 	return env.DROP_RELEVANCE_LIST === "1" || env.DROP_RELEVANCE_LIST === "true" || rawPromptWordCount < minWords;
 }
 
+/**
+ * Build the context message prefix block: system + preamble + recency + relevance + contract.
+ * The contract message is always last, immediately before the actionable prompt.
+ */
 export function buildContextMessagePrefix(
 	systemMsg: unknown | null,
 	preamble: string | null,
 	recencyList: string | null,
 	relevanceList: string | null,
+	contractMsg?: { role: string; content: Array<{ type: string; text: string }> } | null,
 ): unknown[] {
 	const finalMessages: unknown[] = [];
 	if (systemMsg) finalMessages.push(systemMsg);
@@ -110,5 +118,6 @@ export function buildContextMessagePrefix(
 		finalMessages.push({ role: "user" as const, content: [{ type: "text" as const, text: recencyList }] });
 	if (relevanceList)
 		finalMessages.push({ role: "user" as const, content: [{ type: "text" as const, text: relevanceList }] });
+	if (contractMsg) finalMessages.push(contractMsg);
 	return finalMessages;
 }
