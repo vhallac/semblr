@@ -13,3 +13,4 @@ shell.nix
 
 temp/
 coverage/
+.stryker-tmp/
