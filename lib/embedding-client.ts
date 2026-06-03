@@ -21,7 +21,7 @@ export async function getApiKey(ctx?: ApiKeyContext, deps: ApiKeyLookupDeps = {}
 	if (envKey) return envKey;
 
 	try {
-		const piKey = await ctx!.modelRegistry!.getApiKeyForProvider("openrouter");
+		const piKey = await ctx?.modelRegistry?.getApiKeyForProvider("openrouter");
 		if (piKey) return piKey;
 	} catch {
 		// Pi auth lookup failed, fall through.
@@ -34,7 +34,7 @@ export async function getApiKey(ctx?: ApiKeyContext, deps: ApiKeyLookupDeps = {}
 				stdio: ["pipe", "pipe", "pipe"],
 			});
 			let stdout = "";
-			child.stdout!.on("data", (chunk: Buffer) => {
+			child.stdout?.on("data", (chunk: Buffer) => {
 				stdout += chunk.toString();
 			});
 			child.on("close", (code) => {

@@ -52,13 +52,14 @@ export function formatRoundToolMeta(roundData: Record<string, unknown>): string 
 export function collapseRoundDetails(roundName: string, roundData: Record<string, unknown>): Record<string, unknown> {
 	const collapsedDetails = { ...roundData };
 	if (Array.isArray(collapsedDetails.toolCalls)) {
-		collapsedDetails.toolCalls = collapsedDetails.toolCalls.map((tc: any) => {
-			const sourceText = tc.result_full ?? tc.result_summary ?? "";
+		collapsedDetails.toolCalls = collapsedDetails.toolCalls.map((tc: unknown) => {
+			const typedTc = tc as Record<string, unknown>;
+			const sourceText = (typedTc.result_full as string) ?? (typedTc.result_summary as string) ?? "";
 			const sizeLabel = formatFileSize(Buffer.byteLength(sourceText, "utf-8"));
 			return {
-				...tc,
-				arguments: `[REDACTED — use get_tool_details("${roundName}", ${tc.index}) to expand]`,
-				result_summary: `[REDACTED — size: ${sizeLabel}; use get_tool_details("${roundName}", ${tc.index}) to expand]`,
+				...typedTc,
+				arguments: `[REDACTED — use get_tool_details("${roundName}", ${typedTc.index}) to expand]`,
+				result_summary: `[REDACTED — size: ${sizeLabel}; use get_tool_details("${roundName}", ${typedTc.index}) to expand]`,
 				result_full: undefined,
 			};
 		});

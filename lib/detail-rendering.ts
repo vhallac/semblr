@@ -84,7 +84,7 @@ export function selectRoundAssistantOutput(params: RoundAssistantSelectionParams
 		}
 	} else if (useMatch) {
 		try {
-			const regex = new RegExp(params.match!, "gm");
+			const regex = new RegExp(params.match as string, "gm");
 			const allLines = params.responseSequence.split("\n");
 			responseTotalLines = allLines.length;
 			const lineCount = params.lineCount ?? 0;
@@ -179,7 +179,7 @@ export function selectToolResultOutput(params: ToolResultSelectionParams): ToolR
 
 	if (useMatch) {
 		try {
-			const regex = new RegExp(params.match!, "gm");
+			const regex = new RegExp(params.match as string, "gm");
 			const allLines = params.resultText.split("\n");
 			const totalLines = allLines.length;
 			const lineCount = params.lineCount ?? 0;
