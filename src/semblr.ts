@@ -194,6 +194,60 @@ function getRoundSize(fileName: string): string | null {
 // formatCollapsedIndex removed — replaced by buildGroupedRecencyList / buildRelevanceList / buildContextPreamble
 
 /**
+ * Post-embedding tail: update round.json with the embedding vector,
+ * run semantic grouping, and optionally backfill relatedParentId.
+ * Shared by both the skip-prompt-embedding and full-embedding paths
+ * in agent_end. Only the embedding vector and status message differ.
+ */
+function finalizeRoundEmbedding({
+	roundPath,
+	embeddingVec,
+	needsFollowup,
+}: {
+	roundPath: string;
+	embeddingVec: number[];
+	needsFollowup: boolean;
+}): number {
+	// Atomic update of round.json with the embedding vector
+	const existing = JSON.parse(fs.readFileSync(roundPath, "utf-8"));
+	existing.promptEmbedding = embeddingVec;
+	fs.writeFileSync(roundPath + ".tmp." + process.pid, JSON.stringify(existing, null, 2));
+	fs.renameSync(roundPath + ".tmp." + process.pid, roundPath);
+
+	// Assign to a semantic group.
+	// If this round is tagged needsFollowup, remember the group index so
+	// the next round is auto-assigned to the same group without semantic matching.
+	const roundEntry = causalChain[causalChain.length - 1];
+	const groupIdx = assignToGroup(
+		roundGroups,
+		roundEntry,
+		embeddingVec,
+		SEMBLR_GROUP_THRESHOLD,
+		needsFollowup ? lastFollowupGroupIdx : null,
+	);
+	if (needsFollowup) {
+		lastFollowupGroupIdx = groupIdx;
+	}
+
+	// Find the most recent round in the same group *before* this round
+	const group = roundGroups[groupIdx];
+	const relatedParentId = getRelatedParentIdFromGroup(group, roundEntry);
+	if (relatedParentId) {
+		// Re-read, update, re-write atomically
+		try {
+			const updated = JSON.parse(fs.readFileSync(roundPath, "utf-8"));
+			updated.relatedParentId = relatedParentId;
+			fs.writeFileSync(roundPath + ".tmp." + process.pid, JSON.stringify(updated, null, 2));
+			fs.renameSync(roundPath + ".tmp." + process.pid, roundPath);
+		} catch {
+			/* best-effort */
+		}
+	}
+
+	return groupIdx;
+}
+
+/**
  * Check if the last round has `needsFollowup: true`. If so, build a
  * follow-up section and clear the flag atomically.
  * Returns null if no follow-up is needed.
@@ -837,38 +891,13 @@ export default function (pi: ExtensionAPI) {
 				// Write :response row to index (skip :prompt -- prompt was noise)
 				appendToIndex(`${roundFileName}:response`, responseVec);
 
-				// Update round.json with response embedding (used for grouping, not prompt+response combined)
-				const existing = JSON.parse(fs.readFileSync(roundPath, "utf-8"));
-				existing.promptEmbedding = responseVec;
-				fs.writeFileSync(roundPath + ".tmp." + process.pid, JSON.stringify(existing, null, 2));
-				fs.renameSync(roundPath + ".tmp." + process.pid, roundPath);
-
 				ctx.ui.setStatus("semblr", `🧠 saved + response-embedded round (${roundFileName})`);
 
-				// — Grouping + metadata —
-				const roundEntry = causalChain[causalChain.length - 1];
-				const groupIdx = assignToGroup(
-					roundGroups,
-					roundEntry,
-					responseVec,
-					SEMBLR_GROUP_THRESHOLD,
-					needsFollowup ? lastFollowupGroupIdx : null,
-				);
-				if (needsFollowup) {
-					lastFollowupGroupIdx = groupIdx;
-				}
-				const group = roundGroups[groupIdx];
-				const relatedParentId = getRelatedParentIdFromGroup(group, roundEntry);
-				if (relatedParentId) {
-					try {
-						const updated = JSON.parse(fs.readFileSync(roundPath, "utf-8"));
-						updated.relatedParentId = relatedParentId;
-						fs.writeFileSync(roundPath + ".tmp." + process.pid, JSON.stringify(updated, null, 2));
-						fs.renameSync(roundPath + ".tmp." + process.pid, roundPath);
-					} catch {
-						/* best-effort */
-					}
-				}
+				finalizeRoundEmbedding({
+					roundPath,
+					embeddingVec: responseVec,
+					needsFollowup,
+				});
 			} catch (err) {
 				ctx.ui.setStatus("semblr", `🧠 response embedding error: ${(err as Error).message}`);
 			}
@@ -890,43 +919,13 @@ export default function (pi: ExtensionAPI) {
 				appendToIndex(`${roundFileName}:prompt`, normalize(promptVec));
 				appendToIndex(`${roundFileName}:response`, normalize(responseVec));
 
-				// Update round.json with combined embedding
-				const existing = JSON.parse(fs.readFileSync(roundPath, "utf-8"));
-				existing.promptEmbedding = combinedVec;
-				fs.writeFileSync(roundPath + ".tmp." + process.pid, JSON.stringify(existing, null, 2));
-				fs.renameSync(roundPath + ".tmp." + process.pid, roundPath);
-
 				ctx.ui.setStatus("semblr", `\u{1f9e0} saved + embedded round (${roundFileName})`);
 
-				// — Grouping + metadata update —
-				// Assign to a semantic group using the combined embedding.
-				// If this round is tagged needsFollowup, remember the group index so
-				// the next round is auto-assigned to the same group without semantic matching.
-				const roundEntry = causalChain[causalChain.length - 1];
-				const groupIdx = assignToGroup(
-					roundGroups,
-					roundEntry,
-					combinedVec,
-					SEMBLR_GROUP_THRESHOLD,
-					needsFollowup ? lastFollowupGroupIdx : null,
-				);
-				if (needsFollowup) {
-					lastFollowupGroupIdx = groupIdx;
-				}
-				const group = roundGroups[groupIdx];
-				// Find the most recent round in the same group *before* this round
-				const relatedParentId = getRelatedParentIdFromGroup(group, roundEntry);
-				if (relatedParentId) {
-					// Re-read, update, re-write atomically
-					try {
-						const updated = JSON.parse(fs.readFileSync(roundPath, "utf-8"));
-						updated.relatedParentId = relatedParentId;
-						fs.writeFileSync(roundPath + ".tmp." + process.pid, JSON.stringify(updated, null, 2));
-						fs.renameSync(roundPath + ".tmp." + process.pid, roundPath);
-					} catch {
-						/* best-effort */
-					}
-				}
+				finalizeRoundEmbedding({
+					roundPath,
+					embeddingVec: combinedVec,
+					needsFollowup,
+				});
 			} catch (err) {
 				ctx.ui.setStatus("semblr", `\u{1f9e0} embedding error: ${(err as Error).message}`);
 			}
