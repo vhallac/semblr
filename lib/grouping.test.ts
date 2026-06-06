@@ -43,4 +43,21 @@ describe("semantic grouping", () => {
 		expect(groups[1].rounds).toEqual(["b", "c"]);
 		expect(groups[1].centroid).toEqual([0.6, 0.8]);
 	});
+
+	it("creates a new singleton group when vec is null", () => {
+		const groups: Array<{ centroid: number[]; rounds: string[] }> = [{ centroid: [1, 0], rounds: ["a"] }];
+
+		expect(assignToGroup(groups, "b", null, 0.8)).toBe(1);
+		expect(groups).toHaveLength(2);
+		expect(groups[1].centroid).toEqual([]);
+		expect(groups[1].rounds).toEqual(["b"]);
+	});
+
+	it("uses forceGroupIdx with null vec (does not update centroid)", () => {
+		const groups: Array<{ centroid: number[]; rounds: string[] }> = [{ centroid: [1, 0, 0], rounds: ["a"] }];
+
+		expect(assignToGroup(groups, "b", null, 0.8, 0)).toBe(0);
+		expect(groups[0].rounds).toEqual(["a", "b"]);
+		expect(groups[0].centroid).toEqual([1, 0, 0]); // unchanged
+	});
 });

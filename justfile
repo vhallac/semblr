@@ -52,6 +52,12 @@ migrate *args:
     SEMBLR_ROUNDS_DIR="{{SEMBLR_ROUNDS_DIR}}" \
         npx tsx scripts/migrate-content-hash.ts {{args}}
 
+# Erase embeddings for short prompts from index.csv and round JSON files
+# (Idempotent — safe to re-run)
+erase-short-embeddings *args:
+    SEMBLR_ROUNDS_DIR="{{SEMBLR_ROUNDS_DIR}}" \
+        npx tsx scripts/erase-short-embeddings.ts {{args}}
+
 # Query the index with a natural language query (via pi + semblr extension)
 # Usage: just query "<your question>"
 query query *args:

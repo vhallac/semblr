@@ -23,7 +23,7 @@ export function formatGroupStats<T>(groups: Array<SemanticGroup<T>>, threshold: 
 export function assignToGroup<T>(
 	groups: Array<SemanticGroup<T>>,
 	roundEntry: T,
-	vec: number[],
+	vec: number[] | null,
 	threshold: number,
 	/** When set, skip semantic matching and force-assign to this group index instead. */
 	forceGroupIdx?: number | null,
@@ -33,9 +33,21 @@ export function assignToGroup<T>(
 	if (forceGroupIdx !== undefined && forceGroupIdx !== null && forceGroupIdx < groups.length) {
 		const group = groups[forceGroupIdx];
 		group.rounds.push(roundEntry);
-		const n = group.rounds.length;
-		group.centroid = group.centroid.map((c, i) => c + (vec[i] - c) / n);
+		if (vec) {
+			const n = group.rounds.length;
+			group.centroid = group.centroid.map((c, i) => c + (vec[i] - c) / n);
+		}
 		return forceGroupIdx;
+	}
+
+	// Null vector: create a new singleton group (short prompts with sparse info
+	// produce noisy embeddings — better to not match against existing groups)
+	if (!vec) {
+		groups.push({
+			centroid: [],
+			rounds: [roundEntry],
+		});
+		return groups.length - 1;
 	}
 
 	let bestIdx = -1;
