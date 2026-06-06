@@ -101,6 +101,27 @@ export function shouldDropRelevanceList(
 }
 
 /**
+ * Check whether the prompt embedding should be skipped for short prompts.
+ * Uses the same RELEVANCE_LIST_MIN_WORDS threshold (default: 20 words).
+ * Short prompts produce noisy embeddings that waste API credits, pollute the
+ * vector index, and cause false-positive search matches.
+ *
+ * When this returns true:
+ * - No embedText() call for the prompt vector
+ * - No :prompt row written to index.csv
+ * - Response embedding is still computed and written as :response
+ * - promptEmbedding in round JSON uses the response vector (not prompt+response)
+ * - assignToGroup() uses the response vector (not a null signal)
+ */
+export function shouldDropEmbedding(
+	rawPromptWordCount: number,
+	env: { RELEVANCE_LIST_MIN_WORDS?: string } = process.env,
+): boolean {
+	const minWords = Number.parseInt(env.RELEVANCE_LIST_MIN_WORDS ?? "20", 10);
+	return rawPromptWordCount < minWords;
+}
+
+/**
  * Build the context message prefix block: system + preamble + recency + relevance + contract.
  * The contract message is always last, immediately before the actionable prompt.
  */

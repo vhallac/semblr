@@ -23,7 +23,12 @@ import {
 	formatFileSize,
 	splitCommandArgs,
 } from "../lib/context-format.ts";
-import { prepareContextMessages, shouldDropRelevanceList } from "../lib/context-messages.ts";
+import {
+	buildContextMessagePrefix,
+	prepareContextMessages,
+	shouldDropEmbedding,
+	shouldDropRelevanceList,
+} from "../lib/context-messages.ts";
 import { embedText, getApiKey } from "../lib/embedding-client.ts";
 import { assignToGroup, formatGroupStats, parseGroupThreshold, type SemanticGroup } from "../lib/grouping.ts";
 import { createRoundFilePath } from "../lib/hash.ts";
@@ -72,10 +77,10 @@ import {
 import { normalize } from "../lib/vector.ts";
 
 export {
-	buildContextMessagePrefix,
 	countWordsInMessageContent,
 	extractContextPrompt,
 	prepareContextMessages,
+	shouldDropEmbedding,
 	shouldDropRelevanceList,
 	startsWithEnvironmentPreamble,
 } from "../lib/context-messages.ts";
@@ -296,6 +301,7 @@ let agentResponseSegments: ResponseSegment[] = [];
 let lastContextUserPrompt: string | null = null;
 let lastContextVec: number[] = [];
 let agentPromptVec: number[] | null = null; // cached from context hook, reused in agent_end to avoid redundant embed
+let agentSkipPromptEmbedding = false; // set by context hook for short prompts, signals agent_end to skip prompt embedding only (response still embedded)
 let roundPresentedRecorded = false; // dedup: recordPresented only once per agent cycle
 
 // Full-message cache — the envPreamble plus context-building-reference sections
@@ -468,6 +474,54 @@ export default function (pi: ExtensionAPI) {
 			return { messages: finalMessages } as any;
 		}
 
+		// --- Short-prompt fast path: skip embedding and retrieval but keep ───
+		//     recency list, follow-up injection, and preamble (all zero API cost).
+		// Short prompts ("yes", "do it", "continue") produce noisy embeddings.
+		if (shouldDropEmbedding(rawPromptWordCount)) {
+			// Short prompt: skip prompt embedding (noisy) but still embed response (significant).
+			// Per https://github.com/vhallac/semblr/issues/38#issuecomment-4629826478
+			agentSkipPromptEmbedding = true;
+			agentPromptVec = null;
+			cachedEnvPreamble = envPreamble;
+			cachedUserPromptForContext = userPrompt;
+
+			// Build non-embedding context sections (all in-memory / disk, zero API cost)
+			const recencyList = buildGroupedRecencyList(roundGroups, causalChain, getRoundSize);
+			const preamble = buildContextPreamble(!!recencyList, false);
+
+			// Follow-up injection: if previous round was flagged, include its full text
+			let followUpMsg: unknown | null = null;
+			if (lastRoundFileName && needsFollowupInjection(lastRoundFileName)) {
+				const followUpSection = buildFollowUpContext(lastRoundFileName);
+				if (followUpSection) {
+					followUpMsg = {
+						role: "user" as const,
+						content: [{ type: "text" as const, text: followUpSection }],
+					};
+					injectedFollowupRounds.add(lastRoundFileName);
+				}
+			}
+
+			const contractMsg = {
+				role: "user" as const,
+				content: [{ type: "text" as const, text: buildFinalResponseContract() }],
+			};
+
+			// Compose via buildContextMessagePrefix to keep all paths consistent
+			const prefixMsgs = buildContextMessagePrefix(systemMsg, preamble, recencyList, null, contractMsg);
+			if (followUpMsg) prefixMsgs.push(followUpMsg);
+			cachedContextMessages = [...prefixMsgs];
+
+			// ══ Stats: record all 5 positions presented ══
+			if (!roundPresentedRecorded) {
+				recordPresented(statsState, statsPresentedHashes, causalChain, TRACK_POSITIONS);
+				roundPresentedRecorded = true;
+			}
+
+			const finalMessages: unknown[] = [...cachedContextMessages, ...currentMessages];
+			return { messages: finalMessages } as any;
+		}
+
 		// agentPromptVec is stashed after embedding below for agent_end to reuse
 
 		try {
@@ -635,6 +689,7 @@ export default function (pi: ExtensionAPI) {
 		lastContextUserPrompt = null;
 		lastContextVec = [];
 		agentPromptVec = null;
+		agentSkipPromptEmbedding = false;
 		roundPresentedRecorded = false;
 
 		// Reset full-message cache — env preamble and context blocks rebuilt on first context call
@@ -696,13 +751,15 @@ export default function (pi: ExtensionAPI) {
 		// Skip if already saved (deduplication by content hash)
 		if (fs.existsSync(roundPath)) {
 			// Even on dedup, run grouping if the round has a combined embedding
+			// (or if this is a short-prompt round with embedding skipped, use null)
 			try {
 				const existing = JSON.parse(fs.readFileSync(roundPath, "utf-8"));
 				if (existing.promptEmbedding) {
+					const vec = existing.promptEmbedding || null;
 					assignToGroup(
 						roundGroups,
 						causalChain[causalChain.length - 1],
-						existing.promptEmbedding,
+						vec,
 						SEMBLR_GROUP_THRESHOLD,
 						needsFollowup ? lastFollowupGroupIdx : null,
 					);
@@ -764,62 +821,115 @@ export default function (pi: ExtensionAPI) {
 			return;
 		}
 
-		try {
-			// Strip context-injection REDACTED markers and clip to ~24KB (8K tokens)
-			const { clippedResponse, combinedText } = buildAgentEndEmbeddingTexts(userPrompt, responseText);
+		if (agentSkipPromptEmbedding) {
+			// Short prompt: skip prompt embedding (noisy), but still embed response.
+			// Response is usually significant even when the prompt is short.
+			// Per https://github.com/vhallac/semblr/issues/38#issuecomment-4629826478
+			try {
+				const strippedResponse = responseText.replace(/\[(?:Tool call )?REDACTED[^\]]*\]\n?/g, "");
+				const responseBuf = Buffer.from(strippedResponse, "utf-8");
+				const clippedResponse =
+					responseBuf.length > 24000 ? responseBuf.slice(0, 24000).toString("utf-8") : strippedResponse;
 
-			// Embedding #1: prompt (reuse cached agentPromptVec if available)
-			const promptVec = agentPromptVec ?? normalize(await embedText(userPrompt, apiKey));
+				// Embed response only (no noisy prompt prefix)
+				const responseVec = normalize(await embedText(clippedResponse, apiKey));
 
-			// Embedding #2 + #3 in parallel
-			const [responseVec, combinedVec] = await Promise.all([
-				embedText(clippedResponse, apiKey),
-				embedText(combinedText, apiKey),
-			]);
+				// Write :response row to index (skip :prompt -- prompt was noise)
+				appendToIndex(`${roundFileName}:response`, responseVec);
 
-			// Save to index: :prompt and :response (normalized for cosine similarity)
-			appendToIndex(`${roundFileName}:prompt`, normalize(promptVec));
-			appendToIndex(`${roundFileName}:response`, normalize(responseVec));
+				// Update round.json with response embedding (used for grouping, not prompt+response combined)
+				const existing = JSON.parse(fs.readFileSync(roundPath, "utf-8"));
+				existing.promptEmbedding = responseVec;
+				fs.writeFileSync(roundPath + ".tmp." + process.pid, JSON.stringify(existing, null, 2));
+				fs.renameSync(roundPath + ".tmp." + process.pid, roundPath);
 
-			// Update round.json with combined embedding
-			const existing = JSON.parse(fs.readFileSync(roundPath, "utf-8"));
-			existing.promptEmbedding = combinedVec;
-			fs.writeFileSync(roundPath + ".tmp." + process.pid, JSON.stringify(existing, null, 2));
-			fs.renameSync(roundPath + ".tmp." + process.pid, roundPath);
+				ctx.ui.setStatus("semblr", `🧠 saved + response-embedded round (${roundFileName})`);
 
-			ctx.ui.setStatus("semblr", `\u{1f9e0} saved + embedded round (${roundFileName})`);
-
-			// — Grouping + metadata update —
-			// Assign to a semantic group using the combined embedding.
-			// If this round is tagged needsFollowup, remember the group index so
-			// the next round is auto-assigned to the same group without semantic matching.
-			const roundEntry = causalChain[causalChain.length - 1];
-			const groupIdx = assignToGroup(
-				roundGroups,
-				roundEntry,
-				combinedVec,
-				SEMBLR_GROUP_THRESHOLD,
-				needsFollowup ? lastFollowupGroupIdx : null,
-			);
-			if (needsFollowup) {
-				lastFollowupGroupIdx = groupIdx;
-			}
-			const group = roundGroups[groupIdx];
-			// Find the most recent round in the same group *before* this round
-			const relatedParentId = getRelatedParentIdFromGroup(group, roundEntry);
-			if (relatedParentId) {
-				// Re-read, update, re-write atomically
-				try {
-					const updated = JSON.parse(fs.readFileSync(roundPath, "utf-8"));
-					updated.relatedParentId = relatedParentId;
-					fs.writeFileSync(roundPath + ".tmp." + process.pid, JSON.stringify(updated, null, 2));
-					fs.renameSync(roundPath + ".tmp." + process.pid, roundPath);
-				} catch {
-					/* best-effort */
+				// — Grouping + metadata —
+				const roundEntry = causalChain[causalChain.length - 1];
+				const groupIdx = assignToGroup(
+					roundGroups,
+					roundEntry,
+					responseVec,
+					SEMBLR_GROUP_THRESHOLD,
+					needsFollowup ? lastFollowupGroupIdx : null,
+				);
+				if (needsFollowup) {
+					lastFollowupGroupIdx = groupIdx;
 				}
+				const group = roundGroups[groupIdx];
+				const relatedParentId = getRelatedParentIdFromGroup(group, roundEntry);
+				if (relatedParentId) {
+					try {
+						const updated = JSON.parse(fs.readFileSync(roundPath, "utf-8"));
+						updated.relatedParentId = relatedParentId;
+						fs.writeFileSync(roundPath + ".tmp." + process.pid, JSON.stringify(updated, null, 2));
+						fs.renameSync(roundPath + ".tmp." + process.pid, roundPath);
+					} catch {
+						/* best-effort */
+					}
+				}
+			} catch (err) {
+				ctx.ui.setStatus("semblr", `🧠 response embedding error: ${(err as Error).message}`);
 			}
-		} catch (err) {
-			ctx.ui.setStatus("semblr", `\u{1f9e0} embedding error: ${(err as Error).message}`);
+		} else {
+			try {
+				// Strip context-injection REDACTED markers and clip to ~24KB (8K tokens)
+				const { clippedResponse, combinedText } = buildAgentEndEmbeddingTexts(userPrompt, responseText);
+
+				// Embedding #1: prompt (reuse cached agentPromptVec if available)
+				const promptVec = agentPromptVec ?? normalize(await embedText(userPrompt, apiKey));
+
+				// Embedding #2 + #3 in parallel
+				const [responseVec, combinedVec] = await Promise.all([
+					embedText(clippedResponse, apiKey),
+					embedText(combinedText, apiKey),
+				]);
+
+				// Save to index: :prompt and :response (normalized for cosine similarity)
+				appendToIndex(`${roundFileName}:prompt`, normalize(promptVec));
+				appendToIndex(`${roundFileName}:response`, normalize(responseVec));
+
+				// Update round.json with combined embedding
+				const existing = JSON.parse(fs.readFileSync(roundPath, "utf-8"));
+				existing.promptEmbedding = combinedVec;
+				fs.writeFileSync(roundPath + ".tmp." + process.pid, JSON.stringify(existing, null, 2));
+				fs.renameSync(roundPath + ".tmp." + process.pid, roundPath);
+
+				ctx.ui.setStatus("semblr", `\u{1f9e0} saved + embedded round (${roundFileName})`);
+
+				// — Grouping + metadata update —
+				// Assign to a semantic group using the combined embedding.
+				// If this round is tagged needsFollowup, remember the group index so
+				// the next round is auto-assigned to the same group without semantic matching.
+				const roundEntry = causalChain[causalChain.length - 1];
+				const groupIdx = assignToGroup(
+					roundGroups,
+					roundEntry,
+					combinedVec,
+					SEMBLR_GROUP_THRESHOLD,
+					needsFollowup ? lastFollowupGroupIdx : null,
+				);
+				if (needsFollowup) {
+					lastFollowupGroupIdx = groupIdx;
+				}
+				const group = roundGroups[groupIdx];
+				// Find the most recent round in the same group *before* this round
+				const relatedParentId = getRelatedParentIdFromGroup(group, roundEntry);
+				if (relatedParentId) {
+					// Re-read, update, re-write atomically
+					try {
+						const updated = JSON.parse(fs.readFileSync(roundPath, "utf-8"));
+						updated.relatedParentId = relatedParentId;
+						fs.writeFileSync(roundPath + ".tmp." + process.pid, JSON.stringify(updated, null, 2));
+						fs.renameSync(roundPath + ".tmp." + process.pid, roundPath);
+					} catch {
+						/* best-effort */
+					}
+				}
+			} catch (err) {
+				ctx.ui.setStatus("semblr", `\u{1f9e0} embedding error: ${(err as Error).message}`);
+			}
 		}
 
 		lastRoundFileName = roundFileName;

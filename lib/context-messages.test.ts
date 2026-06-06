@@ -4,6 +4,7 @@ import {
 	countWordsInMessageContent,
 	extractContextPrompt,
 	prepareContextMessages,
+	shouldDropEmbedding,
 	shouldDropRelevanceList,
 	startsWithEnvironmentPreamble,
 } from "./context-messages.ts";
@@ -242,6 +243,26 @@ describe("shouldDropRelevanceList", () => {
 	});
 });
 
+describe("shouldDropEmbedding", () => {
+	it("returns true when word count is below minimum", () => {
+		expect(shouldDropEmbedding(10, {})).toBe(true);
+	});
+
+	it("returns false when word count is at or above minimum", () => {
+		expect(shouldDropEmbedding(20, {})).toBe(false);
+		expect(shouldDropEmbedding(25, {})).toBe(false);
+	});
+
+	it("respects custom RELEVANCE_LIST_MIN_WORDS", () => {
+		expect(shouldDropEmbedding(5, { RELEVANCE_LIST_MIN_WORDS: "3" })).toBe(false);
+		expect(shouldDropEmbedding(2, { RELEVANCE_LIST_MIN_WORDS: "3" })).toBe(true);
+	});
+
+	it("returns true for zero words", () => {
+		expect(shouldDropEmbedding(0, {})).toBe(true);
+	});
+});
+
 describe("buildContextMessagePrefix", () => {
 	it("returns empty array when all inputs are null", () => {
 		expect(buildContextMessagePrefix(null, null, null, null)).toEqual([]);
@@ -288,5 +309,49 @@ describe("buildContextMessagePrefix", () => {
 		};
 		const result = buildContextMessagePrefix(systemMsg, "preamble", "recent", "relevant", contract);
 		expect(result).toHaveLength(5);
+	});
+
+	it("includes recency, preamble, and contract when relevance is null (short-prompt scenario)", () => {
+		// Bug: the short-prompt fast path in src/semblr.ts composes messages manually
+		// as [systemMsg, contractMsg], dropping recency list and preamble.
+		// This test demonstrates that buildContextMessagePrefix correctly includes
+		// recency, preamble, and contract even when relevanceList is null.
+		const systemMsg = { role: "system", content: "You are helpful" };
+		const preamble = "[CONTEXT BUILDING REFERENCES]\n...";
+		const recencyList = "--- RECENCY LIST ---\n...";
+		const contract = {
+			role: "user",
+			content: [{ type: "text", text: "[FINAL RESPONSE CONTRACT]" }],
+		};
+
+		// relevanceList is null — intentional, embedding pipeline skipped for short prompts
+		const result = buildContextMessagePrefix(systemMsg, preamble, recencyList, null, contract);
+
+		// Should produce: system, preamble, recency, contract (4 messages)
+		expect(result).toHaveLength(4);
+
+		// Verify each component is present (result[0] = systemMsg, rest = user role messages)
+		expect((result[0] as { role: string }).role).toBe("system");
+		const userTexts = result
+			.slice(1)
+			.map((m) => (m as { content: Array<{ type: string; text: string }> }).content[0].text);
+		expect(userTexts[0]).toBe("[CONTEXT BUILDING REFERENCES]\n...");
+		expect(userTexts[1]).toBe("--- RECENCY LIST ---\n...");
+		expect(userTexts[2]).toBe("[FINAL RESPONSE CONTRACT]");
+	});
+
+	it("produces only system + contract when recency and preamble are also null (empty-chain scenario)", () => {
+		// No causal chain = no recency list, but contract should still be present
+		const systemMsg = { role: "system", content: "You are helpful" };
+		const contract = {
+			role: "user",
+			content: [{ type: "text", text: "[FINAL RESPONSE CONTRACT]" }],
+		};
+
+		const result = buildContextMessagePrefix(systemMsg, null, null, null, contract);
+
+		expect(result).toHaveLength(2);
+		expect(result[0]).toEqual(systemMsg);
+		expect(result[1]).toEqual(contract);
 	});
 });
