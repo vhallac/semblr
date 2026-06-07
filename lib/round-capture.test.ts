@@ -5,6 +5,7 @@ import {
 	buildAgentEndEmbeddingTexts,
 	buildAgentEndRoundData,
 	buildAgentEndToolSummary,
+	embeddingMaxTokensToResponseBytes,
 	extractAgentEndResponseText,
 	extractAgentEndUserPrompt,
 	extractAndStripFollowupMarker,
@@ -198,6 +199,16 @@ describe("getAgentEndParentId", () => {
 	it("returns second-to-last filename for longer chains", () => {
 		const chain = [{ fileName: "a.json" }, { fileName: "b.json" }, { fileName: "c.json" }];
 		expect(getAgentEndParentId(chain)).toBe("b.json");
+	});
+});
+
+describe("embeddingMaxTokensToResponseBytes", () => {
+	it("preserves the existing 8K-token clipping default", () => {
+		expect(embeddingMaxTokensToResponseBytes(8000)).toBe(24000);
+	});
+
+	it("converts configured embedding max tokens into the response byte clip budget", () => {
+		expect(embeddingMaxTokensToResponseBytes(1234)).toBe(3702);
 	});
 });
 

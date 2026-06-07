@@ -29,8 +29,8 @@ import {
 	shouldDropEmbedding,
 	shouldDropRelevanceList,
 } from "../lib/context-messages.ts";
-import { EMBEDDING_MODEL, embedText, getApiKey } from "../lib/embedding-client.ts";
-import { assignToGroup, formatGroupStats, parseGroupThreshold, type SemanticGroup } from "../lib/grouping.ts";
+import { embedText, getApiKey } from "../lib/embedding-client.ts";
+import { assignToGroup, formatGroupStats, type SemanticGroup } from "../lib/grouping.ts";
 import { createRoundFilePath } from "../lib/hash.ts";
 import {
 	appendToIndexPath,
@@ -44,6 +44,7 @@ import {
 	buildAgentEndChainEntry,
 	buildAgentEndEmbeddingTexts,
 	buildAgentEndRoundData,
+	embeddingMaxTokensToResponseBytes,
 	extractAgentEndResponseText,
 	extractAgentEndUserPrompt,
 	extractAndStripFollowupMarker,
@@ -67,6 +68,7 @@ import {
 	type SearchInteractionsParams,
 	selectContextRounds,
 } from "../lib/search-interactions.ts";
+import { loadSemblrConfig, type SemblrConfig } from "../lib/semblr-config.ts";
 import {
 	flushStatsFile,
 	formatChainReadStatsReport,
@@ -120,13 +122,12 @@ export {
 // Config
 // ─────────────────────────────────────────────
 
-// PI_CODING_AGENT_DIR overrides the default ~/.pi/agent config directory.
-// We store semblr rounds under that directory so they survive project moves.
-const PI_CONFIG_DIR = process.env.PI_CODING_AGENT_DIR || `${os.homedir()}/.pi/agent`;
-const ROUNDS_DIR = process.env.SEMBLR_ROUNDS_DIR || `${PI_CONFIG_DIR}/semblr/rounds`;
-const INDEX_PATH = `${ROUNDS_DIR}/index.csv`;
-const SEMBLR_DIR = `${PI_CONFIG_DIR}/semblr`;
-const STATS_PATH = `${SEMBLR_DIR}/chain-read-stats.json`;
+const SEMBLR_CONFIG = loadSemblrConfig();
+const ROUNDS_DIR = SEMBLR_CONFIG.roundsDir;
+const INDEX_PATH = SEMBLR_CONFIG.indexPath;
+const SEMBLR_DIR = path.dirname(ROUNDS_DIR);
+const STATS_PATH = path.join(SEMBLR_DIR, "chain-read-stats.json");
+const EMBEDDING_RESPONSE_MAX_BYTES = embeddingMaxTokensToResponseBytes(SEMBLR_CONFIG.embeddingMaxTokens);
 
 // ◈ Causal-chain read statistics — global, never injected into context
 //   Tracks all 5 causal-chain display positions (1-5, where 1 = most recent round).
@@ -173,7 +174,7 @@ let lastFollowupGroupIdx: number | null = null;
  *  across agent restarts within the same session. Never modifies saved JSON. */
 let injectedFollowupRounds: Set<string> = new Set();
 
-const SEMBLR_GROUP_THRESHOLD = parseGroupThreshold(process.env.SEMBLR_GROUP_THRESHOLD);
+const SEMBLR_GROUP_THRESHOLD = SEMBLR_CONFIG.groupThreshold;
 
 // Context formatting helpers live in lib/context-format.ts.
 
@@ -371,6 +372,10 @@ function appendToIndex(filePath: string, vector: number[], model?: string) {
 	appendToIndexPath(INDEX_PATH, ROUNDS_DIR, filePath, vector, {}, model);
 }
 
+function embeddingClientDeps(ctx: ExtensionContext) {
+	return { config: SEMBLR_CONFIG, modelRegistry: ctx.modelRegistry };
+}
+
 function extensionRoot(): string {
 	// src/semblr.ts -> project root. __dirname is available in pi's jiti runtime.
 	return path.resolve(__dirname, "..");
@@ -399,11 +404,21 @@ export function buildImportClaudeSpawnRequest(
 	parsedArgs: readonly string[],
 	apiKey: string | null,
 	env: Record<string, string | undefined> = process.env,
+	config: SemblrConfig = SEMBLR_CONFIG,
 ) {
 	const childEnv: Record<string, string | undefined> = {
 		...env,
 		...(apiKey ? { OPENROUTER_API_KEY: apiKey } : {}),
-		SEMBLR_ROUNDS_DIR: ROUNDS_DIR,
+		SEMBLR_ROUNDS_DIR: config.roundsDir,
+		SEMBLR_EMBEDDING_PROVIDER: config.embeddingProvider,
+		SEMBLR_EMBEDDING_MODEL: config.embeddingModel,
+		SEMBLR_EMBEDDING_MAX_TOKENS: String(config.embeddingMaxTokens),
+		...(config.embeddingApiUrl ? { SEMBLR_EMBEDDING_API_URL: config.embeddingApiUrl } : {}),
+		SEMBLR_GROUP_THRESHOLD: String(config.groupThreshold),
+		SEMBLR_MIN_SIMILARITY: String(config.minSimilarity),
+		SEMBLR_EMBED_TIMEOUT: String(config.embedTimeoutMs),
+		SEMBLR_EMBED_RETRIES: String(config.embedMaxRetries),
+		SEMBLR_EMBED_BACKOFF: String(config.embedBackoffMs),
 	};
 	return {
 		command: "npx",
@@ -466,7 +481,7 @@ export default function (pi: ExtensionAPI) {
 			ctx.ui.setStatus("semblr", statusText);
 			ctx.ui.notify(startNotification, "info");
 
-			const apiKey = await getApiKey(ctx as Parameters<typeof getApiKey>[0]);
+			const apiKey = await getApiKey(ctx, { config: SEMBLR_CONFIG });
 			const spawnRequest = buildImportClaudeSpawnRequest(root, script, parsedArgs, apiKey);
 			const child = spawn(spawnRequest.command, spawnRequest.args, spawnRequest.options);
 
@@ -579,7 +594,7 @@ export default function (pi: ExtensionAPI) {
 		// agentPromptVec is stashed after embedding below for agent_end to reuse
 
 		try {
-			const apiKey = await getApiKey(ctx);
+			const apiKey = await getApiKey(ctx, { config: SEMBLR_CONFIG });
 			if (!apiKey) {
 				const contractMsg = {
 					role: "user" as const,
@@ -597,7 +612,7 @@ export default function (pi: ExtensionAPI) {
 			if (userPrompt === lastContextUserPrompt) {
 				queryVec = lastContextVec;
 			} else {
-				queryVec = normalize(await embedText(userPrompt, apiKey));
+				queryVec = normalize(await embedText(userPrompt, apiKey, embeddingClientDeps(ctx)));
 				lastContextUserPrompt = userPrompt;
 				lastContextVec = queryVec;
 			}
@@ -623,15 +638,14 @@ export default function (pi: ExtensionAPI) {
 			const bestScore = scoredRounds.length > 0 ? scoredRounds[0].bestScore : 0;
 
 			// --- Dynamic budget ---
-			const MIN_SIMILARITY = 0.3;
 			const budgetTokens = computeContextBudget(
 				bestScore,
-				(ctx as ExtensionContext).model?.contextWindow ?? 128_000,
-				MIN_SIMILARITY,
+				ctx.model?.contextWindow ?? 128_000,
+				SEMBLR_CONFIG.minSimilarity,
 			);
 
 			const selectedRounds = selectContextRounds(scoredRounds, lastRoundFileName, readRoundFile, {
-				minSimilarity: MIN_SIMILARITY,
+				minSimilarity: SEMBLR_CONFIG.minSimilarity,
 				budgetTokens,
 			});
 
@@ -860,12 +874,12 @@ export default function (pi: ExtensionAPI) {
 		//   1. prompt embedding → index.csv as :prompt
 		//   2. response (truncated, REDACTED dropped) embedding → index.csv as :response
 		//   3. concat(prompt, truncated+dropped response) embedding → round.json (for grouping)
-		// text-embedding-3-small silently truncates at 8K tokens (~24KB), so we clip
-		// the response explicitly to control what gets included.
+		// Embedding providers may truncate long inputs, so we clip the response explicitly
+		// using the configured embedding max-token budget to control what gets included.
 		// Embedding a single concatenated text (rather than averaging separate prompt
 		// and response vectors) preserves the semantic relationship between them.
 		// See https://github.com/vhallac/semblr/issues/36
-		const apiKey = await getApiKey(ctx);
+		const apiKey = await getApiKey(ctx, { config: SEMBLR_CONFIG });
 		if (!apiKey) {
 			ctx.ui.setStatus("semblr", "\u{1f9e0} saved but not embedded (no API key)");
 			lastRoundFileName = roundFileName;
@@ -880,16 +894,13 @@ export default function (pi: ExtensionAPI) {
 			// Response is usually significant even when the prompt is short.
 			// Per https://github.com/vhallac/semblr/issues/38#issuecomment-4629826478
 			try {
-				const strippedResponse = responseText.replace(/\[(?:Tool call )?REDACTED[^\]]*\]\n?/g, "");
-				const responseBuf = Buffer.from(strippedResponse, "utf-8");
-				const clippedResponse =
-					responseBuf.length > 24000 ? responseBuf.slice(0, 24000).toString("utf-8") : strippedResponse;
+				const { clippedResponse } = buildAgentEndEmbeddingTexts("", responseText, EMBEDDING_RESPONSE_MAX_BYTES);
 
 				// Embed response only (no noisy prompt prefix)
-				const responseVec = normalize(await embedText(clippedResponse, apiKey));
+				const responseVec = normalize(await embedText(clippedResponse, apiKey, embeddingClientDeps(ctx)));
 
 				// Write :response row to index (skip :prompt -- prompt was noise)
-				appendToIndex(`${roundFileName}:response`, responseVec, EMBEDDING_MODEL);
+				appendToIndex(`${roundFileName}:response`, responseVec, SEMBLR_CONFIG.embeddingModel);
 
 				ctx.ui.setStatus("semblr", `🧠 saved + response-embedded round (${roundFileName})`);
 
@@ -903,21 +914,26 @@ export default function (pi: ExtensionAPI) {
 			}
 		} else {
 			try {
-				// Strip context-injection REDACTED markers and clip to ~24KB (8K tokens)
-				const { clippedResponse, combinedText } = buildAgentEndEmbeddingTexts(userPrompt, responseText);
+				// Strip context-injection REDACTED markers and clip to the configured embedding budget.
+				const { clippedResponse, combinedText } = buildAgentEndEmbeddingTexts(
+					userPrompt,
+					responseText,
+					EMBEDDING_RESPONSE_MAX_BYTES,
+				);
 
 				// Embedding #1: prompt (reuse cached agentPromptVec if available)
-				const promptVec = agentPromptVec ?? normalize(await embedText(userPrompt, apiKey));
+				const promptVec =
+					agentPromptVec ?? normalize(await embedText(userPrompt, apiKey, embeddingClientDeps(ctx)));
 
 				// Embedding #2 + #3 in parallel
 				const [responseVec, combinedVec] = await Promise.all([
-					embedText(clippedResponse, apiKey),
-					embedText(combinedText, apiKey),
+					embedText(clippedResponse, apiKey, embeddingClientDeps(ctx)),
+					embedText(combinedText, apiKey, embeddingClientDeps(ctx)),
 				]);
 
 				// Save to index: :prompt and :response (normalized for cosine similarity)
-				appendToIndex(`${roundFileName}:prompt`, normalize(promptVec), EMBEDDING_MODEL);
-				appendToIndex(`${roundFileName}:response`, normalize(responseVec), EMBEDDING_MODEL);
+				appendToIndex(`${roundFileName}:prompt`, normalize(promptVec), SEMBLR_CONFIG.embeddingModel);
+				appendToIndex(`${roundFileName}:response`, normalize(responseVec), SEMBLR_CONFIG.embeddingModel);
 
 				ctx.ui.setStatus("semblr", `\u{1f9e0} saved + embedded round (${roundFileName})`);
 
@@ -1008,7 +1024,7 @@ export default function (pi: ExtensionAPI) {
 					};
 				}
 
-				const apiKey = await getApiKey(ctx2);
+				const apiKey = await getApiKey(ctx2, { config: SEMBLR_CONFIG });
 				if (!apiKey) {
 					return {
 						content: [{ type: "text", text: "No API key available for embedding. Skipping search." }],
@@ -1017,7 +1033,7 @@ export default function (pi: ExtensionAPI) {
 				}
 
 				// Embed the query
-				const queryVec = normalize(await embedText(query, apiKey));
+				const queryVec = normalize(await embedText(query, apiKey, embeddingClientDeps(ctx2)));
 
 				// Load index and score
 				const index = loadIndex();

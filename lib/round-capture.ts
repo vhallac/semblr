@@ -89,10 +89,14 @@ export function buildAgentEndRoundData(args: {
 	};
 }
 
+export function embeddingMaxTokensToResponseBytes(embeddingMaxTokens: number): number {
+	return Math.max(0, Math.floor(embeddingMaxTokens * 3));
+}
+
 export function buildAgentEndEmbeddingTexts(
 	userPrompt: string,
 	responseText: string,
-	maxResponseBytes = 24000,
+	maxResponseBytes = embeddingMaxTokensToResponseBytes(8000),
 ): { clippedResponse: string; combinedText: string } {
 	const strippedResponse = responseText.replace(/\[(?:Tool call )?REDACTED[^\]]*\]\n?/g, "");
 	const responseBuf = Buffer.from(strippedResponse, "utf-8");
