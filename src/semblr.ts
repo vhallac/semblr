@@ -123,7 +123,7 @@ export {
 // PI_CODING_AGENT_DIR overrides the default ~/.pi/agent config directory.
 // We store semblr rounds under that directory so they survive project moves.
 const PI_CONFIG_DIR = process.env.PI_CODING_AGENT_DIR || `${os.homedir()}/.pi/agent`;
-const ROUNDS_DIR = `${PI_CONFIG_DIR}/semblr/rounds`;
+const ROUNDS_DIR = process.env.SEMBLR_ROUNDS_DIR || `${PI_CONFIG_DIR}/semblr/rounds`;
 const INDEX_PATH = `${ROUNDS_DIR}/index.csv`;
 const SEMBLR_DIR = `${PI_CONFIG_DIR}/semblr`;
 const STATS_PATH = `${SEMBLR_DIR}/chain-read-stats.json`;
