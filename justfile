@@ -45,12 +45,14 @@ uninstall:
     pi remove ./src/semblr.ts
 
 # Run all pending round migrations (idempotent — safe to re-run)
-# Old migration first (migrate-rounds), then new migration (migrate-content-hash)
+# Round migrations first, then index migration (model column)
 migrate *args:
     SEMBLR_ROUNDS_DIR="{{SEMBLR_ROUNDS_DIR}}" \
         npx tsx scripts/migrate-rounds.ts
     SEMBLR_ROUNDS_DIR="{{SEMBLR_ROUNDS_DIR}}" \
         npx tsx scripts/migrate-content-hash.ts {{args}}
+    SEMBLR_ROUNDS_DIR="{{SEMBLR_ROUNDS_DIR}}" \
+        npx tsx scripts/migrate-model-column.ts {{args}}
 
 # Erase embeddings for short prompts from index.csv and round JSON files
 # (Idempotent — safe to re-run)
