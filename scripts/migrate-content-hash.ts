@@ -15,7 +15,6 @@
  */
 
 import * as fs from "node:fs";
-import * as os from "node:os";
 import { pathToFileURL } from "node:url";
 import { computeContentHash } from "../lib/hash.ts";
 import {
@@ -25,14 +24,11 @@ import {
 	replaceIndexLineFilename,
 	writeIndexLines,
 } from "../lib/index-io.ts";
+import { resolveScriptConfig, resolveScriptIndexPath, type ScriptConfigOptions } from "../lib/script-config.ts";
 
 // ─────────────────────────────────────────────
 // Config
 // ─────────────────────────────────────────────
-
-const PI_CONFIG_DIR = process.env.PI_CODING_AGENT_DIR || `${os.homedir()}/.pi/agent`;
-const ROUNDS_DIR = process.env.SEMBLR_ROUNDS_DIR || `${PI_CONFIG_DIR}/semblr/rounds`;
-const INDEX_PATH = `${ROUNDS_DIR}/index.csv`;
 
 // ─────────────────────────────────────────────
 // Types
@@ -59,7 +55,7 @@ interface RoundData {
 	[key: string]: unknown; // allow other metadata
 }
 
-export interface ContentHashMigrationOptions {
+export interface ContentHashMigrationOptions extends ScriptConfigOptions {
 	args?: string[];
 	roundsDir?: string;
 	indexPath?: string;
@@ -76,8 +72,9 @@ export function runContentHashMigration(options: ContentHashMigrationOptions = {
 	const args = options.args ?? process.argv.slice(2);
 	const dryRun = args.includes("--dry-run");
 	const doBackup = args.includes("--backup");
-	const roundsDir = options.roundsDir ?? ROUNDS_DIR;
-	const indexPath = options.indexPath ?? INDEX_PATH;
+	const config = resolveScriptConfig(options);
+	const roundsDir = options.roundsDir ?? config.roundsDir;
+	const indexPath = resolveScriptIndexPath(config, roundsDir, options.indexPath);
 	const out = options.stdout ?? console;
 	const err = options.stderr ?? console;
 

@@ -20,15 +20,13 @@
  */
 
 import * as fs from "node:fs";
-import * as os from "node:os";
 import * as path from "node:path";
 import { pathToFileURL } from "node:url";
+import { resolveScriptConfig, type ScriptConfigOptions } from "../lib/script-config.ts";
 
 // ─────────────────────────────────────────────
 // Config
 // ─────────────────────────────────────────────
-
-const ROUNDS_DIR = process.env.SEMBLR_ROUNDS_DIR || path.resolve(os.homedir(), ".pi", "agent", "semblr", "rounds");
 
 // ─────────────────────────────────────────────
 // Types
@@ -59,14 +57,15 @@ interface Round {
 // Main
 // ─────────────────────────────────────────────
 
-export interface MigrateRoundsOptions {
+export interface MigrateRoundsOptions extends ScriptConfigOptions {
 	roundsDir?: string;
 	stdout?: Pick<typeof console, "log">;
 	stderr?: Pick<typeof console, "error" | "warn">;
 }
 
 export function runResponseSegmentsMigration(options: MigrateRoundsOptions = {}): number {
-	const roundsDir = options.roundsDir ?? ROUNDS_DIR;
+	const config = resolveScriptConfig(options);
+	const roundsDir = options.roundsDir ?? config.roundsDir;
 	const out = options.stdout ?? console;
 	const err = options.stderr ?? console;
 

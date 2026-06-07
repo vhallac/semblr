@@ -3,6 +3,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 
 export interface SemblrConfig {
+	agentDir: string;
 	embeddingProvider: string;
 	embeddingModel: string;
 	embeddingMaxTokens: number;
@@ -38,7 +39,7 @@ export interface SemblrConfigDeps {
 	warn?: (message: string) => void;
 }
 
-type ConfigKey = keyof Omit<SemblrConfig, "indexPath">;
+type ConfigKey = keyof Omit<SemblrConfig, "agentDir" | "indexPath">;
 type SettingValue = string | number | boolean | null | SettingRecord | SettingValue[];
 type SettingRecord = { [key: string]: SettingValue | undefined };
 
@@ -189,6 +190,7 @@ export function loadSemblrConfig(deps: SemblrConfigDeps = {}): SemblrConfig {
 	const roundsDir = resolveRoundsDir(env, projectSettings, globalSettings, cwd, agentDir);
 
 	return {
+		agentDir,
 		embeddingProvider: resolveString(
 			"embeddingProvider",
 			DEFAULTS.embeddingProvider,

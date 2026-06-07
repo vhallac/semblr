@@ -11,10 +11,9 @@
  */
 
 import * as fs from "node:fs";
-import * as os from "node:os";
 import * as path from "node:path";
 import { pathToFileURL } from "node:url";
-import { EMBEDDING_MODEL, embedText, getApiKey, normalize } from "../lib/embed.ts";
+import { type EmbeddingModelRegistry, embedText, normalize } from "../lib/embed.ts";
 import { computeContentHash } from "../lib/hash.ts";
 import {
 	appendVectorIndexEntry,
@@ -23,18 +22,26 @@ import {
 	migrateIndexEntries as migrateIndexEntriesFile,
 } from "../lib/index-io.ts";
 import { type ParsedPiRound, parsePiSessionJsonl } from "../lib/pi-session.ts";
+import {
+	resolveScriptApiKey,
+	resolveScriptConfig,
+	resolveScriptIndexPath,
+	resolveScriptModelRegistry,
+	type ScriptConfigOptions,
+	scriptEmbeddingConfig,
+} from "../lib/script-config.ts";
 
 // ─────────────────────────────────────────────
 // Config (matches digest-session.ts)
 // ─────────────────────────────────────────────
 
-const SESSIONS_DIR = path.resolve(os.homedir(), ".pi", "agent", "sessions");
-const ROUNDS_DIR = process.env.SEMBLR_ROUNDS_DIR || path.resolve(os.homedir(), ".pi", "agent", "semblr", "rounds");
+function defaultSessionsDir(agentDir: string): string {
+	return path.resolve(agentDir, "sessions");
+}
+
 // Keep bulk digest single-worker: stale-hash migrations rewrite index.csv and delete
 // duplicate files, so concurrent duplicate-content rounds can race and leave stale refs.
 const CONCURRENCY = 1;
-const MAX_PROMPT_CHARS = 8000;
-const MAX_RESPONSE_CHARS = 8000;
 
 // ─────────────────────────────────────────────
 // Types
@@ -87,12 +94,13 @@ function gatherSessionFiles(
 // Main
 // ─────────────────────────────────────────────
 
-export interface DigestAllOptions {
+export interface DigestAllOptions extends ScriptConfigOptions {
 	sessionsDir?: string;
 	roundsDir?: string;
 	indexPath?: string;
 	apiKey?: string;
 	fetchImpl?: typeof fetch;
+	modelRegistry?: EmbeddingModelRegistry;
 	concurrency?: number;
 	stdout?: Pick<typeof console, "log">;
 	stderr?: Pick<typeof console, "error">;
@@ -100,15 +108,18 @@ export interface DigestAllOptions {
 }
 
 export async function runDigestAll(options: DigestAllOptions = {}): Promise<number> {
-	const sessionsDir = options.sessionsDir ?? SESSIONS_DIR;
-	const roundsDir = options.roundsDir ?? ROUNDS_DIR;
-	const indexPath = options.indexPath ?? path.resolve(roundsDir, "index.csv");
+	const config = resolveScriptConfig(options);
+	const sessionsDir = options.sessionsDir ?? defaultSessionsDir(config.agentDir);
+	const roundsDir = options.roundsDir ?? config.roundsDir;
+	const indexPath = resolveScriptIndexPath(config, roundsDir, options.indexPath);
+	const modelRegistry = resolveScriptModelRegistry(config, options);
+	const embeddingConfig = scriptEmbeddingConfig(config);
 	const concurrency = Math.max(1, options.concurrency ?? CONCURRENCY);
 	const out = options.stdout ?? console;
 	const err = options.stderr ?? console;
 	const f = options.fsImpl ?? fs;
 
-	const rawApiKey = options.apiKey ?? (await getApiKey());
+	const rawApiKey = await resolveScriptApiKey(config, { ...options, modelRegistry });
 	if (!rawApiKey) {
 		err.error("❌ OPENROUTER_API_KEY environment variable required");
 		return 1;
@@ -184,17 +195,21 @@ export async function runDigestAll(options: DigestAllOptions = {}): Promise<numb
 		}
 
 		try {
-			const promptVector = await embedText(round.userPrompt.slice(0, MAX_PROMPT_CHARS), apiKey, {
+			const promptVector = await embedText(round.userPrompt.slice(0, config.embeddingMaxTokens), apiKey, {
 				fetchImpl: options.fetchImpl,
+				config: embeddingConfig,
+				modelRegistry,
 			});
-			appendVectorIndexEntry(indexPath, normalize(promptVector), `${roundFile}:prompt`, EMBEDDING_MODEL);
+			appendVectorIndexEntry(indexPath, normalize(promptVector), `${roundFile}:prompt`, config.embeddingModel);
 
-			const respText = round.responseSequence.slice(0, MAX_RESPONSE_CHARS);
+			const respText = round.responseSequence.slice(0, config.embeddingMaxTokens);
 			if (respText) {
 				const respVector = await embedText(respText, apiKey, {
 					fetchImpl: options.fetchImpl,
+					config: embeddingConfig,
+					modelRegistry,
 				});
-				appendVectorIndexEntry(indexPath, normalize(respVector), `${roundFile}:response`, EMBEDDING_MODEL);
+				appendVectorIndexEntry(indexPath, normalize(respVector), `${roundFile}:response`, config.embeddingModel);
 			}
 
 			completed++;

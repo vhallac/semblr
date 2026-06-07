@@ -18,13 +18,19 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { pathToFileURL } from "node:url";
 import { type ClaudeRound, claudeRoundFileName, parseClaudeCodeJsonl } from "../lib/claude-code.ts";
-import { embedText, getApiKey, normalize } from "../lib/embed.ts";
+import { type EmbeddingModelRegistry, embedText, normalize } from "../lib/embed.ts";
 import { appendVectorIndexEntry, loadIndexedRoundFiles as loadIndexedRoundFilesFromIndex } from "../lib/index-io.ts";
+import {
+	resolveScriptApiKey,
+	resolveScriptConfig,
+	resolveScriptIndexPath,
+	resolveScriptModelRegistry,
+	type ScriptConfigOptions,
+	scriptEmbeddingConfig,
+} from "../lib/script-config.ts";
 
 const CLAUDE_PROJECTS_DIR = process.env.CLAUDE_PROJECTS_DIR || path.resolve(os.homedir(), ".claude", "projects");
-const ROUNDS_DIR = process.env.SEMBLR_ROUNDS_DIR || path.resolve(os.homedir(), ".pi", "agent", "semblr", "rounds");
 const CONCURRENCY = Number(process.env.SEMBLR_IMPORT_CONCURRENCY || "5");
-const MAX_RESPONSE_CHARS = 8000;
 
 type Round = ClaudeRound;
 
@@ -53,7 +59,7 @@ export function walkJsonlFiles(dir: string, deps: { fsImpl?: typeof fs } = {}): 
 // Main
 // ─────────────────────────────────────────────
 
-export interface ImportClaudeCodeOptions {
+export interface ImportClaudeCodeOptions extends ScriptConfigOptions {
 	projectsDir?: string;
 	roundsDir?: string;
 	indexPath?: string;
@@ -62,6 +68,7 @@ export interface ImportClaudeCodeOptions {
 	limit?: number | null;
 	apiKey?: string;
 	fetchImpl?: typeof fetch;
+	modelRegistry?: EmbeddingModelRegistry;
 	concurrency?: number;
 	stdout?: Pick<typeof console, "log">;
 	stderr?: Pick<typeof console, "error">;
@@ -69,9 +76,12 @@ export interface ImportClaudeCodeOptions {
 }
 
 export async function runImportClaudeCode(options: ImportClaudeCodeOptions = {}): Promise<number> {
+	const config = resolveScriptConfig(options);
 	const projectsDir = options.projectsDir ?? CLAUDE_PROJECTS_DIR;
-	const roundsDir = options.roundsDir ?? ROUNDS_DIR;
-	const indexPath = options.indexPath ?? path.resolve(roundsDir, "index.csv");
+	const roundsDir = options.roundsDir ?? config.roundsDir;
+	const indexPath = resolveScriptIndexPath(config, roundsDir, options.indexPath);
+	const modelRegistry = resolveScriptModelRegistry(config, options);
+	const embeddingConfig = scriptEmbeddingConfig(config);
 	const dryRun = options.dryRun ?? false;
 	const includeSidechains = options.includeSidechains ?? false;
 	const limit = options.limit ?? null;
@@ -80,7 +90,7 @@ export async function runImportClaudeCode(options: ImportClaudeCodeOptions = {})
 	const err = options.stderr ?? console;
 	const f = options.fsImpl ?? fs;
 
-	const apiKey = options.apiKey ?? (await getApiKey());
+	const apiKey = dryRun ? null : await resolveScriptApiKey(config, { ...options, modelRegistry });
 	if (!dryRun && !apiKey) {
 		err.error("❌ OPENROUTER_API_KEY required");
 		return 1;
@@ -141,12 +151,20 @@ export async function runImportClaudeCode(options: ImportClaudeCodeOptions = {})
 		const file = claudeRoundFileName(round);
 		f.writeFileSync(path.resolve(roundsDir, file), JSON.stringify(round, null, 2));
 		try {
-			const promptVec = await embedText(round.userPrompt, apiKey!, { fetchImpl: options.fetchImpl });
-			appendVectorIndexEntry(indexPath, normalize(promptVec), `${file}:prompt`);
-			const respText = round.responseSequence.slice(0, MAX_RESPONSE_CHARS);
+			const promptVec = await embedText(round.userPrompt.slice(0, config.embeddingMaxTokens), apiKey!, {
+				fetchImpl: options.fetchImpl,
+				config: embeddingConfig,
+				modelRegistry,
+			});
+			appendVectorIndexEntry(indexPath, normalize(promptVec), `${file}:prompt`, config.embeddingModel);
+			const respText = round.responseSequence.slice(0, config.embeddingMaxTokens);
 			if (respText) {
-				const respVec = await embedText(respText, apiKey!, { fetchImpl: options.fetchImpl });
-				appendVectorIndexEntry(indexPath, normalize(respVec), `${file}:response`);
+				const respVec = await embedText(respText, apiKey!, {
+					fetchImpl: options.fetchImpl,
+					config: embeddingConfig,
+					modelRegistry,
+				});
+				appendVectorIndexEntry(indexPath, normalize(respVec), `${file}:response`, config.embeddingModel);
 			}
 			completed++;
 			err.error(`  ✅ [${completed}/${newRounds.length}] ${file} ${round.cwd ?? ""}`);

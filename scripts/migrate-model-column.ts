@@ -18,17 +18,12 @@
  */
 
 import * as fs from "node:fs";
-import * as os from "node:os";
-import * as path from "node:path";
 import { pathToFileURL } from "node:url";
-import { EMBEDDING_MODEL } from "../lib/embedding-client.ts";
+import { resolveScriptConfig, type ScriptConfigOptions } from "../lib/script-config.ts";
 
 // ─────────────────────────────────────────────
 // Config
 // ─────────────────────────────────────────────
-
-const ROUNDS_DIR = process.env.SEMBLR_ROUNDS_DIR || path.resolve(os.homedir(), ".pi", "agent", "semblr", "rounds");
-const INDEX_PATH = process.env.SEMBLR_INDEX_PATH || path.resolve(ROUNDS_DIR, "..", "index.csv");
 
 // ─────────────────────────────────────────────
 // Helpers
@@ -48,16 +43,16 @@ function hasModelColumn(line: string): boolean {
 /**
  * Add the current EMBEDDING_MODEL as a 3rd column.
  */
-function addModelColumn(line: string): string {
+function addModelColumn(line: string, model: string): string {
 	if (hasModelColumn(line)) return line;
-	return `${line},${EMBEDDING_MODEL}`;
+	return `${line},${model}`;
 }
 
 // ─────────────────────────────────────────────
 // Main
 // ─────────────────────────────────────────────
 
-export interface MigrateModelColumnOptions {
+export interface MigrateModelColumnOptions extends ScriptConfigOptions {
 	indexPath?: string;
 	dryRun?: boolean;
 	backup?: boolean;
@@ -66,7 +61,9 @@ export interface MigrateModelColumnOptions {
 }
 
 export function runModelColumnMigration(options: MigrateModelColumnOptions = {}): number {
-	const indexPath = options.indexPath ?? INDEX_PATH;
+	const config = resolveScriptConfig(options);
+	const indexPath = options.indexPath ?? process.env.SEMBLR_INDEX_PATH ?? config.indexPath;
+	const model = config.embeddingModel;
 	const out = options.stdout ?? console;
 	const err = options.stderr ?? console;
 
@@ -101,7 +98,7 @@ export function runModelColumnMigration(options: MigrateModelColumnOptions = {})
 	for (const idx of migrated) {
 		out.log(`   L${idx + 1}: ${lines[idx]}`);
 	}
-	out.log(`\n📝 Model to add: ${EMBEDDING_MODEL}`);
+	out.log(`\n📝 Model to add: ${model}`);
 
 	if (options.dryRun) {
 		out.log("\n🚫 Dry-run mode: no changes written.");
@@ -118,7 +115,7 @@ export function runModelColumnMigration(options: MigrateModelColumnOptions = {})
 
 	// Apply migration
 	for (const idx of migrated) {
-		lines[idx] = addModelColumn(lines[idx]);
+		lines[idx] = addModelColumn(lines[idx], model);
 	}
 	fs.writeFileSync(indexPath, `${lines.join("\n")}\n`);
 

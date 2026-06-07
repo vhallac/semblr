@@ -19,6 +19,7 @@ describe("loadSemblrConfig", () => {
 		const config = loadSemblrConfig({ cwd: "/repo", agentDir: "/agent", env: {}, fsImpl: fsFromFiles({}) });
 
 		expect(config).toEqual({
+			agentDir: "/agent",
 			embeddingProvider: "openrouter",
 			embeddingModel: "openai/text-embedding-3-small",
 			embeddingMaxTokens: 8000,

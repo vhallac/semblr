@@ -20,17 +20,14 @@
  */
 
 import * as fs from "node:fs";
-import * as os from "node:os";
 import { pathToFileURL } from "node:url";
 import { readIndexLines, writeIndexLines } from "../lib/index-io.ts";
+import { resolveScriptConfig, resolveScriptIndexPath, type ScriptConfigOptions } from "../lib/script-config.ts";
 
 // ─────────────────────────────────────────────
 // Config
 // ─────────────────────────────────────────────
 
-const PI_CONFIG_DIR = process.env.PI_CODING_AGENT_DIR || `${os.homedir()}/.pi/agent`;
-const ROUNDS_DIR = process.env.SEMBLR_ROUNDS_DIR || `${PI_CONFIG_DIR}/semblr/rounds`;
-const INDEX_PATH = `${ROUNDS_DIR}/index.csv`;
 const MIN_WORDS = Number.parseInt(process.env.RELEVANCE_LIST_MIN_WORDS ?? "20", 10);
 
 // ─────────────────────────────────────────────
@@ -66,7 +63,7 @@ function parseLine(line: string): IndexEntry | null {
 // Main
 // ─────────────────────────────────────────────
 
-export interface EraseShortEmbeddingsOptions {
+export interface EraseShortEmbeddingsOptions extends ScriptConfigOptions {
 	args?: string[];
 	roundsDir?: string;
 	indexPath?: string;
@@ -80,8 +77,9 @@ export function runEraseShortEmbeddings(options: EraseShortEmbeddingsOptions = {
 	const dryRun = args.includes("--dry-run");
 	const doBackup = args.includes("--backup");
 	const verbose = args.includes("--verbose");
-	const roundsDir = options.roundsDir ?? ROUNDS_DIR;
-	const indexPath = options.indexPath ?? INDEX_PATH;
+	const config = resolveScriptConfig(options);
+	const roundsDir = options.roundsDir ?? config.roundsDir;
+	const indexPath = resolveScriptIndexPath(config, roundsDir, options.indexPath);
 	const minWords = options.minWords ?? MIN_WORDS;
 	const out = options.stdout ?? console;
 
