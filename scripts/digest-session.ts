@@ -1,13 +1,13 @@
 /**
- * digest-session.ts — Parse a pi session JSONL into rounds, embed them via OpenRouter,
- * and build a vector index for semblr.
+ * digest-session.ts — Parse a pi session JSONL into rounds, embed them through
+ * the configured Semblr provider/model, and build a vector index for semblr.
  *
  * Usage:
  *   npx tsx scripts/digest-session.ts <session-file>
  *
- * Output (default, override with SEMBLR_ROUNDS_DIR):
+ * Output (default, override with Semblr settings or SEMBLR_ROUNDS_DIR):
  *   ~/.pi/agent/semblr/rounds/<id>.json  — each round as a file
- *   ~/.pi/agent/semblr/rounds/index.csv  — vector index (base64(vector),filepath)
+ *   ~/.pi/agent/semblr/rounds/index.csv  — vector index (base64(vector),filepath,model)
  */
 
 import * as fs from "node:fs";
@@ -50,7 +50,7 @@ export function parseSession(filePath: string): Round[] {
 }
 
 // ─────────────────────────────────────────────
-// Embedding via OpenRouter (wraps lib/embed for backward compat)
+// Embedding via configured provider/model (wraps lib/embed for backward compat)
 // ─────────────────────────────────────────────
 
 export { normalize };

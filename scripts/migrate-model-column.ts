@@ -4,8 +4,8 @@
  * Entries created before issue #62 was implemented have only 2 columns:
  *   base64url(vector),filePath
  *
- * This script adds the current EMBEDDING_MODEL as a 3rd column to entries
- * that don't already have one.
+ * This script adds the configured Semblr embedding model as a 3rd column to
+ * entries that don't already have one.
  *
  * Usage:
  *   npx tsx scripts/migrate-model-column.ts
@@ -13,8 +13,8 @@
  * Dry-run (no changes):
  *   npx tsx scripts/migrate-model-column.ts --dry-run
  *
- * Custom index path (default: ~/.pi/agent/semblr/index.csv):
- *   SEMBLR_INDEX_PATH=/custom/path/index.csv npx tsx scripts/migrate-model-column.ts
+ * Custom rounds directory:
+ *   SEMBLR_ROUNDS_DIR=/custom/path npx tsx scripts/migrate-model-column.ts
  */
 
 import * as fs from "node:fs";
@@ -41,7 +41,7 @@ function hasModelColumn(line: string): boolean {
 }
 
 /**
- * Add the current EMBEDDING_MODEL as a 3rd column.
+ * Add the configured embedding model as a 3rd column.
  */
 function addModelColumn(line: string, model: string): string {
 	if (hasModelColumn(line)) return line;

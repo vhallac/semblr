@@ -29,8 +29,8 @@ Within a session, as context grows past the window, summarization compresses it.
 ### Embedding Index
 - Each round gets two embeddings: prompt vector + response vector
 - Stored as an append-only CSV: `base64url(vector_json),<filepath>:prompt|:response`
-- Embedding model: `openai/text-embedding-3-small` via OpenRouter API
-- Bulk indexing scripts in `scripts/` for historical sessions
+- Embedding provider/model: configurable through Semblr settings; default is pi's `openrouter` provider with `openai/text-embedding-3-small`
+- Bulk indexing scripts in `scripts/` for historical sessions, using the same config resolution as the extension
 
 ### Context Assembly (on each prompt)
 1. Embed the incoming user prompt
@@ -45,7 +45,7 @@ Within a session, as context grows past the window, summarization compresses it.
 
 ### Context Budget
 - A percentage of the model's max context size (default 50%)
-- Dynamic interpolation: at `MIN_SIMILARITY=0.30` the budget is 2,000 tokens; at 1.0 it's 50% of the context window
+- Dynamic interpolation: at configured `minSimilarity` (default `0.30`) the budget is 2,000 tokens; at 1.0 it's 50% of the context window
 - Room reserved for system prompt, current prompt, and model response
 
 ### Three-Section Context Injection
@@ -88,7 +88,7 @@ Because context is assembled dynamically, every prompt is a fresh embedding API 
 - **Platform:** [pi coding agent](https://pi.dev) — extensions
 - **Agent loop, tools, TUI, model abstraction:** Inherited from pi
 - **Round repository:** Flat files on disk under a `rounds/` directory
-- **Embeddings:** OpenRouter API, `text-embedding-3-small`
+- **Embeddings:** Configurable OpenAI-compatible embedding provider/model; default `openrouter` + `openai/text-embedding-3-small`
 - **Vector index:** Flat CSV + cosine similarity in TypeScript
 - **Context assembly:** Extension hooks (`agent_start`, `agent_end`, `message_end`, `context`, `session_before_compact`, `session_compact`, `session_start`)
 - **Native tools:** `search_interactions`, `get_round_details`, `get_tool_details` (registered in `session_start`)
@@ -128,7 +128,7 @@ Because context is assembled dynamically, every prompt is a fresh embedding API 
 
 ### Phase 4 — Quality & Iteration
 - [x] Log context construction decisions (status bar)
-- [x] Experiment with different embedding models (currently using `text-embedding-3-small` — switchable but not yet automated)
+- [x] Experiment with different embedding models (provider/model now configurable; benchmarking remains future work)
 - [ ] Experiment with prompt vs response vector weighting
 - [ ] Measure retrieval quality (precision/recall against manual ideal)
 - [ ] Explore collapse modes: variable collapse threshold by round score

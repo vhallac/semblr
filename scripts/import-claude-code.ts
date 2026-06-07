@@ -5,7 +5,7 @@
  * Semblr round format, and embeds prompt + response into the shared index.
  *
  * Usage:
- *   OPENROUTER_API_KEY="$(pass show ai/openrouter)" npx tsx scripts/import-claude-code.ts
+ *   npx tsx scripts/import-claude-code.ts
  *
  * Options:
  *   --dry-run              Parse/count only; do not write or embed

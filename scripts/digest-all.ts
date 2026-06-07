@@ -2,10 +2,10 @@
  * digest-all.ts — Bulk-embed all pi session JSONL files into the semblr index.
  *
  * Iterates every session in ~/.pi/agent/sessions/, skips already-indexed rounds,
- * parallelizes embedding via OpenRouter.
+ * and embeds through the configured Semblr provider/model.
  *
  * Usage:
- *   OPENROUTER_API_KEY="$(pass show ai/openrouter)" npx tsx scripts/digest-all.ts
+ *   npx tsx scripts/digest-all.ts
  *
  * Safe to run while pi is using the extension — the index is append-only.
  */

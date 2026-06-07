@@ -1,7 +1,8 @@
 # ── semblr ─────────────────────────────────────────────────────────────────
 # See VISION.md for architecture and AGENTS.md for project context.
 
-# Override via: just --set SEMBLR_ROUNDS_DIR /custom/path index
+# Configuration is read from Semblr settings/env. For one-off rounds-dir overrides:
+#   just --set SEMBLR_ROUNDS_DIR /custom/path index
 # or set SEMBLR_ROUNDS_DIR in the environment.
 SEMBLR_ROUNDS_DIR := env_var_or_default("SEMBLR_ROUNDS_DIR", "")
 
