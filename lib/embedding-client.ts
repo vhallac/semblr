@@ -1,6 +1,6 @@
 import { spawn } from "node:child_process";
 
-const EMBEDDING_MODEL = "openai/text-embedding-3-small";
+export const EMBEDDING_MODEL = "openai/text-embedding-3-small";
 const OPENROUTER_URL = "https://openrouter.ai/api/v1/embeddings";
 const EMBED_TIMEOUT_MS = 15_000;
 const EMBED_MAX_RETRIES = 3;

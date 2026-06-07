@@ -29,7 +29,7 @@ import {
 	shouldDropEmbedding,
 	shouldDropRelevanceList,
 } from "../lib/context-messages.ts";
-import { embedText, getApiKey } from "../lib/embedding-client.ts";
+import { EMBEDDING_MODEL, embedText, getApiKey } from "../lib/embedding-client.ts";
 import { assignToGroup, formatGroupStats, parseGroupThreshold, type SemanticGroup } from "../lib/grouping.ts";
 import { createRoundFilePath } from "../lib/hash.ts";
 import {
@@ -367,8 +367,8 @@ let cachedEnvPreamble: string | null = null;
 let cachedContextMessages: unknown[] | null = null;
 let cachedUserPromptForContext: string | null = null; // the extracted user prompt used to build cachedContextMessages
 
-function appendToIndex(filePath: string, vector: number[]) {
-	appendToIndexPath(INDEX_PATH, ROUNDS_DIR, filePath, vector);
+function appendToIndex(filePath: string, vector: number[], model?: string) {
+	appendToIndexPath(INDEX_PATH, ROUNDS_DIR, filePath, vector, {}, model);
 }
 
 function extensionRoot(): string {
@@ -889,7 +889,7 @@ export default function (pi: ExtensionAPI) {
 				const responseVec = normalize(await embedText(clippedResponse, apiKey));
 
 				// Write :response row to index (skip :prompt -- prompt was noise)
-				appendToIndex(`${roundFileName}:response`, responseVec);
+				appendToIndex(`${roundFileName}:response`, responseVec, EMBEDDING_MODEL);
 
 				ctx.ui.setStatus("semblr", `🧠 saved + response-embedded round (${roundFileName})`);
 
@@ -916,8 +916,8 @@ export default function (pi: ExtensionAPI) {
 				]);
 
 				// Save to index: :prompt and :response (normalized for cosine similarity)
-				appendToIndex(`${roundFileName}:prompt`, normalize(promptVec));
-				appendToIndex(`${roundFileName}:response`, normalize(responseVec));
+				appendToIndex(`${roundFileName}:prompt`, normalize(promptVec), EMBEDDING_MODEL);
+				appendToIndex(`${roundFileName}:response`, normalize(responseVec), EMBEDDING_MODEL);
 
 				ctx.ui.setStatus("semblr", `\u{1f9e0} saved + embedded round (${roundFileName})`);
 

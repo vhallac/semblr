@@ -7,6 +7,7 @@
 export {
 	type ApiKeyContext,
 	type ApiKeyLookupDeps,
+	EMBEDDING_MODEL,
 	type EmbedTextDeps,
 	embedText,
 	getApiKey,

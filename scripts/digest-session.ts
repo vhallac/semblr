@@ -14,7 +14,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { pathToFileURL } from "node:url";
-import { embedText, normalize } from "../lib/embed.ts";
+import { EMBEDDING_MODEL, embedText, normalize } from "../lib/embed.ts";
 import { computeContentHash } from "../lib/hash.ts";
 import {
 	appendVectorIndexEntry,
@@ -138,13 +138,13 @@ export async function runDigestSession(options: DigestSessionOptions = {}): Prom
 		const promptVector = await embedText(round.userPrompt.slice(0, MAX_PROMPT_CHARS), apiKey, {
 			fetchImpl: options.fetchImpl,
 		});
-		appendVectorIndexEntry(indexPath, normalize(promptVector), `${roundFile}:prompt`);
+		appendVectorIndexEntry(indexPath, normalize(promptVector), `${roundFile}:prompt`, EMBEDDING_MODEL);
 
 		// Embed response
 		const respVector = await embedText(round.responseSequence.slice(0, MAX_RESPONSE_CHARS), apiKey, {
 			fetchImpl: options.fetchImpl,
 		});
-		appendVectorIndexEntry(indexPath, normalize(respVector), `${roundFile}:response`);
+		appendVectorIndexEntry(indexPath, normalize(respVector), `${roundFile}:response`, EMBEDDING_MODEL);
 
 		embedded++;
 	}

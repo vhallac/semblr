@@ -93,8 +93,8 @@ describe("digest-session script", () => {
 		const roundFile = `${computeContentHash(userPrompt, responseSequence, [])}.json`;
 		expect(fs.existsSync(path.join(roundsDir, roundFile))).toBe(true);
 		expect(loadVectorIndex(indexPath)).toEqual([
-			{ vector: [0.6, 0.8], filePath: `${roundFile}:prompt` },
-			{ vector: [0, 0], filePath: `${roundFile}:response` },
+			{ vector: [0.6, 0.8], filePath: `${roundFile}:prompt`, model: "openai/text-embedding-3-small" },
+			{ vector: [0, 0], filePath: `${roundFile}:response`, model: "openai/text-embedding-3-small" },
 		]);
 		expect(requests).toEqual([
 			{
