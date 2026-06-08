@@ -5,7 +5,6 @@ import { AuthStorage, ModelRegistry } from "@earendil-works/pi-coding-agent";
 import { SEMBLR_CONFIG_DEFAULTS, type SemblrConfig } from "./semblr-config.ts";
 
 export const EMBEDDING_MODEL = SEMBLR_CONFIG_DEFAULTS.embeddingModel;
-const DEFAULT_EMBEDDING_URL = "https://openrouter.ai/api/v1/embeddings";
 
 export interface EmbeddingModelLike {
 	baseUrl: string;
@@ -55,7 +54,7 @@ function isDefaultEmbeddingSelection(config: EmbeddingClientConfig): boolean {
 }
 
 function appendEmbeddingsPath(baseUrl: string): string {
-	return `${baseUrl.replace(/\/+$/, "")}/v1/embeddings`;
+	return `${baseUrl.replace(/\/+$/, "")}/embeddings`;
 }
 
 export function resolveEmbeddingApiUrl(
@@ -68,7 +67,7 @@ export function resolveEmbeddingApiUrl(
 	const model = modelRegistry?.find(config.embeddingProvider, config.embeddingModel);
 	if (model) return appendEmbeddingsPath(model.baseUrl);
 
-	if (isDefaultEmbeddingSelection(config)) return DEFAULT_EMBEDDING_URL;
+	if (isDefaultEmbeddingSelection(config)) return SEMBLR_CONFIG_DEFAULTS.defaultEmbeddingApiUrl;
 
 	throw new Error(
 		`Semblr embedding model ${config.embeddingProvider}/${config.embeddingModel} was not found. ` +

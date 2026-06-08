@@ -80,9 +80,13 @@ describe("embedding-client", () => {
 		expect(registry.find).not.toHaveBeenCalled();
 	});
 
-	it("derives the embeddings endpoint from provider model baseUrl", () => {
+	it.each([
+		["https://provider.example/root", "https://provider.example/root/embeddings"],
+		["https://provider.example/root/", "https://provider.example/root/embeddings"],
+		["https://openrouter.ai/api/v1", "https://openrouter.ai/api/v1/embeddings"],
+	])("derives the embeddings endpoint from provider model baseUrl %s", (baseUrl, expectedUrl) => {
 		const registry = {
-			find: vi.fn(() => ({ baseUrl: "https://provider.example/root/" })),
+			find: vi.fn(() => ({ baseUrl })),
 		};
 
 		const url = resolveEmbeddingApiUrl(
@@ -91,7 +95,7 @@ describe("embedding-client", () => {
 		);
 
 		expect(registry.find).toHaveBeenCalledWith("provider", "embedding-model");
-		expect(url).toBe("https://provider.example/root/v1/embeddings");
+		expect(url).toBe(expectedUrl);
 	});
 
 	it("explains how to fix a missing non-default provider/model lookup", () => {

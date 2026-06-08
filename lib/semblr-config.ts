@@ -46,6 +46,7 @@ type SettingRecord = { [key: string]: SettingValue | undefined };
 const DEFAULTS = {
 	embeddingProvider: "openrouter",
 	embeddingModel: "openai/text-embedding-3-small",
+	defaultEmbeddingApiUrl: "https://openrouter.ai/api/v1/embeddings",
 	embeddingMaxTokens: 8000,
 	groupThreshold: 0.77,
 	minSimilarity: 0.3,
