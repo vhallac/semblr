@@ -4,8 +4,6 @@ import * as path from "node:path";
 import { AuthStorage, ModelRegistry } from "@earendil-works/pi-coding-agent";
 import { SEMBLR_CONFIG_DEFAULTS, type SemblrConfig } from "./semblr-config.ts";
 
-export const EMBEDDING_MODEL = SEMBLR_CONFIG_DEFAULTS.embeddingModel;
-
 export interface EmbeddingModelLike {
 	baseUrl: string;
 }

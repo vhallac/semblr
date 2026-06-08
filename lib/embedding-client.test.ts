@@ -2,13 +2,13 @@ import type { spawn } from "node:child_process";
 import { describe, expect, it, vi } from "vitest";
 import {
 	createEmbeddingModelRegistry,
-	EMBEDDING_MODEL,
 	type EmbeddingClientConfig,
 	type EmbeddingModelRegistry,
 	embedText,
 	getApiKey,
 	resolveEmbeddingApiUrl,
 } from "./embedding-client.ts";
+import { SEMBLR_CONFIG_DEFAULTS } from "./semblr-config.ts";
 
 function okEmbeddingFetch(requests: Array<{ url: string; body: unknown }>, vector = [1, 2]): typeof fetch {
 	return vi.fn(async (url: string | URL | Request, init?: RequestInit) => {
@@ -20,7 +20,7 @@ function okEmbeddingFetch(requests: Array<{ url: string; body: unknown }>, vecto
 function config(overrides: Partial<EmbeddingClientConfig> = {}): EmbeddingClientConfig {
 	return {
 		embeddingProvider: "openrouter",
-		embeddingModel: EMBEDDING_MODEL,
+		embeddingModel: SEMBLR_CONFIG_DEFAULTS.embeddingModel,
 		embeddingApiUrl: undefined,
 		embedTimeoutMs: 15_000,
 		embedMaxRetries: 3,

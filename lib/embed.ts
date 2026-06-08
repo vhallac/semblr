@@ -8,7 +8,6 @@ export {
 	type ApiKeyContext,
 	type ApiKeyLookupDeps,
 	createEmbeddingModelRegistry,
-	EMBEDDING_MODEL,
 	type EmbeddingClientConfig,
 	type EmbeddingModelLike,
 	type EmbeddingModelRegistry,
