@@ -531,6 +531,71 @@ export default function (pi: ExtensionAPI) {
 	// ────────────────────────────────────────────
 	// 1. context — assemble context from round repository
 	// ────────────────────────────────────────────
+
+	/** Compute the context-size warning level based on non-system tokens.
+	 *  Returns 0 (no warning), 1 (70% threshold), 2 (85%), or 3 (100%+).
+	 *  If the level is higher than the previously issued level, the
+	 *  warning message is injected between prefixMessages and currentMessages. */
+	function applyContextSizeWarning(
+		prefixMessages: unknown[],
+		currentMsgs: unknown[],
+		systemMsg: unknown | null,
+	): unknown[] {
+		const threshold = SEMBLR_CONFIG.summaryThresholdExtra;
+		if (threshold <= 0) return [...prefixMessages, ...currentMsgs];
+
+		// Measure all messages including current (this is what the LLM will see)
+		const allMessages = [...prefixMessages, ...currentMsgs];
+		const totalTokens = estimateMessagesTokens(allMessages);
+
+		// Subtract system message tokens — user wants to ignore system prompt
+		const systemTokens = systemMsg ? estimateMessagesTokens([systemMsg]) : 0;
+		const nonSystemTokens = totalTokens - systemTokens;
+
+		// Compute warning level
+		let newLevel = 0;
+		if (nonSystemTokens >= threshold) {
+			newLevel = 3;
+		} else if (nonSystemTokens >= threshold * 0.85) {
+			newLevel = 2;
+		} else if (nonSystemTokens >= threshold * 0.70) {
+			newLevel = 1;
+		}
+
+		// Only inject if level increased (escalation) or first warning
+		if (newLevel <= contextWarningIssued) return allMessages;
+		contextWarningIssued = newLevel;
+
+		// Build the warning message
+		const levelLabel = newLevel === 3 ? "3 — IMMEDIATE" : String(newLevel);
+		const urgency =
+			newLevel === 3
+				? "You MUST stop IMMEDIATELY. Do not make any further tool calls except `semblr_checkpoint`. Call it now with your progress summary, then stop."
+				: newLevel === 2
+					? "You MUST wrap up your current work after this round. Before finishing, call the `semblr_checkpoint` tool with a summary of your progress. Then stop — do not start new work."
+				: "You SHOULD wrap up your current work after this round. Before finishing, call the `semblr_checkpoint` tool with a summary of your progress. Then stop — do not start new work.";
+
+		const warningText =
+			`[CONTEXT SIZE WARNING — LEVEL ${levelLabel}]
+
+` +
+			`Your context has grown to ${nonSystemTokens} non-system tokens (threshold: ${threshold}). This is the ${newLevel >= 3 ? "exceeded" : "approaching"} the configured limit.
+
+` +
+			`${urgency}
+
+` +
+			`The semblr_checkpoint tool parameters are: currentTask (string), progressMade (string[]), currentState (string[]), nextSteps (string[]), keyFindings (string[]).`;
+
+		// Inject warning message between prefix and current messages
+		const warningMsg = {
+			role: "user" as const,
+			content: [{ type: "text" as const, text: warningText }],
+		};
+
+		return [...prefixMessages, warningMsg, ...currentMsgs];
+	}
+
 	pi.on("context", async (event: ContextEvent, ctx: ExtensionContext) => {
 		const { messages } = event;
 
@@ -559,8 +624,7 @@ export default function (pi: ExtensionAPI) {
 		//     are stable across tool turns; only the currentMessages section changes.
 		if (cachedContextMessages && cachedEnvPreamble && userPrompt === cachedUserPromptForContext) {
 			// Compose: system + preamble + recency + relevance + current turn messages
-			const finalMessages = [...cachedContextMessages];
-			finalMessages.push(...currentMessages);
+			const finalMessages = applyContextSizeWarning(cachedContextMessages, currentMessages, systemMsg);
 			return { messages: finalMessages } as any;
 		}
 
@@ -608,7 +672,11 @@ export default function (pi: ExtensionAPI) {
 				roundPresentedRecorded = true;
 			}
 
-			const finalMessages: unknown[] = [...cachedContextMessages, ...currentMessages];
+			const finalMessages: unknown[] = applyContextSizeWarning(
+				cachedContextMessages,
+				currentMessages,
+				systemMsg,
+			);
 			return { messages: finalMessages } as any;
 		}
 
@@ -621,9 +689,12 @@ export default function (pi: ExtensionAPI) {
 					role: "user" as const,
 					content: [{ type: "text" as const, text: buildFinalResponseContract() }],
 				};
-				const finalMessages: unknown[] = systemMsg
-					? [systemMsg, contractMsg, ...currentMessages]
-					: [contractMsg, ...currentMessages];
+				const prefixMsgs: unknown[] = systemMsg ? [systemMsg, contractMsg] : [contractMsg];
+				const finalMessages: unknown[] = applyContextSizeWarning(
+					prefixMsgs,
+					currentMessages,
+					systemMsg,
+				);
 				return { messages: finalMessages } as any;
 			}
 
@@ -651,7 +722,11 @@ export default function (pi: ExtensionAPI) {
 					content: [{ type: "text" as const, text: buildFinalResponseContract() }],
 				};
 				cachedContextMessages = systemMsg ? [systemMsg, contractMsg] : [contractMsg];
-				const finalMessages: unknown[] = [...cachedContextMessages, ...currentMessages];
+				const finalMessages: unknown[] = applyContextSizeWarning(
+					cachedContextMessages,
+					currentMessages,
+					systemMsg,
+				);
 				return { messages: finalMessages } as any;
 			}
 
@@ -680,7 +755,11 @@ export default function (pi: ExtensionAPI) {
 					content: [{ type: "text" as const, text: buildFinalResponseContract() }],
 				};
 				cachedContextMessages = systemMsg ? [systemMsg, contractMsg] : [contractMsg];
-				const finalMessages: unknown[] = [...cachedContextMessages, ...currentMessages];
+				const finalMessages: unknown[] = applyContextSizeWarning(
+					cachedContextMessages,
+					currentMessages,
+					systemMsg,
+				);
 				return { messages: finalMessages } as any;
 			}
 
@@ -748,11 +827,15 @@ export default function (pi: ExtensionAPI) {
 			// appended fresh each time.
 			cachedEnvPreamble = envPreamble;
 			cachedUserPromptForContext = userPrompt;
-			cachedContextMessages = [...finalMessages]; // snapshot before mutation below
+			cachedContextMessages = [...finalMessages]; // snapshot before warning injection
 
-			finalMessages.push(...currentMessages);
+			const resultMessages = applyContextSizeWarning(
+				cachedContextMessages,
+				currentMessages,
+				systemMsg,
+			);
 
-			return { messages: finalMessages } as any;
+			return { messages: resultMessages } as any;
 		} catch (err) {
 			ctx.ui.setStatus("semblr", `🧠 error: ${(err as Error).message}`);
 		}
