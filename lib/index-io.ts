@@ -64,6 +64,26 @@ export function loadIndexedRoundFiles(indexPath: string): Set<string> {
 	return new Set(loadVectorIndex(indexPath).map((entry) => path.basename(indexRoundFileFromPath(entry.filePath))));
 }
 
+export function loadRoundFilesWithDifferentModel(indexPath: string, currentModel: string): Set<string> {
+	const mismatched = loadVectorIndex(indexPath)
+		.filter((entry) => entry.model !== undefined && entry.model !== currentModel)
+		.map((entry) => path.basename(indexRoundFileFromPath(entry.filePath)));
+	return new Set(mismatched);
+}
+
+export function replaceIndexEntriesForRoundFile(
+	indexPath: string,
+	roundFile: string,
+	entries: VectorIndexEntry[],
+): void {
+	const remaining = readIndexLines(indexPath).filter((line) => {
+		const filename = indexEntryFilename(line);
+		return !filename || path.basename(filename) !== roundFile;
+	});
+	const replacement = entries.map((entry) => encodeVectorIndexLine(entry.vector, entry.filePath, entry.model));
+	writeIndexLines(indexPath, [...remaining, ...replacement]);
+}
+
 export function migrateIndexEntryLine(line: string, oldRoundFile: string, newRoundFile: string): string {
 	const firstComma = line.indexOf(",");
 	const rest = line.slice(firstComma + 1);

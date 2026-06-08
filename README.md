@@ -336,10 +336,11 @@ Three scripts parse historical conversation data into semblr rounds:
 When `digest-all.ts` runs:
 1. Loads all existing entries from `index.csv`
 2. Computes the expected file path for each parsed round via content hash
-3. Skips any round whose file path already appears in the index
-4. Only new rounds are sent to the embedding API
+3. Skips rounds already indexed with the current embedding model
+4. Re-embeds rounds whose index rows have an explicit different embedding model
+5. Only new or model-stale rounds are sent to the embedding API
 
-This makes it safe to run repeatedly — only unindexed session data gets embedded.
+This makes it safe to run repeatedly — only unindexed or model-stale session data gets embedded. Legacy two-column rows without a model column are treated as current-model rows; run `just migrate` to stamp them with the configured model.
 
 ### Session file format
 
@@ -367,14 +368,14 @@ just query "what did we discuss about caching"
 
 ### Index format
 
-The index is an append-only CSV with no schema header:
+The index is a CSV with no schema header:
 
 ```
 <base64url(JSON vector)>,<round_id>.json:prompt,<embedding-model>
 <base64url(JSON vector)>,<round_id>.json:response,<embedding-model>
 ```
 
-Legacy two-column rows without the model column are still readable. Each round produces two rows: one for the prompt embedding and one for the clipped-response embedding. The combined prompt+response embedding is stored in the round JSON file for grouping, not in the index CSV. The vector dimensions match the configured embedding model (1536 for the default `openai/text-embedding-3-small`). Cosine similarity is used for retrieval.
+Legacy two-column rows without the model column are still readable and are assumed to use the current configured embedding model. Each round produces two rows: one for the prompt embedding and one for the clipped-response embedding. The combined prompt+response embedding is stored in the round JSON file for grouping, not in the index CSV. The vector dimensions match the configured embedding model (1536 for the default `openai/text-embedding-3-small`). `just index` rewrites rows for rounds that were explicitly embedded with a different model so the index converges to the configured model. Cosine similarity is used for retrieval.
 
 ## Known Problems
 

@@ -241,6 +241,101 @@ describe("digest-all script", () => {
 		expect(secondLogs.stdout.join("\n")).toContain("✨ Nothing to do — all sessions already indexed!");
 	});
 
+	it("does not re-embed legacy two-column rows because missing model means current model", async () => {
+		const root = tmpDir();
+		const sessionsDir = path.join(root, "sessions");
+		const sDir = path.join(sessionsDir, "--test");
+		fs.mkdirSync(sDir, { recursive: true });
+		const roundsDir = path.join(root, "rounds");
+		fs.mkdirSync(roundsDir, { recursive: true });
+		const indexPath = path.join(roundsDir, "index.csv");
+		const userPrompt = "What is a legacy indexed prompt?";
+		const responseSequence = "It is an old two-column index row.";
+		const roundFile = `${computeContentHash(userPrompt, responseSequence, [])}.json`;
+
+		writeSession(path.join(sDir, "session.jsonl"), [{ userPrompt, responseSequence }]);
+		fs.writeFileSync(
+			path.join(roundsDir, roundFile),
+			JSON.stringify({ userPrompt, responseSequence, toolCalls: [] }),
+		);
+		fs.writeFileSync(indexPath, `${encodeVectorIndexLine([1], `${roundFile}:prompt`)}\n`);
+
+		const logs = logger();
+		const fetchImpl = vi.fn(async () => new Response("should not be called")) as typeof fetch;
+
+		await expect(
+			runDigestAll({
+				sessionsDir,
+				roundsDir,
+				indexPath,
+				apiKey: "key",
+				fetchImpl,
+				stdout: logs.out,
+				stderr: logs.err,
+			}),
+		).resolves.toBe(0);
+
+		expect(fetchImpl).not.toHaveBeenCalled();
+		expect(readIndexLines(indexPath)).toEqual([encodeVectorIndexLine([1], `${roundFile}:prompt`)]);
+		expect(logs.stdout.join("\n")).toContain("📊 Model-mismatched rounds to re-index: 0");
+		expect(logs.stdout.join("\n")).toContain("📊 New rounds to embed: 0 (1 already indexed)");
+	});
+
+	it("re-indexes rounds whose index rows were generated with a different explicit model", async () => {
+		const root = tmpDir();
+		const sessionsDir = path.join(root, "sessions");
+		const sDir = path.join(sessionsDir, "--test");
+		fs.mkdirSync(sDir, { recursive: true });
+		const roundsDir = path.join(root, "rounds");
+		fs.mkdirSync(roundsDir, { recursive: true });
+		const indexPath = path.join(roundsDir, "index.csv");
+		const userPrompt = "What should be re-indexed?";
+		const responseSequence = "Rounds embedded with an old model should be refreshed.";
+		const roundFile = `${computeContentHash(userPrompt, responseSequence, [])}.json`;
+		const unrelated = encodeVectorIndexLine([9], "unrelated.json:prompt", "old-model");
+		const requests: unknown[] = [];
+
+		writeSession(path.join(sDir, "session.jsonl"), [{ userPrompt, responseSequence }]);
+		fs.writeFileSync(
+			path.join(roundsDir, roundFile),
+			JSON.stringify({ userPrompt, responseSequence, toolCalls: [] }),
+		);
+		fs.writeFileSync(
+			indexPath,
+			`${[
+				encodeVectorIndexLine([1], `${roundFile}:prompt`, "old-model"),
+				encodeVectorIndexLine([2], `${roundFile}:response`, "old-model"),
+				unrelated,
+			].join("\n")}\n`,
+		);
+
+		await expect(
+			runDigestAll({
+				sessionsDir,
+				roundsDir,
+				indexPath,
+				apiKey: "key",
+				fetchImpl: embeddingFetch(
+					[
+						[3, 4],
+						[0, 5],
+					],
+					requests,
+				),
+				stdout: logger().out,
+			}),
+		).resolves.toBe(0);
+
+		expect(requests).toHaveLength(2);
+		expect((requests[0] as any).body).toEqual({ model: "openai/text-embedding-3-small", input: userPrompt });
+		expect((requests[1] as any).body).toEqual({ model: "openai/text-embedding-3-small", input: responseSequence });
+		expect(loadVectorIndex(indexPath)).toEqual([
+			{ vector: [9], filePath: "unrelated.json:prompt", model: "old-model" },
+			{ vector: [0.6, 0.8], filePath: `${roundFile}:prompt`, model: "openai/text-embedding-3-small" },
+			{ vector: [0, 1], filePath: `${roundFile}:response`, model: "openai/text-embedding-3-small" },
+		]);
+	});
+
 	it("migrates stale round filenames before deciding a round is already indexed", async () => {
 		const root = tmpDir();
 		const sessionsDir = path.join(root, "sessions");

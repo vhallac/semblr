@@ -11,11 +11,13 @@ import {
 	indexEntryFilename,
 	indexRoundFileFromPath,
 	loadIndexedRoundFiles,
+	loadRoundFilesWithDifferentModel,
 	loadVectorIndex,
 	migrateIndexEntries,
 	migrateIndexEntryLine,
 	readIndexByFilename,
 	readIndexLines,
+	replaceIndexEntriesForRoundFile,
 	replaceIndexLineFilename,
 	writeIndexLines,
 } from "./index-io.ts";
@@ -50,6 +52,38 @@ describe("index I/O helpers", () => {
 
 		expect(indexRoundFileFromPath("dir/one.json:prompt")).toBe("dir/one.json");
 		expect(loadIndexedRoundFiles(indexPath())).toEqual(new Set(["one.json", "two.json", "three.json"]));
+	});
+
+	it("detects only explicit non-current model rows as model mismatches", () => {
+		writeIndexLines(indexPath(), [
+			encodeVectorIndexLine([1], "legacy.json:prompt"),
+			encodeVectorIndexLine([2], "same.json:prompt", "current-model"),
+			encodeVectorIndexLine([3], "different.json:prompt", "old-model"),
+			encodeVectorIndexLine([4], "nested/also-different.json:response", "older-model"),
+		]);
+
+		expect(loadRoundFilesWithDifferentModel(indexPath(), "current-model")).toEqual(
+			new Set(["different.json", "also-different.json"]),
+		);
+	});
+
+	it("replaces all rows for one round file while preserving unrelated and malformed rows", () => {
+		const keep = encodeVectorIndexLine([1], "keep.json:prompt", "old-model");
+		const oldPrompt = encodeVectorIndexLine([2], "old.json:prompt", "old-model");
+		const oldResponse = encodeVectorIndexLine([3], "old.json:response", "old-model");
+		writeIndexLines(indexPath(), [keep, oldPrompt, oldResponse, "malformed"]);
+
+		replaceIndexEntriesForRoundFile(indexPath(), "old.json", [
+			{ vector: [4], filePath: "old.json:prompt", model: "current-model" },
+			{ vector: [5], filePath: "old.json:response", model: "current-model" },
+		]);
+
+		expect(readIndexLines(indexPath())).toEqual([
+			keep,
+			"malformed",
+			encodeVectorIndexLine([4], "old.json:prompt", "current-model"),
+			encodeVectorIndexLine([5], "old.json:response", "current-model"),
+		]);
 	});
 
 	it("migrates matching index entry prefixes and leaves unrelated rows unchanged", () => {
