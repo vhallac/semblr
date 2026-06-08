@@ -32,6 +32,15 @@ export interface RoundData {
 	parentId?: string | null;
 	relatedParentId?: string | null;
 	needsFollowup?: boolean;
+	summary?: CheckpointSummary;
+}
+
+export interface CheckpointSummary {
+	currentTask: string;
+	progressMade: string[];
+	currentState: string[];
+	nextSteps: string[];
+	keyFindings: string[];
 }
 
 export interface ToolResult {

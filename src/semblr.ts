@@ -52,7 +52,8 @@ import {
 	getRelatedParentIdFromGroup,
 	type MessageEndProcessingState,
 } from "../lib/round-capture.ts";
-import type { ChainEntry, ResponseSegment, RoundData, ToolCallDetail } from "../lib/round-data.ts";
+import type { ChainEntry, CheckpointSummary, ResponseSegment, RoundData, ToolCallDetail } from "../lib/round-data.ts";
+import { estimateMessagesTokens } from "../lib/tokens.ts";
 import {
 	loadRoundDataForToolDetails,
 	renderRoundDetailsToolResult,
@@ -173,6 +174,26 @@ let lastFollowupGroupIdx: number | null = null;
  *  injected into context. Prevents re-injection on subsequent tool turns or
  *  across agent restarts within the same session. Never modifies saved JSON. */
 let injectedFollowupRounds: Set<string> = new Set();
+
+// ─────────────────────────────────────────────
+// Context-size checkpoint — per-session state
+// ─────────────────────────────────────────────
+
+/** Most recent checkpoint summary set by the semblr_checkpoint tool.
+ *  Written by the tool execute handler, consumed by agent_end.
+ *  Reset at agent_start. */
+let lastCheckpointSummary: CheckpointSummary | null = null;
+
+/** Highest context-size warning level issued during this agent cycle.
+ *  0 = no warning, 1 = 70% threshold, 2 = 85%, 3 = 100%+.
+ *  Reset at agent_start. Used to prevent re-injection on tool turns
+ *  and to escalate if context grows further within the same cycle. */
+let contextWarningIssued = 0;
+
+/** In-memory set of round filenames whose checkpoint summary has already been
+ *  injected into context. Same pattern as injectedFollowupRounds.
+ *  Reset at session_start. */
+let injectedCheckpointRounds: Set<string> = new Set();
 
 const SEMBLR_GROUP_THRESHOLD = SEMBLR_CONFIG.groupThreshold;
 
@@ -764,6 +785,10 @@ export default function (pi: ExtensionAPI) {
 		cachedEnvPreamble = null;
 		cachedContextMessages = null;
 		cachedUserPromptForContext = null;
+
+		// Reset checkpoint state — new agent cycle starts fresh
+		lastCheckpointSummary = null;
+		contextWarningIssued = 0;
 	});
 
 	pi.on("message_end", async (event, _ctx) => {
@@ -988,6 +1013,7 @@ export default function (pi: ExtensionAPI) {
 		roundGroups = [];
 		lastFollowupGroupIdx = null;
 		injectedFollowupRounds = new Set();
+		injectedCheckpointRounds = new Set();
 
 		const index = loadSessionStartIndex();
 		ctx.ui.setStatus("semblr", buildSessionStartStatus(index));
@@ -1168,6 +1194,67 @@ export default function (pi: ExtensionAPI) {
 				const loaded = loadRoundDataForToolDetails(`${ROUNDS_DIR}/${p.round}`, p.round);
 				if (!loaded.ok) return loaded.result;
 				return renderToolDetailsToolResult(p, loaded.roundData);
+			},
+		});
+
+		// Register semblr_checkpoint — progress checkpoint for context-size warnings
+		// Always registered; the agent is instructed NOT to call it unless a context-size
+		// warning prompt explicitly tells it to. Dynamic registration would wreck the cache.
+		pi.registerTool({
+			name: "semblr_checkpoint",
+			label: "Semblr Checkpoint",
+			description:
+				"INTERNAL: Records a progress checkpoint. DO NOT call this tool unless explicitly instructed to do so by a context size warning in the conversation. Calling this tool without being instructed is a waste of tokens.",
+			promptSnippet: "Records a progress checkpoint (internal use only)",
+			parameters: Type.Object({
+				currentTask: Type.String({
+					description: "1-2 sentence summary of the current task you were working on",
+				}),
+				progressMade: Type.Array(Type.String(), {
+					description: "Concrete items completed so far, one per entry",
+				}),
+				currentState: Type.Array(Type.String(), {
+					description:
+						"Current state: files modified, decisions made, tests passing/failing, known issues",
+				}),
+				nextSteps: Type.Array(Type.String(), {
+					description: "Concrete next actions, ordered by priority",
+				}),
+				keyFindings: Type.Array(Type.String(), {
+					description: "Important discoveries, design decisions, rationale",
+				}),
+			}),
+			async execute(_toolCallId, params, _signal, _onUpdate, _ctx2) {
+				const p = params as CheckpointSummary;
+				// Only store if a context-size warning was actually issued this cycle.
+				// This prevents the agent from calling it unsolicited and corrupting state.
+				if (contextWarningIssued > 0) {
+					lastCheckpointSummary = {
+						currentTask: p.currentTask,
+						progressMade: p.progressMade,
+						currentState: p.currentState,
+						nextSteps: p.nextSteps,
+						keyFindings: p.keyFindings,
+					};
+					return {
+						content: [
+							{
+								type: "text",
+								text: "Checkpoint recorded. Your progress summary has been saved. You may now stop — do not start new work.",
+							},
+						],
+						details: {},
+					};
+				}
+				return {
+					content: [
+						{
+							type: "text",
+							text: "No context size warning is active. This tool should not be called without being instructed. No checkpoint was saved.",
+						},
+					],
+					details: {},
+				};
 			},
 		});
 
