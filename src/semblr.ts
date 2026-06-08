@@ -197,6 +197,29 @@ let injectedCheckpointRounds: Set<string> = new Set();
 
 const SEMBLR_GROUP_THRESHOLD = SEMBLR_CONFIG.groupThreshold;
 
+/** Build a flat text representation of a checkpoint summary for embedding. */
+function buildCheckpointSummaryText(summary: CheckpointSummary): string {
+	const lines: string[] = [];
+	lines.push(`Current Task: ${summary.currentTask}`);
+	if (summary.progressMade.length > 0) {
+		lines.push("Progress Made:");
+		for (const item of summary.progressMade) lines.push(`- ${item}`);
+	}
+	if (summary.currentState.length > 0) {
+		lines.push("Current State:");
+		for (const item of summary.currentState) lines.push(`- ${item}`);
+	}
+	if (summary.nextSteps.length > 0) {
+		lines.push("Next Steps:");
+		for (const item of summary.nextSteps) lines.push(`- ${item}`);
+	}
+	if (summary.keyFindings.length > 0) {
+		lines.push("Key Findings / Decisions:");
+		for (const item of summary.keyFindings) lines.push(`- ${item}`);
+	}
+	return lines.join("\n");
+}
+
 // Context formatting helpers live in lib/context-format.ts.
 
 // ─────────────────────────────────────────────
@@ -966,6 +989,7 @@ export default function (pi: ExtensionAPI) {
 			responseSegments: agentResponseSegments,
 			parentId,
 			needsFollowup,
+			summary: lastCheckpointSummary ?? undefined,
 		});
 
 		try {
@@ -1010,6 +1034,13 @@ export default function (pi: ExtensionAPI) {
 				// Write :response row to index (skip :prompt -- prompt was noise)
 				appendToIndex(`${roundFileName}:response`, responseVec, SEMBLR_CONFIG.embeddingModel);
 
+				// Embed checkpoint summary if present
+				if (lastCheckpointSummary) {
+					const summaryText = buildCheckpointSummaryText(lastCheckpointSummary);
+					const summaryVec = normalize(await embedText(summaryText, apiKey, embeddingClientDeps(ctx)));
+					appendToIndex(`${roundFileName}:summary`, summaryVec, SEMBLR_CONFIG.embeddingModel);
+				}
+
 				ctx.ui.setStatus("semblr", `🧠 saved + response-embedded round (${roundFileName})`);
 
 				finalizeRoundEmbedding({
@@ -1042,6 +1073,13 @@ export default function (pi: ExtensionAPI) {
 				// Save to index: :prompt and :response (normalized for cosine similarity)
 				appendToIndex(`${roundFileName}:prompt`, normalize(promptVec), SEMBLR_CONFIG.embeddingModel);
 				appendToIndex(`${roundFileName}:response`, normalize(responseVec), SEMBLR_CONFIG.embeddingModel);
+
+				// Embed checkpoint summary if present
+				if (lastCheckpointSummary) {
+					const summaryText = buildCheckpointSummaryText(lastCheckpointSummary);
+					const summaryVec = normalize(await embedText(summaryText, apiKey, embeddingClientDeps(ctx)));
+					appendToIndex(`${roundFileName}:summary`, summaryVec, SEMBLR_CONFIG.embeddingModel);
+				}
 
 				ctx.ui.setStatus("semblr", `\u{1f9e0} saved + embedded round (${roundFileName})`);
 
