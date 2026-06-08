@@ -8,7 +8,6 @@ Semblr stores every conversation round permanently, embeds it, and retrieves the
 
 Runs as a [pi coding agent](https://pi.dev) extension at `src`.
 
-Version-controlled with [Jujutsu (jj)](https://martinvonz.github.io/jj/latest/), not git.
 
 ## Installation
 
@@ -40,7 +39,7 @@ npm install
 
 ```bash
 # Clone the repository
-jj git clone <repo-url> semblr
+git clone <repo-url> semblr
 cd semblr
 
 # Install project dependencies (for indexing scripts)
