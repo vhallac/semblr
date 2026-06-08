@@ -20,6 +20,7 @@ import {
 	buildFollowUpSectionContent,
 	buildGroupedRecencyList,
 	buildRelevanceList,
+	buildCheckpointSectionContent,
 	formatFileSize,
 	splitCommandArgs,
 } from "../lib/context-format.ts";
@@ -383,6 +384,34 @@ function needsFollowupInjection(fileName: string): boolean {
 	}
 }
 
+/** Check if the last round has a checkpoint summary that hasn't been injected yet. */
+function needsCheckpointInjection(fileName: string): boolean {
+	const fullPath = `${ROUNDS_DIR}/${fileName}`;
+	try {
+		if (!fs.existsSync(fullPath)) return false;
+		const parsed = JSON.parse(fs.readFileSync(fullPath, "utf-8"));
+		return parsed.summary != null && !injectedCheckpointRounds.has(fileName);
+	} catch {
+		return false;
+	}
+}
+
+/** Build the checkpoint injection section for context. */
+function buildCheckpointContext(fileName: string): string | null {
+	const fullPath = `${ROUNDS_DIR}/${fileName}`;
+	let summary: CheckpointSummary | null = null;
+	try {
+		if (fs.existsSync(fullPath)) {
+			const parsed = JSON.parse(fs.readFileSync(fullPath, "utf-8"));
+			if (parsed.summary) summary = parsed.summary as CheckpointSummary;
+		}
+	} catch {
+		return null;
+	}
+	if (!summary) return null;
+	return buildCheckpointSectionContent(fileName, summary);
+}
+
 // Per-agent accumulation (reset in agent_start, saved in agent_end)
 let agentUserPrompt: string | null = null;
 let agentTurnIndex: number | null = null;
@@ -679,6 +708,19 @@ export default function (pi: ExtensionAPI) {
 				}
 			}
 
+			// Checkpoint injection: if previous round was checkpointed, include its summary
+			let checkpointMsg: unknown | null = null;
+			if (lastRoundFileName && needsCheckpointInjection(lastRoundFileName)) {
+				const checkpointSection = buildCheckpointContext(lastRoundFileName);
+				if (checkpointSection) {
+					checkpointMsg = {
+						role: "user" as const,
+						content: [{ type: "text" as const, text: checkpointSection }],
+					};
+					injectedCheckpointRounds.add(lastRoundFileName);
+				}
+			}
+
 			const contractMsg = {
 				role: "user" as const,
 				content: [{ type: "text" as const, text: buildFinalResponseContract() }],
@@ -687,6 +729,7 @@ export default function (pi: ExtensionAPI) {
 			// Compose via buildContextMessagePrefix to keep all paths consistent
 			const prefixMsgs = buildContextMessagePrefix(systemMsg, preamble, recencyList, null, contractMsg);
 			if (followUpMsg) prefixMsgs.push(followUpMsg);
+			if (checkpointMsg) prefixMsgs.push(checkpointMsg);
 			cachedContextMessages = [...prefixMsgs];
 
 			// ══ Stats: record all 5 positions presented ══
@@ -828,12 +871,25 @@ export default function (pi: ExtensionAPI) {
 				}
 			}
 
+			// Checkpoint injection: if previous round was checkpointed, include its summary
+			let checkpointMsg: unknown | null = null;
+			if (lastRoundFileName && needsCheckpointInjection(lastRoundFileName)) {
+				const checkpointSection = buildCheckpointContext(lastRoundFileName);
+				if (checkpointSection) {
+					checkpointMsg = {
+						role: "user" as const,
+						content: [{ type: "text" as const, text: checkpointSection }],
+					};
+					injectedCheckpointRounds.add(lastRoundFileName);
+				}
+			}
+
 			const contractMsg = {
 				role: "user" as const,
 				content: [{ type: "text" as const, text: buildFinalResponseContract() }],
 			};
 
-			// Build prefix: system + preamble + recency + relevance [+ followUp] + contract
+			// Build prefix: system + preamble + recency + relevance [+ followUp] [+ checkpoint] + contract
 			const prefixMsgs: unknown[] = [];
 			if (systemMsg) prefixMsgs.push(systemMsg);
 			if (preamble) prefixMsgs.push({ role: "user" as const, content: [{ type: "text" as const, text: preamble }] });
@@ -842,6 +898,7 @@ export default function (pi: ExtensionAPI) {
 			if (relevanceList)
 				prefixMsgs.push({ role: "user" as const, content: [{ type: "text" as const, text: relevanceList }] });
 			if (followUpMsg) prefixMsgs.push(followUpMsg);
+			if (checkpointMsg) prefixMsgs.push(checkpointMsg);
 			if (contractMsg) prefixMsgs.push(contractMsg);
 			const finalMessages = prefixMsgs;
 
