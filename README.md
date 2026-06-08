@@ -20,7 +20,7 @@ Semblr runs as a [pi coding agent](https://pi.dev) extension.
 
 - **[pi coding agent](https://pi.dev/install)** — the prerequisite runtime. Must be installed before using Semblr.
 - **[Node.js](https://nodejs.org/)** >= 22 — required by the extension runtime and scripts.
-- **[OpenRouter API key](https://openrouter.ai/keys)** — Semblr uses the `text-embedding-3-small` model via OpenRouter for embedding prompts and responses.
+- **Embedding provider API key** — by default Semblr uses pi's `openrouter` provider with `openai/text-embedding-3-small`; configure the provider/API key through pi, or set a Semblr embedding endpoint override.
 
 #### Development
 
@@ -82,7 +82,7 @@ When the extension is loaded, pi exposes:
 Current AI agent sessions degrade as they accumulate context. Pi's compaction mechanism summarises past rounds to free memory, but the summaries lose detail. Semblr replaces this with a different approach:
 
 1. **Save every round permanently.** Each user prompt + full assistant response sequence (tool calls, thinking, final answer) is saved as an individual JSON file.
-2. **Embed prompt, response, and combined text.** Three texts are sent to the embedding API (`text-embedding-3-small`, which has an 8K token limit): the user prompt, the clipped response (truncated to ~24KB, context-injection artifacts stripped), and the concatenation of both (`prompt + "\n\n" + clippedResponse`). The prompt and response vectors are stored in an append-only CSV index. The combined vector is stored in the round file for semantic grouping.
+2. **Embed prompt, response, and combined text.** Three texts are sent to the configured embedding API: the user prompt, the clipped response (by default truncated to ~24KB, context-injection artifacts stripped), and the concatenation of both (`prompt + "\n\n" + clippedResponse`). The prompt and response vectors are stored in an append-only CSV index. The combined vector is stored in the round file for semantic grouping.
 3. **Retrieve by relevance.** On every user prompt, the prompt is embedded and compared against all stored vectors via cosine similarity. The closest rounds are injected into context — up to a dynamic token budget.
 4. **Drill-down via tools.** By default, rounds are shown as a compact numbered index. The LLM uses `get_round_details()` to expand a round and `get_tool_details()` to inspect individual tool calls within it.
 
@@ -230,7 +230,7 @@ Semblr has two sources of API cost:
 | **Context assembly** | 1 embedding API call (the current prompt) |
 | **Index search** (via `search_interactions` tool) | 1 embedding API call per search |
 
-All embeddings go to OpenRouter → `text-embedding-3-small`. At current pricing (~$0.13/1M tokens for input, ~0.26/1M for output for text-embedding-3-small, but OpenRouter may add a small markup), the cost per embedding is on the order of fractions of a cent.
+By default, embeddings go to OpenRouter → `openai/text-embedding-3-small`. If you configure another embedding provider/model or `embeddingApiUrl`, pricing and vector dimensions follow that endpoint/model instead.
 
 The ongoing cost is ~2–3 embeddings per user prompt (the prompt embedding from context assembly is reused for saving, so the net cost is one response embedding plus one combined embedding).
 
@@ -254,23 +254,65 @@ This was fixed by caching the assembled preamble and context blocks once per inv
 
 Semblr stores conversation data in two areas, both outside the project tree so they survive repository moves:
 
-### Round Storage (`SEMBLR_ROUNDS_DIR`)
+### Round Storage (`semblr.roundsDir` / `SEMBLR_ROUNDS_DIR`)
 
 | File | Purpose |
 |---|---|
 | `<id>.json` | A single round: user prompt, full assistant response, tool call metadata |
-| `index.csv` | Append-only vector index — one line per embedding: `base64(vector),<filepath>:round` |
+| `index.csv` | Append-only vector index — one line per embedding: `base64(vector),<filepath>:prompt|response,<model>` |
 
 Round IDs are content-addressed (MD5 of `userPrompt + responseSequence`), so re-indexing is idempotent — same content produces the same file.
 
-### Environment Variables
+### Configuration
+
+Semblr reads a `semblr` section from pi settings. Values are resolved per key in this order:
+
+1. Environment variable
+2. Project `.pi/settings.json`
+3. Global `$PI_CODING_AGENT_DIR/settings.json` (default `~/.pi/agent/settings.json`)
+4. Hardcoded default
+
+Example:
+
+```json
+{
+  "semblr": {
+    "embeddingProvider": "openrouter",
+    "embeddingModel": "openai/text-embedding-3-small",
+    "embeddingMaxTokens": 8000,
+    "roundsDir": "semblr/rounds",
+    "groupThreshold": 0.77,
+    "minSimilarity": 0.3,
+    "embedTimeoutMs": 15000,
+    "embedMaxRetries": 3,
+    "embedBackoffMs": 1000
+  }
+}
+```
+
+`embeddingProvider` is a reference to pi's provider registry (`models.json` + auth storage). Semblr asks pi for the provider base URL and API key, then sends OpenAI-compatible embedding requests. If `embeddingApiUrl` is set, it is used as a full embeddings endpoint override instead of deriving `<provider baseUrl>/v1/embeddings`.
+
+Relative `roundsDir` values in project settings resolve under the project cwd. Relative `roundsDir` values in global settings resolve under `$PI_CODING_AGENT_DIR` (default `~/.pi/agent`).
+
+| Setting | Env var | Default | Purpose |
+|---|---|---|---|
+| `embeddingProvider` | `SEMBLR_EMBEDDING_PROVIDER` | `openrouter` | pi provider name used for embedding API key/base URL lookup |
+| `embeddingModel` | `SEMBLR_EMBEDDING_MODEL` | `openai/text-embedding-3-small` | Model identifier sent in embedding request bodies and written to index rows |
+| `embeddingMaxTokens` | `SEMBLR_EMBEDDING_MAX_TOKENS` | `8000` | Prompt/response clipping budget for embedding inputs |
+| `embeddingApiUrl` | `SEMBLR_EMBEDDING_API_URL` | derived | Full embeddings endpoint override |
+| `roundsDir` | `SEMBLR_ROUNDS_DIR` | `$PI_CODING_AGENT_DIR/semblr/rounds` | Round repository and `index.csv` directory |
+| `groupThreshold` | `SEMBLR_GROUP_THRESHOLD` | `0.77` | Minimum cosine similarity for grouping rounds into topics. Higher = more groups |
+| `minSimilarity` | `SEMBLR_MIN_SIMILARITY` | `0.3` | Minimum semantic similarity for relevance retrieval |
+| `embedTimeoutMs` | `SEMBLR_EMBED_TIMEOUT` | `15000` | Embedding request timeout |
+| `embedMaxRetries` | `SEMBLR_EMBED_RETRIES` | `3` | Embedding request retry count |
+| `embedBackoffMs` | `SEMBLR_EMBED_BACKOFF` | `1000` | Base retry backoff in milliseconds |
+
+Additional runtime-only switches:
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `SEMBLR_GROUP_THRESHOLD` | `0.77` | Minimum cosine similarity for grouping rounds into topics. Higher = more groups |
 | `RELEVANCE_LIST_MIN_WORDS` | `20` | Raw word count threshold. Prompts shorter than this skip the relevance list entirely |
 | `DROP_RELEVANCE_LIST` | not set | If `1` or `true`, the relevance list section is always suppressed regardless of matches |
-| `SEMBLR_ROUNDS_DIR` | (pi defaults) | Override the round repository directory |
 
 ### Digest Scripts
 
@@ -294,10 +336,11 @@ Three scripts parse historical conversation data into semblr rounds:
 When `digest-all.ts` runs:
 1. Loads all existing entries from `index.csv`
 2. Computes the expected file path for each parsed round via content hash
-3. Skips any round whose file path already appears in the index
-4. Only new rounds are sent to the embedding API
+3. Skips rounds already indexed with the current embedding model
+4. Re-embeds rounds whose index rows have an explicit different embedding model
+5. Only new or model-stale rounds are sent to the embedding API
 
-This makes it safe to run repeatedly — only unindexed session data gets embedded.
+This makes it safe to run repeatedly — only unindexed or model-stale session data gets embedded. Legacy two-column rows without a model column are treated as current-model rows; run `just migrate` to stamp them with the configured model.
 
 ### Session file format
 
@@ -325,14 +368,14 @@ just query "what did we discuss about caching"
 
 ### Index format
 
-The index is an append-only CSV with no schema header:
+The index is a CSV with no schema header:
 
 ```
-<base64url(JSON vector)>,<round_id>.json:prompt
-<base64url(JSON vector)>,<round_id>.json:response
+<base64url(JSON vector)>,<round_id>.json:prompt,<embedding-model>
+<base64url(JSON vector)>,<round_id>.json:response,<embedding-model>
 ```
 
-Each round produces two rows: one for the prompt embedding and one for the clipped-response embedding. The combined prompt+response embedding is stored in the round JSON file for grouping, not in the index CSV. The vector dimensions match the embedding model (1536 for `text-embedding-3-small`). Cosine similarity is used for retrieval.
+Legacy two-column rows without the model column are still readable and are assumed to use the current configured embedding model. Each round produces two rows: one for the prompt embedding and one for the clipped-response embedding. The combined prompt+response embedding is stored in the round JSON file for grouping, not in the index CSV. The vector dimensions match the configured embedding model (1536 for the default `openai/text-embedding-3-small`). `just index` rewrites rows for rounds that were explicitly embedded with a different model so the index converges to the configured model. Cosine similarity is used for retrieval.
 
 ## Known Problems
 
@@ -340,10 +383,10 @@ Each round produces two rows: one for the prompt embedding and one for the clipp
 The Recency List (see [Injected Context Structure](#injected-context-structure)) shows the most recent rounds from the current session with instructions for the model to expand them when resolving references like "those changes" or "it". The list covers all prior rounds in the session, so the special-case last-round injection is no longer needed.
 
 ### Embedding API dependency
-Semblr requires a working OpenRouter API key (or an alternative embedding endpoint) to function. If the API is unreachable, context assembly falls back to a no-op (no historical context injected). The extension degrades gracefully but silently.
+Semblr requires a working embedding provider/API key to function. By default it uses pi's `openrouter` provider with `openai/text-embedding-3-small`, but you can configure another pi provider/model or set `embeddingApiUrl` as a full endpoint override. If the API is unreachable, context assembly falls back to a no-op (no historical context injected). The extension degrades gracefully but silently.
 
 ### No local embedding fallback
-Currently only one embedding model (`text-embedding-3-small` via OpenRouter) is wired. There is no local embedding option (e.g., `sentence-transformers` → ONNX → TypeScript). Adding one would eliminate the API dependency and cost for index queries.
+Semblr currently sends OpenAI-compatible embedding requests to a configured HTTP endpoint. There is no local embedding option (e.g., `sentence-transformers` → ONNX → TypeScript). Adding one would eliminate the API dependency and cost for index queries.
 
 ## Quick Start
 
@@ -376,16 +419,18 @@ just query "what did we discuss about caching"
 
 ```
 ├── src                         # The extension directory
-│   ├── semblr.ts                 # Main extension orchestration / pi lifecycle glue
-│   └── core/                     # Domain helpers used by the extension and tests
-│       ├── context-messages.ts     # User-message preparation and context prefix assembly
-│       ├── embedding-client.ts     # OpenRouter API-key lookup and embedding client
-│       ├── index-storage.ts        # Runtime vector-index loading and locked appends
-│       ├── message-content.ts      # Shared text extraction from message content blocks
-│       ├── round-capture.ts        # agent_end/message_end round capture helpers
-│       ├── round-data.ts           # Shared round/tool-call data contracts
-│       ├── round-tool-results.ts   # get_round_details/get_tool_details result rendering
-│       └── search-interactions.ts  # search_interactions scoring, selection, and rendering
+│   └── semblr.ts                 # Main extension orchestration / pi lifecycle glue
+├── lib/                           # Domain helpers used by the extension, scripts, and tests
+│   ├── context-messages.ts        # User-message preparation and context prefix assembly
+│   ├── embedding-client.ts        # Provider-aware embedding client
+│   ├── index-storage.ts           # Runtime vector-index loading and locked appends
+│   ├── message-content.ts         # Shared text extraction from message content blocks
+│   ├── round-capture.ts           # agent_end/message_end round capture helpers
+│   ├── round-data.ts              # Shared round/tool-call data contracts
+│   ├── round-tool-results.ts      # get_round_details/get_tool_details result rendering
+│   ├── script-config.ts           # Shared config/auth setup for scripts
+│   ├── search-interactions.ts     # search_interactions scoring, selection, and rendering
+│   └── semblr-config.ts           # Semblr settings/env resolution
 ├── scripts/
 │   ├── digest-all.ts               # Bulk-embed all historical sessions
 │   ├── digest-session.ts           # Embed a single session file

@@ -3,6 +3,7 @@ import * as fs from "node:fs";
 export interface IndexEntry {
 	filePath: string;
 	vector: number[];
+	model?: string;
 }
 
 export function loadIndexFromPath(
@@ -13,11 +14,14 @@ export function loadIndexFromPath(
 	const raw = fsImpl.readFileSync(indexPath, "utf-8").trim();
 	if (!raw) return [];
 	return raw.split("\n").map((line) => {
-		const comma = line.indexOf(",");
-		const b64 = line.slice(0, comma);
-		const filePath = line.slice(comma + 1);
+		const firstComma = line.indexOf(",");
+		const b64 = line.slice(0, firstComma);
+		const rest = line.slice(firstComma + 1);
+		const lastComma = rest.lastIndexOf(",");
+		const filePath = lastComma === -1 ? rest : rest.slice(0, lastComma);
+		const model = lastComma === -1 ? undefined : rest.slice(lastComma + 1);
 		const decoded = JSON.parse(Buffer.from(b64, "base64url").toString("utf-8"));
-		return { filePath, vector: Array.isArray(decoded) ? decoded : [] };
+		return { filePath, vector: Array.isArray(decoded) ? decoded : [], model };
 	});
 }
 
@@ -68,6 +72,7 @@ export function appendToIndexPath(
 	filePath: string,
 	vector: number[],
 	deps: AppendIndexDeps = {},
+	model?: string,
 ) {
 	const fsImpl = deps.fsImpl ?? fs;
 	const lockRetries = deps.lockRetries ?? 15;
@@ -77,7 +82,7 @@ export function appendToIndexPath(
 	const wait = deps.wait ?? ((ms: number) => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms));
 	const processId = deps.processId ?? process.pid;
 	const b64 = Buffer.from(JSON.stringify(vector)).toString("base64url");
-	const line = `${b64},${filePath}\n`;
+	const line = model !== undefined ? `${b64},${filePath},${model}\n` : `${b64},${filePath}\n`;
 	fsImpl.mkdirSync(roundsDir, { recursive: true });
 
 	const lockPath = `${indexPath}.lock`;

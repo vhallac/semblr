@@ -7,8 +7,13 @@
 export {
 	type ApiKeyContext,
 	type ApiKeyLookupDeps,
+	createEmbeddingModelRegistry,
+	type EmbeddingClientConfig,
+	type EmbeddingModelLike,
+	type EmbeddingModelRegistry,
 	type EmbedTextDeps,
 	embedText,
 	getApiKey,
+	resolveEmbeddingApiUrl,
 } from "./embedding-client.ts";
 export { cosineSimilarity, normalize } from "./vector.ts";

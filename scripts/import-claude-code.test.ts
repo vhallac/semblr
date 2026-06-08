@@ -181,8 +181,8 @@ describe("import-claude-code script", () => {
 		expect(writtenRound.gitBranch).toBe("main");
 
 		expect(loadVectorIndex(indexPath)).toEqual([
-			{ vector: [0.6, 0.8], filePath: `${roundFile}:prompt` },
-			{ vector: [0.6, 0.8], filePath: `${roundFile}:response` },
+			{ vector: [0.6, 0.8], filePath: `${roundFile}:prompt`, model: "openai/text-embedding-3-small" },
+			{ vector: [0.6, 0.8], filePath: `${roundFile}:response`, model: "openai/text-embedding-3-small" },
 		]);
 
 		expect(requests).toEqual([

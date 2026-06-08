@@ -1,7 +1,8 @@
 # ── semblr ─────────────────────────────────────────────────────────────────
 # See VISION.md for architecture and AGENTS.md for project context.
 
-# Override via: just --set SEMBLR_ROUNDS_DIR /custom/path index
+# Configuration is read from Semblr settings/env. For one-off rounds-dir overrides:
+#   just --set SEMBLR_ROUNDS_DIR /custom/path index
 # or set SEMBLR_ROUNDS_DIR in the environment.
 SEMBLR_ROUNDS_DIR := env_var_or_default("SEMBLR_ROUNDS_DIR", "")
 
@@ -45,12 +46,14 @@ uninstall:
     pi remove ./src/semblr.ts
 
 # Run all pending round migrations (idempotent — safe to re-run)
-# Old migration first (migrate-rounds), then new migration (migrate-content-hash)
+# Round migrations first, then index migration (model column)
 migrate *args:
     SEMBLR_ROUNDS_DIR="{{SEMBLR_ROUNDS_DIR}}" \
         npx tsx scripts/migrate-rounds.ts
     SEMBLR_ROUNDS_DIR="{{SEMBLR_ROUNDS_DIR}}" \
         npx tsx scripts/migrate-content-hash.ts {{args}}
+    SEMBLR_ROUNDS_DIR="{{SEMBLR_ROUNDS_DIR}}" \
+        npx tsx scripts/migrate-model-column.ts {{args}}
 
 # Erase embeddings for short prompts from index.csv and round JSON files
 # (Idempotent — safe to re-run)

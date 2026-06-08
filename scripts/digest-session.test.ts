@@ -93,8 +93,8 @@ describe("digest-session script", () => {
 		const roundFile = `${computeContentHash(userPrompt, responseSequence, [])}.json`;
 		expect(fs.existsSync(path.join(roundsDir, roundFile))).toBe(true);
 		expect(loadVectorIndex(indexPath)).toEqual([
-			{ vector: [0.6, 0.8], filePath: `${roundFile}:prompt` },
-			{ vector: [0, 0], filePath: `${roundFile}:response` },
+			{ vector: [0.6, 0.8], filePath: `${roundFile}:prompt`, model: "openai/text-embedding-3-small" },
+			{ vector: [0, 0], filePath: `${roundFile}:response`, model: "openai/text-embedding-3-small" },
 		]);
 		expect(requests).toEqual([
 			{
@@ -122,6 +122,58 @@ describe("digest-session script", () => {
 
 		expect(secondFetch).not.toHaveBeenCalled();
 		expect(readIndexLines(indexPath)).toHaveLength(2);
+	});
+
+	it("uses shared config for script rounds dir, embedding endpoint, model, and clipping", async () => {
+		const root = tmpDir();
+		const sessionFile = path.join(root, "session.jsonl");
+		const configuredRoundsDir = path.join(root, "configured-rounds");
+		fs.mkdirSync(path.join(root, ".pi"), { recursive: true });
+		fs.writeFileSync(
+			path.join(root, ".pi", "settings.json"),
+			JSON.stringify({
+				semblr: {
+					roundsDir: "configured-rounds",
+					embeddingModel: "configured-embedding-model",
+					embeddingApiUrl: "https://embeddings.example/custom",
+					embeddingMaxTokens: 4,
+				},
+			}),
+		);
+		writeSession(sessionFile, "123456", "abcdef");
+		const requests: unknown[] = [];
+		const fetchImpl = embeddingFetch([[1], [2]], requests);
+
+		await expect(
+			runDigestSession({
+				sessionFile,
+				apiKey: "key",
+				fetchImpl,
+				stdout: logger().out,
+				configDeps: { cwd: root, agentDir: path.join(root, "agent"), env: {} },
+			}),
+		).resolves.toBe(0);
+
+		const roundFile = `${computeContentHash("123456", "abcdef", [])}.json`;
+		expect(fs.existsSync(path.join(configuredRoundsDir, roundFile))).toBe(true);
+		expect(loadVectorIndex(path.join(configuredRoundsDir, "index.csv"))).toEqual([
+			{ vector: [1], filePath: `${roundFile}:prompt`, model: "configured-embedding-model" },
+			{ vector: [1], filePath: `${roundFile}:response`, model: "configured-embedding-model" },
+		]);
+		expect(requests).toEqual([
+			{
+				input: "https://embeddings.example/custom",
+				method: "POST",
+				headers: { Authorization: "Bearer key", "Content-Type": "application/json" },
+				body: { model: "configured-embedding-model", input: "1234" },
+			},
+			{
+				input: "https://embeddings.example/custom",
+				method: "POST",
+				headers: { Authorization: "Bearer key", "Content-Type": "application/json" },
+				body: { model: "configured-embedding-model", input: "abcd" },
+			},
+		]);
 	});
 
 	it("migrates stale round filenames before deciding a round is already indexed", async () => {

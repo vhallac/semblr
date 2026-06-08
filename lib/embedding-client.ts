@@ -1,31 +1,120 @@
 import { spawn } from "node:child_process";
+import * as os from "node:os";
+import * as path from "node:path";
+import { AuthStorage, ModelRegistry } from "@earendil-works/pi-coding-agent";
+import { SEMBLR_CONFIG_DEFAULTS, type SemblrConfig } from "./semblr-config.ts";
 
-const EMBEDDING_MODEL = "openai/text-embedding-3-small";
-const OPENROUTER_URL = "https://openrouter.ai/api/v1/embeddings";
-const EMBED_TIMEOUT_MS = 15_000;
-const EMBED_MAX_RETRIES = 3;
-const EMBED_BACKOFF_MS = 1000;
+export interface EmbeddingModelLike {
+	baseUrl: string;
+}
+
+export interface EmbeddingModelRegistry {
+	find(provider: string, modelId: string): EmbeddingModelLike | undefined;
+	getApiKeyForProvider(provider: string): Promise<string | undefined>;
+	registerProvider?(provider: string, config: { apiKey?: string }): void;
+}
+
+export type EmbeddingClientConfig = Pick<
+	SemblrConfig,
+	"embeddingProvider" | "embeddingModel" | "embeddingApiUrl" | "embedTimeoutMs" | "embedMaxRetries" | "embedBackoffMs"
+>;
+
+type EmbeddingClientConfigInput = Partial<EmbeddingClientConfig>;
 
 export interface ApiKeyContext {
-	modelRegistry?: { getApiKeyForProvider(provider: string): Promise<string | undefined> };
+	modelRegistry?: EmbeddingModelRegistry;
 }
 
 export interface ApiKeyLookupDeps {
 	env?: { OPENROUTER_API_KEY?: string };
 	spawnImpl?: typeof spawn;
+	config?: EmbeddingClientConfigInput;
+	modelRegistry?: EmbeddingModelRegistry;
+}
+
+function normalizeEmbeddingConfig(config: EmbeddingClientConfigInput = {}): EmbeddingClientConfig {
+	return {
+		embeddingProvider: config.embeddingProvider ?? SEMBLR_CONFIG_DEFAULTS.embeddingProvider,
+		embeddingModel: config.embeddingModel ?? SEMBLR_CONFIG_DEFAULTS.embeddingModel,
+		embeddingApiUrl: config.embeddingApiUrl,
+		embedTimeoutMs: config.embedTimeoutMs ?? SEMBLR_CONFIG_DEFAULTS.embedTimeoutMs,
+		embedMaxRetries: config.embedMaxRetries ?? SEMBLR_CONFIG_DEFAULTS.embedMaxRetries,
+		embedBackoffMs: config.embedBackoffMs ?? SEMBLR_CONFIG_DEFAULTS.embedBackoffMs,
+	};
+}
+
+function isDefaultEmbeddingSelection(config: EmbeddingClientConfig): boolean {
+	return (
+		config.embeddingProvider === SEMBLR_CONFIG_DEFAULTS.embeddingProvider &&
+		config.embeddingModel === SEMBLR_CONFIG_DEFAULTS.embeddingModel &&
+		config.embeddingApiUrl === undefined
+	);
+}
+
+function appendEmbeddingsPath(baseUrl: string): string {
+	return `${baseUrl.replace(/\/+$/, "")}/embeddings`;
+}
+
+export function resolveEmbeddingApiUrl(
+	configInput: EmbeddingClientConfigInput = {},
+	modelRegistry?: Pick<EmbeddingModelRegistry, "find">,
+): string {
+	const config = normalizeEmbeddingConfig(configInput);
+	if (config.embeddingApiUrl) return config.embeddingApiUrl;
+
+	const model = modelRegistry?.find(config.embeddingProvider, config.embeddingModel);
+	if (model) return appendEmbeddingsPath(model.baseUrl);
+
+	if (isDefaultEmbeddingSelection(config)) return SEMBLR_CONFIG_DEFAULTS.defaultEmbeddingApiUrl;
+
+	throw new Error(
+		`Semblr embedding model ${config.embeddingProvider}/${config.embeddingModel} was not found. ` +
+			"Add the embedding model to pi models.json or set semblr.embeddingApiUrl / SEMBLR_EMBEDDING_API_URL.",
+	);
+}
+
+function defaultAgentDir(env: NodeJS.ProcessEnv = process.env): string {
+	return env.PI_CODING_AGENT_DIR || path.join(os.homedir(), ".pi", "agent");
+}
+
+export interface CreateEmbeddingModelRegistryOptions {
+	agentDir?: string;
+	apiKey?: string;
+	env?: NodeJS.ProcessEnv;
+}
+
+export function createEmbeddingModelRegistry(
+	configInput: EmbeddingClientConfigInput = {},
+	options: CreateEmbeddingModelRegistryOptions = {},
+): EmbeddingModelRegistry {
+	const config = normalizeEmbeddingConfig(configInput);
+	const agentDir = options.agentDir ?? defaultAgentDir(options.env);
+	const authStorage = AuthStorage.create(path.join(agentDir, "auth.json"));
+	const modelRegistry = ModelRegistry.create(authStorage, path.join(agentDir, "models.json"));
+	if (options.apiKey) {
+		modelRegistry.registerProvider(config.embeddingProvider, { apiKey: options.apiKey });
+	}
+	return modelRegistry;
 }
 
 export async function getApiKey(ctx?: ApiKeyContext, deps: ApiKeyLookupDeps = {}): Promise<string | null> {
+	const config = normalizeEmbeddingConfig(deps.config);
 	const env = deps.env ?? process.env;
-	const envKey = env.OPENROUTER_API_KEY;
-	if (envKey) return envKey;
+	const modelRegistry = deps.modelRegistry ?? ctx?.modelRegistry;
+
+	if (config.embeddingProvider === SEMBLR_CONFIG_DEFAULTS.embeddingProvider) {
+		const envKey = env.OPENROUTER_API_KEY;
+		if (envKey) return envKey;
+	}
 
 	try {
-		const piKey = await ctx?.modelRegistry?.getApiKeyForProvider("openrouter");
+		const piKey = await modelRegistry?.getApiKeyForProvider(config.embeddingProvider);
 		if (piKey) return piKey;
 	} catch {
-		// Pi auth lookup failed, fall through.
+		// Pi auth lookup failed, fall through to legacy OpenRouter fallback if applicable.
 	}
+
+	if (config.embeddingProvider !== SEMBLR_CONFIG_DEFAULTS.embeddingProvider) return null;
 
 	try {
 		return await new Promise<string | null>((resolve) => {
@@ -69,6 +158,8 @@ export interface EmbedTextDeps {
 	timeoutMs?: number;
 	maxRetries?: number;
 	backoffMs?: number;
+	config?: EmbeddingClientConfigInput;
+	modelRegistry?: Pick<EmbeddingModelRegistry, "find">;
 }
 
 function sleep(ms: number): Promise<void> {
@@ -76,11 +167,13 @@ function sleep(ms: number): Promise<void> {
 }
 
 export async function embedText(text: string, apiKey: string, deps: EmbedTextDeps = {}): Promise<number[]> {
+	const config = normalizeEmbeddingConfig(deps.config);
 	const fetchImpl: EmbeddingFetch = deps.fetchImpl ?? ((url, init) => fetch(url, init));
 	const sleepImpl = deps.sleep ?? sleep;
-	const timeoutMs = deps.timeoutMs ?? EMBED_TIMEOUT_MS;
-	const maxRetries = deps.maxRetries ?? EMBED_MAX_RETRIES;
-	const backoffMs = deps.backoffMs ?? EMBED_BACKOFF_MS;
+	const timeoutMs = deps.timeoutMs ?? config.embedTimeoutMs;
+	const maxRetries = deps.maxRetries ?? config.embedMaxRetries;
+	const backoffMs = deps.backoffMs ?? config.embedBackoffMs;
+	const embeddingApiUrl = resolveEmbeddingApiUrl(config, deps.modelRegistry);
 	let lastError: Error | undefined;
 
 	for (let attempt = 0; attempt < maxRetries; attempt++) {
@@ -88,14 +181,14 @@ export async function embedText(text: string, apiKey: string, deps: EmbedTextDep
 		const timer = setTimeout(() => controller.abort(), timeoutMs);
 
 		try {
-			const response = await fetchImpl(OPENROUTER_URL, {
+			const response = await fetchImpl(embeddingApiUrl, {
 				method: "POST",
 				headers: {
 					"Content-Type": "application/json",
 					Authorization: `Bearer ${apiKey}`,
 				},
 				body: JSON.stringify({
-					model: EMBEDDING_MODEL,
+					model: config.embeddingModel,
 					input: text,
 				}),
 				signal: controller.signal,

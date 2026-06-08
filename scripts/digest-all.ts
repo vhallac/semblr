@@ -2,39 +2,50 @@
  * digest-all.ts — Bulk-embed all pi session JSONL files into the semblr index.
  *
  * Iterates every session in ~/.pi/agent/sessions/, skips already-indexed rounds,
- * parallelizes embedding via OpenRouter.
+ * and embeds through the configured Semblr provider/model.
  *
  * Usage:
- *   OPENROUTER_API_KEY="$(pass show ai/openrouter)" npx tsx scripts/digest-all.ts
+ *   npx tsx scripts/digest-all.ts
  *
- * Safe to run while pi is using the extension — the index is append-only.
+ * Re-runnable: appends new rows and rewrites rows whose explicit model differs
+ * from the current configured embedding model.
  */
 
 import * as fs from "node:fs";
-import * as os from "node:os";
 import * as path from "node:path";
 import { pathToFileURL } from "node:url";
-import { embedText, getApiKey, normalize } from "../lib/embed.ts";
+import { type EmbeddingModelRegistry, embedText, normalize } from "../lib/embed.ts";
 import { computeContentHash } from "../lib/hash.ts";
 import {
 	appendVectorIndexEntry,
 	findStaleContentMatches as findStaleContentMatchesInDir,
 	loadIndexedRoundFiles,
+	loadRoundFilesWithDifferentModel,
 	migrateIndexEntries as migrateIndexEntriesFile,
+	replaceIndexEntriesForRoundFile,
+	type VectorIndexEntry,
 } from "../lib/index-io.ts";
 import { type ParsedPiRound, parsePiSessionJsonl } from "../lib/pi-session.ts";
+import {
+	resolveScriptApiKey,
+	resolveScriptConfig,
+	resolveScriptIndexPath,
+	resolveScriptModelRegistry,
+	type ScriptConfigOptions,
+	scriptEmbeddingConfig,
+} from "../lib/script-config.ts";
 
 // ─────────────────────────────────────────────
 // Config (matches digest-session.ts)
 // ─────────────────────────────────────────────
 
-const SESSIONS_DIR = path.resolve(os.homedir(), ".pi", "agent", "sessions");
-const ROUNDS_DIR = process.env.SEMBLR_ROUNDS_DIR || path.resolve(os.homedir(), ".pi", "agent", "semblr", "rounds");
+function defaultSessionsDir(agentDir: string): string {
+	return path.resolve(agentDir, "sessions");
+}
+
 // Keep bulk digest single-worker: stale-hash migrations rewrite index.csv and delete
 // duplicate files, so concurrent duplicate-content rounds can race and leave stale refs.
 const CONCURRENCY = 1;
-const MAX_PROMPT_CHARS = 8000;
-const MAX_RESPONSE_CHARS = 8000;
 
 // ─────────────────────────────────────────────
 // Types
@@ -87,12 +98,13 @@ function gatherSessionFiles(
 // Main
 // ─────────────────────────────────────────────
 
-export interface DigestAllOptions {
+export interface DigestAllOptions extends ScriptConfigOptions {
 	sessionsDir?: string;
 	roundsDir?: string;
 	indexPath?: string;
 	apiKey?: string;
 	fetchImpl?: typeof fetch;
+	modelRegistry?: EmbeddingModelRegistry;
 	concurrency?: number;
 	stdout?: Pick<typeof console, "log">;
 	stderr?: Pick<typeof console, "error">;
@@ -100,15 +112,18 @@ export interface DigestAllOptions {
 }
 
 export async function runDigestAll(options: DigestAllOptions = {}): Promise<number> {
-	const sessionsDir = options.sessionsDir ?? SESSIONS_DIR;
-	const roundsDir = options.roundsDir ?? ROUNDS_DIR;
-	const indexPath = options.indexPath ?? path.resolve(roundsDir, "index.csv");
+	const config = resolveScriptConfig(options);
+	const sessionsDir = options.sessionsDir ?? defaultSessionsDir(config.agentDir);
+	const roundsDir = options.roundsDir ?? config.roundsDir;
+	const indexPath = resolveScriptIndexPath(config, roundsDir, options.indexPath);
+	const modelRegistry = resolveScriptModelRegistry(config, options);
+	const embeddingConfig = scriptEmbeddingConfig(config);
 	const concurrency = Math.max(1, options.concurrency ?? CONCURRENCY);
 	const out = options.stdout ?? console;
 	const err = options.stderr ?? console;
 	const f = options.fsImpl ?? fs;
 
-	const rawApiKey = options.apiKey ?? (await getApiKey());
+	const rawApiKey = await resolveScriptApiKey(config, { ...options, modelRegistry });
 	if (!rawApiKey) {
 		err.error("❌ OPENROUTER_API_KEY environment variable required");
 		return 1;
@@ -125,9 +140,12 @@ export async function runDigestAll(options: DigestAllOptions = {}): Promise<numb
 	// Ensure rounds dir
 	f.mkdirSync(roundsDir, { recursive: true });
 
-	// Load existing index dedup set
+	// Load existing index dedup set and explicit model mismatches.
+	// Legacy two-column rows have no model and are treated as current per #62.
 	const existingRounds = loadIndexedRoundFiles(indexPath);
-	out.log(`📊 Already indexed: ${existingRounds.size} rounds\n`);
+	const modelMismatchedRounds = loadRoundFilesWithDifferentModel(indexPath, config.embeddingModel);
+	out.log(`📊 Already indexed: ${existingRounds.size} rounds`);
+	out.log(`📊 Model-mismatched rounds to re-index: ${modelMismatchedRounds.size}\n`);
 
 	// Parse all sessions into a flat list of rounds (skipping already-indexed)
 	const allRounds: Round[] = [];
@@ -137,7 +155,7 @@ export async function runDigestAll(options: DigestAllOptions = {}): Promise<numb
 		const rounds = parseSessionFile(filePath, label, { fsImpl: f });
 		const newRounds = rounds.filter((t) => {
 			const key = `${computeContentHash(t.userPrompt, t.responseSequence, t.toolCalls)}.json`;
-			return !existingRounds.has(key);
+			return !existingRounds.has(key) || modelMismatchedRounds.has(key);
 		});
 		skippedTotal += rounds.length - newRounds.length;
 		allRounds.push(...newRounds);
@@ -174,32 +192,56 @@ export async function runDigestAll(options: DigestAllOptions = {}): Promise<numb
 			err.error(`  ♻️  Migrated stale: ${staleFile} → ${roundFile}`);
 		}
 
-		// Skip embedding if already indexed under the correct hash
-		// (must reload after potential deletions above)
+		// Skip embedding if already indexed under the correct hash and current model
+		// (must reload after potential migrations above).
 		const indexedAfterCleanup = loadIndexedRoundFiles(indexPath);
-		if (indexedAfterCleanup.has(roundFile)) {
+		const modelMismatchedAfterCleanup = loadRoundFilesWithDifferentModel(indexPath, config.embeddingModel);
+		const needsModelReindex = modelMismatchedAfterCleanup.has(roundFile);
+		if (indexedAfterCleanup.has(roundFile) && !needsModelReindex) {
 			completed++;
 			err.error(`  ⏭  [${completed}/${totalNew}] ${roundId} (already indexed)`);
 			return;
 		}
 
 		try {
-			const promptVector = await embedText(round.userPrompt.slice(0, MAX_PROMPT_CHARS), apiKey, {
+			const entries: VectorIndexEntry[] = [];
+			const promptVector = await embedText(round.userPrompt.slice(0, config.embeddingMaxTokens), apiKey, {
 				fetchImpl: options.fetchImpl,
+				config: embeddingConfig,
+				modelRegistry,
 			});
-			appendVectorIndexEntry(indexPath, normalize(promptVector), `${roundFile}:prompt`);
+			entries.push({
+				vector: normalize(promptVector),
+				filePath: `${roundFile}:prompt`,
+				model: config.embeddingModel,
+			});
 
-			const respText = round.responseSequence.slice(0, MAX_RESPONSE_CHARS);
+			const respText = round.responseSequence.slice(0, config.embeddingMaxTokens);
 			if (respText) {
 				const respVector = await embedText(respText, apiKey, {
 					fetchImpl: options.fetchImpl,
+					config: embeddingConfig,
+					modelRegistry,
 				});
-				appendVectorIndexEntry(indexPath, normalize(respVector), `${roundFile}:response`);
+				entries.push({
+					vector: normalize(respVector),
+					filePath: `${roundFile}:response`,
+					model: config.embeddingModel,
+				});
+			}
+
+			if (needsModelReindex) {
+				replaceIndexEntriesForRoundFile(indexPath, roundFile, entries);
+			} else {
+				for (const entry of entries) {
+					appendVectorIndexEntry(indexPath, entry.vector, entry.filePath, entry.model);
+				}
 			}
 
 			completed++;
 			const pct = ((completed / totalNew) * 100).toFixed(1);
-			err.error(`  ✅ [${completed}/${totalNew} ${pct}%] ${roundId}`);
+			const action = needsModelReindex ? "re-indexed" : "embedded";
+			err.error(`  ✅ [${completed}/${totalNew} ${pct}%] ${roundId} (${action})`);
 		} catch (e) {
 			errors++;
 			err.error(`  ❌ [ERROR] ${roundId}: ${(e as Error).message}`);
