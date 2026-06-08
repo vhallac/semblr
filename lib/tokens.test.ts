@@ -37,12 +37,7 @@ describe("token estimation", () => {
 		});
 
 		it("skips null/undefined content", () => {
-			expect(
-				estimateMessagesTokens([
-					{ role: "user", content: null },
-					{ role: "assistant" },
-				]),
-			).toBe(0);
+			expect(estimateMessagesTokens([{ role: "user", content: null }, { role: "assistant" }])).toBe(0);
 		});
 
 		it("handles mixed string and block content", () => {

@@ -15,12 +15,12 @@ import * as path from "node:path";
 import type { ContextEvent, ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Type } from "@sinclair/typebox";
 import {
+	buildCheckpointSectionContent,
 	buildContextPreamble,
 	buildFinalResponseContract,
 	buildFollowUpSectionContent,
 	buildGroupedRecencyList,
 	buildRelevanceList,
-	buildCheckpointSectionContent,
 	formatFileSize,
 	splitCommandArgs,
 } from "../lib/context-format.ts";
@@ -54,7 +54,6 @@ import {
 	type MessageEndProcessingState,
 } from "../lib/round-capture.ts";
 import type { ChainEntry, CheckpointSummary, ResponseSegment, RoundData, ToolCallDetail } from "../lib/round-data.ts";
-import { estimateMessagesTokens } from "../lib/tokens.ts";
 import {
 	loadRoundDataForToolDetails,
 	renderRoundDetailsToolResult,
@@ -78,6 +77,7 @@ import {
 	recordPresented,
 	recordRead,
 } from "../lib/stats.ts";
+import { estimateMessagesTokens } from "../lib/tokens.ts";
 import { normalize } from "../lib/vector.ts";
 
 export {
@@ -610,7 +610,7 @@ export default function (pi: ExtensionAPI) {
 			newLevel = 3;
 		} else if (nonSystemTokens >= threshold * 0.85) {
 			newLevel = 2;
-		} else if (nonSystemTokens >= threshold * 0.70) {
+		} else if (nonSystemTokens >= threshold * 0.7) {
 			newLevel = 1;
 		}
 
@@ -625,7 +625,7 @@ export default function (pi: ExtensionAPI) {
 				? "You MUST stop IMMEDIATELY. Do not make any further tool calls except `semblr_checkpoint`. Call it now with your progress summary, then stop."
 				: newLevel === 2
 					? "You MUST wrap up your current work after this round. Before finishing, call the `semblr_checkpoint` tool with a summary of your progress. Then stop — do not start new work."
-				: "You SHOULD wrap up your current work after this round. Before finishing, call the `semblr_checkpoint` tool with a summary of your progress. Then stop — do not start new work.";
+					: "You SHOULD wrap up your current work after this round. Before finishing, call the `semblr_checkpoint` tool with a summary of your progress. Then stop — do not start new work.";
 
 		const warningText =
 			`[CONTEXT SIZE WARNING — LEVEL ${levelLabel}]
@@ -738,11 +738,7 @@ export default function (pi: ExtensionAPI) {
 				roundPresentedRecorded = true;
 			}
 
-			const finalMessages: unknown[] = applyContextSizeWarning(
-				cachedContextMessages,
-				currentMessages,
-				systemMsg,
-			);
+			const finalMessages: unknown[] = applyContextSizeWarning(cachedContextMessages, currentMessages, systemMsg);
 			return { messages: finalMessages } as any;
 		}
 
@@ -756,11 +752,7 @@ export default function (pi: ExtensionAPI) {
 					content: [{ type: "text" as const, text: buildFinalResponseContract() }],
 				};
 				const prefixMsgs: unknown[] = systemMsg ? [systemMsg, contractMsg] : [contractMsg];
-				const finalMessages: unknown[] = applyContextSizeWarning(
-					prefixMsgs,
-					currentMessages,
-					systemMsg,
-				);
+				const finalMessages: unknown[] = applyContextSizeWarning(prefixMsgs, currentMessages, systemMsg);
 				return { messages: finalMessages } as any;
 			}
 
@@ -788,11 +780,7 @@ export default function (pi: ExtensionAPI) {
 					content: [{ type: "text" as const, text: buildFinalResponseContract() }],
 				};
 				cachedContextMessages = systemMsg ? [systemMsg, contractMsg] : [contractMsg];
-				const finalMessages: unknown[] = applyContextSizeWarning(
-					cachedContextMessages,
-					currentMessages,
-					systemMsg,
-				);
+				const finalMessages: unknown[] = applyContextSizeWarning(cachedContextMessages, currentMessages, systemMsg);
 				return { messages: finalMessages } as any;
 			}
 
@@ -821,11 +809,7 @@ export default function (pi: ExtensionAPI) {
 					content: [{ type: "text" as const, text: buildFinalResponseContract() }],
 				};
 				cachedContextMessages = systemMsg ? [systemMsg, contractMsg] : [contractMsg];
-				const finalMessages: unknown[] = applyContextSizeWarning(
-					cachedContextMessages,
-					currentMessages,
-					systemMsg,
-				);
+				const finalMessages: unknown[] = applyContextSizeWarning(cachedContextMessages, currentMessages, systemMsg);
 				return { messages: finalMessages } as any;
 			}
 
@@ -909,11 +893,7 @@ export default function (pi: ExtensionAPI) {
 			cachedUserPromptForContext = userPrompt;
 			cachedContextMessages = [...finalMessages]; // snapshot before warning injection
 
-			const resultMessages = applyContextSizeWarning(
-				cachedContextMessages,
-				currentMessages,
-				systemMsg,
-			);
+			const resultMessages = applyContextSizeWarning(cachedContextMessages, currentMessages, systemMsg);
 
 			return { messages: resultMessages } as any;
 		} catch (err) {
@@ -1392,8 +1372,7 @@ export default function (pi: ExtensionAPI) {
 					description: "Concrete items completed so far, one per entry",
 				}),
 				currentState: Type.Array(Type.String(), {
-					description:
-						"Current state: files modified, decisions made, tests passing/failing, known issues",
+					description: "Current state: files modified, decisions made, tests passing/failing, known issues",
 				}),
 				nextSteps: Type.Array(Type.String(), {
 					description: "Concrete next actions, ordered by priority",

@@ -225,12 +225,20 @@ ${responseSequence}`;
  */
 export function buildCheckpointSectionContent(
 	fileName: string,
-	summary: { currentTask: string; progressMade: string[]; currentState: string[]; nextSteps: string[]; keyFindings: string[] },
+	summary: {
+		currentTask: string;
+		progressMade: string[];
+		currentState: string[];
+		nextSteps: string[];
+		keyFindings: string[];
+	},
 ): string {
 	const lines: string[] = [];
 	lines.push(`--- PREVIOUS ROUND CHECKPOINT ---`);
 	lines.push(`The previous round (${fileName}) was checkpointed due to context size limits.`);
-	lines.push(`Below is the progress summary from that round. Use this to understand what was in progress and resume work.`);
+	lines.push(
+		`Below is the progress summary from that round. Use this to understand what was in progress and resume work.`,
+	);
 	lines.push("");
 	lines.push(`## Current Task`);
 	lines.push(summary.currentTask);
