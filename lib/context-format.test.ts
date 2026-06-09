@@ -79,7 +79,7 @@ describe("context formatting", () => {
 		);
 
 		expect(list).toContain("--- RELEVANCE LIST (all sessions, by similarity) ---");
-		expect(list).toContain("1. round.json [0.88 | 2 tools (read (1KB), grep) | 10KB]:");
+		expect(list).toContain("1. round.json [0.88 | 2 tools (read×1 (1KB), grep×1) | 10KB]:");
 		expect(buildRelevanceList([])).toBeNull();
 	});
 

@@ -136,6 +136,28 @@ answer.`;
 	return lines.join("\n");
 }
 
+export function buildToolSummary(toolCalls: ContextToolCallDetail[], totalCount: number): string {
+	// Group tool calls by name, summing sizes
+	const grouped = new Map<string, { count: number; totalBytes: number }>();
+	for (const tc of toolCalls) {
+		const sourceText = tc.result_full ?? tc.result_summary ?? "";
+		const bytes = sourceText.length > 0 ? Buffer.byteLength(sourceText, "utf-8") : 0;
+		const entry = grouped.get(tc.name);
+		if (entry) {
+			entry.count++;
+			entry.totalBytes += bytes;
+		} else {
+			grouped.set(tc.name, { count: 1, totalBytes: bytes });
+		}
+	}
+
+	// Format as "name×count (size)" with stable ordering
+	const parts = Array.from(grouped.entries()).map(([name, info]) =>
+		info.totalBytes > 0 ? `${name}×${info.count} (${formatFileSize(info.totalBytes)})` : `${name}×${info.count}`,
+	);
+	return `${totalCount} tools (${parts.join(", ")})`;
+}
+
 export function buildRelevanceList(
 	rounds: RelevanceRound[],
 	getRoundSize: (fileName: string) => string | null = () => null,
@@ -160,13 +182,7 @@ If nothing rings a bell, ignore this list — it's a pre-filter, not a map.`;
 
 		let toolSummary = `${toolCount} tools`;
 		if (round.data.toolCalls && round.data.toolCalls.length > 0) {
-			const toolSizes = round.data.toolCalls.map((tc) => {
-				const sourceText = tc.result_full ?? tc.result_summary ?? "";
-				return sourceText.length > 0
-					? `${tc.name} (${formatFileSize(Buffer.byteLength(sourceText, "utf-8"))})`
-					: tc.name;
-			});
-			toolSummary = `${toolCount} tools (${toolSizes.join(", ")})`;
+			toolSummary = buildToolSummary(round.data.toolCalls, toolCount);
 		}
 
 		lines.push(
