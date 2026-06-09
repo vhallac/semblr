@@ -587,7 +587,8 @@ export default function (pi: ExtensionAPI) {
 	/** Compute the context-size warning level based on non-system tokens.
 	 *  Returns 0 (no warning), 1 (70% threshold), 2 (85%), or 3 (100%+).
 	 *  If the level is higher than the previously issued level, the
-	 *  warning message is injected between prefixMessages and currentMessages. */
+	 *  warning message is appended after currentMessages (last thing the
+	 *  LLM sees, minimal KV-cache disruption). */
 	function applyContextSizeWarning(
 		prefixMessages: unknown[],
 		currentMsgs: unknown[],
@@ -639,13 +640,15 @@ export default function (pi: ExtensionAPI) {
 ` +
 			`The semblr_checkpoint tool parameters are: currentTask (string), progressMade (string[]), currentState (string[]), nextSteps (string[]), keyFindings (string[]).`;
 
-		// Inject warning message between prefix and current messages
+		// Append warning message at the end — after current messages (including tool results).
+		// This positions the warning as the LAST thing the LLM sees, giving it full
+		// attention and minimising KV-cache disruption (only the tail shifts).
 		const warningMsg = {
 			role: "user" as const,
 			content: [{ type: "text" as const, text: warningText }],
 		};
 
-		return [...prefixMessages, warningMsg, ...currentMsgs];
+		return [...prefixMessages, ...currentMsgs, warningMsg];
 	}
 
 	pi.on("context", async (event: ContextEvent, ctx: ExtensionContext) => {
