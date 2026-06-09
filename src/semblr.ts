@@ -699,21 +699,11 @@ export default function (pi: ExtensionAPI) {
 			const recencyList = buildGroupedRecencyList(roundGroups, causalChain, getRoundSize);
 			const preamble = buildContextPreamble(!!recencyList, false);
 
-			// Follow-up injection: if previous round was flagged, include its full text
-			let followUpMsg: unknown | null = null;
-			if (lastRoundFileName && needsFollowupInjection(lastRoundFileName)) {
-				const followUpSection = buildFollowUpContext(lastRoundFileName);
-				if (followUpSection) {
-					followUpMsg = {
-						role: "user" as const,
-						content: [{ type: "text" as const, text: followUpSection }],
-					};
-					injectedFollowupRounds.add(lastRoundFileName);
-				}
-			}
-
-			// Checkpoint injection: if previous round was checkpointed, include its summary
+			// Checkpoint injection: if previous round was checkpointed, include its summary.
+			// When a checkpoint is present, suppress the follow-up (full round text) — the
+			// checkpoint already carries enough state for the agent to resume work.
 			let checkpointMsg: unknown | null = null;
+			let hasCheckpoint = false;
 			if (lastRoundFileName && needsCheckpointInjection(lastRoundFileName)) {
 				const checkpointSection = buildCheckpointContext(lastRoundFileName);
 				if (checkpointSection) {
@@ -722,6 +712,22 @@ export default function (pi: ExtensionAPI) {
 						content: [{ type: "text" as const, text: checkpointSection }],
 					};
 					injectedCheckpointRounds.add(lastRoundFileName);
+					hasCheckpoint = true;
+				}
+			}
+
+			// Follow-up injection: if previous round was flagged, include its full text.
+			// Suppressed when a checkpoint is present for the same round (checkpoint carries
+			// sufficient context and including both is redundant).
+			let followUpMsg: unknown | null = null;
+			if (!hasCheckpoint && lastRoundFileName && needsFollowupInjection(lastRoundFileName)) {
+				const followUpSection = buildFollowUpContext(lastRoundFileName);
+				if (followUpSection) {
+					followUpMsg = {
+						role: "user" as const,
+						content: [{ type: "text" as const, text: followUpSection }],
+					};
+					injectedFollowupRounds.add(lastRoundFileName);
 				}
 			}
 
@@ -842,24 +848,11 @@ export default function (pi: ExtensionAPI) {
 				);
 			}
 
-			// ── Follow-up injection: if previous round was flagged, include its ──
-			// full text so the LLM can see what question was asked.
-			// Gated by in-memory set to prevent re-injection on subsequent tool turns.
-			let followUpMsg: unknown | null = null;
-			if (lastRoundFileName && needsFollowupInjection(lastRoundFileName)) {
-				const followUpSection = buildFollowUpContext(lastRoundFileName);
-				if (followUpSection) {
-					followUpMsg = {
-						role: "user" as const,
-						content: [{ type: "text" as const, text: followUpSection }],
-					};
-					// Mark as injected so subsequent tool turns don't re-inject
-					injectedFollowupRounds.add(lastRoundFileName);
-				}
-			}
-
-			// Checkpoint injection: if previous round was checkpointed, include its summary
+			// Checkpoint injection: if previous round was checkpointed, include its summary.
+			// When a checkpoint is present, suppress the follow-up (full round text) — the
+			// checkpoint already carries enough state for the agent to resume work.
 			let checkpointMsg: unknown | null = null;
+			let hasCheckpoint = false;
 			if (lastRoundFileName && needsCheckpointInjection(lastRoundFileName)) {
 				const checkpointSection = buildCheckpointContext(lastRoundFileName);
 				if (checkpointSection) {
@@ -868,6 +861,23 @@ export default function (pi: ExtensionAPI) {
 						content: [{ type: "text" as const, text: checkpointSection }],
 					};
 					injectedCheckpointRounds.add(lastRoundFileName);
+					hasCheckpoint = true;
+				}
+			}
+
+			// Follow-up injection: if previous round was flagged, include its full text.
+			// Suppressed when a checkpoint is present for the same round (checkpoint carries
+			// sufficient context and including both is redundant).
+			let followUpMsg: unknown | null = null;
+			if (!hasCheckpoint && lastRoundFileName && needsFollowupInjection(lastRoundFileName)) {
+				const followUpSection = buildFollowUpContext(lastRoundFileName);
+				if (followUpSection) {
+					followUpMsg = {
+						role: "user" as const,
+						content: [{ type: "text" as const, text: followUpSection }],
+					};
+					// Mark as injected so subsequent tool turns don't re-inject
+					injectedFollowupRounds.add(lastRoundFileName);
 				}
 			}
 
