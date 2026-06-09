@@ -15,6 +15,7 @@ import * as path from "node:path";
 import type { ContextEvent, ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Type } from "@sinclair/typebox";
 import {
+	buildCheckpointSectionContent,
 	buildContextPreamble,
 	buildFinalResponseContract,
 	buildFollowUpSectionContent,
@@ -32,6 +33,7 @@ import {
 import { embedText, getApiKey } from "../lib/embedding-client.ts";
 import { assignToGroup, formatGroupStats, type SemanticGroup } from "../lib/grouping.ts";
 import { createRoundFilePath } from "../lib/hash.ts";
+import { indexRoundFileFromPath } from "../lib/index-io.ts";
 import {
 	appendToIndexPath,
 	buildSessionStartStatus,
@@ -52,7 +54,7 @@ import {
 	getRelatedParentIdFromGroup,
 	type MessageEndProcessingState,
 } from "../lib/round-capture.ts";
-import type { ChainEntry, ResponseSegment, RoundData, ToolCallDetail } from "../lib/round-data.ts";
+import type { ChainEntry, CheckpointSummary, ResponseSegment, RoundData, ToolCallDetail } from "../lib/round-data.ts";
 import {
 	loadRoundDataForToolDetails,
 	renderRoundDetailsToolResult,
@@ -76,6 +78,7 @@ import {
 	recordPresented,
 	recordRead,
 } from "../lib/stats.ts";
+import { estimateMessagesTokens } from "../lib/tokens.ts";
 import { normalize } from "../lib/vector.ts";
 
 export {
@@ -174,7 +177,50 @@ let lastFollowupGroupIdx: number | null = null;
  *  across agent restarts within the same session. Never modifies saved JSON. */
 let injectedFollowupRounds: Set<string> = new Set();
 
+// ─────────────────────────────────────────────
+// Context-size checkpoint — per-session state
+// ─────────────────────────────────────────────
+
+/** Most recent checkpoint summary set by the semblr_checkpoint tool.
+ *  Written by the tool execute handler, consumed by agent_end.
+ *  Reset at agent_start. */
+let lastCheckpointSummary: CheckpointSummary | null = null;
+
+/** Highest context-size warning level issued during this agent cycle.
+ *  0 = no warning, 1 = 70% threshold, 2 = 85%, 3 = 100%+.
+ *  Reset at agent_start. Used to prevent re-injection on tool turns
+ *  and to escalate if context grows further within the same cycle. */
+let contextWarningIssued = 0;
+
+/** In-memory set of round filenames whose checkpoint summary has already been
+ *  injected into context. Same pattern as injectedFollowupRounds.
+ *  Reset at session_start. */
+let injectedCheckpointRounds: Set<string> = new Set();
+
 const SEMBLR_GROUP_THRESHOLD = SEMBLR_CONFIG.groupThreshold;
+
+/** Build a flat text representation of a checkpoint summary for embedding. */
+function buildCheckpointSummaryText(summary: CheckpointSummary): string {
+	const lines: string[] = [];
+	lines.push(`Current Task: ${summary.currentTask}`);
+	if (summary.progressMade.length > 0) {
+		lines.push("Progress Made:");
+		for (const item of summary.progressMade) lines.push(`- ${item}`);
+	}
+	if (summary.currentState.length > 0) {
+		lines.push("Current State:");
+		for (const item of summary.currentState) lines.push(`- ${item}`);
+	}
+	if (summary.nextSteps.length > 0) {
+		lines.push("Next Steps:");
+		for (const item of summary.nextSteps) lines.push(`- ${item}`);
+	}
+	if (summary.keyFindings.length > 0) {
+		lines.push("Key Findings / Decisions:");
+		for (const item of summary.keyFindings) lines.push(`- ${item}`);
+	}
+	return lines.join("\n");
+}
 
 // Context formatting helpers live in lib/context-format.ts.
 
@@ -301,9 +347,9 @@ export function readRoundFileFromDir(
 	roundsDir: string = ROUNDS_DIR,
 	fsImpl: Pick<typeof fs, "existsSync" | "readFileSync"> = fs,
 ): RoundData | null {
-	// filePath may be "xxx.json:prompt", "xxx.json:response", or "xxx.json:round"
+	// filePath may be "xxx.json:prompt", "xxx.json:response", "xxx.json:round", or "xxx.json:summary"
 	// strip the suffix to get the actual file
-	const actualFile = filePath.replace(/(:prompt|:response|:round)$/, "");
+	const actualFile = indexRoundFileFromPath(filePath);
 	const fullPath = `${roundsDir}/${actualFile}`;
 	if (!fsImpl.existsSync(fullPath)) return null;
 	try {
@@ -337,6 +383,34 @@ function needsFollowupInjection(fileName: string): boolean {
 	} catch {
 		return false;
 	}
+}
+
+/** Check if the last round has a checkpoint summary that hasn't been injected yet. */
+function needsCheckpointInjection(fileName: string): boolean {
+	const fullPath = `${ROUNDS_DIR}/${fileName}`;
+	try {
+		if (!fs.existsSync(fullPath)) return false;
+		const parsed = JSON.parse(fs.readFileSync(fullPath, "utf-8"));
+		return parsed.summary != null && !injectedCheckpointRounds.has(fileName);
+	} catch {
+		return false;
+	}
+}
+
+/** Build the checkpoint injection section for context. */
+function buildCheckpointContext(fileName: string): string | null {
+	const fullPath = `${ROUNDS_DIR}/${fileName}`;
+	let summary: CheckpointSummary | null = null;
+	try {
+		if (fs.existsSync(fullPath)) {
+			const parsed = JSON.parse(fs.readFileSync(fullPath, "utf-8"));
+			if (parsed.summary) summary = parsed.summary as CheckpointSummary;
+		}
+	} catch {
+		return null;
+	}
+	if (!summary) return null;
+	return buildCheckpointSectionContent(fileName, summary);
 }
 
 // Per-agent accumulation (reset in agent_start, saved in agent_end)
@@ -510,6 +584,74 @@ export default function (pi: ExtensionAPI) {
 	// ────────────────────────────────────────────
 	// 1. context — assemble context from round repository
 	// ────────────────────────────────────────────
+
+	/** Compute the context-size warning level based on non-system tokens.
+	 *  Returns 0 (no warning), 1 (70% threshold), 2 (85%), or 3 (100%+).
+	 *  If the level is higher than the previously issued level, the
+	 *  warning message is appended after currentMessages (last thing the
+	 *  LLM sees, minimal KV-cache disruption). */
+	function applyContextSizeWarning(
+		prefixMessages: unknown[],
+		currentMsgs: unknown[],
+		systemMsg: unknown | null,
+	): unknown[] {
+		const threshold = SEMBLR_CONFIG.summaryThresholdExtra;
+		if (threshold <= 0) return [...prefixMessages, ...currentMsgs];
+
+		// Measure all messages including current (this is what the LLM will see)
+		const allMessages = [...prefixMessages, ...currentMsgs];
+		const totalTokens = estimateMessagesTokens(allMessages);
+
+		// Subtract system message tokens — user wants to ignore system prompt
+		const systemTokens = systemMsg ? estimateMessagesTokens([systemMsg]) : 0;
+		const nonSystemTokens = totalTokens - systemTokens;
+
+		// Compute warning level
+		let newLevel = 0;
+		if (nonSystemTokens >= threshold) {
+			newLevel = 3;
+		} else if (nonSystemTokens >= threshold * 0.85) {
+			newLevel = 2;
+		} else if (nonSystemTokens >= threshold * 0.7) {
+			newLevel = 1;
+		}
+
+		// Only inject if level increased (escalation) or first warning
+		if (newLevel <= contextWarningIssued) return allMessages;
+		contextWarningIssued = newLevel;
+
+		// Build the warning message
+		const levelLabel = newLevel === 3 ? "3 — IMMEDIATE" : String(newLevel);
+		const urgency =
+			newLevel === 3
+				? "You MUST stop IMMEDIATELY. Do not make any further tool calls except `semblr_checkpoint`. Call it now with your progress summary, then stop."
+				: newLevel === 2
+					? "You MUST wrap up your current work after this round. Before finishing, call the `semblr_checkpoint` tool with a summary of your progress. Then stop — do not start new work."
+					: "You SHOULD wrap up your current work after this round. Before finishing, call the `semblr_checkpoint` tool with a summary of your progress. Then stop — do not start new work.";
+
+		const warningText =
+			`[CONTEXT SIZE WARNING — LEVEL ${levelLabel}]
+
+` +
+			`Your context has grown to ${nonSystemTokens} non-system tokens (threshold: ${threshold}). This is the ${newLevel >= 3 ? "exceeded" : "approaching"} the configured limit.
+
+` +
+			`${urgency}
+
+` +
+			`The semblr_checkpoint tool parameters are: currentTask (string), progressMade (string[]), currentState (string[]), nextSteps (string[]), keyFindings (string[]).`;
+
+		// Append warning message at the end — after current messages (including tool results).
+		// This positions the warning as the LAST thing the LLM sees, giving it full
+		// attention and minimising KV-cache disruption (only the tail shifts).
+		const warningMsg = {
+			role: "user" as const,
+			content: [{ type: "text" as const, text: warningText }],
+		};
+
+		return [...prefixMessages, ...currentMsgs, warningMsg];
+	}
+
 	pi.on("context", async (event: ContextEvent, ctx: ExtensionContext) => {
 		const { messages } = event;
 
@@ -538,8 +680,7 @@ export default function (pi: ExtensionAPI) {
 		//     are stable across tool turns; only the currentMessages section changes.
 		if (cachedContextMessages && cachedEnvPreamble && userPrompt === cachedUserPromptForContext) {
 			// Compose: system + preamble + recency + relevance + current turn messages
-			const finalMessages = [...cachedContextMessages];
-			finalMessages.push(...currentMessages);
+			const finalMessages = applyContextSizeWarning(cachedContextMessages, currentMessages, systemMsg);
 			return { messages: finalMessages } as any;
 		}
 
@@ -558,9 +699,28 @@ export default function (pi: ExtensionAPI) {
 			const recencyList = buildGroupedRecencyList(roundGroups, causalChain, getRoundSize);
 			const preamble = buildContextPreamble(!!recencyList, false);
 
-			// Follow-up injection: if previous round was flagged, include its full text
+			// Checkpoint injection: if previous round was checkpointed, include its summary.
+			// When a checkpoint is present, suppress the follow-up (full round text) — the
+			// checkpoint already carries enough state for the agent to resume work.
+			let checkpointMsg: unknown | null = null;
+			let hasCheckpoint = false;
+			if (lastRoundFileName && needsCheckpointInjection(lastRoundFileName)) {
+				const checkpointSection = buildCheckpointContext(lastRoundFileName);
+				if (checkpointSection) {
+					checkpointMsg = {
+						role: "user" as const,
+						content: [{ type: "text" as const, text: checkpointSection }],
+					};
+					injectedCheckpointRounds.add(lastRoundFileName);
+					hasCheckpoint = true;
+				}
+			}
+
+			// Follow-up injection: if previous round was flagged, include its full text.
+			// Suppressed when a checkpoint is present for the same round (checkpoint carries
+			// sufficient context and including both is redundant).
 			let followUpMsg: unknown | null = null;
-			if (lastRoundFileName && needsFollowupInjection(lastRoundFileName)) {
+			if (!hasCheckpoint && lastRoundFileName && needsFollowupInjection(lastRoundFileName)) {
 				const followUpSection = buildFollowUpContext(lastRoundFileName);
 				if (followUpSection) {
 					followUpMsg = {
@@ -579,6 +739,7 @@ export default function (pi: ExtensionAPI) {
 			// Compose via buildContextMessagePrefix to keep all paths consistent
 			const prefixMsgs = buildContextMessagePrefix(systemMsg, preamble, recencyList, null, contractMsg);
 			if (followUpMsg) prefixMsgs.push(followUpMsg);
+			if (checkpointMsg) prefixMsgs.push(checkpointMsg);
 			cachedContextMessages = [...prefixMsgs];
 
 			// ══ Stats: record all 5 positions presented ══
@@ -587,7 +748,7 @@ export default function (pi: ExtensionAPI) {
 				roundPresentedRecorded = true;
 			}
 
-			const finalMessages: unknown[] = [...cachedContextMessages, ...currentMessages];
+			const finalMessages: unknown[] = applyContextSizeWarning(cachedContextMessages, currentMessages, systemMsg);
 			return { messages: finalMessages } as any;
 		}
 
@@ -600,9 +761,8 @@ export default function (pi: ExtensionAPI) {
 					role: "user" as const,
 					content: [{ type: "text" as const, text: buildFinalResponseContract() }],
 				};
-				const finalMessages: unknown[] = systemMsg
-					? [systemMsg, contractMsg, ...currentMessages]
-					: [contractMsg, ...currentMessages];
+				const prefixMsgs: unknown[] = systemMsg ? [systemMsg, contractMsg] : [contractMsg];
+				const finalMessages: unknown[] = applyContextSizeWarning(prefixMsgs, currentMessages, systemMsg);
 				return { messages: finalMessages } as any;
 			}
 
@@ -630,7 +790,7 @@ export default function (pi: ExtensionAPI) {
 					content: [{ type: "text" as const, text: buildFinalResponseContract() }],
 				};
 				cachedContextMessages = systemMsg ? [systemMsg, contractMsg] : [contractMsg];
-				const finalMessages: unknown[] = [...cachedContextMessages, ...currentMessages];
+				const finalMessages: unknown[] = applyContextSizeWarning(cachedContextMessages, currentMessages, systemMsg);
 				return { messages: finalMessages } as any;
 			}
 
@@ -659,7 +819,7 @@ export default function (pi: ExtensionAPI) {
 					content: [{ type: "text" as const, text: buildFinalResponseContract() }],
 				};
 				cachedContextMessages = systemMsg ? [systemMsg, contractMsg] : [contractMsg];
-				const finalMessages: unknown[] = [...cachedContextMessages, ...currentMessages];
+				const finalMessages: unknown[] = applyContextSizeWarning(cachedContextMessages, currentMessages, systemMsg);
 				return { messages: finalMessages } as any;
 			}
 
@@ -680,20 +840,36 @@ export default function (pi: ExtensionAPI) {
 					recordPresented(statsState, statsPresentedHashes, causalChain, TRACK_POSITIONS);
 					roundPresentedRecorded = true;
 				}
-				const uniqueRounds = new Set(
-					index.map((e: { filePath: string }) => e.filePath.replace(/(:prompt|:response|:round)$/, "")),
-				).size;
+				const uniqueRounds = new Set(index.map((e: { filePath: string }) => indexRoundFileFromPath(e.filePath)))
+					.size;
 				ctx.ui.setStatus(
 					"semblr",
 					`🧠 collapsed: ${selectedRounds.length} matched / ${uniqueRounds} total | ${formatGroupStats(roundGroups, SEMBLR_GROUP_THRESHOLD)}`,
 				);
 			}
 
-			// ── Follow-up injection: if previous round was flagged, include its ──
-			// full text so the LLM can see what question was asked.
-			// Gated by in-memory set to prevent re-injection on subsequent tool turns.
+			// Checkpoint injection: if previous round was checkpointed, include its summary.
+			// When a checkpoint is present, suppress the follow-up (full round text) — the
+			// checkpoint already carries enough state for the agent to resume work.
+			let checkpointMsg: unknown | null = null;
+			let hasCheckpoint = false;
+			if (lastRoundFileName && needsCheckpointInjection(lastRoundFileName)) {
+				const checkpointSection = buildCheckpointContext(lastRoundFileName);
+				if (checkpointSection) {
+					checkpointMsg = {
+						role: "user" as const,
+						content: [{ type: "text" as const, text: checkpointSection }],
+					};
+					injectedCheckpointRounds.add(lastRoundFileName);
+					hasCheckpoint = true;
+				}
+			}
+
+			// Follow-up injection: if previous round was flagged, include its full text.
+			// Suppressed when a checkpoint is present for the same round (checkpoint carries
+			// sufficient context and including both is redundant).
 			let followUpMsg: unknown | null = null;
-			if (lastRoundFileName && needsFollowupInjection(lastRoundFileName)) {
+			if (!hasCheckpoint && lastRoundFileName && needsFollowupInjection(lastRoundFileName)) {
 				const followUpSection = buildFollowUpContext(lastRoundFileName);
 				if (followUpSection) {
 					followUpMsg = {
@@ -710,7 +886,7 @@ export default function (pi: ExtensionAPI) {
 				content: [{ type: "text" as const, text: buildFinalResponseContract() }],
 			};
 
-			// Build prefix: system + preamble + recency + relevance [+ followUp] + contract
+			// Build prefix: system + preamble + recency + relevance [+ followUp] [+ checkpoint] + contract
 			const prefixMsgs: unknown[] = [];
 			if (systemMsg) prefixMsgs.push(systemMsg);
 			if (preamble) prefixMsgs.push({ role: "user" as const, content: [{ type: "text" as const, text: preamble }] });
@@ -719,6 +895,7 @@ export default function (pi: ExtensionAPI) {
 			if (relevanceList)
 				prefixMsgs.push({ role: "user" as const, content: [{ type: "text" as const, text: relevanceList }] });
 			if (followUpMsg) prefixMsgs.push(followUpMsg);
+			if (checkpointMsg) prefixMsgs.push(checkpointMsg);
 			if (contractMsg) prefixMsgs.push(contractMsg);
 			const finalMessages = prefixMsgs;
 
@@ -727,11 +904,11 @@ export default function (pi: ExtensionAPI) {
 			// appended fresh each time.
 			cachedEnvPreamble = envPreamble;
 			cachedUserPromptForContext = userPrompt;
-			cachedContextMessages = [...finalMessages]; // snapshot before mutation below
+			cachedContextMessages = [...finalMessages]; // snapshot before warning injection
 
-			finalMessages.push(...currentMessages);
+			const resultMessages = applyContextSizeWarning(cachedContextMessages, currentMessages, systemMsg);
 
-			return { messages: finalMessages } as any;
+			return { messages: resultMessages } as any;
 		} catch (err) {
 			ctx.ui.setStatus("semblr", `🧠 error: ${(err as Error).message}`);
 		}
@@ -764,6 +941,10 @@ export default function (pi: ExtensionAPI) {
 		cachedEnvPreamble = null;
 		cachedContextMessages = null;
 		cachedUserPromptForContext = null;
+
+		// Reset checkpoint state — new agent cycle starts fresh
+		lastCheckpointSummary = null;
+		contextWarningIssued = 0;
 	});
 
 	pi.on("message_end", async (event, _ctx) => {
@@ -858,6 +1039,7 @@ export default function (pi: ExtensionAPI) {
 			responseSegments: agentResponseSegments,
 			parentId,
 			needsFollowup,
+			summary: lastCheckpointSummary ?? undefined,
 		});
 
 		try {
@@ -902,6 +1084,13 @@ export default function (pi: ExtensionAPI) {
 				// Write :response row to index (skip :prompt -- prompt was noise)
 				appendToIndex(`${roundFileName}:response`, responseVec, SEMBLR_CONFIG.embeddingModel);
 
+				// Embed checkpoint summary if present
+				if (lastCheckpointSummary) {
+					const summaryText = buildCheckpointSummaryText(lastCheckpointSummary);
+					const summaryVec = normalize(await embedText(summaryText, apiKey, embeddingClientDeps(ctx)));
+					appendToIndex(`${roundFileName}:summary`, summaryVec, SEMBLR_CONFIG.embeddingModel);
+				}
+
 				ctx.ui.setStatus("semblr", `🧠 saved + response-embedded round (${roundFileName})`);
 
 				finalizeRoundEmbedding({
@@ -935,6 +1124,13 @@ export default function (pi: ExtensionAPI) {
 				appendToIndex(`${roundFileName}:prompt`, normalize(promptVec), SEMBLR_CONFIG.embeddingModel);
 				appendToIndex(`${roundFileName}:response`, normalize(responseVec), SEMBLR_CONFIG.embeddingModel);
 
+				// Embed checkpoint summary if present
+				if (lastCheckpointSummary) {
+					const summaryText = buildCheckpointSummaryText(lastCheckpointSummary);
+					const summaryVec = normalize(await embedText(summaryText, apiKey, embeddingClientDeps(ctx)));
+					appendToIndex(`${roundFileName}:summary`, summaryVec, SEMBLR_CONFIG.embeddingModel);
+				}
+
 				ctx.ui.setStatus("semblr", `\u{1f9e0} saved + embedded round (${roundFileName})`);
 
 				finalizeRoundEmbedding({
@@ -958,9 +1154,7 @@ export default function (pi: ExtensionAPI) {
 		// Combine chain-read stats with total indexed rounds count
 		const indexExists = fs.existsSync(INDEX_PATH);
 		const idx = indexExists ? loadIndex() : [];
-		const totalRounds = new Set(
-			idx.map((e: { filePath: string }) => e.filePath.replace(/(:prompt|:response|:round)$/, "")),
-		).size;
+		const totalRounds = new Set(idx.map((e: { filePath: string }) => indexRoundFileFromPath(e.filePath))).size;
 		ctx.ui.setStatus(
 			"semblr",
 			`🧠 ${totalRounds} total indexed | ${formatGroupStats(roundGroups, SEMBLR_GROUP_THRESHOLD)}`,
@@ -988,6 +1182,7 @@ export default function (pi: ExtensionAPI) {
 		roundGroups = [];
 		lastFollowupGroupIdx = null;
 		injectedFollowupRounds = new Set();
+		injectedCheckpointRounds = new Set();
 
 		const index = loadSessionStartIndex();
 		ctx.ui.setStatus("semblr", buildSessionStartStatus(index));
@@ -1168,6 +1363,66 @@ export default function (pi: ExtensionAPI) {
 				const loaded = loadRoundDataForToolDetails(`${ROUNDS_DIR}/${p.round}`, p.round);
 				if (!loaded.ok) return loaded.result;
 				return renderToolDetailsToolResult(p, loaded.roundData);
+			},
+		});
+
+		// Register semblr_checkpoint — progress checkpoint for context-size warnings
+		// Always registered; the agent is instructed NOT to call it unless a context-size
+		// warning prompt explicitly tells it to. Dynamic registration would wreck the cache.
+		pi.registerTool({
+			name: "semblr_checkpoint",
+			label: "Semblr Checkpoint",
+			description:
+				"INTERNAL: Records a progress checkpoint. DO NOT call this tool unless explicitly instructed to do so by a context size warning in the conversation. Calling this tool without being instructed is a waste of tokens.",
+			promptSnippet: "Records a progress checkpoint (internal use only)",
+			parameters: Type.Object({
+				currentTask: Type.String({
+					description: "1-2 sentence summary of the current task you were working on",
+				}),
+				progressMade: Type.Array(Type.String(), {
+					description: "Concrete items completed so far, one per entry",
+				}),
+				currentState: Type.Array(Type.String(), {
+					description: "Current state: files modified, decisions made, tests passing/failing, known issues",
+				}),
+				nextSteps: Type.Array(Type.String(), {
+					description: "Concrete next actions, ordered by priority",
+				}),
+				keyFindings: Type.Array(Type.String(), {
+					description: "Important discoveries, design decisions, rationale",
+				}),
+			}),
+			async execute(_toolCallId, params, _signal, _onUpdate, _ctx2) {
+				const p = params as CheckpointSummary;
+				// Only store if a context-size warning was actually issued this cycle.
+				// This prevents the agent from calling it unsolicited and corrupting state.
+				if (contextWarningIssued > 0) {
+					lastCheckpointSummary = {
+						currentTask: p.currentTask,
+						progressMade: p.progressMade,
+						currentState: p.currentState,
+						nextSteps: p.nextSteps,
+						keyFindings: p.keyFindings,
+					};
+					return {
+						content: [
+							{
+								type: "text",
+								text: "Checkpoint recorded. Your progress summary has been saved. You may now stop — do not start new work.",
+							},
+						],
+						details: {},
+					};
+				}
+				return {
+					content: [
+						{
+							type: "text",
+							text: "No context size warning is active. This tool should not be called without being instructed. No checkpoint was saved.",
+						},
+					],
+					details: {},
+				};
 			},
 		});
 

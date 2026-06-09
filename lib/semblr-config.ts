@@ -15,6 +15,7 @@ export interface SemblrConfig {
 	embedTimeoutMs: number;
 	embedMaxRetries: number;
 	embedBackoffMs: number;
+	summaryThresholdExtra: number;
 }
 
 export interface SemblrConfigEnv {
@@ -29,6 +30,7 @@ export interface SemblrConfigEnv {
 	SEMBLR_EMBED_TIMEOUT?: string;
 	SEMBLR_EMBED_RETRIES?: string;
 	SEMBLR_EMBED_BACKOFF?: string;
+	SEMBLR_SUMMARY_THRESHOLD_EXTRA?: string;
 }
 
 export interface SemblrConfigDeps {
@@ -53,6 +55,7 @@ const DEFAULTS = {
 	embedTimeoutMs: 15_000,
 	embedMaxRetries: 3,
 	embedBackoffMs: 1000,
+	summaryThresholdExtra: 40000,
 };
 
 const ENV_KEYS = {
@@ -66,6 +69,7 @@ const ENV_KEYS = {
 	embedTimeoutMs: "SEMBLR_EMBED_TIMEOUT",
 	embedMaxRetries: "SEMBLR_EMBED_RETRIES",
 	embedBackoffMs: "SEMBLR_EMBED_BACKOFF",
+	summaryThresholdExtra: "SEMBLR_SUMMARY_THRESHOLD_EXTRA",
 } satisfies Record<ConfigKey, keyof SemblrConfigEnv>;
 
 function defaultAgentDir(env: SemblrConfigEnv): string {
@@ -216,6 +220,14 @@ export function loadSemblrConfig(deps: SemblrConfigDeps = {}): SemblrConfig {
 		embedTimeoutMs: resolveNumber("embedTimeoutMs", DEFAULTS.embedTimeoutMs, env, mergedSettings, {}, warn),
 		embedMaxRetries: resolveNumber("embedMaxRetries", DEFAULTS.embedMaxRetries, env, mergedSettings, {}, warn),
 		embedBackoffMs: resolveNumber("embedBackoffMs", DEFAULTS.embedBackoffMs, env, mergedSettings, {}, warn),
+		summaryThresholdExtra: resolveNumber(
+			"summaryThresholdExtra",
+			DEFAULTS.summaryThresholdExtra,
+			env,
+			mergedSettings,
+			{},
+			warn,
+		),
 	};
 }
 

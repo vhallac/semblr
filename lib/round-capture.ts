@@ -1,7 +1,7 @@
 import * as fs from "node:fs";
 import { computeContentHash } from "./hash.ts";
 import { extractText } from "./message-content.ts";
-import type { ChainEntry, ResponseSegment, RoundData, ToolCallDetail } from "./round-data.ts";
+import type { ChainEntry, CheckpointSummary, ResponseSegment, RoundData, ToolCallDetail } from "./round-data.ts";
 
 export function extractAgentEndUserPrompt(cachedPrompt: string | null, messages?: readonly unknown[]): string {
 	let userPrompt = cachedPrompt ?? "";
@@ -71,6 +71,7 @@ export function buildAgentEndRoundData(args: {
 	parentId: string | null;
 	userTimestamp?: number;
 	needsFollowup?: boolean;
+	summary?: CheckpointSummary;
 }): Record<string, unknown> {
 	return {
 		id: computeContentHash(args.userPrompt, args.responseText, args.toolCalls),
@@ -86,6 +87,7 @@ export function buildAgentEndRoundData(args: {
 		parentId: args.parentId,
 		relatedParentId: null,
 		needsFollowup: args.needsFollowup ?? false,
+		...(args.summary ? { summary: args.summary } : {}),
 	};
 }
 

@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { indexRoundFileFromPath } from "./index-io.ts";
 import type { IndexEntry } from "./index-storage.ts";
 import type { RoundData } from "./round-data.ts";
 import {
@@ -84,6 +85,7 @@ describe("collectSearchRoundScores", () => {
 		{ filePath: "rounds/abc.json:prompt", vector: [1, 0, 0] },
 		{ filePath: "rounds/abc.json:response", vector: [0.9, 0.1, 0] },
 		{ filePath: "rounds/def.json:round", vector: [0, 1, 0] },
+		{ filePath: "rounds/ghi.json:summary", vector: [0, 0, 1] },
 	];
 
 	const roundDataMap: Record<string, RoundData> = {
@@ -97,17 +99,22 @@ describe("collectSearchRoundScores", () => {
 			responseSequence: "another response",
 			turnIndex: 0,
 		},
+		"rounds/ghi.json": {
+			userPrompt: "checkpoint summary input",
+			responseSequence: "checkpoint summary output",
+			turnIndex: 1,
+		},
 	};
 
 	function readRound(filePath: string): RoundData | null {
-		const roundFile = filePath.replace(/(:prompt|:response|:round)$/, "");
+		const roundFile = indexRoundFileFromPath(filePath);
 		return roundDataMap[roundFile] ?? null;
 	}
 
 	it("scores and returns rounds sorted by similarity", () => {
 		const queryVec = [1, 0, 0]; // close to abc
 		const results = collectSearchRoundScores(index, queryVec, readRound);
-		expect(results).toHaveLength(2);
+		expect(results).toHaveLength(3);
 		// abc should have higher score than def
 		expect(results[0].fileName).toBe("rounds/abc.json");
 		expect(results[0].bestScore).toBeGreaterThan(results[1].bestScore);
@@ -132,6 +139,16 @@ describe("collectSearchRoundScores", () => {
 		expect(abcEntry).toBeDefined();
 		// Should be 1.0 (exact match with prompt vector)
 		expect(abcEntry?.bestScore).toBeCloseTo(1.0, 5);
+	});
+
+	it("matches :summary entries", () => {
+		// ghi.json:summary vector [0,0,1] should match query [0,0,1] exactly
+		const queryVec = [0, 0, 1];
+		const results = collectSearchRoundScores(index, queryVec, readRound);
+		expect(results).toHaveLength(3);
+		const ghiEntry = results.find((r) => r.fileName === "rounds/ghi.json");
+		expect(ghiEntry).toBeDefined();
+		expect(ghiEntry?.bestScore).toBeCloseTo(1.0, 5);
 	});
 });
 

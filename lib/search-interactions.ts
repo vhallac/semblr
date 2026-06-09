@@ -1,4 +1,5 @@
 import { formatFileSize } from "./context-format.ts";
+import { indexRoundFileFromPath } from "./index-io.ts";
 import type { IndexEntry } from "./index-storage.ts";
 import type { RoundData, ToolCallDetail, ToolResult } from "./round-data.ts";
 import { estimateTokens } from "./tokens.ts";
@@ -43,7 +44,7 @@ export function filterSearchIndexByRounds(
 	if (!scopeRounds || scopeRounds.length === 0) return [...index];
 	const scopeSet = new Set(scopeRounds);
 	return index.filter((entry) => {
-		const roundFile = entry.filePath.replace(/(:prompt|:response|:round)$/, "");
+		const roundFile = indexRoundFileFromPath(entry.filePath);
 		return scopeSet.has(roundFile);
 	});
 }
@@ -59,7 +60,7 @@ export function collectSearchRoundScores(
 
 	const roundScores = new Map<string, SearchRoundScore>();
 	for (const entry of scored) {
-		const roundFile = entry.filePath.replace(/(:prompt|:response|:round)$/, "");
+		const roundFile = indexRoundFileFromPath(entry.filePath);
 		if (!roundFile.endsWith(".json")) continue;
 		if (roundScores.has(roundFile)) continue;
 		const roundData = readRound(entry.filePath);

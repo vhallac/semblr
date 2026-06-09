@@ -18,6 +18,7 @@ import { computeContentHash } from "../lib/hash.ts";
 import {
 	appendVectorIndexEntry,
 	findStaleContentMatches as findStaleContentMatchesInDir,
+	indexRoundFileFromPath,
 	loadVectorIndex,
 	migrateIndexEntries as migrateIndexEntriesFile,
 } from "../lib/index-io.ts";
@@ -136,7 +137,7 @@ export async function runDigestSession(options: DigestSessionOptions = {}): Prom
 
 		// Refresh existing set after potential deletions
 		const freshExisting = new Set(
-			loadVectorIndex(indexPath).map((e) => path.basename(e.filePath.replace(/(:prompt|:response|:round)$/, ""))),
+			loadVectorIndex(indexPath).map((e) => path.basename(indexRoundFileFromPath(e.filePath))),
 		);
 		if (freshExisting.has(roundFile)) {
 			skipped++;

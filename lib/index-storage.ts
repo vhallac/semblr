@@ -1,4 +1,5 @@
 import * as fs from "node:fs";
+import { indexRoundFileFromPath } from "./index-io.ts";
 
 export interface IndexEntry {
 	filePath: string;
@@ -35,7 +36,7 @@ export function loadSessionStartIndex(
 }
 
 export function countUniqueIndexedRounds(index: readonly { filePath: string }[]): number {
-	return new Set(index.map((e) => e.filePath.replace(/(:prompt|:response|:round)$/, ""))).size;
+	return new Set(index.map((e) => indexRoundFileFromPath(e.filePath))).size;
 }
 
 export function buildSessionStartStatus(index: readonly { filePath: string }[]): string {
