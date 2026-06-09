@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { indexRoundFileFromPath } from "./index-io.ts";
 import type { IndexEntry } from "./index-storage.ts";
 import type { RoundData } from "./round-data.ts";
 import {
@@ -106,7 +107,7 @@ describe("collectSearchRoundScores", () => {
 	};
 
 	function readRound(filePath: string): RoundData | null {
-		const roundFile = filePath.replace(/(:prompt|:response|:round|:summary)$/, "");
+		const roundFile = indexRoundFileFromPath(filePath);
 		return roundDataMap[roundFile] ?? null;
 	}
 

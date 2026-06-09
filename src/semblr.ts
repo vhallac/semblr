@@ -33,6 +33,7 @@ import {
 import { embedText, getApiKey } from "../lib/embedding-client.ts";
 import { assignToGroup, formatGroupStats, type SemanticGroup } from "../lib/grouping.ts";
 import { createRoundFilePath } from "../lib/hash.ts";
+import { indexRoundFileFromPath } from "../lib/index-io.ts";
 import {
 	appendToIndexPath,
 	buildSessionStartStatus,
@@ -348,7 +349,7 @@ export function readRoundFileFromDir(
 ): RoundData | null {
 	// filePath may be "xxx.json:prompt", "xxx.json:response", "xxx.json:round", or "xxx.json:summary"
 	// strip the suffix to get the actual file
-	const actualFile = filePath.replace(/(:prompt|:response|:round|:summary)$/, "");
+	const actualFile = indexRoundFileFromPath(filePath);
 	const fullPath = `${roundsDir}/${actualFile}`;
 	if (!fsImpl.existsSync(fullPath)) return null;
 	try {
@@ -833,9 +834,8 @@ export default function (pi: ExtensionAPI) {
 					recordPresented(statsState, statsPresentedHashes, causalChain, TRACK_POSITIONS);
 					roundPresentedRecorded = true;
 				}
-				const uniqueRounds = new Set(
-					index.map((e: { filePath: string }) => e.filePath.replace(/(:prompt|:response|:round|:summary)$/, "")),
-				).size;
+				const uniqueRounds = new Set(index.map((e: { filePath: string }) => indexRoundFileFromPath(e.filePath)))
+					.size;
 				ctx.ui.setStatus(
 					"semblr",
 					`🧠 collapsed: ${selectedRounds.length} matched / ${uniqueRounds} total | ${formatGroupStats(roundGroups, SEMBLR_GROUP_THRESHOLD)}`,
@@ -1144,9 +1144,7 @@ export default function (pi: ExtensionAPI) {
 		// Combine chain-read stats with total indexed rounds count
 		const indexExists = fs.existsSync(INDEX_PATH);
 		const idx = indexExists ? loadIndex() : [];
-		const totalRounds = new Set(
-			idx.map((e: { filePath: string }) => e.filePath.replace(/(:prompt|:response|:round|:summary)$/, "")),
-		).size;
+		const totalRounds = new Set(idx.map((e: { filePath: string }) => indexRoundFileFromPath(e.filePath))).size;
 		ctx.ui.setStatus(
 			"semblr",
 			`🧠 ${totalRounds} total indexed | ${formatGroupStats(roundGroups, SEMBLR_GROUP_THRESHOLD)}`,
