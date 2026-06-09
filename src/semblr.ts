@@ -346,9 +346,9 @@ export function readRoundFileFromDir(
 	roundsDir: string = ROUNDS_DIR,
 	fsImpl: Pick<typeof fs, "existsSync" | "readFileSync"> = fs,
 ): RoundData | null {
-	// filePath may be "xxx.json:prompt", "xxx.json:response", or "xxx.json:round"
+	// filePath may be "xxx.json:prompt", "xxx.json:response", "xxx.json:round", or "xxx.json:summary"
 	// strip the suffix to get the actual file
-	const actualFile = filePath.replace(/(:prompt|:response|:round)$/, "");
+	const actualFile = filePath.replace(/(:prompt|:response|:round|:summary)$/, "");
 	const fullPath = `${roundsDir}/${actualFile}`;
 	if (!fsImpl.existsSync(fullPath)) return null;
 	try {
@@ -834,7 +834,7 @@ export default function (pi: ExtensionAPI) {
 					roundPresentedRecorded = true;
 				}
 				const uniqueRounds = new Set(
-					index.map((e: { filePath: string }) => e.filePath.replace(/(:prompt|:response|:round)$/, "")),
+					index.map((e: { filePath: string }) => e.filePath.replace(/(:prompt|:response|:round|:summary)$/, "")),
 				).size;
 				ctx.ui.setStatus(
 					"semblr",
@@ -1145,7 +1145,7 @@ export default function (pi: ExtensionAPI) {
 		const indexExists = fs.existsSync(INDEX_PATH);
 		const idx = indexExists ? loadIndex() : [];
 		const totalRounds = new Set(
-			idx.map((e: { filePath: string }) => e.filePath.replace(/(:prompt|:response|:round)$/, "")),
+			idx.map((e: { filePath: string }) => e.filePath.replace(/(:prompt|:response|:round|:summary)$/, "")),
 		).size;
 		ctx.ui.setStatus(
 			"semblr",

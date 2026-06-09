@@ -136,7 +136,9 @@ export async function runDigestSession(options: DigestSessionOptions = {}): Prom
 
 		// Refresh existing set after potential deletions
 		const freshExisting = new Set(
-			loadVectorIndex(indexPath).map((e) => path.basename(e.filePath.replace(/(:prompt|:response|:round)$/, ""))),
+			loadVectorIndex(indexPath).map((e) =>
+				path.basename(e.filePath.replace(/(:prompt|:response|:round|:summary)$/, "")),
+			),
 		);
 		if (freshExisting.has(roundFile)) {
 			skipped++;

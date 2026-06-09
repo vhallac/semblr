@@ -43,7 +43,7 @@ export function filterSearchIndexByRounds(
 	if (!scopeRounds || scopeRounds.length === 0) return [...index];
 	const scopeSet = new Set(scopeRounds);
 	return index.filter((entry) => {
-		const roundFile = entry.filePath.replace(/(:prompt|:response|:round)$/, "");
+		const roundFile = entry.filePath.replace(/(:prompt|:response|:round|:summary)$/, "");
 		return scopeSet.has(roundFile);
 	});
 }
@@ -59,7 +59,7 @@ export function collectSearchRoundScores(
 
 	const roundScores = new Map<string, SearchRoundScore>();
 	for (const entry of scored) {
-		const roundFile = entry.filePath.replace(/(:prompt|:response|:round)$/, "");
+		const roundFile = entry.filePath.replace(/(:prompt|:response|:round|:summary)$/, "");
 		if (!roundFile.endsWith(".json")) continue;
 		if (roundScores.has(roundFile)) continue;
 		const roundData = readRound(entry.filePath);

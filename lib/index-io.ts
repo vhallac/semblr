@@ -57,7 +57,7 @@ export function loadVectorIndex(indexPath: string): VectorIndexEntry[] {
 }
 
 export function indexRoundFileFromPath(filePath: string): string {
-	return filePath.replace(/(:prompt|:response|:round)$/, "");
+	return filePath.replace(/(:prompt|:response|:round|:summary)$/, "");
 }
 
 export function loadIndexedRoundFiles(indexPath: string): Set<string> {

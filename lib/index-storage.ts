@@ -35,7 +35,7 @@ export function loadSessionStartIndex(
 }
 
 export function countUniqueIndexedRounds(index: readonly { filePath: string }[]): number {
-	return new Set(index.map((e) => e.filePath.replace(/(:prompt|:response|:round)$/, ""))).size;
+	return new Set(index.map((e) => e.filePath.replace(/(:prompt|:response|:round|:summary)$/, ""))).size;
 }
 
 export function buildSessionStartStatus(index: readonly { filePath: string }[]): string {
