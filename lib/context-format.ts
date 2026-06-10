@@ -206,7 +206,33 @@ The lists below show past conversation rounds. Each entry contains only the user
 Use get_round_details("hash.json") to expand a round's full conversation.
 Use get_tool_details("hash.json", N) to inspect tool call N within a round.
 
-Format: [index: N] hash.json [score | N tools | size]: followed by the full user prompt (indented).`;
+Format: [index: N] hash.json [score | N tools | size]: followed by the full user prompt (indented).
+
+These tools exist because you forget everything between rounds. See the SESSION ARCHITECTURE section for details.`;
+}
+
+/**
+ * Build the SESSION ARCHITECTURE section — informs the LLM about the
+ * fundamental constraint that information dies at round boundaries and
+ * must be explicitly carried forward via survival mechanisms.
+ *
+ * Injected unconditionally (even on short-prompt fast path) after the
+ * system message and before the context preamble, because this is
+ * foundational session knowledge, not prompt-specific tool instruction.
+ *
+ * Stage 1 covers follow-up injection and checkpoint. Stage 2 (post-#68)
+ * adds the working memory bullet.
+ */
+export function buildSessionArchitecture(): string {
+	return `--- SESSION ARCHITECTURE ---
+Each conversation round starts fresh. Your previous responses, tool results, and
+reasoning from earlier rounds are NOT visible unless they are explicitly injected
+through one of semblr's survival mechanisms:
+
+- **Follow-up injection:** \`round_needs_followup\` on your last line pulls the
+  full previous round into the next round's context.
+- **Checkpoint:** \`semblr_checkpoint\` persists a structured progress summary
+  across context-size boundaries.`;
 }
 
 export function formatFileSize(bytes: number): string {

@@ -21,6 +21,7 @@ import {
 	buildFollowUpSectionContent,
 	buildGroupedRecencyList,
 	buildRelevanceList,
+	buildSessionArchitecture,
 	formatFileSize,
 	splitCommandArgs,
 } from "../lib/context-format.ts";
@@ -731,13 +732,22 @@ export default function (pi: ExtensionAPI) {
 				}
 			}
 
+			const sessionArchitecture = buildSessionArchitecture();
+
 			const contractMsg = {
 				role: "user" as const,
 				content: [{ type: "text" as const, text: buildFinalResponseContract() }],
 			};
 
 			// Compose via buildContextMessagePrefix to keep all paths consistent
-			const prefixMsgs = buildContextMessagePrefix(systemMsg, preamble, recencyList, null, contractMsg);
+			const prefixMsgs = buildContextMessagePrefix(
+				systemMsg,
+				sessionArchitecture,
+				preamble,
+				recencyList,
+				null,
+				contractMsg,
+			);
 			if (followUpMsg) prefixMsgs.push(followUpMsg);
 			if (checkpointMsg) prefixMsgs.push(checkpointMsg);
 			cachedContextMessages = [...prefixMsgs];
@@ -757,11 +767,21 @@ export default function (pi: ExtensionAPI) {
 		try {
 			const apiKey = await getApiKey(ctx, { config: SEMBLR_CONFIG });
 			if (!apiKey) {
+				const sessionArchitecture = buildSessionArchitecture();
 				const contractMsg = {
 					role: "user" as const,
 					content: [{ type: "text" as const, text: buildFinalResponseContract() }],
 				};
-				const prefixMsgs: unknown[] = systemMsg ? [systemMsg, contractMsg] : [contractMsg];
+				const prefixMsgs: unknown[] = systemMsg
+					? [
+							systemMsg,
+							{ role: "user" as const, content: [{ type: "text" as const, text: sessionArchitecture }] },
+							contractMsg,
+						]
+					: [
+							{ role: "user" as const, content: [{ type: "text" as const, text: sessionArchitecture }] },
+							contractMsg,
+						];
 				const finalMessages: unknown[] = applyContextSizeWarning(prefixMsgs, currentMessages, systemMsg);
 				return { messages: finalMessages } as any;
 			}
@@ -785,11 +805,21 @@ export default function (pi: ExtensionAPI) {
 				// Final response contract + current messages (no context lists)
 				cachedEnvPreamble = envPreamble;
 				cachedUserPromptForContext = userPrompt;
+				const sessionArchitecture = buildSessionArchitecture();
 				const contractMsg = {
 					role: "user" as const,
 					content: [{ type: "text" as const, text: buildFinalResponseContract() }],
 				};
-				cachedContextMessages = systemMsg ? [systemMsg, contractMsg] : [contractMsg];
+				cachedContextMessages = systemMsg
+					? [
+							systemMsg,
+							{ role: "user" as const, content: [{ type: "text" as const, text: sessionArchitecture }] },
+							contractMsg,
+						]
+					: [
+							{ role: "user" as const, content: [{ type: "text" as const, text: sessionArchitecture }] },
+							contractMsg,
+						];
 				const finalMessages: unknown[] = applyContextSizeWarning(cachedContextMessages, currentMessages, systemMsg);
 				return { messages: finalMessages } as any;
 			}
@@ -814,11 +844,21 @@ export default function (pi: ExtensionAPI) {
 				// Cache the empty-context result so subsequent turns reuse it
 				cachedEnvPreamble = envPreamble;
 				cachedUserPromptForContext = userPrompt;
+				const sessionArchitecture = buildSessionArchitecture();
 				const contractMsg = {
 					role: "user" as const,
 					content: [{ type: "text" as const, text: buildFinalResponseContract() }],
 				};
-				cachedContextMessages = systemMsg ? [systemMsg, contractMsg] : [contractMsg];
+				cachedContextMessages = systemMsg
+					? [
+							systemMsg,
+							{ role: "user" as const, content: [{ type: "text" as const, text: sessionArchitecture }] },
+							contractMsg,
+						]
+					: [
+							{ role: "user" as const, content: [{ type: "text" as const, text: sessionArchitecture }] },
+							contractMsg,
+						];
 				const finalMessages: unknown[] = applyContextSizeWarning(cachedContextMessages, currentMessages, systemMsg);
 				return { messages: finalMessages } as any;
 			}
@@ -881,14 +921,18 @@ export default function (pi: ExtensionAPI) {
 				}
 			}
 
+			const sessionArchitecture = buildSessionArchitecture();
+
 			const contractMsg = {
 				role: "user" as const,
 				content: [{ type: "text" as const, text: buildFinalResponseContract() }],
 			};
 
-			// Build prefix: system + preamble + recency + relevance [+ followUp] [+ checkpoint] + contract
+			// Build prefix: system + sessionArchitecture + preamble + recency + relevance [+ followUp] [+ checkpoint] + contract
 			const prefixMsgs: unknown[] = [];
 			if (systemMsg) prefixMsgs.push(systemMsg);
+			if (sessionArchitecture)
+				prefixMsgs.push({ role: "user" as const, content: [{ type: "text" as const, text: sessionArchitecture }] });
 			if (preamble) prefixMsgs.push({ role: "user" as const, content: [{ type: "text" as const, text: preamble }] });
 			if (recencyList)
 				prefixMsgs.push({ role: "user" as const, content: [{ type: "text" as const, text: recencyList }] });

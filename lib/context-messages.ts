@@ -122,11 +122,13 @@ export function shouldDropEmbedding(
 }
 
 /**
- * Build the context message prefix block: system + preamble + recency + relevance + contract.
+ * Build the context message prefix block: system + sessionArchitecture + preamble + recency + relevance + contract.
+ * The session architecture is injected right after the system message (unconditionally).
  * The contract message is always last, immediately before the actionable prompt.
  */
 export function buildContextMessagePrefix(
 	systemMsg: unknown | null,
+	sessionArchitecture: string | null,
 	preamble: string | null,
 	recencyList: string | null,
 	relevanceList: string | null,
@@ -134,6 +136,8 @@ export function buildContextMessagePrefix(
 ): unknown[] {
 	const finalMessages: unknown[] = [];
 	if (systemMsg) finalMessages.push(systemMsg);
+	if (sessionArchitecture)
+		finalMessages.push({ role: "user" as const, content: [{ type: "text" as const, text: sessionArchitecture }] });
 	if (preamble) finalMessages.push({ role: "user" as const, content: [{ type: "text" as const, text: preamble }] });
 	if (recencyList)
 		finalMessages.push({ role: "user" as const, content: [{ type: "text" as const, text: recencyList }] });
