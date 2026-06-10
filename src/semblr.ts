@@ -22,6 +22,7 @@ import {
 	buildGroupedRecencyList,
 	buildRelevanceList,
 	buildSessionArchitecture,
+	buildWorkingMemorySection,
 	formatFileSize,
 	splitCommandArgs,
 } from "../lib/context-format.ts";
@@ -33,6 +34,7 @@ import {
 } from "../lib/context-messages.ts";
 import { embedText, getApiKey } from "../lib/embedding-client.ts";
 import { assignToGroup, formatGroupStats, type SemanticGroup } from "../lib/grouping.ts";
+import { createMiniMemStore, type MiniMemStore } from "../lib/working-memory.ts";
 import { createRoundFilePath } from "../lib/hash.ts";
 import { indexRoundFileFromPath } from "../lib/index-io.ts";
 import {
@@ -147,6 +149,15 @@ const statsPresentedHashes: (string | null)[] = [null, null, null, null, null];
 // Use get_round_details() to expand. The Recency List contains the in-memory causal
 // chain from the current session; the Relevance List contains semantically similar
 // rounds from all past sessions.
+
+// ─────────────────────────────────────────────
+// Working Memory — in-memory named slot store
+// ─────────────────────────────────────────────
+
+/** In-memory working memory store. Session-scoped, survives between agent cycles
+ *  within the same session. Cleared on session_start. Not persisted to disk.
+ *  Max 7 slots (Miller's Law); oldest silently evicted when full. */
+let miniMemStore: MiniMemStore = createMiniMemStore();
 
 // ─────────────────────────────────────────────
 // Causal Chain — in-memory buffer of session rounds
@@ -732,6 +743,8 @@ export default function (pi: ExtensionAPI) {
 				}
 			}
 
+			const workingMem = buildWorkingMemorySection(miniMemStore);
+
 			const sessionArchitecture = buildSessionArchitecture();
 
 			const contractMsg = {
@@ -748,6 +761,20 @@ export default function (pi: ExtensionAPI) {
 				null,
 				contractMsg,
 			);
+			// Insert working memory after session architecture, before preamble
+			if (workingMem) {
+				const wmIdx = prefixMsgs.findIndex(
+					(m) =>
+						typeof (m as { content?: unknown }).content === "string" &&
+						((m as { content: string }).content as string).startsWith("[SESSION ARCHITECTURE]"),
+				);
+				if (wmIdx >= 0) {
+					prefixMsgs.splice(wmIdx + 1, 0, {
+						role: "user" as const,
+						content: [{ type: "text" as const, text: workingMem }],
+					});
+				}
+			}
 			if (followUpMsg) prefixMsgs.push(followUpMsg);
 			if (checkpointMsg) prefixMsgs.push(checkpointMsg);
 			cachedContextMessages = [...prefixMsgs];
@@ -767,21 +794,19 @@ export default function (pi: ExtensionAPI) {
 		try {
 			const apiKey = await getApiKey(ctx, { config: SEMBLR_CONFIG });
 			if (!apiKey) {
+				const workingMem = buildWorkingMemorySection(miniMemStore);
 				const sessionArchitecture = buildSessionArchitecture();
 				const contractMsg = {
 					role: "user" as const,
 					content: [{ type: "text" as const, text: buildFinalResponseContract() }],
 				};
-				const prefixMsgs: unknown[] = systemMsg
-					? [
-							systemMsg,
-							{ role: "user" as const, content: [{ type: "text" as const, text: sessionArchitecture }] },
-							contractMsg,
-						]
-					: [
-							{ role: "user" as const, content: [{ type: "text" as const, text: sessionArchitecture }] },
-							contractMsg,
-						];
+				const prefixMsgs: unknown[] = [];
+				if (systemMsg) prefixMsgs.push(systemMsg);
+				prefixMsgs.push({ role: "user" as const, content: [{ type: "text" as const, text: sessionArchitecture }] });
+				if (workingMem) {
+					prefixMsgs.push({ role: "user" as const, content: [{ type: "text" as const, text: workingMem }] });
+				}
+				prefixMsgs.push(contractMsg);
 				const finalMessages: unknown[] = applyContextSizeWarning(prefixMsgs, currentMessages, systemMsg);
 				return { messages: finalMessages } as any;
 			}
@@ -805,21 +830,23 @@ export default function (pi: ExtensionAPI) {
 				// Final response contract + current messages (no context lists)
 				cachedEnvPreamble = envPreamble;
 				cachedUserPromptForContext = userPrompt;
+				const workingMem = buildWorkingMemorySection(miniMemStore);
 				const sessionArchitecture = buildSessionArchitecture();
 				const contractMsg = {
 					role: "user" as const,
 					content: [{ type: "text" as const, text: buildFinalResponseContract() }],
 				};
-				cachedContextMessages = systemMsg
-					? [
-							systemMsg,
-							{ role: "user" as const, content: [{ type: "text" as const, text: sessionArchitecture }] },
-							contractMsg,
-						]
-					: [
-							{ role: "user" as const, content: [{ type: "text" as const, text: sessionArchitecture }] },
-							contractMsg,
-						];
+				const emptyIdxMsgs: unknown[] = [];
+				if (systemMsg) emptyIdxMsgs.push(systemMsg);
+				emptyIdxMsgs.push({
+					role: "user" as const,
+					content: [{ type: "text" as const, text: sessionArchitecture }],
+				});
+				if (workingMem) {
+					emptyIdxMsgs.push({ role: "user" as const, content: [{ type: "text" as const, text: workingMem }] });
+				}
+				emptyIdxMsgs.push(contractMsg);
+				cachedContextMessages = emptyIdxMsgs;
 				const finalMessages: unknown[] = applyContextSizeWarning(cachedContextMessages, currentMessages, systemMsg);
 				return { messages: finalMessages } as any;
 			}
@@ -844,21 +871,23 @@ export default function (pi: ExtensionAPI) {
 				// Cache the empty-context result so subsequent turns reuse it
 				cachedEnvPreamble = envPreamble;
 				cachedUserPromptForContext = userPrompt;
+				const workingMem = buildWorkingMemorySection(miniMemStore);
 				const sessionArchitecture = buildSessionArchitecture();
 				const contractMsg = {
 					role: "user" as const,
 					content: [{ type: "text" as const, text: buildFinalResponseContract() }],
 				};
-				cachedContextMessages = systemMsg
-					? [
-							systemMsg,
-							{ role: "user" as const, content: [{ type: "text" as const, text: sessionArchitecture }] },
-							contractMsg,
-						]
-					: [
-							{ role: "user" as const, content: [{ type: "text" as const, text: sessionArchitecture }] },
-							contractMsg,
-						];
+				const zeroResultMsgs: unknown[] = [];
+				if (systemMsg) zeroResultMsgs.push(systemMsg);
+				zeroResultMsgs.push({
+					role: "user" as const,
+					content: [{ type: "text" as const, text: sessionArchitecture }],
+				});
+				if (workingMem) {
+					zeroResultMsgs.push({ role: "user" as const, content: [{ type: "text" as const, text: workingMem }] });
+				}
+				zeroResultMsgs.push(contractMsg);
+				cachedContextMessages = zeroResultMsgs;
 				const finalMessages: unknown[] = applyContextSizeWarning(cachedContextMessages, currentMessages, systemMsg);
 				return { messages: finalMessages } as any;
 			}
@@ -921,6 +950,7 @@ export default function (pi: ExtensionAPI) {
 				}
 			}
 
+			const workingMem = buildWorkingMemorySection(miniMemStore);
 			const sessionArchitecture = buildSessionArchitecture();
 
 			const contractMsg = {
@@ -928,11 +958,13 @@ export default function (pi: ExtensionAPI) {
 				content: [{ type: "text" as const, text: buildFinalResponseContract() }],
 			};
 
-			// Build prefix: system + sessionArchitecture + preamble + recency + relevance [+ followUp] [+ checkpoint] + contract
+			// Build prefix: system + sessionArchitecture + [working memory] + preamble + recency + relevance [+ followUp] [+ checkpoint] + contract
 			const prefixMsgs: unknown[] = [];
 			if (systemMsg) prefixMsgs.push(systemMsg);
 			if (sessionArchitecture)
 				prefixMsgs.push({ role: "user" as const, content: [{ type: "text" as const, text: sessionArchitecture }] });
+			if (workingMem)
+				prefixMsgs.push({ role: "user" as const, content: [{ type: "text" as const, text: workingMem }] });
 			if (preamble) prefixMsgs.push({ role: "user" as const, content: [{ type: "text" as const, text: preamble }] });
 			if (recencyList)
 				prefixMsgs.push({ role: "user" as const, content: [{ type: "text" as const, text: recencyList }] });
@@ -1227,6 +1259,7 @@ export default function (pi: ExtensionAPI) {
 		lastFollowupGroupIdx = null;
 		injectedFollowupRounds = new Set();
 		injectedCheckpointRounds = new Set();
+		miniMemStore = createMiniMemStore();
 
 		const index = loadSessionStartIndex();
 		ctx.ui.setStatus("semblr", buildSessionStartStatus(index));
