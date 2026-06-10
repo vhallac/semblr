@@ -7,6 +7,45 @@ export type { ChainEntry, CheckpointSummary, ResponseSegment, ToolCallDetail } f
 export type RoundGroup = SemanticGroup<ChainEntry>;
 
 // ─────────────────────────────────────────────
+// ContextCache — triple that must stay in lockstep.
+// Wrapping these in a single helper prevents the three variables drifting apart
+// (partial reset, set-one-miss-two, etc.).  Use .valid(userPrompt) to check and
+// .store(preamble, messages, userPrompt) to set all three at once.
+// ─────────────────────────────────────────────
+
+export interface ContextCache {
+	envPreamble: string | null;
+	messages: unknown[] | null;
+	userPrompt: string | null;
+}
+
+export function createContextCache(): ContextCache {
+	return { envPreamble: null, messages: null, userPrompt: null };
+}
+
+/** True when the cache is populated AND the current user prompt matches. */
+export function contextCacheValid(cc: ContextCache, userPrompt: string): boolean {
+	return !!(cc.messages && cc.envPreamble && cc.userPrompt === userPrompt);
+}
+
+/** Store all three at once — atomic assignment. */
+export function contextCacheStore(
+	cc: ContextCache,
+	envPreamble: string,
+	messages: unknown[],
+	userPrompt: string,
+): void {
+	cc.envPreamble = envPreamble;
+	cc.messages = messages;
+	cc.userPrompt = userPrompt;
+}
+
+/** Snapshot messages into the cache (keeps envPreamble + userPrompt as-is). */
+export function contextCacheSnapshot(cc: ContextCache, messages: unknown[]): void {
+	cc.messages = messages;
+}
+
+// ─────────────────────────────────────────────
 // Session — state that survives between rounds within the same session.
 // Reset at session_start.
 // ─────────────────────────────────────────────
@@ -49,10 +88,8 @@ export interface RoundState {
 	promptVec: number[] | null;
 	skipPromptEmbedding: boolean;
 	presentedRecorded: boolean;
-	// full-message cache
-	cachedEnvPreamble: string | null;
-	cachedContextMessages: unknown[] | null;
-	cachedUserPromptForContext: string | null;
+	// full-message cache (triple wrapped in ContextCache — see helpers above)
+	contextCache: ContextCache;
 	// checkpoint
 	lastCheckpointSummary: CheckpointSummary | null;
 	contextWarningIssued: number;
@@ -72,9 +109,7 @@ export function createRound(): RoundState {
 		promptVec: null,
 		skipPromptEmbedding: false,
 		presentedRecorded: false,
-		cachedEnvPreamble: null,
-		cachedContextMessages: null,
-		cachedUserPromptForContext: null,
+		contextCache: createContextCache(),
 		lastCheckpointSummary: null,
 		contextWarningIssued: 0,
 	};

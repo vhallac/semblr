@@ -1,5 +1,12 @@
 import { describe, expect, it } from "vitest";
-import { createRound, createSession } from "./state.ts";
+import {
+	contextCacheSnapshot,
+	contextCacheStore,
+	contextCacheValid,
+	createContextCache,
+	createRound,
+	createSession,
+} from "./state.ts";
 
 describe("createSession", () => {
 	it("initialises all fields with sensible defaults", () => {
@@ -34,6 +41,51 @@ describe("createSession", () => {
 	});
 });
 
+describe("ContextCache", () => {
+	it("createContextCache returns nulls", () => {
+		const cc = createContextCache();
+		expect(cc.envPreamble).toBeNull();
+		expect(cc.messages).toBeNull();
+		expect(cc.userPrompt).toBeNull();
+	});
+
+	it("contextCacheValid returns false when any field is null", () => {
+		const cc = createContextCache();
+		expect(contextCacheValid(cc, "prompt")).toBe(false);
+
+		cc.envPreamble = "env";
+		expect(contextCacheValid(cc, "prompt")).toBe(false);
+
+		cc.messages = [];
+		expect(contextCacheValid(cc, "prompt")).toBe(false);
+
+		cc.userPrompt = "wrong";
+		expect(contextCacheValid(cc, "prompt")).toBe(false);
+
+		cc.userPrompt = "prompt";
+		expect(contextCacheValid(cc, "prompt")).toBe(true);
+	});
+
+	it("contextCacheStore sets all three at once", () => {
+		const cc = createContextCache();
+		contextCacheStore(cc, "env", ["msg"], "prompt");
+		expect(cc.envPreamble).toBe("env");
+		expect(cc.messages).toEqual(["msg"]);
+		expect(cc.userPrompt).toBe("prompt");
+		expect(contextCacheValid(cc, "prompt")).toBe(true);
+	});
+
+	it("contextCacheSnapshot updates only messages", () => {
+		const cc = createContextCache();
+		cc.envPreamble = "env";
+		cc.userPrompt = "prompt";
+		contextCacheSnapshot(cc, ["updated"]);
+		expect(cc.envPreamble).toBe("env");
+		expect(cc.messages).toEqual(["updated"]);
+		expect(cc.userPrompt).toBe("prompt");
+	});
+});
+
 describe("createRound", () => {
 	it("initialises all fields with sensible defaults", () => {
 		const r = createRound();
@@ -59,9 +111,9 @@ describe("createRound", () => {
 		expect(r.presentedRecorded).toBe(false);
 
 		// full-message cache
-		expect(r.cachedEnvPreamble).toBeNull();
-		expect(r.cachedContextMessages).toBeNull();
-		expect(r.cachedUserPromptForContext).toBeNull();
+		expect(r.contextCache.envPreamble).toBeNull();
+		expect(r.contextCache.messages).toBeNull();
+		expect(r.contextCache.userPrompt).toBeNull();
 
 		// checkpoint
 		expect(r.lastCheckpointSummary).toBeNull();
@@ -104,5 +156,14 @@ describe("createRound", () => {
 
 		expect(r2.toolCalls.length).toBe(0);
 		expect(r2.responseSegments.length).toBe(0);
+	});
+
+	it("independent rounds have independent context caches", () => {
+		const r1 = createRound();
+		const r2 = createRound();
+
+		contextCacheStore(r1.contextCache, "env", ["msg"], "p");
+		expect(r1.contextCache.messages).toEqual(["msg"]);
+		expect(r2.contextCache.messages).toBeNull();
 	});
 });

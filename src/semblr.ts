@@ -74,7 +74,13 @@ import {
 } from "../lib/search-interactions.ts";
 import { loadSemblrConfig, type SemblrConfig } from "../lib/semblr-config.ts";
 import type { CheckpointSummary, ToolCallDetail } from "../lib/state.ts";
-import { createRound, createSession } from "../lib/state.ts";
+import {
+	contextCacheSnapshot,
+	contextCacheStore,
+	contextCacheValid,
+	createRound,
+	createSession,
+} from "../lib/state.ts";
 import {
 	flushStatsFile,
 	formatChainReadStatsReport,
@@ -638,12 +644,12 @@ export default function (pi: ExtensionAPI) {
 		const { messages } = event;
 
 		// --- Prepend environment info to the current user prompt ---
-		// Computed once per agent cycle (round.cachedEnvPreamble) so the timestamp is
+		// Computed once per agent cycle (round.contextCache.envPreamble) so the timestamp is
 		// stable across tool turns — avoids busting the LLM prompt cache.
 		const envPreamble =
-			round.cachedEnvPreamble ??
+			round.contextCache.envPreamble ??
 			`[ENVIRONMENT]\nHost: ${os.hostname()}\nCWD: ${process.cwd()}\nCurrent date/time: ${new Date().toISOString().replace(/[-:]/g, "").replace(/\.\d+/, "")}`;
-		round.cachedEnvPreamble = envPreamble; // pin early so guard below can use it
+		round.contextCache.envPreamble = envPreamble; // pin early so guard below can use it
 
 		// --- Extract system prompt + current round messages ---
 		// We strip all prior rounds to prevent conversation bloat.
@@ -660,9 +666,9 @@ export default function (pi: ExtensionAPI) {
 		// --- Reuse cached context blocks if this is a subsequent context call within
 		//     the same agent cycle. The recency list, relevance list, and preamble
 		//     are stable across tool turns; only the currentMessages section changes.
-		if (round.cachedContextMessages && round.cachedEnvPreamble && userPrompt === round.cachedUserPromptForContext) {
+		if (contextCacheValid(round.contextCache, userPrompt)) {
 			// Compose: system + preamble + recency + relevance + current turn messages
-			const finalMessages = applyContextSizeWarning(round.cachedContextMessages, currentMessages, systemMsg);
+			const finalMessages = applyContextSizeWarning(round.contextCache.messages!, currentMessages, systemMsg);
 			return { messages: finalMessages } as any;
 		}
 
@@ -674,8 +680,8 @@ export default function (pi: ExtensionAPI) {
 			// Per https://github.com/vhallac/semblr/issues/38#issuecomment-4629826478
 			round.skipPromptEmbedding = true;
 			round.promptVec = null;
-			round.cachedEnvPreamble = envPreamble;
-			round.cachedUserPromptForContext = userPrompt;
+			round.contextCache.envPreamble = envPreamble;
+			round.contextCache.userPrompt = userPrompt;
 
 			// Build non-embedding context sections (all in-memory / disk, zero API cost)
 			const recencyList = buildGroupedRecencyList(session.roundGroups, session.causalChain, getRoundSize);
@@ -704,7 +710,7 @@ export default function (pi: ExtensionAPI) {
 				checkpointMsg,
 				contractMsg,
 			});
-			round.cachedContextMessages = [...prefixMsgs];
+			contextCacheSnapshot(round.contextCache, [...prefixMsgs]);
 
 			// ══ Stats: record all 5 positions presented ══
 			if (!round.presentedRecorded) {
@@ -713,7 +719,7 @@ export default function (pi: ExtensionAPI) {
 			}
 
 			const finalMessages: unknown[] = applyContextSizeWarning(
-				round.cachedContextMessages,
+				round.contextCache.messages!,
 				currentMessages,
 				systemMsg,
 			);
@@ -760,8 +766,8 @@ export default function (pi: ExtensionAPI) {
 			const index = loadIndex();
 			if (index.length === 0) {
 				// Final response contract + current messages (no context lists)
-				round.cachedEnvPreamble = envPreamble;
-				round.cachedUserPromptForContext = userPrompt;
+				round.contextCache.envPreamble = envPreamble;
+				round.contextCache.userPrompt = userPrompt;
 				const emptyIdxMsgs = assembleContextPrefix({
 					systemMsg,
 					sessionArchitecture: buildSessionArchitecture(),
@@ -776,9 +782,9 @@ export default function (pi: ExtensionAPI) {
 						content: [{ type: "text" as const, text: buildFinalResponseContract() }],
 					},
 				});
-				round.cachedContextMessages = emptyIdxMsgs;
+				contextCacheSnapshot(round.contextCache, emptyIdxMsgs);
 				const finalMessages: unknown[] = applyContextSizeWarning(
-					round.cachedContextMessages,
+					round.contextCache.messages!,
 					currentMessages,
 					systemMsg,
 				);
@@ -803,8 +809,8 @@ export default function (pi: ExtensionAPI) {
 			if (selectedRounds.length === 0) {
 				ctx.ui.setStatus("semblr", `🧠 no relevant context (best: ${bestScore.toFixed(3)})`);
 				// Cache the empty-context result so subsequent turns reuse it
-				round.cachedEnvPreamble = envPreamble;
-				round.cachedUserPromptForContext = userPrompt;
+				round.contextCache.envPreamble = envPreamble;
+				round.contextCache.userPrompt = userPrompt;
 				const zeroResultMsgs = assembleContextPrefix({
 					systemMsg,
 					sessionArchitecture: buildSessionArchitecture(),
@@ -819,9 +825,9 @@ export default function (pi: ExtensionAPI) {
 						content: [{ type: "text" as const, text: buildFinalResponseContract() }],
 					},
 				});
-				round.cachedContextMessages = zeroResultMsgs;
+				contextCacheSnapshot(round.contextCache, zeroResultMsgs);
 				const finalMessages: unknown[] = applyContextSizeWarning(
-					round.cachedContextMessages,
+					round.contextCache.messages!,
 					currentMessages,
 					systemMsg,
 				);
@@ -879,11 +885,9 @@ export default function (pi: ExtensionAPI) {
 			// Cache the stable prefix (system + context sections + final response contract) for
 			// subsequent context calls within this agent cycle. currentMessages is
 			// appended fresh each time.
-			round.cachedEnvPreamble = envPreamble;
-			round.cachedUserPromptForContext = userPrompt;
-			round.cachedContextMessages = [...prefixMsgs]; // snapshot before warning injection
+			contextCacheStore(round.contextCache, envPreamble, [...prefixMsgs], userPrompt);
 
-			const resultMessages = applyContextSizeWarning(round.cachedContextMessages, currentMessages, systemMsg);
+			const resultMessages = applyContextSizeWarning(round.contextCache.messages!, currentMessages, systemMsg);
 
 			return { messages: resultMessages } as any;
 		} catch (err) {
