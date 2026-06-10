@@ -4,6 +4,7 @@ import {
 	buildFollowUpSectionContent,
 	buildGroupedRecencyList,
 	buildRelevanceList,
+	buildSessionArchitecture,
 	formatFileSize,
 	formatGroupedRoundEntry,
 	formatRoundEntry,
@@ -25,6 +26,37 @@ describe("follow-up section", () => {
 		expect(result).toContain("ASSISTANT RESPONSE:");
 		expect(result).toContain("multi\nline\nprompt");
 		expect(result).toContain("multi\nline\nresponse");
+	});
+});
+
+describe("session architecture", () => {
+	it("builds session architecture section with heading", () => {
+		const result = buildSessionArchitecture();
+		expect(result).toContain("[SESSION ARCHITECTURE]");
+	});
+
+	it("describes round boundary amnesia", () => {
+		const result = buildSessionArchitecture();
+		expect(result).toContain("Each conversation round starts fresh");
+		expect(result).toContain("NOT visible unless they are explicitly injected");
+	});
+
+	it("lists follow-up injection as a survival mechanism (stage 1)", () => {
+		const result = buildSessionArchitecture();
+		expect(result).toContain("Follow-up injection");
+		expect(result).toContain("round_needs_followup");
+	});
+
+	it("lists checkpoint as a survival mechanism (stage 1)", () => {
+		const result = buildSessionArchitecture();
+		expect(result).toContain("Checkpoint");
+		expect(result).toContain("semblr_checkpoint");
+	});
+
+	it("does not mention working memory in stage 1", () => {
+		const result = buildSessionArchitecture();
+		expect(result).not.toContain("Working memory");
+		expect(result).not.toContain("addMiniMem");
 	});
 });
 
@@ -87,6 +119,12 @@ describe("context formatting", () => {
 		expect(buildContextPreamble(false, false)).toBeNull();
 		expect(buildContextPreamble(true, false)).toContain("[CONTEXT BUILDING REFERENCES]");
 		expect(buildContextPreamble(false, true)).toContain("get_round_details");
+	});
+
+	it("context preamble includes survival mechanism hint", () => {
+		const result = buildContextPreamble(true, false);
+		expect(result).toContain("These tools exist because you forget everything between rounds.");
+		expect(result).toContain("See the SESSION ARCHITECTURE section for details.");
 	});
 
 	it("formats byte counts", () => {
