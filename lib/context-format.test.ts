@@ -32,7 +32,7 @@ describe("follow-up section", () => {
 describe("session architecture", () => {
 	it("builds session architecture section with heading", () => {
 		const result = buildSessionArchitecture();
-		expect(result).toContain("--- SESSION ARCHITECTURE ---");
+		expect(result).toContain("[SESSION ARCHITECTURE]");
 	});
 
 	it("describes round boundary amnesia", () => {

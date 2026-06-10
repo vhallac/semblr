@@ -276,7 +276,7 @@ describe("buildContextMessagePrefix", () => {
 	});
 
 	it("includes session architecture when provided", () => {
-		const arch = "--- SESSION ARCHITECTURE ---\nsome text";
+		const arch = "[SESSION ARCHITECTURE]\nsome text";
 		const result = buildContextMessagePrefix(null, arch, null, null, null);
 		expect(result).toHaveLength(1);
 		expect((result[0] as { content: Array<{ type: string; text: string }> }).content[0].text).toBe(arch);
@@ -284,7 +284,7 @@ describe("buildContextMessagePrefix", () => {
 
 	it("injects session architecture after system and before preamble", () => {
 		const systemMsg = { role: "system", content: "sys" };
-		const arch = "--- SESSION ARCHITECTURE ---";
+		const arch = "[SESSION ARCHITECTURE]";
 		const preamble = "preamble text";
 		const result = buildContextMessagePrefix(systemMsg, arch, preamble, null, null);
 		expect(result).toHaveLength(3);
@@ -321,7 +321,7 @@ describe("buildContextMessagePrefix", () => {
 
 	it("includes all components in order", () => {
 		const systemMsg = { role: "system", content: "sys" };
-		const arch = "--- SESSION ARCHITECTURE ---";
+		const arch = "[SESSION ARCHITECTURE]";
 		const contract = {
 			role: "user",
 			content: [{ type: "text", text: "contract" }],
@@ -335,7 +335,7 @@ describe("buildContextMessagePrefix", () => {
 		// This test verifies that buildContextMessagePrefix correctly includes
 		// sessionArchitecture, recency, preamble, and contract even when relevanceList is null.
 		const systemMsg = { role: "system", content: "You are helpful" };
-		const arch = "--- SESSION ARCHITECTURE ---";
+		const arch = "[SESSION ARCHITECTURE]";
 		const preamble = "[CONTEXT BUILDING REFERENCES]\n...";
 		const recencyList = "--- RECENCY LIST ---\n...";
 		const contract = {
@@ -354,7 +354,7 @@ describe("buildContextMessagePrefix", () => {
 		const userTexts = result
 			.slice(1)
 			.map((m) => (m as { content: Array<{ type: string; text: string }> }).content[0].text);
-		expect(userTexts[0]).toBe("--- SESSION ARCHITECTURE ---");
+		expect(userTexts[0]).toBe("[SESSION ARCHITECTURE]");
 		expect(userTexts[1]).toBe("[CONTEXT BUILDING REFERENCES]\n...");
 		expect(userTexts[2]).toBe("--- RECENCY LIST ---\n...");
 		expect(userTexts[3]).toBe("[FINAL RESPONSE CONTRACT]");
@@ -363,7 +363,7 @@ describe("buildContextMessagePrefix", () => {
 	it("produces only system + sessionArchitecture + contract when recency and preamble are also null (empty-chain scenario)", () => {
 		// No causal chain = no recency list, but sessionArchitecture and contract should still be present
 		const systemMsg = { role: "system", content: "You are helpful" };
-		const arch = "--- SESSION ARCHITECTURE ---";
+		const arch = "[SESSION ARCHITECTURE]";
 		const contract = {
 			role: "user",
 			content: [{ type: "text", text: "[FINAL RESPONSE CONTRACT]" }],

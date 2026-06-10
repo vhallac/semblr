@@ -224,7 +224,7 @@ These tools exist because you forget everything between rounds. See the SESSION 
  * adds the working memory bullet.
  */
 export function buildSessionArchitecture(): string {
-	return `--- SESSION ARCHITECTURE ---
+	return `[SESSION ARCHITECTURE]
 Each conversation round starts fresh. Your previous responses, tool results, and
 reasoning from earlier rounds are NOT visible unless they are explicitly injected
 through one of semblr's survival mechanisms:
