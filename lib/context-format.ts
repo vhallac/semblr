@@ -1,3 +1,5 @@
+import type { MiniMemStore } from "./working-memory.ts";
+
 export interface ContextChainEntry {
 	fileName: string;
 	userPrompt: string;
@@ -212,6 +214,25 @@ These tools exist because you forget everything between rounds. See the SESSION 
 }
 
 /**
+ * Build the WORKING MEMORY section. Returns null when the store is empty.
+ * Injected between [SESSION ARCHITECTURE] and [CONTEXT BUILDING REFERENCES].
+ *
+ * The list shows id + summary only — the LLM uses mini_mem__get to expand.
+ */
+export function buildWorkingMemorySection(store: MiniMemStore): string | null {
+	if (store.slots.length === 0) return null;
+	const lines: string[] = [
+		"[WORKING MEMORY]",
+		"The following list is the id and summary of working memory. Use mini_mem__xxx tools to access and manipulate it.",
+		"",
+	];
+	for (const slot of store.slots) {
+		lines.push(`- [id: ${slot.id}] ${slot.summary}`);
+	}
+	return lines.join("\n");
+}
+
+/**
  * Build the SESSION ARCHITECTURE section — informs the LLM about the
  * fundamental constraint that information dies at round boundaries and
  * must be explicitly carried forward via survival mechanisms.
@@ -232,7 +253,10 @@ through one of semblr's survival mechanisms:
 - **Follow-up injection:** \`round_needs_followup\` on your last line pulls the
   full previous round into the next round's context.
 - **Checkpoint:** \`semblr_checkpoint\` persists a structured progress summary
-  across context-size boundaries.`;
+  across context-size boundaries.
+- **Working Memory:** \`mini_mem__add\` / \`mini_mem__get\` / \`mini_mem__update\` /
+  \`mini_mem__delete\` / \`mini_mem__get_and_delete\` provides named slots
+  for short-term notes that survive round boundaries within a session.`;
 }
 
 export function formatFileSize(bytes: number): string {

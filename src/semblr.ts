@@ -22,6 +22,7 @@ import {
 	buildGroupedRecencyList,
 	buildRelevanceList,
 	buildSessionArchitecture,
+	buildWorkingMemorySection,
 	formatFileSize,
 	splitCommandArgs,
 } from "../lib/context-format.ts";
@@ -81,6 +82,15 @@ import {
 } from "../lib/stats.ts";
 import { estimateMessagesTokens } from "../lib/tokens.ts";
 import { normalize } from "../lib/vector.ts";
+import {
+	addSlot,
+	createMiniMemStore,
+	deleteSlot,
+	getAndDeleteSlot,
+	getSlot,
+	type MiniMemStore,
+	updateSlot,
+} from "../lib/working-memory.ts";
 
 export {
 	countWordsInMessageContent,
@@ -147,6 +157,15 @@ const statsPresentedHashes: (string | null)[] = [null, null, null, null, null];
 // Use get_round_details() to expand. The Recency List contains the in-memory causal
 // chain from the current session; the Relevance List contains semantically similar
 // rounds from all past sessions.
+
+// ─────────────────────────────────────────────
+// Working Memory — in-memory named slot store
+// ─────────────────────────────────────────────
+
+/** In-memory working memory store. Session-scoped, survives between agent cycles
+ *  within the same session. Cleared on session_start. Not persisted to disk.
+ *  Max 7 slots (Miller's Law); oldest silently evicted when full. */
+let miniMemStore: MiniMemStore = createMiniMemStore();
 
 // ─────────────────────────────────────────────
 // Causal Chain — in-memory buffer of session rounds
@@ -732,6 +751,8 @@ export default function (pi: ExtensionAPI) {
 				}
 			}
 
+			const workingMem = buildWorkingMemorySection(miniMemStore);
+
 			const sessionArchitecture = buildSessionArchitecture();
 
 			const contractMsg = {
@@ -748,6 +769,20 @@ export default function (pi: ExtensionAPI) {
 				null,
 				contractMsg,
 			);
+			// Insert working memory after session architecture, before preamble
+			if (workingMem) {
+				const wmIdx = prefixMsgs.findIndex(
+					(m) =>
+						typeof (m as { content?: unknown }).content === "string" &&
+						((m as { content: string }).content as string).startsWith("[SESSION ARCHITECTURE]"),
+				);
+				if (wmIdx >= 0) {
+					prefixMsgs.splice(wmIdx + 1, 0, {
+						role: "user" as const,
+						content: [{ type: "text" as const, text: workingMem }],
+					});
+				}
+			}
 			if (followUpMsg) prefixMsgs.push(followUpMsg);
 			if (checkpointMsg) prefixMsgs.push(checkpointMsg);
 			cachedContextMessages = [...prefixMsgs];
@@ -767,21 +802,19 @@ export default function (pi: ExtensionAPI) {
 		try {
 			const apiKey = await getApiKey(ctx, { config: SEMBLR_CONFIG });
 			if (!apiKey) {
+				const workingMem = buildWorkingMemorySection(miniMemStore);
 				const sessionArchitecture = buildSessionArchitecture();
 				const contractMsg = {
 					role: "user" as const,
 					content: [{ type: "text" as const, text: buildFinalResponseContract() }],
 				};
-				const prefixMsgs: unknown[] = systemMsg
-					? [
-							systemMsg,
-							{ role: "user" as const, content: [{ type: "text" as const, text: sessionArchitecture }] },
-							contractMsg,
-						]
-					: [
-							{ role: "user" as const, content: [{ type: "text" as const, text: sessionArchitecture }] },
-							contractMsg,
-						];
+				const prefixMsgs: unknown[] = [];
+				if (systemMsg) prefixMsgs.push(systemMsg);
+				prefixMsgs.push({ role: "user" as const, content: [{ type: "text" as const, text: sessionArchitecture }] });
+				if (workingMem) {
+					prefixMsgs.push({ role: "user" as const, content: [{ type: "text" as const, text: workingMem }] });
+				}
+				prefixMsgs.push(contractMsg);
 				const finalMessages: unknown[] = applyContextSizeWarning(prefixMsgs, currentMessages, systemMsg);
 				return { messages: finalMessages } as any;
 			}
@@ -805,21 +838,23 @@ export default function (pi: ExtensionAPI) {
 				// Final response contract + current messages (no context lists)
 				cachedEnvPreamble = envPreamble;
 				cachedUserPromptForContext = userPrompt;
+				const workingMem = buildWorkingMemorySection(miniMemStore);
 				const sessionArchitecture = buildSessionArchitecture();
 				const contractMsg = {
 					role: "user" as const,
 					content: [{ type: "text" as const, text: buildFinalResponseContract() }],
 				};
-				cachedContextMessages = systemMsg
-					? [
-							systemMsg,
-							{ role: "user" as const, content: [{ type: "text" as const, text: sessionArchitecture }] },
-							contractMsg,
-						]
-					: [
-							{ role: "user" as const, content: [{ type: "text" as const, text: sessionArchitecture }] },
-							contractMsg,
-						];
+				const emptyIdxMsgs: unknown[] = [];
+				if (systemMsg) emptyIdxMsgs.push(systemMsg);
+				emptyIdxMsgs.push({
+					role: "user" as const,
+					content: [{ type: "text" as const, text: sessionArchitecture }],
+				});
+				if (workingMem) {
+					emptyIdxMsgs.push({ role: "user" as const, content: [{ type: "text" as const, text: workingMem }] });
+				}
+				emptyIdxMsgs.push(contractMsg);
+				cachedContextMessages = emptyIdxMsgs;
 				const finalMessages: unknown[] = applyContextSizeWarning(cachedContextMessages, currentMessages, systemMsg);
 				return { messages: finalMessages } as any;
 			}
@@ -844,21 +879,23 @@ export default function (pi: ExtensionAPI) {
 				// Cache the empty-context result so subsequent turns reuse it
 				cachedEnvPreamble = envPreamble;
 				cachedUserPromptForContext = userPrompt;
+				const workingMem = buildWorkingMemorySection(miniMemStore);
 				const sessionArchitecture = buildSessionArchitecture();
 				const contractMsg = {
 					role: "user" as const,
 					content: [{ type: "text" as const, text: buildFinalResponseContract() }],
 				};
-				cachedContextMessages = systemMsg
-					? [
-							systemMsg,
-							{ role: "user" as const, content: [{ type: "text" as const, text: sessionArchitecture }] },
-							contractMsg,
-						]
-					: [
-							{ role: "user" as const, content: [{ type: "text" as const, text: sessionArchitecture }] },
-							contractMsg,
-						];
+				const zeroResultMsgs: unknown[] = [];
+				if (systemMsg) zeroResultMsgs.push(systemMsg);
+				zeroResultMsgs.push({
+					role: "user" as const,
+					content: [{ type: "text" as const, text: sessionArchitecture }],
+				});
+				if (workingMem) {
+					zeroResultMsgs.push({ role: "user" as const, content: [{ type: "text" as const, text: workingMem }] });
+				}
+				zeroResultMsgs.push(contractMsg);
+				cachedContextMessages = zeroResultMsgs;
 				const finalMessages: unknown[] = applyContextSizeWarning(cachedContextMessages, currentMessages, systemMsg);
 				return { messages: finalMessages } as any;
 			}
@@ -921,6 +958,7 @@ export default function (pi: ExtensionAPI) {
 				}
 			}
 
+			const workingMem = buildWorkingMemorySection(miniMemStore);
 			const sessionArchitecture = buildSessionArchitecture();
 
 			const contractMsg = {
@@ -928,11 +966,13 @@ export default function (pi: ExtensionAPI) {
 				content: [{ type: "text" as const, text: buildFinalResponseContract() }],
 			};
 
-			// Build prefix: system + sessionArchitecture + preamble + recency + relevance [+ followUp] [+ checkpoint] + contract
+			// Build prefix: system + sessionArchitecture + [working memory] + preamble + recency + relevance [+ followUp] [+ checkpoint] + contract
 			const prefixMsgs: unknown[] = [];
 			if (systemMsg) prefixMsgs.push(systemMsg);
 			if (sessionArchitecture)
 				prefixMsgs.push({ role: "user" as const, content: [{ type: "text" as const, text: sessionArchitecture }] });
+			if (workingMem)
+				prefixMsgs.push({ role: "user" as const, content: [{ type: "text" as const, text: workingMem }] });
 			if (preamble) prefixMsgs.push({ role: "user" as const, content: [{ type: "text" as const, text: preamble }] });
 			if (recencyList)
 				prefixMsgs.push({ role: "user" as const, content: [{ type: "text" as const, text: recencyList }] });
@@ -1227,6 +1267,7 @@ export default function (pi: ExtensionAPI) {
 		lastFollowupGroupIdx = null;
 		injectedFollowupRounds = new Set();
 		injectedCheckpointRounds = new Set();
+		miniMemStore = createMiniMemStore();
 
 		const index = loadSessionStartIndex();
 		ctx.ui.setStatus("semblr", buildSessionStartStatus(index));
@@ -1465,6 +1506,151 @@ export default function (pi: ExtensionAPI) {
 							text: "No context size warning is active. This tool should not be called without being instructed. No checkpoint was saved.",
 						},
 					],
+					details: {},
+				};
+			},
+		});
+
+		// Register mini_mem__add — add a working memory slot
+		pi.registerTool({
+			name: "mini_mem__add",
+			label: "Add Working Memory",
+			description:
+				'Store a note in working memory. Use this after making a plan, after an important decision, or when the user says "remember this." Slots are limited to ~7; when full, the oldest is silently evicted. Returns the assigned id and the updated list.',
+			promptSnippet: "Add a note to working memory",
+			parameters: Type.Object({
+				summary: Type.String({ description: "Short label for the memory slot" }),
+				content: Type.String({ description: "Full note text to store" }),
+			}),
+			async execute(_toolCallId, params, _signal, _onUpdate, _ctx2) {
+				const { summary, content } = params as { summary: string; content: string };
+				const id = addSlot(miniMemStore, summary, content, lastRoundFileName ?? undefined);
+				const lines: string[] = [`Stored as memory slot [id: ${id}]. Current slots:`];
+				for (const slot of miniMemStore.slots) {
+					lines.push(`- [id: ${slot.id}] ${slot.summary}`);
+				}
+				return {
+					content: [{ type: "text", text: lines.join("\n") }],
+					details: {},
+				};
+			},
+		});
+
+		// Register mini_mem__get — retrieve a working memory slot without consuming it
+		pi.registerTool({
+			name: "mini_mem__get",
+			label: "Get Working Memory",
+			description:
+				"Retrieve a working memory slot by its id. The slot stays in memory after retrieval. Use this to review a plan, decision, or note stored earlier.",
+			promptSnippet: "Retrieve a working memory slot",
+			parameters: Type.Object({
+				id: Type.Number({ description: "The slot id to retrieve" }),
+			}),
+			async execute(_toolCallId, params, _signal, _onUpdate, _ctx2) {
+				const { id } = params as { id: number };
+				const slot = getSlot(miniMemStore, id);
+				if (!slot) {
+					return {
+						content: [{ type: "text", text: `No memory slot found with id: ${id}.` }],
+						details: {},
+					};
+				}
+				let text = `[id: ${slot.id}] ${slot.summary}`;
+				if (slot.sourceRound) {
+					text += `\nSource round: ${slot.sourceRound}`;
+				}
+				text += `\n\n${slot.content}`;
+				return {
+					content: [{ type: "text", text }],
+					details: {},
+				};
+			},
+		});
+
+		// Register mini_mem__update — overwrite a working memory slot
+		pi.registerTool({
+			name: "mini_mem__update",
+			label: "Update Working Memory",
+			description:
+				"Overwrite an existing working memory slot's summary and content. Use for evolving plans, TODO lists, or updating decisions.",
+			promptSnippet: "Update a working memory slot",
+			parameters: Type.Object({
+				id: Type.Number({ description: "The slot id to update" }),
+				summary: Type.String({ description: "New short label" }),
+				content: Type.String({ description: "New full content" }),
+			}),
+			async execute(_toolCallId, params, _signal, _onUpdate, _ctx2) {
+				const { id, summary, content } = params as { id: number; summary: string; content: string };
+				const slot = updateSlot(miniMemStore, id, summary, content, lastRoundFileName ?? undefined);
+				if (!slot) {
+					return {
+						content: [{ type: "text", text: `No memory slot found with id: ${id}.` }],
+						details: {},
+					};
+				}
+				let text = `[id: ${slot.id}] ${slot.summary}`;
+				if (slot.sourceRound) {
+					text += `\nSource round: ${slot.sourceRound}`;
+				}
+				text += `\n\n${slot.content}`;
+				return {
+					content: [{ type: "text", text }],
+					details: {},
+				};
+			},
+		});
+
+		// Register mini_mem__delete — remove a working memory slot
+		pi.registerTool({
+			name: "mini_mem__delete",
+			label: "Delete Working Memory",
+			description: "Delete a working memory slot by its id.",
+			promptSnippet: "Delete a working memory slot",
+			parameters: Type.Object({
+				id: Type.Number({ description: "The slot id to delete" }),
+			}),
+			async execute(_toolCallId, params, _signal, _onUpdate, _ctx2) {
+				const { id } = params as { id: number };
+				const found = deleteSlot(miniMemStore, id);
+				if (!found) {
+					return {
+						content: [{ type: "text", text: `No memory slot found with id: ${id}.` }],
+						details: {},
+					};
+				}
+				return {
+					content: [{ type: "text", text: `Memory slot [id: ${id}] deleted.` }],
+					details: {},
+				};
+			},
+		});
+
+		// Register mini_mem__get_and_delete — one-shot get + delete
+		pi.registerTool({
+			name: "mini_mem__get_and_delete",
+			label: "Get and Delete Working Memory",
+			description:
+				'One-shot retrieval: get the full content of a working memory slot, then delete it. Use for truly disposable notes (e.g., "after this task remind me to X").',
+			promptSnippet: "Retrieve and delete a working memory slot",
+			parameters: Type.Object({
+				id: Type.Number({ description: "The slot id to retrieve and delete" }),
+			}),
+			async execute(_toolCallId, params, _signal, _onUpdate, _ctx2) {
+				const { id } = params as { id: number };
+				const slot = getAndDeleteSlot(miniMemStore, id);
+				if (!slot) {
+					return {
+						content: [{ type: "text", text: `No memory slot found with id: ${id}.` }],
+						details: {},
+					};
+				}
+				let text = `[id: ${slot.id}] ${slot.summary}`;
+				if (slot.sourceRound) {
+					text += `\nSource round: ${slot.sourceRound}`;
+				}
+				text += `\n\n${slot.content}`;
+				return {
+					content: [{ type: "text", text }],
 					details: {},
 				};
 			},

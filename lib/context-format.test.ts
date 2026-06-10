@@ -5,11 +5,13 @@ import {
 	buildGroupedRecencyList,
 	buildRelevanceList,
 	buildSessionArchitecture,
+	buildWorkingMemorySection,
 	formatFileSize,
 	formatGroupedRoundEntry,
 	formatRoundEntry,
 	splitCommandArgs,
 } from "./context-format.ts";
+import { addSlot, createMiniMemStore } from "./working-memory.ts";
 
 describe("follow-up section", () => {
 	it("builds the follow-up section with round content", () => {
@@ -53,10 +55,55 @@ describe("session architecture", () => {
 		expect(result).toContain("semblr_checkpoint");
 	});
 
-	it("does not mention working memory in stage 1", () => {
+	it("lists working memory as a survival mechanism (stage 2)", () => {
 		const result = buildSessionArchitecture();
-		expect(result).not.toContain("Working memory");
-		expect(result).not.toContain("addMiniMem");
+		expect(result).toContain("Working Memory");
+		expect(result).toContain("mini_mem__add");
+		expect(result).toContain("mini_mem__get");
+		expect(result).toContain("mini_mem__update");
+		expect(result).toContain("mini_mem__delete");
+		expect(result).toContain("mini_mem__get_and_delete");
+		expect(result).toContain("short-term notes that survive round boundaries");
+	});
+});
+
+describe("working memory section", () => {
+	it("returns null for empty store", () => {
+		const store = createMiniMemStore();
+		expect(buildWorkingMemorySection(store)).toBeNull();
+	});
+
+	it("outputs correct single-entry list", () => {
+		const store = createMiniMemStore();
+		addSlot(store, "Fix the authentication flow", "Detailed plan here");
+		const result = buildWorkingMemorySection(store);
+		expect(result).toContain("[WORKING MEMORY]");
+		expect(result).toContain("Use mini_mem__xxx tools");
+		expect(result).toContain("- [id: 1] Fix the authentication flow");
+	});
+
+	it("outputs ordered list with correct ids and summaries for multiple slots", () => {
+		const store = createMiniMemStore();
+		addSlot(store, "First plan", "Content 1");
+		addSlot(store, "Second note", "Content 2");
+		addSlot(store, "Third decision", "Content 3");
+		const result = buildWorkingMemorySection(store);
+		expect(result).toContain("- [id: 1] First plan");
+		expect(result).toContain("- [id: 2] Second note");
+		expect(result).toContain("- [id: 3] Third decision");
+		// Verify order — id 1 before id 2 before id 3
+		const idx1 = result?.indexOf("[id: 1]") ?? -1;
+		const idx2 = result?.indexOf("[id: 2]") ?? -1;
+		const idx3 = result?.indexOf("[id: 3]") ?? -1;
+		expect(idx1).toBeLessThan(idx2);
+		expect(idx2).toBeLessThan(idx3);
+	});
+
+	it("does not expose full slot content in the section", () => {
+		const store = createMiniMemStore();
+		addSlot(store, "Secret plan", "TOP SECRET DETAILS HERE");
+		const result = buildWorkingMemorySection(store);
+		expect(result).not.toContain("TOP SECRET DETAILS HERE");
 	});
 });
 
