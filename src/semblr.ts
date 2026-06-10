@@ -160,63 +160,83 @@ const statsPresentedHashes: (string | null)[] = [null, null, null, null, null];
 // rounds from all past sessions.
 
 // ─────────────────────────────────────────────
-// Working Memory — in-memory named slot store
-// ─────────────────────────────────────────────
-
-/** In-memory working memory store. Session-scoped, survives between agent cycles
- *  within the same session. Cleared on session_start. Not persisted to disk.
- *  Max 7 slots (Miller's Law); oldest silently evicted when full. */
-let miniMemStore: MiniMemStore = createMiniMemStore();
-
-// ─────────────────────────────────────────────
-// Causal Chain — in-memory buffer of session rounds
-// ─────────────────────────────────────────────
-
-/** In-memory buffer of rounds from the current session, in chronological order.
- *  Survives between agent cycles within the same session. Cleared on session_start.
- *  Injected into context so the model can resolve "it", "those changes", "the fix", etc.
- *  without needing to search the vector index. */
-let causalChain: ChainEntry[] = [];
-
-// ─────────────────────────────────────────────
-// Round Groups — centroid-based semantic grouping
+// Session — state that survives between rounds within the same session.
+// Reset at session_start.
 // ─────────────────────────────────────────────
 
 type RoundGroup = SemanticGroup<ChainEntry>;
 
-/** In-memory groups of semantically similar rounds. Not persisted across sessions.
- *  Reset on session_start. Built incrementally at agent_end after each round save. */
-let roundGroups: RoundGroup[] = [];
+interface SessionState {
+	miniMemStore: MiniMemStore;
+	causalChain: ChainEntry[];
+	roundGroups: RoundGroup[];
+	lastFollowupGroupIdx: number | null;
+	injectedFollowupRounds: Set<string>;
+	injectedCheckpointRounds: Set<string>;
+}
 
-/** When a round has needsFollowup: true, the next round is automatically
- *  assigned to the same group — no semantic matching needed. This holds
- *  the group index to force-assign the next round to. Consumed once. */
-let lastFollowupGroupIdx: number | null = null;
-
-/** In-memory set of round filenames whose follow-up section has already been
- *  injected into context. Prevents re-injection on subsequent tool turns or
- *  across agent restarts within the same session. Never modifies saved JSON. */
-let injectedFollowupRounds: Set<string> = new Set();
+function createSession(): SessionState {
+	return {
+		miniMemStore: createMiniMemStore(),
+		causalChain: [],
+		roundGroups: [],
+		lastFollowupGroupIdx: null,
+		injectedFollowupRounds: new Set(),
+		injectedCheckpointRounds: new Set(),
+	};
+}
 
 // ─────────────────────────────────────────────
-// Context-size checkpoint — per-session state
+// Round — state reset at each agent_start. Lives for one user prompt → full response.
 // ─────────────────────────────────────────────
 
-/** Most recent checkpoint summary set by the semblr_checkpoint tool.
- *  Written by the tool execute handler, consumed by agent_end.
- *  Reset at agent_start. */
-let lastCheckpointSummary: CheckpointSummary | null = null;
+interface RoundState {
+	userPrompt: string | null;
+	turnIndex: number | null;
+	accumulatedText: string[];
+	toolCallCount: number;
+	toolCallNames: string[];
+	toolCalls: ToolCallDetail[];
+	responseSegments: ResponseSegment[];
+	// embedding cache
+	lastContextUserPrompt: string | null;
+	lastContextVec: number[];
+	promptVec: number[] | null;
+	skipPromptEmbedding: boolean;
+	presentedRecorded: boolean;
+	// full-message cache
+	cachedEnvPreamble: string | null;
+	cachedContextMessages: unknown[] | null;
+	cachedUserPromptForContext: string | null;
+	// checkpoint
+	lastCheckpointSummary: CheckpointSummary | null;
+	contextWarningIssued: number;
+}
 
-/** Highest context-size warning level issued during this agent cycle.
- *  0 = no warning, 1 = 70% threshold, 2 = 85%, 3 = 100%+.
- *  Reset at agent_start. Used to prevent re-injection on tool turns
- *  and to escalate if context grows further within the same cycle. */
-let contextWarningIssued = 0;
+function createRound(): RoundState {
+	return {
+		userPrompt: null,
+		turnIndex: null,
+		accumulatedText: [],
+		toolCallCount: 0,
+		toolCallNames: [],
+		toolCalls: [],
+		responseSegments: [],
+		lastContextUserPrompt: null,
+		lastContextVec: [],
+		promptVec: null,
+		skipPromptEmbedding: false,
+		presentedRecorded: false,
+		cachedEnvPreamble: null,
+		cachedContextMessages: null,
+		cachedUserPromptForContext: null,
+		lastCheckpointSummary: null,
+		contextWarningIssued: 0,
+	};
+}
 
-/** In-memory set of round filenames whose checkpoint summary has already been
- *  injected into context. Same pattern as injectedFollowupRounds.
- *  Reset at session_start. */
-let injectedCheckpointRounds: Set<string> = new Set();
+let session = createSession();
+let round = createRound();
 
 const SEMBLR_GROUP_THRESHOLD = SEMBLR_CONFIG.groupThreshold;
 
@@ -285,20 +305,20 @@ function finalizeRoundEmbedding({
 	// Assign to a semantic group.
 	// If this round is tagged needsFollowup, remember the group index so
 	// the next round is auto-assigned to the same group without semantic matching.
-	const roundEntry = causalChain[causalChain.length - 1];
+	const roundEntry = session.causalChain[session.causalChain.length - 1];
 	const groupIdx = assignToGroup(
-		roundGroups,
+		session.roundGroups,
 		roundEntry,
 		embeddingVec,
 		SEMBLR_GROUP_THRESHOLD,
-		needsFollowup ? lastFollowupGroupIdx : null,
+		needsFollowup ? session.lastFollowupGroupIdx : null,
 	);
 	if (needsFollowup) {
-		lastFollowupGroupIdx = groupIdx;
+		session.lastFollowupGroupIdx = groupIdx;
 	}
 
 	// Find the most recent round in the same group *before* this round
-	const group = roundGroups[groupIdx];
+	const group = session.roundGroups[groupIdx];
 	const relatedParentId = getRelatedParentIdFromGroup(group, roundEntry);
 	if (relatedParentId) {
 		// Re-read, update, re-write atomically
@@ -400,7 +420,7 @@ function needsFollowupInjection(fileName: string): boolean {
 	try {
 		if (!fs.existsSync(fullPath)) return false;
 		const parsed = JSON.parse(fs.readFileSync(fullPath, "utf-8"));
-		return parsed.needsFollowup === true && !injectedFollowupRounds.has(fileName);
+		return parsed.needsFollowup === true && !session.injectedFollowupRounds.has(fileName);
 	} catch {
 		return false;
 	}
@@ -412,7 +432,7 @@ function needsCheckpointInjection(fileName: string): boolean {
 	try {
 		if (!fs.existsSync(fullPath)) return false;
 		const parsed = JSON.parse(fs.readFileSync(fullPath, "utf-8"));
-		return parsed.summary != null && !injectedCheckpointRounds.has(fileName);
+		return parsed.summary != null && !session.injectedCheckpointRounds.has(fileName);
 	} catch {
 		return false;
 	}
@@ -434,34 +454,11 @@ function buildCheckpointContext(fileName: string): string | null {
 	return buildCheckpointSectionContent(fileName, summary);
 }
 
-// Per-agent accumulation (reset in agent_start, saved in agent_end)
-let agentUserPrompt: string | null = null;
-let agentTurnIndex: number | null = null;
-let agentAccumulatedText: string[] = [];
-let agentToolCallCount = 0;
-let agentToolCallNames: string[] = [];
-let agentToolCalls: ToolCallDetail[] = [];
+// Per-agent accumulation state now lives in `round` object (createRound()).
+// Reset at each agent_start.
+
+// Thread-local pending tool call IDs — cleared per tool call, not per round
 const _agentPendingToolCallIds: Map<string, ToolCallDetail> = new Map(); // toolCallId → partial detail
-
-// Interleaved response segments — preserves tool call positions within assistant text
-let agentResponseSegments: ResponseSegment[] = [];
-
-// Context embedding cache — avoids redundant embedding API calls across tool turns
-// within the same agent cycle. Reset in agent_start.
-let lastContextUserPrompt: string | null = null;
-let lastContextVec: number[] = [];
-let agentPromptVec: number[] | null = null; // cached from context hook, reused in agent_end to avoid redundant embed
-let agentSkipPromptEmbedding = false; // set by context hook for short prompts, signals agent_end to skip prompt embedding only (response still embedded)
-let roundPresentedRecorded = false; // dedup: recordPresented only once per agent cycle
-
-// Full-message cache — the envPreamble plus context-building-reference sections
-// (recency list, relevance list, preamble) are computed once per agent cycle on
-// the first context hook invocation and reused for subsequent tool turns.
-// This fixes a prompt-cache-busting bug where new Date() timestamps in the
-// envPreamble changed on every inner LLM call.
-let cachedEnvPreamble: string | null = null;
-let cachedContextMessages: unknown[] | null = null;
-let cachedUserPromptForContext: string | null = null; // the extracted user prompt used to build cachedContextMessages
 
 function appendToIndex(filePath: string, vector: number[], model?: string) {
 	appendToIndexPath(INDEX_PATH, ROUNDS_DIR, filePath, vector, {}, model);
@@ -638,8 +635,8 @@ export default function (pi: ExtensionAPI) {
 		}
 
 		// Only inject if level increased (escalation) or first warning
-		if (newLevel <= contextWarningIssued) return allMessages;
-		contextWarningIssued = newLevel;
+		if (newLevel <= round.contextWarningIssued) return allMessages;
+		round.contextWarningIssued = newLevel;
 
 		// Build the warning message
 		const levelLabel = newLevel === 3 ? "3 — IMMEDIATE" : String(newLevel);
@@ -694,7 +691,7 @@ export default function (pi: ExtensionAPI) {
 					role: "user" as const,
 					content: [{ type: "text" as const, text: checkpointSection }],
 				};
-				injectedCheckpointRounds.add(lastRoundFileName);
+				session.injectedCheckpointRounds.add(lastRoundFileName);
 				hasCheckpoint = true;
 			}
 		}
@@ -707,7 +704,7 @@ export default function (pi: ExtensionAPI) {
 					role: "user" as const,
 					content: [{ type: "text" as const, text: followUpSection }],
 				};
-				injectedFollowupRounds.add(lastRoundFileName);
+				session.injectedFollowupRounds.add(lastRoundFileName);
 			}
 		}
 
@@ -718,12 +715,12 @@ export default function (pi: ExtensionAPI) {
 		const { messages } = event;
 
 		// --- Prepend environment info to the current user prompt ---
-		// Computed once per agent cycle (cachedEnvPreamble) so the timestamp is
+		// Computed once per agent cycle (round.cachedEnvPreamble) so the timestamp is
 		// stable across tool turns — avoids busting the LLM prompt cache.
 		const envPreamble =
-			cachedEnvPreamble ??
+			round.cachedEnvPreamble ??
 			`[ENVIRONMENT]\nHost: ${os.hostname()}\nCWD: ${process.cwd()}\nCurrent date/time: ${new Date().toISOString().replace(/[-:]/g, "").replace(/\.\d+/, "")}`;
-		cachedEnvPreamble = envPreamble; // pin early so guard below can use it
+		round.cachedEnvPreamble = envPreamble; // pin early so guard below can use it
 
 		// --- Extract system prompt + current round messages ---
 		// We strip all prior rounds to prevent conversation bloat.
@@ -740,9 +737,9 @@ export default function (pi: ExtensionAPI) {
 		// --- Reuse cached context blocks if this is a subsequent context call within
 		//     the same agent cycle. The recency list, relevance list, and preamble
 		//     are stable across tool turns; only the currentMessages section changes.
-		if (cachedContextMessages && cachedEnvPreamble && userPrompt === cachedUserPromptForContext) {
+		if (round.cachedContextMessages && round.cachedEnvPreamble && userPrompt === round.cachedUserPromptForContext) {
 			// Compose: system + preamble + recency + relevance + current turn messages
-			const finalMessages = applyContextSizeWarning(cachedContextMessages, currentMessages, systemMsg);
+			const finalMessages = applyContextSizeWarning(round.cachedContextMessages, currentMessages, systemMsg);
 			return { messages: finalMessages } as any;
 		}
 
@@ -752,18 +749,18 @@ export default function (pi: ExtensionAPI) {
 		if (shouldDropEmbedding(rawPromptWordCount)) {
 			// Short prompt: skip prompt embedding (noisy) but still embed response (significant).
 			// Per https://github.com/vhallac/semblr/issues/38#issuecomment-4629826478
-			agentSkipPromptEmbedding = true;
-			agentPromptVec = null;
-			cachedEnvPreamble = envPreamble;
-			cachedUserPromptForContext = userPrompt;
+			round.skipPromptEmbedding = true;
+			round.promptVec = null;
+			round.cachedEnvPreamble = envPreamble;
+			round.cachedUserPromptForContext = userPrompt;
 
 			// Build non-embedding context sections (all in-memory / disk, zero API cost)
-			const recencyList = buildGroupedRecencyList(roundGroups, causalChain, getRoundSize);
+			const recencyList = buildGroupedRecencyList(session.roundGroups, session.causalChain, getRoundSize);
 			const preamble = buildContextPreamble(!!recencyList, false);
 
 			const { followUpMsg, checkpointMsg } = resolveCompoundInjections();
 
-			const workingMem = buildWorkingMemorySection(miniMemStore);
+			const workingMem = buildWorkingMemorySection(session.miniMemStore);
 
 			const sessionArchitecture = buildSessionArchitecture();
 
@@ -784,19 +781,23 @@ export default function (pi: ExtensionAPI) {
 				checkpointMsg,
 				contractMsg,
 			});
-			cachedContextMessages = [...prefixMsgs];
+			round.cachedContextMessages = [...prefixMsgs];
 
 			// ══ Stats: record all 5 positions presented ══
-			if (!roundPresentedRecorded) {
-				recordPresented(statsState, statsPresentedHashes, causalChain, TRACK_POSITIONS);
-				roundPresentedRecorded = true;
+			if (!round.presentedRecorded) {
+				recordPresented(statsState, statsPresentedHashes, session.causalChain, TRACK_POSITIONS);
+				round.presentedRecorded = true;
 			}
 
-			const finalMessages: unknown[] = applyContextSizeWarning(cachedContextMessages, currentMessages, systemMsg);
+			const finalMessages: unknown[] = applyContextSizeWarning(
+				round.cachedContextMessages,
+				currentMessages,
+				systemMsg,
+			);
 			return { messages: finalMessages } as any;
 		}
 
-		// agentPromptVec is stashed after embedding below for agent_end to reuse
+		// round.promptVec is stashed after embedding below for agent_end to reuse
 
 		try {
 			const apiKey = await getApiKey(ctx, { config: SEMBLR_CONFIG });
@@ -804,7 +805,7 @@ export default function (pi: ExtensionAPI) {
 				const prefixMsgs = assembleContextPrefix({
 					systemMsg,
 					sessionArchitecture: buildSessionArchitecture(),
-					workingMemory: buildWorkingMemorySection(miniMemStore),
+					workingMemory: buildWorkingMemorySection(session.miniMemStore),
 					preamble: null,
 					recencyList: null,
 					relevanceList: null,
@@ -822,26 +823,26 @@ export default function (pi: ExtensionAPI) {
 			// Embed the user prompt — cached per agent cycle to avoid redundant API calls
 			// across multiple tool turns within the same user prompt.
 			let queryVec: number[];
-			if (userPrompt === lastContextUserPrompt) {
-				queryVec = lastContextVec;
+			if (userPrompt === round.lastContextUserPrompt) {
+				queryVec = round.lastContextVec;
 			} else {
 				queryVec = normalize(await embedText(userPrompt, apiKey, embeddingClientDeps(ctx)));
-				lastContextUserPrompt = userPrompt;
-				lastContextVec = queryVec;
+				round.lastContextUserPrompt = userPrompt;
+				round.lastContextVec = queryVec;
 			}
 			// Stash for agent_end to reuse (saves 1 embedding call per round)
-			agentPromptVec = queryVec;
+			round.promptVec = queryVec;
 
 			// Load and score the index
 			const index = loadIndex();
 			if (index.length === 0) {
 				// Final response contract + current messages (no context lists)
-				cachedEnvPreamble = envPreamble;
-				cachedUserPromptForContext = userPrompt;
+				round.cachedEnvPreamble = envPreamble;
+				round.cachedUserPromptForContext = userPrompt;
 				const emptyIdxMsgs = assembleContextPrefix({
 					systemMsg,
 					sessionArchitecture: buildSessionArchitecture(),
-					workingMemory: buildWorkingMemorySection(miniMemStore),
+					workingMemory: buildWorkingMemorySection(session.miniMemStore),
 					preamble: null,
 					recencyList: null,
 					relevanceList: null,
@@ -852,8 +853,12 @@ export default function (pi: ExtensionAPI) {
 						content: [{ type: "text" as const, text: buildFinalResponseContract() }],
 					},
 				});
-				cachedContextMessages = emptyIdxMsgs;
-				const finalMessages: unknown[] = applyContextSizeWarning(cachedContextMessages, currentMessages, systemMsg);
+				round.cachedContextMessages = emptyIdxMsgs;
+				const finalMessages: unknown[] = applyContextSizeWarning(
+					round.cachedContextMessages,
+					currentMessages,
+					systemMsg,
+				);
 				return { messages: finalMessages } as any;
 			}
 
@@ -875,12 +880,12 @@ export default function (pi: ExtensionAPI) {
 			if (selectedRounds.length === 0) {
 				ctx.ui.setStatus("semblr", `🧠 no relevant context (best: ${bestScore.toFixed(3)})`);
 				// Cache the empty-context result so subsequent turns reuse it
-				cachedEnvPreamble = envPreamble;
-				cachedUserPromptForContext = userPrompt;
+				round.cachedEnvPreamble = envPreamble;
+				round.cachedUserPromptForContext = userPrompt;
 				const zeroResultMsgs = assembleContextPrefix({
 					systemMsg,
 					sessionArchitecture: buildSessionArchitecture(),
-					workingMemory: buildWorkingMemorySection(miniMemStore),
+					workingMemory: buildWorkingMemorySection(session.miniMemStore),
 					preamble: null,
 					recencyList: null,
 					relevanceList: null,
@@ -891,8 +896,12 @@ export default function (pi: ExtensionAPI) {
 						content: [{ type: "text" as const, text: buildFinalResponseContract() }],
 					},
 				});
-				cachedContextMessages = zeroResultMsgs;
-				const finalMessages: unknown[] = applyContextSizeWarning(cachedContextMessages, currentMessages, systemMsg);
+				round.cachedContextMessages = zeroResultMsgs;
+				const finalMessages: unknown[] = applyContextSizeWarning(
+					round.cachedContextMessages,
+					currentMessages,
+					systemMsg,
+				);
 				return { messages: finalMessages } as any;
 			}
 
@@ -904,26 +913,26 @@ export default function (pi: ExtensionAPI) {
 						selectedRounds.map((r) => ({ fileName: r.fileName, bestScore: r.bestScore, data: r.data })),
 						getRoundSize,
 					);
-			const recencyList = buildGroupedRecencyList(roundGroups, causalChain, getRoundSize);
+			const recencyList = buildGroupedRecencyList(session.roundGroups, session.causalChain, getRoundSize);
 			const preamble = buildContextPreamble(!!recencyList, !!relevanceList);
 
 			// ══ Stats: record all 5 positions presented ══
 			{
-				if (!roundPresentedRecorded) {
-					recordPresented(statsState, statsPresentedHashes, causalChain, TRACK_POSITIONS);
-					roundPresentedRecorded = true;
+				if (!round.presentedRecorded) {
+					recordPresented(statsState, statsPresentedHashes, session.causalChain, TRACK_POSITIONS);
+					round.presentedRecorded = true;
 				}
 				const uniqueRounds = new Set(index.map((e: { filePath: string }) => indexRoundFileFromPath(e.filePath)))
 					.size;
 				ctx.ui.setStatus(
 					"semblr",
-					`🧠 collapsed: ${selectedRounds.length} matched / ${uniqueRounds} total | ${formatGroupStats(roundGroups, SEMBLR_GROUP_THRESHOLD)}`,
+					`🧠 collapsed: ${selectedRounds.length} matched / ${uniqueRounds} total | ${formatGroupStats(session.roundGroups, SEMBLR_GROUP_THRESHOLD)}`,
 				);
 			}
 
 			const { followUpMsg, checkpointMsg } = resolveCompoundInjections();
 
-			const workingMem = buildWorkingMemorySection(miniMemStore);
+			const workingMem = buildWorkingMemorySection(session.miniMemStore);
 			const sessionArchitecture = buildSessionArchitecture();
 
 			const contractMsg = {
@@ -947,11 +956,11 @@ export default function (pi: ExtensionAPI) {
 			// Cache the stable prefix (system + context sections + final response contract) for
 			// subsequent context calls within this agent cycle. currentMessages is
 			// appended fresh each time.
-			cachedEnvPreamble = envPreamble;
-			cachedUserPromptForContext = userPrompt;
-			cachedContextMessages = [...prefixMsgs]; // snapshot before warning injection
+			round.cachedEnvPreamble = envPreamble;
+			round.cachedUserPromptForContext = userPrompt;
+			round.cachedContextMessages = [...prefixMsgs]; // snapshot before warning injection
 
-			const resultMessages = applyContextSizeWarning(cachedContextMessages, currentMessages, systemMsg);
+			const resultMessages = applyContextSizeWarning(round.cachedContextMessages, currentMessages, systemMsg);
 
 			return { messages: resultMessages } as any;
 		} catch (err) {
@@ -966,53 +975,31 @@ export default function (pi: ExtensionAPI) {
 	// which fire per inner LLM call within a tool-calling loop). By saving at
 	// agent_end we capture the FULL assistant response across all tool iterations.
 	pi.on("agent_start", async (_event, _ctx) => {
-		// agent_start no longer carries messages/turnIndex in current pi API.
-		// Hooks that need this info use agentPromptVec from context embedding
-		// or before_agent_start prompt. turnIndex defaults to 0 in round data.
-		agentAccumulatedText = [];
-		agentToolCallCount = 0;
-		agentToolCallNames = [];
-		agentToolCalls = [];
-		agentResponseSegments = [];
-
-		// Reset context embedding cache — new agent cycle = new user prompt
-		lastContextUserPrompt = null;
-		lastContextVec = [];
-		agentPromptVec = null;
-		agentSkipPromptEmbedding = false;
-		roundPresentedRecorded = false;
-
-		// Reset full-message cache — env preamble and context blocks rebuilt on first context call
-		cachedEnvPreamble = null;
-		cachedContextMessages = null;
-		cachedUserPromptForContext = null;
-
-		// Reset checkpoint state — new agent cycle starts fresh
-		lastCheckpointSummary = null;
-		contextWarningIssued = 0;
+		// New agent cycle — fresh round state
+		round = createRound();
 	});
 
 	pi.on("message_end", async (event, _ctx) => {
 		const state: MessageEndProcessingState = {
-			accumulatedText: agentAccumulatedText,
-			toolCallCount: agentToolCallCount,
-			toolCallNames: agentToolCallNames,
-			toolCalls: agentToolCalls,
-			responseSegments: agentResponseSegments,
+			accumulatedText: round.accumulatedText,
+			toolCallCount: round.toolCallCount,
+			toolCallNames: round.toolCallNames,
+			toolCalls: round.toolCalls,
+			responseSegments: round.responseSegments,
 		};
 		applyMessageEndToState(event.message, state);
-		agentAccumulatedText = state.accumulatedText;
-		agentToolCallCount = state.toolCallCount;
-		agentToolCallNames = state.toolCallNames;
-		agentToolCalls = state.toolCalls;
-		agentResponseSegments = state.responseSegments;
+		round.accumulatedText = state.accumulatedText;
+		round.toolCallCount = state.toolCallCount;
+		round.toolCallNames = state.toolCallNames;
+		round.toolCalls = state.toolCalls;
+		round.responseSegments = state.responseSegments;
 	});
 
 	pi.on("agent_end", async (event, ctx) => {
 		const { messages } = event;
 
 		// Get user prompt -- prefer agent_start cached value, fall back to messages
-		const userPrompt = extractAgentEndUserPrompt(agentUserPrompt, messages);
+		const userPrompt = extractAgentEndUserPrompt(round.userPrompt, messages);
 
 		if (!userPrompt) {
 			ctx.ui.setStatus("semblr", "\u{1f9e0} agent_end: no user prompt to save");
@@ -1020,7 +1007,7 @@ export default function (pi: ExtensionAPI) {
 		}
 
 		// Build response text from accumulated assistant text across all tool iterations
-		const rawResponseText = extractAgentEndResponseText(agentAccumulatedText, messages);
+		const rawResponseText = extractAgentEndResponseText(round.accumulatedText, messages);
 
 		if (!rawResponseText) {
 			ctx.ui.setStatus("semblr", "\u{1f9e0} agent_end: no response text");
@@ -1033,13 +1020,13 @@ export default function (pi: ExtensionAPI) {
 
 		fs.mkdirSync(ROUNDS_DIR, { recursive: true });
 
-		const roundFileName = createRoundFilePath(userPrompt, responseText, agentToolCalls);
+		const roundFileName = createRoundFilePath(userPrompt, responseText, round.toolCalls);
 		const roundPath = `${ROUNDS_DIR}/${roundFileName}`;
 
 		// Push to causal chain — even on dedup, this ensures the in-memory buffer
 		// tracks every round seen in this session.
-		causalChain.push(
-			buildAgentEndChainEntry(roundFileName, userPrompt, responseText, agentToolCalls.length, agentToolCallNames),
+		session.causalChain.push(
+			buildAgentEndChainEntry(roundFileName, userPrompt, responseText, round.toolCalls.length, round.toolCallNames),
 		);
 
 		// Skip if already saved (deduplication by content hash)
@@ -1051,11 +1038,11 @@ export default function (pi: ExtensionAPI) {
 				if (existing.promptEmbedding) {
 					const vec = existing.promptEmbedding || null;
 					assignToGroup(
-						roundGroups,
-						causalChain[causalChain.length - 1],
+						session.roundGroups,
+						session.causalChain[session.causalChain.length - 1],
 						vec,
 						SEMBLR_GROUP_THRESHOLD,
-						needsFollowup ? lastFollowupGroupIdx : null,
+						needsFollowup ? session.lastFollowupGroupIdx : null,
 					);
 				}
 			} catch {
@@ -1063,37 +1050,37 @@ export default function (pi: ExtensionAPI) {
 			}
 			ctx.ui.setStatus("semblr", `\u{1f9e0} round already saved (${roundFileName})`);
 			lastRoundFileName = roundFileName;
-			agentAccumulatedText = [];
-			agentUserPrompt = null;
-			agentTurnIndex = null;
+			round.accumulatedText = [];
+			round.userPrompt = null;
+			round.turnIndex = null;
 			flushStatsFile(statsState, STATS_PATH, SEMBLR_DIR); // causal chain was pushed, so position scores may have changed
 			return;
 		}
 
-		// Compute parentId from causalChain
-		const parentId = getAgentEndParentId(causalChain);
+		// Compute parentId from session.causalChain
+		const parentId = getAgentEndParentId(session.causalChain);
 
 		// Write round file
 		const roundData = buildAgentEndRoundData({
 			userPrompt,
 			responseText,
-			turnIndex: agentTurnIndex,
-			toolCallCount: agentToolCallCount,
-			toolCallNames: agentToolCallNames,
-			toolCalls: agentToolCalls,
-			responseSegments: agentResponseSegments,
+			turnIndex: round.turnIndex,
+			toolCallCount: round.toolCallCount,
+			toolCallNames: round.toolCallNames,
+			toolCalls: round.toolCalls,
+			responseSegments: round.responseSegments,
 			parentId,
 			needsFollowup,
-			summary: lastCheckpointSummary ?? undefined,
+			summary: round.lastCheckpointSummary ?? undefined,
 		});
 
 		try {
 			fs.writeFileSync(roundPath, JSON.stringify(roundData, null, 2));
 		} catch (err) {
 			ctx.ui.setStatus("semblr", `\u{1f9e0} write error: ${(err as Error).message}`);
-			agentAccumulatedText = [];
-			agentUserPrompt = null;
-			agentTurnIndex = null;
+			round.accumulatedText = [];
+			round.userPrompt = null;
+			round.turnIndex = null;
 			return;
 		}
 
@@ -1110,13 +1097,13 @@ export default function (pi: ExtensionAPI) {
 		if (!apiKey) {
 			ctx.ui.setStatus("semblr", "\u{1f9e0} saved but not embedded (no API key)");
 			lastRoundFileName = roundFileName;
-			agentAccumulatedText = [];
-			agentUserPrompt = null;
-			agentTurnIndex = null;
+			round.accumulatedText = [];
+			round.userPrompt = null;
+			round.turnIndex = null;
 			return;
 		}
 
-		if (agentSkipPromptEmbedding) {
+		if (round.skipPromptEmbedding) {
 			// Short prompt: skip prompt embedding (noisy), but still embed response.
 			// Response is usually significant even when the prompt is short.
 			// Per https://github.com/vhallac/semblr/issues/38#issuecomment-4629826478
@@ -1130,8 +1117,8 @@ export default function (pi: ExtensionAPI) {
 				appendToIndex(`${roundFileName}:response`, responseVec, SEMBLR_CONFIG.embeddingModel);
 
 				// Embed checkpoint summary if present
-				if (lastCheckpointSummary) {
-					const summaryText = buildCheckpointSummaryText(lastCheckpointSummary);
+				if (round.lastCheckpointSummary) {
+					const summaryText = buildCheckpointSummaryText(round.lastCheckpointSummary);
 					const summaryVec = normalize(await embedText(summaryText, apiKey, embeddingClientDeps(ctx)));
 					appendToIndex(`${roundFileName}:summary`, summaryVec, SEMBLR_CONFIG.embeddingModel);
 				}
@@ -1155,9 +1142,9 @@ export default function (pi: ExtensionAPI) {
 					EMBEDDING_RESPONSE_MAX_BYTES,
 				);
 
-				// Embedding #1: prompt (reuse cached agentPromptVec if available)
+				// Embedding #1: prompt (reuse cached round.promptVec if available)
 				const promptVec =
-					agentPromptVec ?? normalize(await embedText(userPrompt, apiKey, embeddingClientDeps(ctx)));
+					round.promptVec ?? normalize(await embedText(userPrompt, apiKey, embeddingClientDeps(ctx)));
 
 				// Embedding #2 + #3 in parallel
 				const [responseVec, combinedVec] = await Promise.all([
@@ -1170,8 +1157,8 @@ export default function (pi: ExtensionAPI) {
 				appendToIndex(`${roundFileName}:response`, normalize(responseVec), SEMBLR_CONFIG.embeddingModel);
 
 				// Embed checkpoint summary if present
-				if (lastCheckpointSummary) {
-					const summaryText = buildCheckpointSummaryText(lastCheckpointSummary);
+				if (round.lastCheckpointSummary) {
+					const summaryText = buildCheckpointSummaryText(round.lastCheckpointSummary);
 					const summaryVec = normalize(await embedText(summaryText, apiKey, embeddingClientDeps(ctx)));
 					appendToIndex(`${roundFileName}:summary`, summaryVec, SEMBLR_CONFIG.embeddingModel);
 				}
@@ -1189,9 +1176,9 @@ export default function (pi: ExtensionAPI) {
 		}
 
 		lastRoundFileName = roundFileName;
-		agentAccumulatedText = [];
-		agentUserPrompt = null;
-		agentTurnIndex = null;
+		round.accumulatedText = [];
+		round.userPrompt = null;
+		round.turnIndex = null;
 
 		// ◈ Flush stats to disk (atomically) and show in TUI
 		flushStatsFile(statsState, STATS_PATH, SEMBLR_DIR);
@@ -1202,7 +1189,7 @@ export default function (pi: ExtensionAPI) {
 		const totalRounds = new Set(idx.map((e: { filePath: string }) => indexRoundFileFromPath(e.filePath))).size;
 		ctx.ui.setStatus(
 			"semblr",
-			`🧠 ${totalRounds} total indexed | ${formatGroupStats(roundGroups, SEMBLR_GROUP_THRESHOLD)}`,
+			`🧠 ${totalRounds} total indexed | ${formatGroupStats(session.roundGroups, SEMBLR_GROUP_THRESHOLD)}`,
 		);
 	});
 
@@ -1222,13 +1209,8 @@ export default function (pi: ExtensionAPI) {
 	// registerTool is called inside session_start because factory-level
 	// registration doesn't reliably make tools visible to the LLM.
 	pi.on("session_start", async (_event, ctx) => {
-		// Clear causal chain, round groups, and follow-up state — new session starts fresh
-		causalChain = [];
-		roundGroups = [];
-		lastFollowupGroupIdx = null;
-		injectedFollowupRounds = new Set();
-		injectedCheckpointRounds = new Set();
-		miniMemStore = createMiniMemStore();
+		// Clear session scoped state — new session starts fresh
+		session = createSession();
 
 		const index = loadSessionStartIndex();
 		ctx.ui.setStatus("semblr", buildSessionStartStatus(index));
@@ -1442,8 +1424,8 @@ export default function (pi: ExtensionAPI) {
 				const p = params as CheckpointSummary;
 				// Only store if a context-size warning was actually issued this cycle.
 				// This prevents the agent from calling it unsolicited and corrupting state.
-				if (contextWarningIssued > 0) {
-					lastCheckpointSummary = {
+				if (round.contextWarningIssued > 0) {
+					round.lastCheckpointSummary = {
 						currentTask: p.currentTask,
 						progressMade: p.progressMade,
 						currentState: p.currentState,
@@ -1485,9 +1467,9 @@ export default function (pi: ExtensionAPI) {
 			}),
 			async execute(_toolCallId, params, _signal, _onUpdate, _ctx2) {
 				const { summary, content } = params as { summary: string; content: string };
-				const id = addSlot(miniMemStore, summary, content, lastRoundFileName ?? undefined);
+				const id = addSlot(session.miniMemStore, summary, content, lastRoundFileName ?? undefined);
 				const lines: string[] = [`Stored as memory slot [id: ${id}]. Current slots:`];
-				for (const slot of miniMemStore.slots) {
+				for (const slot of session.miniMemStore.slots) {
 					lines.push(`- [id: ${slot.id}] ${slot.summary}`);
 				}
 				return {
@@ -1509,7 +1491,7 @@ export default function (pi: ExtensionAPI) {
 			}),
 			async execute(_toolCallId, params, _signal, _onUpdate, _ctx2) {
 				const { id } = params as { id: number };
-				const slot = getSlot(miniMemStore, id);
+				const slot = getSlot(session.miniMemStore, id);
 				if (!slot) {
 					return {
 						content: [{ type: "text", text: `No memory slot found with id: ${id}.` }],
@@ -1542,7 +1524,7 @@ export default function (pi: ExtensionAPI) {
 			}),
 			async execute(_toolCallId, params, _signal, _onUpdate, _ctx2) {
 				const { id, summary, content } = params as { id: number; summary: string; content: string };
-				const slot = updateSlot(miniMemStore, id, summary, content, lastRoundFileName ?? undefined);
+				const slot = updateSlot(session.miniMemStore, id, summary, content, lastRoundFileName ?? undefined);
 				if (!slot) {
 					return {
 						content: [{ type: "text", text: `No memory slot found with id: ${id}.` }],
@@ -1572,7 +1554,7 @@ export default function (pi: ExtensionAPI) {
 			}),
 			async execute(_toolCallId, params, _signal, _onUpdate, _ctx2) {
 				const { id } = params as { id: number };
-				const found = deleteSlot(miniMemStore, id);
+				const found = deleteSlot(session.miniMemStore, id);
 				if (!found) {
 					return {
 						content: [{ type: "text", text: `No memory slot found with id: ${id}.` }],
@@ -1598,7 +1580,7 @@ export default function (pi: ExtensionAPI) {
 			}),
 			async execute(_toolCallId, params, _signal, _onUpdate, _ctx2) {
 				const { id } = params as { id: number };
-				const slot = getAndDeleteSlot(miniMemStore, id);
+				const slot = getAndDeleteSlot(session.miniMemStore, id);
 				if (!slot) {
 					return {
 						content: [{ type: "text", text: `No memory slot found with id: ${id}.` }],
