@@ -33,7 +33,7 @@ import {
 	shouldDropRelevanceList,
 } from "../lib/context-messages.ts";
 import { embedText, getApiKey } from "../lib/embedding-client.ts";
-import { assignToGroup, formatGroupStats, type SemanticGroup } from "../lib/grouping.ts";
+import { assignToGroup, formatGroupStats } from "../lib/grouping.ts";
 import { createRoundFilePath } from "../lib/hash.ts";
 import { indexRoundFileFromPath } from "../lib/index-io.ts";
 import {
@@ -56,7 +56,7 @@ import {
 	getRelatedParentIdFromGroup,
 	type MessageEndProcessingState,
 } from "../lib/round-capture.ts";
-import type { ChainEntry, CheckpointSummary, ResponseSegment, RoundData, ToolCallDetail } from "../lib/round-data.ts";
+import type { RoundData } from "../lib/round-data.ts";
 import {
 	loadRoundDataForToolDetails,
 	renderRoundDetailsToolResult,
@@ -73,6 +73,8 @@ import {
 	selectContextRounds,
 } from "../lib/search-interactions.ts";
 import { loadSemblrConfig, type SemblrConfig } from "../lib/semblr-config.ts";
+import type { CheckpointSummary, ToolCallDetail } from "../lib/state.ts";
+import { createRound, createSession } from "../lib/state.ts";
 import {
 	flushStatsFile,
 	formatChainReadStatsReport,
@@ -82,15 +84,7 @@ import {
 } from "../lib/stats.ts";
 import { estimateMessagesTokens } from "../lib/tokens.ts";
 import { normalize } from "../lib/vector.ts";
-import {
-	addSlot,
-	createMiniMemStore,
-	deleteSlot,
-	getAndDeleteSlot,
-	getSlot,
-	type MiniMemStore,
-	updateSlot,
-} from "../lib/working-memory.ts";
+import { addSlot, deleteSlot, getAndDeleteSlot, getSlot, updateSlot } from "../lib/working-memory.ts";
 
 export {
 	assembleContextPrefix,
@@ -163,77 +157,6 @@ const statsPresentedHashes: (string | null)[] = [null, null, null, null, null];
 // Session — state that survives between rounds within the same session.
 // Reset at session_start.
 // ─────────────────────────────────────────────
-
-type RoundGroup = SemanticGroup<ChainEntry>;
-
-interface SessionState {
-	miniMemStore: MiniMemStore;
-	causalChain: ChainEntry[];
-	roundGroups: RoundGroup[];
-	lastFollowupGroupIdx: number | null;
-	injectedFollowupRounds: Set<string>;
-	injectedCheckpointRounds: Set<string>;
-}
-
-function createSession(): SessionState {
-	return {
-		miniMemStore: createMiniMemStore(),
-		causalChain: [],
-		roundGroups: [],
-		lastFollowupGroupIdx: null,
-		injectedFollowupRounds: new Set(),
-		injectedCheckpointRounds: new Set(),
-	};
-}
-
-// ─────────────────────────────────────────────
-// Round — state reset at each agent_start. Lives for one user prompt → full response.
-// ─────────────────────────────────────────────
-
-interface RoundState {
-	userPrompt: string | null;
-	turnIndex: number | null;
-	accumulatedText: string[];
-	toolCallCount: number;
-	toolCallNames: string[];
-	toolCalls: ToolCallDetail[];
-	responseSegments: ResponseSegment[];
-	// embedding cache
-	lastContextUserPrompt: string | null;
-	lastContextVec: number[];
-	promptVec: number[] | null;
-	skipPromptEmbedding: boolean;
-	presentedRecorded: boolean;
-	// full-message cache
-	cachedEnvPreamble: string | null;
-	cachedContextMessages: unknown[] | null;
-	cachedUserPromptForContext: string | null;
-	// checkpoint
-	lastCheckpointSummary: CheckpointSummary | null;
-	contextWarningIssued: number;
-}
-
-function createRound(): RoundState {
-	return {
-		userPrompt: null,
-		turnIndex: null,
-		accumulatedText: [],
-		toolCallCount: 0,
-		toolCallNames: [],
-		toolCalls: [],
-		responseSegments: [],
-		lastContextUserPrompt: null,
-		lastContextVec: [],
-		promptVec: null,
-		skipPromptEmbedding: false,
-		presentedRecorded: false,
-		cachedEnvPreamble: null,
-		cachedContextMessages: null,
-		cachedUserPromptForContext: null,
-		lastCheckpointSummary: null,
-		contextWarningIssued: 0,
-	};
-}
 
 let session = createSession();
 let round = createRound();
