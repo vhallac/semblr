@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
-	buildContextMessagePrefix,
+	assembleContextPrefix,
+	type ContextBlocks,
 	countWordsInMessageContent,
 	extractContextPrompt,
 	prepareContextMessages,
@@ -263,21 +264,35 @@ describe("shouldDropEmbedding", () => {
 	});
 });
 
-describe("buildContextMessagePrefix", () => {
-	it("returns empty array when all inputs are null", () => {
-		expect(buildContextMessagePrefix(null, null, null, null, null)).toEqual([]);
+function emptyBlocks(): ContextBlocks {
+	return {
+		systemMsg: null,
+		sessionArchitecture: null,
+		workingMemory: null,
+		preamble: null,
+		recencyList: null,
+		relevanceList: null,
+		followUpMsg: null,
+		checkpointMsg: null,
+		contractMsg: null,
+	};
+}
+
+describe("assembleContextPrefix", () => {
+	it("returns empty array when all blocks are null", () => {
+		expect(assembleContextPrefix(emptyBlocks())).toEqual([]);
 	});
 
 	it("includes system message when provided", () => {
 		const systemMsg = { role: "system", content: "You are helpful" };
-		const result = buildContextMessagePrefix(systemMsg, null, null, null, null);
+		const result = assembleContextPrefix({ ...emptyBlocks(), systemMsg });
 		expect(result).toHaveLength(1);
 		expect(result[0]).toEqual(systemMsg);
 	});
 
 	it("includes session architecture when provided", () => {
 		const arch = "[SESSION ARCHITECTURE]\nsome text";
-		const result = buildContextMessagePrefix(null, arch, null, null, null);
+		const result = assembleContextPrefix({ ...emptyBlocks(), sessionArchitecture: arch });
 		expect(result).toHaveLength(1);
 		expect((result[0] as { content: Array<{ type: string; text: string }> }).content[0].text).toBe(arch);
 	});
@@ -286,54 +301,55 @@ describe("buildContextMessagePrefix", () => {
 		const systemMsg = { role: "system", content: "sys" };
 		const arch = "[SESSION ARCHITECTURE]";
 		const preamble = "preamble text";
-		const result = buildContextMessagePrefix(systemMsg, arch, preamble, null, null);
+		const result = assembleContextPrefix({ ...emptyBlocks(), systemMsg, sessionArchitecture: arch, preamble });
 		expect(result).toHaveLength(3);
 		expect(result[0]).toEqual(systemMsg);
 		expect((result[1] as { content: Array<{ type: string; text: string }> }).content[0].text).toBe(arch);
 		expect((result[2] as { content: Array<{ type: string; text: string }> }).content[0].text).toBe(preamble);
 	});
 
-	it("includes preamble when provided", () => {
-		const result = buildContextMessagePrefix(null, null, "preamble text", null, null);
-		expect(result).toHaveLength(1);
-		expect((result[0] as { content: Array<{ type: string; text: string }> }).content[0].text).toBe("preamble text");
-	});
-
-	it("includes recencyList when provided", () => {
-		const result = buildContextMessagePrefix(null, null, null, "recent rounds", null);
-		expect(result).toHaveLength(1);
-	});
-
-	it("includes relevanceList when provided", () => {
-		const result = buildContextMessagePrefix(null, null, null, null, "relevant rounds");
-		expect(result).toHaveLength(1);
-	});
-
-	it("includes contractMsg when provided", () => {
-		const contract = {
-			role: "user",
-			content: [{ type: "text", text: "contract text" }],
-		};
-		const result = buildContextMessagePrefix(null, null, null, null, null, contract);
-		expect(result).toHaveLength(1);
-		expect(result[0]).toEqual(contract);
-	});
-
-	it("includes all components in order", () => {
-		const systemMsg = { role: "system", content: "sys" };
+	it("includes working memory after session architecture, before preamble", () => {
 		const arch = "[SESSION ARCHITECTURE]";
-		const contract = {
-			role: "user",
-			content: [{ type: "text", text: "contract" }],
-		};
-		const result = buildContextMessagePrefix(systemMsg, arch, "preamble", "recent", "relevant", contract);
-		expect(result).toHaveLength(6);
+		const wm = "[WORKING MEMORY]";
+		const preamble = "preamble";
+		const result = assembleContextPrefix({
+			...emptyBlocks(),
+			sessionArchitecture: arch,
+			workingMemory: wm,
+			preamble,
+		});
+		expect(result).toHaveLength(3);
+		const texts = result.map((m) => (m as { content: Array<{ type: string; text: string }> }).content[0].text);
+		expect(texts).toEqual([arch, wm, preamble]);
+	});
+
+	it("includes all components in correct fixed order", () => {
+		const systemMsg = { role: "system", content: "sys" };
+		const arch = "sa";
+		const wm = "wm";
+		const preamble = "pr";
+		const recency = "rc";
+		const relevance = "rl";
+		const followUp = { role: "user", content: [{ type: "text", text: "fu" }] };
+		const checkpoint = { role: "user", content: [{ type: "text", text: "cp" }] };
+		const contract = { role: "user", content: [{ type: "text", text: "ct" }] };
+		const result = assembleContextPrefix({
+			systemMsg,
+			sessionArchitecture: arch,
+			workingMemory: wm,
+			preamble,
+			recencyList: recency,
+			relevanceList: relevance,
+			followUpMsg: followUp,
+			checkpointMsg: checkpoint,
+			contractMsg: contract,
+		});
+		expect(result).toHaveLength(9);
+		const roles = result.map((m) => (m as { role: string }).role);
+		expect(roles).toEqual(["system", "user", "user", "user", "user", "user", "user", "user", "user"]);
 	});
 
 	it("includes recency, sessionArchitecture, preamble, and contract when relevance is null (short-prompt scenario)", () => {
-		// The short-prompt fast path in src/semblr.ts now includes sessionArchitecture.
-		// This test verifies that buildContextMessagePrefix correctly includes
-		// sessionArchitecture, recency, preamble, and contract even when relevanceList is null.
 		const systemMsg = { role: "system", content: "You are helpful" };
 		const arch = "[SESSION ARCHITECTURE]";
 		const preamble = "[CONTEXT BUILDING REFERENCES]\n...";
@@ -343,13 +359,16 @@ describe("buildContextMessagePrefix", () => {
 			content: [{ type: "text", text: "[FINAL RESPONSE CONTRACT]" }],
 		};
 
-		// relevanceList is null — intentional, embedding pipeline skipped for short prompts
-		const result = buildContextMessagePrefix(systemMsg, arch, preamble, recencyList, null, contract);
+		const result = assembleContextPrefix({
+			...emptyBlocks(),
+			systemMsg,
+			sessionArchitecture: arch,
+			preamble,
+			recencyList,
+			contractMsg: contract,
+		});
 
-		// Should produce: system, sessionArchitecture, preamble, recency, contract (5 messages)
 		expect(result).toHaveLength(5);
-
-		// Verify each component is present (result[0] = systemMsg, rest = user role messages)
 		expect((result[0] as { role: string }).role).toBe("system");
 		const userTexts = result
 			.slice(1)
@@ -360,8 +379,7 @@ describe("buildContextMessagePrefix", () => {
 		expect(userTexts[3]).toBe("[FINAL RESPONSE CONTRACT]");
 	});
 
-	it("produces only system + sessionArchitecture + contract when recency and preamble are also null (empty-chain scenario)", () => {
-		// No causal chain = no recency list, but sessionArchitecture and contract should still be present
+	it("produces only system + sessionArchitecture + contract when recency and preamble are null", () => {
 		const systemMsg = { role: "system", content: "You are helpful" };
 		const arch = "[SESSION ARCHITECTURE]";
 		const contract = {
@@ -369,11 +387,34 @@ describe("buildContextMessagePrefix", () => {
 			content: [{ type: "text", text: "[FINAL RESPONSE CONTRACT]" }],
 		};
 
-		const result = buildContextMessagePrefix(systemMsg, arch, null, null, null, contract);
+		const result = assembleContextPrefix({
+			...emptyBlocks(),
+			systemMsg,
+			sessionArchitecture: arch,
+			contractMsg: contract,
+		});
 
 		expect(result).toHaveLength(3);
 		expect(result[0]).toEqual(systemMsg);
 		expect((result[1] as { content: Array<{ type: string; text: string }> }).content[0].text).toBe(arch);
 		expect(result[2]).toEqual(contract);
+	});
+
+	it("followUp and checkpoint appear after relevance, before contract", () => {
+		const arch = "sa";
+		const relevance = "rl";
+		const followUp = { role: "user", content: [{ type: "text", text: "fu" }] };
+		const checkpoint = { role: "user", content: [{ type: "text", text: "cp" }] };
+		const contract = { role: "user", content: [{ type: "text", text: "ct" }] };
+		const result = assembleContextPrefix({
+			...emptyBlocks(),
+			sessionArchitecture: arch,
+			relevanceList: relevance,
+			followUpMsg: followUp,
+			checkpointMsg: checkpoint,
+			contractMsg: contract,
+		});
+		const texts = result.map((m) => (m as { content: Array<{ type: string; text: string }> }).content[0].text);
+		expect(texts).toEqual([arch, relevance, "fu", "cp", "ct"]);
 	});
 });

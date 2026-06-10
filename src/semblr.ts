@@ -27,7 +27,7 @@ import {
 	splitCommandArgs,
 } from "../lib/context-format.ts";
 import {
-	buildContextMessagePrefix,
+	assembleContextPrefix,
 	prepareContextMessages,
 	shouldDropEmbedding,
 	shouldDropRelevanceList,
@@ -93,6 +93,7 @@ import {
 } from "../lib/working-memory.ts";
 
 export {
+	assembleContextPrefix,
 	countWordsInMessageContent,
 	extractContextPrompt,
 	prepareContextMessages,
@@ -671,6 +672,47 @@ export default function (pi: ExtensionAPI) {
 
 		return [...prefixMessages, ...currentMsgs, warningMsg];
 	}
+	/**
+	 * Resolve checkpoint + follow-up injection for the last round.
+	 * Returns {followUpMsg, checkpointMsg} for the context prefix.
+	 * When a checkpoint is present, follow-up is suppressed (checkpoint
+	 * already carries sufficient state for the agent to resume work).
+	 *
+	 * This was duplicated verbatim (~30 lines) between the short-prompt fast
+	 * path and the full embedding path before the #1 refactoring.
+	 */
+	function resolveCompoundInjections(): {
+		followUpMsg: unknown | null;
+		checkpointMsg: unknown | null;
+	} {
+		let checkpointMsg: unknown | null = null;
+		let hasCheckpoint = false;
+		if (lastRoundFileName && needsCheckpointInjection(lastRoundFileName)) {
+			const checkpointSection = buildCheckpointContext(lastRoundFileName);
+			if (checkpointSection) {
+				checkpointMsg = {
+					role: "user" as const,
+					content: [{ type: "text" as const, text: checkpointSection }],
+				};
+				injectedCheckpointRounds.add(lastRoundFileName);
+				hasCheckpoint = true;
+			}
+		}
+
+		let followUpMsg: unknown | null = null;
+		if (!hasCheckpoint && lastRoundFileName && needsFollowupInjection(lastRoundFileName)) {
+			const followUpSection = buildFollowUpContext(lastRoundFileName);
+			if (followUpSection) {
+				followUpMsg = {
+					role: "user" as const,
+					content: [{ type: "text" as const, text: followUpSection }],
+				};
+				injectedFollowupRounds.add(lastRoundFileName);
+			}
+		}
+
+		return { followUpMsg, checkpointMsg };
+	}
 
 	pi.on("context", async (event: ContextEvent, ctx: ExtensionContext) => {
 		const { messages } = event;
@@ -719,37 +761,7 @@ export default function (pi: ExtensionAPI) {
 			const recencyList = buildGroupedRecencyList(roundGroups, causalChain, getRoundSize);
 			const preamble = buildContextPreamble(!!recencyList, false);
 
-			// Checkpoint injection: if previous round was checkpointed, include its summary.
-			// When a checkpoint is present, suppress the follow-up (full round text) — the
-			// checkpoint already carries enough state for the agent to resume work.
-			let checkpointMsg: unknown | null = null;
-			let hasCheckpoint = false;
-			if (lastRoundFileName && needsCheckpointInjection(lastRoundFileName)) {
-				const checkpointSection = buildCheckpointContext(lastRoundFileName);
-				if (checkpointSection) {
-					checkpointMsg = {
-						role: "user" as const,
-						content: [{ type: "text" as const, text: checkpointSection }],
-					};
-					injectedCheckpointRounds.add(lastRoundFileName);
-					hasCheckpoint = true;
-				}
-			}
-
-			// Follow-up injection: if previous round was flagged, include its full text.
-			// Suppressed when a checkpoint is present for the same round (checkpoint carries
-			// sufficient context and including both is redundant).
-			let followUpMsg: unknown | null = null;
-			if (!hasCheckpoint && lastRoundFileName && needsFollowupInjection(lastRoundFileName)) {
-				const followUpSection = buildFollowUpContext(lastRoundFileName);
-				if (followUpSection) {
-					followUpMsg = {
-						role: "user" as const,
-						content: [{ type: "text" as const, text: followUpSection }],
-					};
-					injectedFollowupRounds.add(lastRoundFileName);
-				}
-			}
+			const { followUpMsg, checkpointMsg } = resolveCompoundInjections();
 
 			const workingMem = buildWorkingMemorySection(miniMemStore);
 
@@ -760,31 +772,18 @@ export default function (pi: ExtensionAPI) {
 				content: [{ type: "text" as const, text: buildFinalResponseContract() }],
 			};
 
-			// Compose via buildContextMessagePrefix to keep all paths consistent
-			const prefixMsgs = buildContextMessagePrefix(
+			// Assemble context prefix via assembleContextPrefix — single call, consistent order
+			const prefixMsgs = assembleContextPrefix({
 				systemMsg,
 				sessionArchitecture,
+				workingMemory: workingMem,
 				preamble,
 				recencyList,
-				null,
+				relevanceList: null,
+				followUpMsg,
+				checkpointMsg,
 				contractMsg,
-			);
-			// Insert working memory after session architecture, before preamble
-			if (workingMem) {
-				const wmIdx = prefixMsgs.findIndex(
-					(m) =>
-						typeof (m as { content?: unknown }).content === "string" &&
-						((m as { content: string }).content as string).startsWith("[SESSION ARCHITECTURE]"),
-				);
-				if (wmIdx >= 0) {
-					prefixMsgs.splice(wmIdx + 1, 0, {
-						role: "user" as const,
-						content: [{ type: "text" as const, text: workingMem }],
-					});
-				}
-			}
-			if (followUpMsg) prefixMsgs.push(followUpMsg);
-			if (checkpointMsg) prefixMsgs.push(checkpointMsg);
+			});
 			cachedContextMessages = [...prefixMsgs];
 
 			// ══ Stats: record all 5 positions presented ══
@@ -802,19 +801,20 @@ export default function (pi: ExtensionAPI) {
 		try {
 			const apiKey = await getApiKey(ctx, { config: SEMBLR_CONFIG });
 			if (!apiKey) {
-				const workingMem = buildWorkingMemorySection(miniMemStore);
-				const sessionArchitecture = buildSessionArchitecture();
-				const contractMsg = {
-					role: "user" as const,
-					content: [{ type: "text" as const, text: buildFinalResponseContract() }],
-				};
-				const prefixMsgs: unknown[] = [];
-				if (systemMsg) prefixMsgs.push(systemMsg);
-				prefixMsgs.push({ role: "user" as const, content: [{ type: "text" as const, text: sessionArchitecture }] });
-				if (workingMem) {
-					prefixMsgs.push({ role: "user" as const, content: [{ type: "text" as const, text: workingMem }] });
-				}
-				prefixMsgs.push(contractMsg);
+				const prefixMsgs = assembleContextPrefix({
+					systemMsg,
+					sessionArchitecture: buildSessionArchitecture(),
+					workingMemory: buildWorkingMemorySection(miniMemStore),
+					preamble: null,
+					recencyList: null,
+					relevanceList: null,
+					followUpMsg: null,
+					checkpointMsg: null,
+					contractMsg: {
+						role: "user" as const,
+						content: [{ type: "text" as const, text: buildFinalResponseContract() }],
+					},
+				});
 				const finalMessages: unknown[] = applyContextSizeWarning(prefixMsgs, currentMessages, systemMsg);
 				return { messages: finalMessages } as any;
 			}
@@ -838,22 +838,20 @@ export default function (pi: ExtensionAPI) {
 				// Final response contract + current messages (no context lists)
 				cachedEnvPreamble = envPreamble;
 				cachedUserPromptForContext = userPrompt;
-				const workingMem = buildWorkingMemorySection(miniMemStore);
-				const sessionArchitecture = buildSessionArchitecture();
-				const contractMsg = {
-					role: "user" as const,
-					content: [{ type: "text" as const, text: buildFinalResponseContract() }],
-				};
-				const emptyIdxMsgs: unknown[] = [];
-				if (systemMsg) emptyIdxMsgs.push(systemMsg);
-				emptyIdxMsgs.push({
-					role: "user" as const,
-					content: [{ type: "text" as const, text: sessionArchitecture }],
+				const emptyIdxMsgs = assembleContextPrefix({
+					systemMsg,
+					sessionArchitecture: buildSessionArchitecture(),
+					workingMemory: buildWorkingMemorySection(miniMemStore),
+					preamble: null,
+					recencyList: null,
+					relevanceList: null,
+					followUpMsg: null,
+					checkpointMsg: null,
+					contractMsg: {
+						role: "user" as const,
+						content: [{ type: "text" as const, text: buildFinalResponseContract() }],
+					},
 				});
-				if (workingMem) {
-					emptyIdxMsgs.push({ role: "user" as const, content: [{ type: "text" as const, text: workingMem }] });
-				}
-				emptyIdxMsgs.push(contractMsg);
 				cachedContextMessages = emptyIdxMsgs;
 				const finalMessages: unknown[] = applyContextSizeWarning(cachedContextMessages, currentMessages, systemMsg);
 				return { messages: finalMessages } as any;
@@ -879,22 +877,20 @@ export default function (pi: ExtensionAPI) {
 				// Cache the empty-context result so subsequent turns reuse it
 				cachedEnvPreamble = envPreamble;
 				cachedUserPromptForContext = userPrompt;
-				const workingMem = buildWorkingMemorySection(miniMemStore);
-				const sessionArchitecture = buildSessionArchitecture();
-				const contractMsg = {
-					role: "user" as const,
-					content: [{ type: "text" as const, text: buildFinalResponseContract() }],
-				};
-				const zeroResultMsgs: unknown[] = [];
-				if (systemMsg) zeroResultMsgs.push(systemMsg);
-				zeroResultMsgs.push({
-					role: "user" as const,
-					content: [{ type: "text" as const, text: sessionArchitecture }],
+				const zeroResultMsgs = assembleContextPrefix({
+					systemMsg,
+					sessionArchitecture: buildSessionArchitecture(),
+					workingMemory: buildWorkingMemorySection(miniMemStore),
+					preamble: null,
+					recencyList: null,
+					relevanceList: null,
+					followUpMsg: null,
+					checkpointMsg: null,
+					contractMsg: {
+						role: "user" as const,
+						content: [{ type: "text" as const, text: buildFinalResponseContract() }],
+					},
 				});
-				if (workingMem) {
-					zeroResultMsgs.push({ role: "user" as const, content: [{ type: "text" as const, text: workingMem }] });
-				}
-				zeroResultMsgs.push(contractMsg);
 				cachedContextMessages = zeroResultMsgs;
 				const finalMessages: unknown[] = applyContextSizeWarning(cachedContextMessages, currentMessages, systemMsg);
 				return { messages: finalMessages } as any;
@@ -925,38 +921,7 @@ export default function (pi: ExtensionAPI) {
 				);
 			}
 
-			// Checkpoint injection: if previous round was checkpointed, include its summary.
-			// When a checkpoint is present, suppress the follow-up (full round text) — the
-			// checkpoint already carries enough state for the agent to resume work.
-			let checkpointMsg: unknown | null = null;
-			let hasCheckpoint = false;
-			if (lastRoundFileName && needsCheckpointInjection(lastRoundFileName)) {
-				const checkpointSection = buildCheckpointContext(lastRoundFileName);
-				if (checkpointSection) {
-					checkpointMsg = {
-						role: "user" as const,
-						content: [{ type: "text" as const, text: checkpointSection }],
-					};
-					injectedCheckpointRounds.add(lastRoundFileName);
-					hasCheckpoint = true;
-				}
-			}
-
-			// Follow-up injection: if previous round was flagged, include its full text.
-			// Suppressed when a checkpoint is present for the same round (checkpoint carries
-			// sufficient context and including both is redundant).
-			let followUpMsg: unknown | null = null;
-			if (!hasCheckpoint && lastRoundFileName && needsFollowupInjection(lastRoundFileName)) {
-				const followUpSection = buildFollowUpContext(lastRoundFileName);
-				if (followUpSection) {
-					followUpMsg = {
-						role: "user" as const,
-						content: [{ type: "text" as const, text: followUpSection }],
-					};
-					// Mark as injected so subsequent tool turns don't re-inject
-					injectedFollowupRounds.add(lastRoundFileName);
-				}
-			}
+			const { followUpMsg, checkpointMsg } = resolveCompoundInjections();
 
 			const workingMem = buildWorkingMemorySection(miniMemStore);
 			const sessionArchitecture = buildSessionArchitecture();
@@ -966,29 +931,25 @@ export default function (pi: ExtensionAPI) {
 				content: [{ type: "text" as const, text: buildFinalResponseContract() }],
 			};
 
-			// Build prefix: system + sessionArchitecture + [working memory] + preamble + recency + relevance [+ followUp] [+ checkpoint] + contract
-			const prefixMsgs: unknown[] = [];
-			if (systemMsg) prefixMsgs.push(systemMsg);
-			if (sessionArchitecture)
-				prefixMsgs.push({ role: "user" as const, content: [{ type: "text" as const, text: sessionArchitecture }] });
-			if (workingMem)
-				prefixMsgs.push({ role: "user" as const, content: [{ type: "text" as const, text: workingMem }] });
-			if (preamble) prefixMsgs.push({ role: "user" as const, content: [{ type: "text" as const, text: preamble }] });
-			if (recencyList)
-				prefixMsgs.push({ role: "user" as const, content: [{ type: "text" as const, text: recencyList }] });
-			if (relevanceList)
-				prefixMsgs.push({ role: "user" as const, content: [{ type: "text" as const, text: relevanceList }] });
-			if (followUpMsg) prefixMsgs.push(followUpMsg);
-			if (checkpointMsg) prefixMsgs.push(checkpointMsg);
-			if (contractMsg) prefixMsgs.push(contractMsg);
-			const finalMessages = prefixMsgs;
+			// Assemble context prefix via assembleContextPrefix — single call, consistent order
+			const prefixMsgs = assembleContextPrefix({
+				systemMsg,
+				sessionArchitecture,
+				workingMemory: workingMem,
+				preamble,
+				recencyList,
+				relevanceList,
+				followUpMsg,
+				checkpointMsg,
+				contractMsg,
+			});
 
 			// Cache the stable prefix (system + context sections + final response contract) for
 			// subsequent context calls within this agent cycle. currentMessages is
 			// appended fresh each time.
 			cachedEnvPreamble = envPreamble;
 			cachedUserPromptForContext = userPrompt;
-			cachedContextMessages = [...finalMessages]; // snapshot before warning injection
+			cachedContextMessages = [...prefixMsgs]; // snapshot before warning injection
 
 			const resultMessages = applyContextSizeWarning(cachedContextMessages, currentMessages, systemMsg);
 
