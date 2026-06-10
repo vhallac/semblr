@@ -122,27 +122,44 @@ export function shouldDropEmbedding(
 }
 
 /**
- * Build the context message prefix block: system + sessionArchitecture + preamble + recency + relevance + contract.
- * The session architecture is injected right after the system message (unconditionally).
- * The contract message is always last, immediately before the actionable prompt.
+ * Blocks that form the context prefix — each is optional. The assembler produces
+ * a fixed-order message array: system → sessionArchitecture → workingMemory →
+ * preamble → recency → relevance → followUp → checkpoint → contract.
  */
-export function buildContextMessagePrefix(
-	systemMsg: unknown | null,
-	sessionArchitecture: string | null,
-	preamble: string | null,
-	recencyList: string | null,
-	relevanceList: string | null,
-	contractMsg?: { role: string; content: Array<{ type: string; text: string }> } | null,
-): unknown[] {
-	const finalMessages: unknown[] = [];
-	if (systemMsg) finalMessages.push(systemMsg);
-	if (sessionArchitecture)
-		finalMessages.push({ role: "user" as const, content: [{ type: "text" as const, text: sessionArchitecture }] });
-	if (preamble) finalMessages.push({ role: "user" as const, content: [{ type: "text" as const, text: preamble }] });
-	if (recencyList)
-		finalMessages.push({ role: "user" as const, content: [{ type: "text" as const, text: recencyList }] });
-	if (relevanceList)
-		finalMessages.push({ role: "user" as const, content: [{ type: "text" as const, text: relevanceList }] });
-	if (contractMsg) finalMessages.push(contractMsg);
-	return finalMessages;
+export interface ContextBlocks {
+	systemMsg: unknown | null;
+	sessionArchitecture: string | null;
+	workingMemory: string | null;
+	preamble: string | null;
+	recencyList: string | null;
+	relevanceList: string | null;
+	followUpMsg: unknown | null;
+	checkpointMsg: unknown | null;
+	contractMsg: { role: string; content: Array<{ type: string; text: string }> } | null;
+}
+
+/** Build a {role:"user", content: [{type:"text", text}]} message. */
+function userTextMsg(text: string): unknown {
+	return { role: "user" as const, content: [{ type: "text" as const, text }] };
+}
+
+/**
+ * Assemble the context prefix from typed blocks. Every block is optional; only
+ * non-null values are pushed. Order: system → sessionArchitecture →
+ * workingMemory → preamble → recency → relevance → followUp → checkpoint → contract.
+ *
+ * This replaces the 5 duplicated inline assembly sites in src/semblr.ts.
+ */
+export function assembleContextPrefix(blocks: ContextBlocks): unknown[] {
+	const out: unknown[] = [];
+	if (blocks.systemMsg) out.push(blocks.systemMsg);
+	if (blocks.sessionArchitecture) out.push(userTextMsg(blocks.sessionArchitecture));
+	if (blocks.workingMemory) out.push(userTextMsg(blocks.workingMemory));
+	if (blocks.preamble) out.push(userTextMsg(blocks.preamble));
+	if (blocks.recencyList) out.push(userTextMsg(blocks.recencyList));
+	if (blocks.relevanceList) out.push(userTextMsg(blocks.relevanceList));
+	if (blocks.followUpMsg) out.push(blocks.followUpMsg);
+	if (blocks.checkpointMsg) out.push(blocks.checkpointMsg);
+	if (blocks.contractMsg) out.push(blocks.contractMsg);
+	return out;
 }
