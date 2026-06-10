@@ -34,7 +34,7 @@ import {
 } from "../lib/context-messages.ts";
 import { embedText, getApiKey } from "../lib/embedding-client.ts";
 import { assignToGroup, formatGroupStats, type SemanticGroup } from "../lib/grouping.ts";
-import { createMiniMemStore, type MiniMemStore } from "../lib/working-memory.ts";
+import { addSlot, createMiniMemStore, deleteSlot, getAndDeleteSlot, getSlot, updateSlot, type MiniMemStore } from "../lib/working-memory.ts";
 import { createRoundFilePath } from "../lib/hash.ts";
 import { indexRoundFileFromPath } from "../lib/index-io.ts";
 import {
@@ -1498,6 +1498,151 @@ export default function (pi: ExtensionAPI) {
 							text: "No context size warning is active. This tool should not be called without being instructed. No checkpoint was saved.",
 						},
 					],
+					details: {},
+				};
+			},
+		});
+
+		// Register mini_mem__add — add a working memory slot
+		pi.registerTool({
+			name: "mini_mem__add",
+			label: "Add Working Memory",
+			description:
+				"Store a note in working memory. Use this after making a plan, after an important decision, or when the user says \"remember this.\" Slots are limited to ~7; when full, the oldest is silently evicted. Returns the assigned id and the updated list.",
+			promptSnippet: "Add a note to working memory",
+			parameters: Type.Object({
+				summary: Type.String({ description: "Short label for the memory slot" }),
+				content: Type.String({ description: "Full note text to store" }),
+			}),
+			async execute(_toolCallId, params, _signal, _onUpdate, _ctx2) {
+				const { summary, content } = params as { summary: string; content: string };
+				const id = addSlot(miniMemStore, summary, content, lastRoundFileName ?? undefined);
+				const lines: string[] = [`Stored as memory slot [id: ${id}]. Current slots:`];
+				for (const slot of miniMemStore.slots) {
+					lines.push(`- [id: ${slot.id}] ${slot.summary}`);
+				}
+				return {
+					content: [{ type: "text", text: lines.join("\n") }],
+					details: {},
+				};
+			},
+		});
+
+		// Register mini_mem__get — retrieve a working memory slot without consuming it
+		pi.registerTool({
+			name: "mini_mem__get",
+			label: "Get Working Memory",
+			description:
+				"Retrieve a working memory slot by its id. The slot stays in memory after retrieval. Use this to review a plan, decision, or note stored earlier.",
+			promptSnippet: "Retrieve a working memory slot",
+			parameters: Type.Object({
+				id: Type.Number({ description: "The slot id to retrieve" }),
+			}),
+			async execute(_toolCallId, params, _signal, _onUpdate, _ctx2) {
+				const { id } = params as { id: number };
+				const slot = getSlot(miniMemStore, id);
+				if (!slot) {
+					return {
+						content: [{ type: "text", text: `No memory slot found with id: ${id}.` }],
+						details: {},
+					};
+				}
+				let text = `[id: ${slot.id}] ${slot.summary}`;
+				if (slot.sourceRound) {
+					text += `\nSource round: ${slot.sourceRound}`;
+				}
+				text += `\n\n${slot.content}`;
+				return {
+					content: [{ type: "text", text }],
+					details: {},
+				};
+			},
+		});
+
+		// Register mini_mem__update — overwrite a working memory slot
+		pi.registerTool({
+			name: "mini_mem__update",
+			label: "Update Working Memory",
+			description:
+				"Overwrite an existing working memory slot's summary and content. Use for evolving plans, TODO lists, or updating decisions.",
+			promptSnippet: "Update a working memory slot",
+			parameters: Type.Object({
+				id: Type.Number({ description: "The slot id to update" }),
+				summary: Type.String({ description: "New short label" }),
+				content: Type.String({ description: "New full content" }),
+			}),
+			async execute(_toolCallId, params, _signal, _onUpdate, _ctx2) {
+				const { id, summary, content } = params as { id: number; summary: string; content: string };
+				const slot = updateSlot(miniMemStore, id, summary, content, lastRoundFileName ?? undefined);
+				if (!slot) {
+					return {
+						content: [{ type: "text", text: `No memory slot found with id: ${id}.` }],
+						details: {},
+					};
+				}
+				let text = `[id: ${slot.id}] ${slot.summary}`;
+				if (slot.sourceRound) {
+					text += `\nSource round: ${slot.sourceRound}`;
+				}
+				text += `\n\n${slot.content}`;
+				return {
+					content: [{ type: "text", text }],
+					details: {},
+				};
+			},
+		});
+
+		// Register mini_mem__delete — remove a working memory slot
+		pi.registerTool({
+			name: "mini_mem__delete",
+			label: "Delete Working Memory",
+			description: "Delete a working memory slot by its id.",
+			promptSnippet: "Delete a working memory slot",
+			parameters: Type.Object({
+				id: Type.Number({ description: "The slot id to delete" }),
+			}),
+			async execute(_toolCallId, params, _signal, _onUpdate, _ctx2) {
+				const { id } = params as { id: number };
+				const found = deleteSlot(miniMemStore, id);
+				if (!found) {
+					return {
+						content: [{ type: "text", text: `No memory slot found with id: ${id}.` }],
+						details: {},
+					};
+				}
+				return {
+					content: [{ type: "text", text: `Memory slot [id: ${id}] deleted.` }],
+					details: {},
+				};
+			},
+		});
+
+		// Register mini_mem__get_and_delete — one-shot get + delete
+		pi.registerTool({
+			name: "mini_mem__get_and_delete",
+			label: "Get and Delete Working Memory",
+			description:
+				"One-shot retrieval: get the full content of a working memory slot, then delete it. Use for truly disposable notes (e.g., \"after this task remind me to X\").",
+			promptSnippet: "Retrieve and delete a working memory slot",
+			parameters: Type.Object({
+				id: Type.Number({ description: "The slot id to retrieve and delete" }),
+			}),
+			async execute(_toolCallId, params, _signal, _onUpdate, _ctx2) {
+				const { id } = params as { id: number };
+				const slot = getAndDeleteSlot(miniMemStore, id);
+				if (!slot) {
+					return {
+						content: [{ type: "text", text: `No memory slot found with id: ${id}.` }],
+						details: {},
+					};
+				}
+				let text = `[id: ${slot.id}] ${slot.summary}`;
+				if (slot.sourceRound) {
+					text += `\nSource round: ${slot.sourceRound}`;
+				}
+				text += `\n\n${slot.content}`;
+				return {
+					content: [{ type: "text", text }],
 					details: {},
 				};
 			},
