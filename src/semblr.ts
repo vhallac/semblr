@@ -23,7 +23,6 @@ import {
 	buildRelevanceList,
 	buildSessionArchitecture,
 	buildWorkingMemorySection,
-	formatFileSize,
 	splitCommandArgs,
 } from "../lib/context-format.ts";
 import {
@@ -57,6 +56,7 @@ import {
 	type MessageEndProcessingState,
 } from "../lib/round-capture.ts";
 import type { RoundData } from "../lib/round-data.ts";
+import { getRoundFileSize, readRoundFileFromDir as readRoundFileFromDirLib, readRoundJson } from "../lib/round-io.ts";
 import {
 	loadRoundDataForToolDetails,
 	renderRoundDetailsToolResult,
@@ -123,6 +123,7 @@ export {
 	getRelatedParentIdFromGroup,
 } from "../lib/round-capture.ts";
 export type { RoundData } from "../lib/round-data.ts";
+export { readRoundFileFromDir } from "../lib/round-io.ts";
 export {
 	buildRoundAssistantOutput,
 	collapseRoundDetails,
@@ -207,12 +208,7 @@ function buildCheckpointSummaryText(summary: CheckpointSummary): string {
 
 /** Stat a round file and return its formatted size string, or null on failure. */
 function getRoundSize(fileName: string): string | null {
-	try {
-		const stat = fs.statSync(`${ROUNDS_DIR}/${fileName}`);
-		return formatFileSize(stat.size);
-	} catch {
-		return null;
-	}
+	return getRoundFileSize(ROUNDS_DIR, fileName);
 }
 
 // formatCollapsedIndex removed — replaced by buildGroupedRecencyList / buildRelevanceList / buildContextPreamble
@@ -277,21 +273,13 @@ function finalizeRoundEmbedding({
  * Returns null if no follow-up is needed.
  */
 function buildFollowUpContext(fileName: string): string | null {
-	const fullPath = `${ROUNDS_DIR}/${fileName}`;
-	// Read needsFollowup from file without mutating it
-	let roundData: RoundData | null = null;
-	try {
-		if (fs.existsSync(fullPath)) {
-			const parsed = JSON.parse(fs.readFileSync(fullPath, "utf-8"));
-			if (parsed.needsFollowup) {
-				roundData = parsed as RoundData;
-			}
-		}
-	} catch {
-		// best-effort
-	}
-	if (!roundData) return null;
-	return buildFollowUpSectionContent(fileName, roundData.userPrompt, roundData.responseSequence);
+	const round = readRoundJson(ROUNDS_DIR, fileName);
+	if (!round?.needsFollowup) return null;
+	return buildFollowUpSectionContent(
+		fileName,
+		(round.userPrompt as string) ?? "",
+		(round.responseSequence as string) ?? "",
+	);
 }
 
 // ─────────────────────────────────────────────
@@ -319,75 +307,28 @@ export function loadSessionStartIndex(
 	return loadSessionStartIndexCore(indexPath, deps);
 }
 
-export function readRoundFileFromDir(
-	filePath: string,
-	roundsDir: string = ROUNDS_DIR,
-	fsImpl: Pick<typeof fs, "existsSync" | "readFileSync"> = fs,
-): RoundData | null {
-	// filePath may be "xxx.json:prompt", "xxx.json:response", "xxx.json:round", or "xxx.json:summary"
-	// strip the suffix to get the actual file
-	const actualFile = indexRoundFileFromPath(filePath);
-	const fullPath = `${roundsDir}/${actualFile}`;
-	if (!fsImpl.existsSync(fullPath)) return null;
-	try {
-		const data = JSON.parse(fsImpl.readFileSync(fullPath, "utf-8"));
-		return {
-			userPrompt: data.userPrompt ?? "",
-			responseSequence: data.responseSequence ?? "",
-			turnIndex: data.turnIndex ?? 0,
-			userTimestamp: data.userTimestamp,
-			toolCallCount: data.toolCallCount,
-			toolCallNames: data.toolCallNames,
-			toolCalls: data.toolCalls,
-		};
-	} catch {
-		return null;
-	}
-}
-
 function readRoundFile(filePath: string): RoundData | null {
-	return readRoundFileFromDir(filePath, ROUNDS_DIR);
+	return readRoundFileFromDirLib(filePath, ROUNDS_DIR);
 }
 
 let lastRoundFileName: string | null = null; // tracks the most recent saved round (process-local)
 // Used in context hook to gate follow-up injection: checks metadata + in-memory state
 function needsFollowupInjection(fileName: string): boolean {
-	const fullPath = `${ROUNDS_DIR}/${fileName}`;
-	try {
-		if (!fs.existsSync(fullPath)) return false;
-		const parsed = JSON.parse(fs.readFileSync(fullPath, "utf-8"));
-		return parsed.needsFollowup === true && !session.injectedFollowupRounds.has(fileName);
-	} catch {
-		return false;
-	}
+	const round = readRoundJson(ROUNDS_DIR, fileName);
+	return round?.needsFollowup === true && !session.injectedFollowupRounds.has(fileName);
 }
 
 /** Check if the last round has a checkpoint summary that hasn't been injected yet. */
 function needsCheckpointInjection(fileName: string): boolean {
-	const fullPath = `${ROUNDS_DIR}/${fileName}`;
-	try {
-		if (!fs.existsSync(fullPath)) return false;
-		const parsed = JSON.parse(fs.readFileSync(fullPath, "utf-8"));
-		return parsed.summary != null && !session.injectedCheckpointRounds.has(fileName);
-	} catch {
-		return false;
-	}
+	const round = readRoundJson(ROUNDS_DIR, fileName);
+	return round?.summary != null && !session.injectedCheckpointRounds.has(fileName);
 }
 
 /** Build the checkpoint injection section for context. */
 function buildCheckpointContext(fileName: string): string | null {
-	const fullPath = `${ROUNDS_DIR}/${fileName}`;
-	let summary: CheckpointSummary | null = null;
-	try {
-		if (fs.existsSync(fullPath)) {
-			const parsed = JSON.parse(fs.readFileSync(fullPath, "utf-8"));
-			if (parsed.summary) summary = parsed.summary as CheckpointSummary;
-		}
-	} catch {
-		return null;
-	}
-	if (!summary) return null;
-	return buildCheckpointSectionContent(fileName, summary);
+	const round = readRoundJson(ROUNDS_DIR, fileName);
+	if (!round?.summary) return null;
+	return buildCheckpointSectionContent(fileName, round.summary as CheckpointSummary);
 }
 
 // Per-agent accumulation state now lives in `round` object (createRound()).
