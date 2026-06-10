@@ -1,5 +1,13 @@
 import { describe, expect, it } from "vitest";
-import { addSlot, createMiniMemStore, deleteSlot, getAndDeleteSlot, getSlot, updateSlot } from "./working-memory.ts";
+import {
+	addSlot,
+	createMiniMemStore,
+	deleteSlot,
+	formatMiniMemSlot,
+	getAndDeleteSlot,
+	getSlot,
+	updateSlot,
+} from "./working-memory.ts";
 
 describe("createMiniMemStore", () => {
 	it("creates an empty store", () => {
@@ -143,6 +151,24 @@ describe("getAndDeleteSlot", () => {
 	it("returns null when id is not found", () => {
 		const store = createMiniMemStore();
 		expect(getAndDeleteSlot(store, 99)).toBeNull();
+	});
+});
+
+describe("formatMiniMemSlot", () => {
+	it("formats a slot with sourceRound", () => {
+		const store = createMiniMemStore();
+		addSlot(store, "Plan A", "Step 1: do X", "round-1.json");
+		const slot = getSlot(store, 1);
+		if (!slot) throw new Error("expected slot");
+		expect(formatMiniMemSlot(slot)).toBe("[id: 1] Plan A\nSource round: round-1.json\n\nStep 1: do X");
+	});
+
+	it("formats a slot without sourceRound", () => {
+		const store = createMiniMemStore();
+		addSlot(store, "Plan B", "Step 2");
+		const slot = getSlot(store, 1);
+		if (!slot) throw new Error("expected slot");
+		expect(formatMiniMemSlot(slot)).toBe("[id: 1] Plan B\n\nStep 2");
 	});
 });
 

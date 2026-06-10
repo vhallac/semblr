@@ -87,3 +87,13 @@ export function getAndDeleteSlot(store: MiniMemStore, id: number): MiniMemSlot |
 	deleteSlot(store, id);
 	return slot;
 }
+
+/** Format a slot for tool response text output. */
+export function formatMiniMemSlot(slot: MiniMemSlot): string {
+	let text = `[id: ${slot.id}] ${slot.summary}`;
+	if (slot.sourceRound) {
+		text += `\nSource round: ${slot.sourceRound}`;
+	}
+	text += `\n\n${slot.content}`;
+	return text;
+}

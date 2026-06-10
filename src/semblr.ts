@@ -90,7 +90,14 @@ import {
 } from "../lib/stats.ts";
 import { estimateMessagesTokens } from "../lib/tokens.ts";
 import { normalize } from "../lib/vector.ts";
-import { addSlot, deleteSlot, getAndDeleteSlot, getSlot, updateSlot } from "../lib/working-memory.ts";
+import {
+	addSlot,
+	deleteSlot,
+	formatMiniMemSlot,
+	getAndDeleteSlot,
+	getSlot,
+	updateSlot,
+} from "../lib/working-memory.ts";
 
 export {
 	assembleContextPrefix,
@@ -1425,13 +1432,8 @@ export default function (pi: ExtensionAPI) {
 						details: {},
 					};
 				}
-				let text = `[id: ${slot.id}] ${slot.summary}`;
-				if (slot.sourceRound) {
-					text += `\nSource round: ${slot.sourceRound}`;
-				}
-				text += `\n\n${slot.content}`;
 				return {
-					content: [{ type: "text", text }],
+					content: [{ type: "text", text: formatMiniMemSlot(slot) }],
 					details: {},
 				};
 			},
@@ -1458,13 +1460,8 @@ export default function (pi: ExtensionAPI) {
 						details: {},
 					};
 				}
-				let text = `[id: ${slot.id}] ${slot.summary}`;
-				if (slot.sourceRound) {
-					text += `\nSource round: ${slot.sourceRound}`;
-				}
-				text += `\n\n${slot.content}`;
 				return {
-					content: [{ type: "text", text }],
+					content: [{ type: "text", text: formatMiniMemSlot(slot) }],
 					details: {},
 				};
 			},
@@ -1514,13 +1511,8 @@ export default function (pi: ExtensionAPI) {
 						details: {},
 					};
 				}
-				let text = `[id: ${slot.id}] ${slot.summary}`;
-				if (slot.sourceRound) {
-					text += `\nSource round: ${slot.sourceRound}`;
-				}
-				text += `\n\n${slot.content}`;
 				return {
-					content: [{ type: "text", text }],
+					content: [{ type: "text", text: formatMiniMemSlot(slot) }],
 					details: {},
 				};
 			},
