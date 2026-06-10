@@ -92,9 +92,9 @@ describe("working memory section", () => {
 		expect(result).toContain("- [id: 2] Second note");
 		expect(result).toContain("- [id: 3] Third decision");
 		// Verify order — id 1 before id 2 before id 3
-		const idx1 = result!.indexOf("[id: 1]");
-		const idx2 = result!.indexOf("[id: 2]");
-		const idx3 = result!.indexOf("[id: 3]");
+		const idx1 = result?.indexOf("[id: 1]") ?? -1;
+		const idx2 = result?.indexOf("[id: 2]") ?? -1;
+		const idx3 = result?.indexOf("[id: 3]") ?? -1;
 		expect(idx1).toBeLessThan(idx2);
 		expect(idx2).toBeLessThan(idx3);
 	});

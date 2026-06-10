@@ -34,7 +34,6 @@ import {
 } from "../lib/context-messages.ts";
 import { embedText, getApiKey } from "../lib/embedding-client.ts";
 import { assignToGroup, formatGroupStats, type SemanticGroup } from "../lib/grouping.ts";
-import { addSlot, createMiniMemStore, deleteSlot, getAndDeleteSlot, getSlot, updateSlot, type MiniMemStore } from "../lib/working-memory.ts";
 import { createRoundFilePath } from "../lib/hash.ts";
 import { indexRoundFileFromPath } from "../lib/index-io.ts";
 import {
@@ -83,6 +82,15 @@ import {
 } from "../lib/stats.ts";
 import { estimateMessagesTokens } from "../lib/tokens.ts";
 import { normalize } from "../lib/vector.ts";
+import {
+	addSlot,
+	createMiniMemStore,
+	deleteSlot,
+	getAndDeleteSlot,
+	getSlot,
+	type MiniMemStore,
+	updateSlot,
+} from "../lib/working-memory.ts";
 
 export {
 	countWordsInMessageContent,
@@ -1508,7 +1516,7 @@ export default function (pi: ExtensionAPI) {
 			name: "mini_mem__add",
 			label: "Add Working Memory",
 			description:
-				"Store a note in working memory. Use this after making a plan, after an important decision, or when the user says \"remember this.\" Slots are limited to ~7; when full, the oldest is silently evicted. Returns the assigned id and the updated list.",
+				'Store a note in working memory. Use this after making a plan, after an important decision, or when the user says "remember this." Slots are limited to ~7; when full, the oldest is silently evicted. Returns the assigned id and the updated list.',
 			promptSnippet: "Add a note to working memory",
 			parameters: Type.Object({
 				summary: Type.String({ description: "Short label for the memory slot" }),
@@ -1622,7 +1630,7 @@ export default function (pi: ExtensionAPI) {
 			name: "mini_mem__get_and_delete",
 			label: "Get and Delete Working Memory",
 			description:
-				"One-shot retrieval: get the full content of a working memory slot, then delete it. Use for truly disposable notes (e.g., \"after this task remind me to X\").",
+				'One-shot retrieval: get the full content of a working memory slot, then delete it. Use for truly disposable notes (e.g., "after this task remind me to X").',
 			promptSnippet: "Retrieve and delete a working memory slot",
 			parameters: Type.Object({
 				id: Type.Number({ description: "The slot id to retrieve and delete" }),
