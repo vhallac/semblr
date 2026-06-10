@@ -39,8 +39,8 @@ describe("session architecture", () => {
 
 	it("describes round boundary amnesia", () => {
 		const result = buildSessionArchitecture();
-		expect(result).toContain("Each conversation round starts fresh");
-		expect(result).toContain("NOT visible unless they are explicitly injected");
+		expect(result).toContain("Each conversation round starts fresh by default");
+		expect(result).toContain("NOT automatic — it exists only through semblr's explicit survival mechanisms");
 	});
 
 	it("lists follow-up injection as a survival mechanism (stage 1)", () => {
@@ -170,7 +170,7 @@ describe("context formatting", () => {
 
 	it("context preamble includes survival mechanism hint", () => {
 		const result = buildContextPreamble(true, false);
-		expect(result).toContain("These tools exist because you forget everything between rounds.");
+		expect(result).toContain("These tools fill in what the context summaries leave out");
 		expect(result).toContain("See the SESSION ARCHITECTURE section for details.");
 	});
 

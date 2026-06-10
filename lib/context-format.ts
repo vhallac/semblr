@@ -210,7 +210,7 @@ Use get_tool_details("hash.json", N) to inspect tool call N within a round.
 
 Format: [index: N] hash.json [score | N tools | size]: followed by the full user prompt (indented).
 
-These tools exist because you forget everything between rounds. See the SESSION ARCHITECTURE section for details.`;
+These tools fill in what the context summaries leave out — use them to expand hidden parts of past rounds and build up the full picture. See the SESSION ARCHITECTURE section for details.`;
 }
 
 /**
@@ -246,9 +246,8 @@ export function buildWorkingMemorySection(store: MiniMemStore): string | null {
  */
 export function buildSessionArchitecture(): string {
 	return `[SESSION ARCHITECTURE]
-Each conversation round starts fresh. Your previous responses, tool results, and
-reasoning from earlier rounds are NOT visible unless they are explicitly injected
-through one of semblr's survival mechanisms:
+Each conversation round starts fresh by default. Continuity across rounds is
+NOT automatic — it exists only through semblr's explicit survival mechanisms:
 
 - **Follow-up injection:** \`round_needs_followup\` on your last line pulls the
   full previous round into the next round's context.
@@ -256,7 +255,13 @@ through one of semblr's survival mechanisms:
   across context-size boundaries.
 - **Working Memory:** \`mini_mem__add\` / \`mini_mem__get\` / \`mini_mem__update\` /
   \`mini_mem__delete\` / \`mini_mem__get_and_delete\` provides named slots
-  for short-term notes that survive round boundaries within a session.`;
+  for short-term notes that survive round boundaries within a session.
+
+When a previous round has been injected into your context (via follow-up or
+checkpoint), you DO have access to it — trust what you see, not the default.
+Likewise, the context lists below are summaries: the full details are hidden.
+Use get_round_details, get_tool_details, and search_interactions to expand
+those hidden parts and build up the full picture yourself.`;
 }
 
 export function formatFileSize(bytes: number): string {
