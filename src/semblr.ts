@@ -539,7 +539,7 @@ export default function (pi: ExtensionAPI) {
 			`[CONTEXT SIZE WARNING — LEVEL ${levelLabel}]
 
 ` +
-			`Your context has grown to ${nonSystemTokens} non-system tokens (threshold: ${threshold}). This is the ${newLevel >= 3 ? "exceeded" : "approaching"} the configured limit.
+			`Your context has grown to ${nonSystemTokens} non-system tokens (threshold: ${threshold}). Context size ${newLevel >= 3 ? "has exceeded" : "is approaching"} the configured limit.
 
 ` +
 			`${urgency}

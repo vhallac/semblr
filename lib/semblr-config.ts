@@ -15,6 +15,7 @@ export interface SemblrConfig {
 	embedTimeoutMs: number;
 	embedMaxRetries: number;
 	embedBackoffMs: number;
+	/** 0 disables the automatic context-size warning; set a positive token count to enable it. */
 	summaryThresholdExtra: number;
 }
 
@@ -55,7 +56,7 @@ const DEFAULTS = {
 	embedTimeoutMs: 15_000,
 	embedMaxRetries: 3,
 	embedBackoffMs: 1000,
-	summaryThresholdExtra: 40000,
+	summaryThresholdExtra: 0,
 };
 
 const ENV_KEYS = {
