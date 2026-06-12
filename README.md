@@ -471,6 +471,18 @@ Configuration:
 
 > **NixOS note:** The npm-installed Biome binary is dynamically linked and won't run. Use the nix-provided one via `nix-shell -p biome --command "biome check"` or add it to `shell.nix`.
 
+### Retrieval evaluation
+
+```bash
+# Replay retrieval against a frozen corpus snapshot and emit a JSON report
+just eval ~/.pi/agent/semblr/snapshots/corpus-2026-06-12
+
+# Explicit output path (default: docs/eval/baseline-weak.json)
+just eval <unpacked-snapshot-dir> /tmp/eval.json
+```
+
+`scripts/eval-retrieval.ts` replays every qualifying historical round (≥20-word prompt, stored prompt embedding, timestamp) through the production scoring path, restricting candidates to strictly-earlier rounds, and scores the top 5 against weak labels (`parentId` links plus `get_round_details` expansions mined from session JSONL files). Reports Hit@5, Recall@5, MRR, and a noise rate derived from `chain-read-stats.json`. Fully offline and deterministic for a given snapshot — never run it against the live rounds directory; snapshot first. See `docs/eval/README.md` for the committed baseline.
+
 ## VISION.md
 
 For the full vision, design principles, architecture docs, and roadmap (with implemented items checked off), see [VISION.md](VISION.md).
