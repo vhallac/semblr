@@ -74,18 +74,18 @@ The groups below are recent messages that are likely to be related to the same
 topic. Lower numbered indices in groups are more recent conversations.
 
 Use this list when the current prompt ...:
-- ... asks about past work, decisions, code, or findings from prior sessions
+- ... asks about past work, decisions, code, or findings from earlier in this
+  session
 - ... is unusually short or lacks clear context/goals/outputs
 - ... uses references with no clear antecedent in the causal chain ("that fix",
   "the plan", "where we left off")
 - ... asks you to remember, verify, continue, or build upon prior work
-- ... requires cross-session continuity (same project, recurring topic,
-  long-running task)
 - ... is ambiguous: lacks proper context or references, and seems to assume
   knowledge was established
 
 When this happens:
-1. Scan the list prompts for relevance. Higher score = stronger match.
+1. Scan the group topics and prompts for relevance to the current prompt.
+   Prefer the most recent entry (lowest index) in the most related group.
 2. If a round looks relevant, expand ONLY that round via get_round_details.
 3. Stop as soon as the expanded round gives you enough context to answer.
 4. If no round looks relevant but the query clearly needs past context,
@@ -172,7 +172,12 @@ semantic match. They come from ALL past sessions, not just the current one.
 
 The extension has pre-run a semantic search against your prompt. The results
 are below. If something here rings a bell, expand it via get_round_details.
-If nothing rings a bell, ignore this list — it's a pre-filter, not a map.`;
+If nothing rings a bell, ignore this list — it's a pre-filter, not a map.
+
+Use this list when the prompt asks about past work, decisions, or findings
+from prior sessions, or requires cross-session continuity (same project,
+recurring topic, long-running task). If nothing here matches but the query
+clearly needs past context, use search_interactions.`;
 	lines.push(header);
 	lines.push("");
 
