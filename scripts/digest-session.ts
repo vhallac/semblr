@@ -14,7 +14,6 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { pathToFileURL } from "node:url";
 import { type EmbeddingModelRegistry, embedText, normalize } from "../lib/embed.ts";
-import { computeContentHash } from "../lib/hash.ts";
 import {
 	appendVectorIndexEntry,
 	findStaleContentMatches as findStaleContentMatchesInDir,
@@ -22,7 +21,7 @@ import {
 	loadVectorIndex,
 	migrateIndexEntries as migrateIndexEntriesFile,
 } from "../lib/index-io.ts";
-import { type ParsedPiRound, parsePiSessionJsonl } from "../lib/pi-session.ts";
+import { parsePiSessionJsonl, reconstructPiSessionRounds } from "../lib/pi-session.ts";
 import {
 	resolveScriptApiKey,
 	resolveScriptConfig,
@@ -33,21 +32,11 @@ import {
 } from "../lib/script-config.ts";
 
 // ─────────────────────────────────────────────
-// Types
-// ─────────────────────────────────────────────
-
-type Round = ParsedPiRound;
-
-// ─────────────────────────────────────────────
-// Config
-// ─────────────────────────────────────────────
-
-// ─────────────────────────────────────────────
 // Parse session into rounds
 // ─────────────────────────────────────────────
 
-export function parseSession(filePath: string): Round[] {
-	return parsePiSessionJsonl(fs.readFileSync(filePath, "utf-8"));
+export function parseSession(filePath: string) {
+	return reconstructPiSessionRounds(parsePiSessionJsonl(fs.readFileSync(filePath, "utf-8")));
 }
 
 // ─────────────────────────────────────────────
@@ -117,9 +106,7 @@ export async function runDigestSession(options: DigestSessionOptions = {}): Prom
 	let embedded = 0;
 	let skipped = 0;
 
-	for (const round of rounds) {
-		const roundFile = `${computeContentHash(round.userPrompt, round.responseSequence, round.toolCalls)}.json`;
-
+	for (const { round, roundFile } of rounds) {
 		// Check for stale files whose stored full hash material belongs under this
 		// content-hash filename. If found, migrate old index entries before deleting
 		// old files so the round remains retrievable even if embedding is unavailable.

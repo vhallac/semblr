@@ -65,3 +65,9 @@ erase-short-embeddings *args:
 # Usage: just query "<your question>"
 query query *args:
     echo "search interactions for '{{query}}'" | pi --print --no-builtin-tools -e ./src/semblr.ts
+
+# Evaluate retrieval against a snapshot corpus using weak labels
+# Usage: just eval /path/to/unpacked-snapshot
+#        just eval /path/to/unpacked-snapshot /tmp/eval.json
+eval corpus out="docs/eval/baseline-weak.json":
+    npx tsx scripts/eval-retrieval.ts --corpus {{corpus}} --out {{out}}
