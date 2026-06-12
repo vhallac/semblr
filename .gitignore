@@ -1,5 +1,6 @@
-# Semblr outputs — turn files and vector index
+# Semblr outputs — turn files, vector index, and local eval reports
 .pi/rounds/
+docs/eval/baseline-weak.local.json
 
 # pi session data (auto-generated)
 .pi/agent/sessions/
