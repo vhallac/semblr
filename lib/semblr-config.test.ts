@@ -31,7 +31,7 @@ describe("loadSemblrConfig", () => {
 			embedTimeoutMs: 15_000,
 			embedMaxRetries: 3,
 			embedBackoffMs: 1000,
-			summaryThresholdExtra: 40000,
+			summaryThresholdExtra: 0,
 		});
 	});
 
@@ -144,7 +144,7 @@ describe("loadSemblrConfig", () => {
 
 		expect(config.embeddingMaxTokens).toBe(8000);
 		expect(config.minSimilarity).toBe(0.3);
-		expect(config.summaryThresholdExtra).toBe(40000);
+		expect(config.summaryThresholdExtra).toBe(0);
 		expect(warnings).toEqual([
 			"Invalid numeric Semblr setting embeddingMaxTokens; using default 8000",
 			"Invalid numeric Semblr setting minSimilarity; using default 0.3",
