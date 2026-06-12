@@ -65,3 +65,21 @@ erase-short-embeddings *args:
 # Usage: just query "<your question>"
 query query *args:
     echo "search interactions for '{{query}}'" | pi --print --no-builtin-tools -e ./src/semblr.ts
+
+# Create a frozen local corpus snapshot for retrieval evaluation
+# Usage: just snapshot
+#        just snapshot --out /tmp/semblr-snapshot
+snapshot *args:
+    npx tsx scripts/snapshot.ts {{args}}
+
+# Evaluate retrieval against a snapshot corpus using weak labels
+# Usage: just eval /path/to/unpacked-snapshot
+#        just eval /path/to/unpacked-snapshot /tmp/eval.json
+eval corpus out="docs/eval/baseline-weak.local.json":
+    npx tsx scripts/eval-retrieval.ts --corpus {{corpus}} --sessions {{corpus}}/sessions --out {{out}}
+
+# Build a local weak baseline from a snapshot without overwriting the committed maintainer baseline
+# Usage: just build-baseline-weak /path/to/unpacked-snapshot
+#        just build-baseline-weak /path/to/unpacked-snapshot /tmp/baseline.json
+build-baseline-weak corpus out="docs/eval/baseline-weak.local.json":
+    npx tsx scripts/eval-retrieval.ts --corpus {{corpus}} --sessions {{corpus}}/sessions --out {{out}}

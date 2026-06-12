@@ -476,6 +476,23 @@ Configuration:
 
 > **NixOS note:** The npm-installed Biome binary is dynamically linked and won't run. Use the nix-provided one via `nix-shell -p biome --command "biome check"` or add it to `shell.nix`.
 
+### Retrieval evaluation
+
+```bash
+# Freeze your current local rounds, index, chain-read stats, and pi sessions
+just snapshot
+
+# Build a local weak baseline from the frozen snapshot
+just build-baseline-weak ~/.pi/agent/semblr/snapshots/<snapshot-dir>
+
+# Explicit output path (default: docs/eval/baseline-weak.local.json)
+just eval <unpacked-snapshot-dir> /tmp/eval.json
+```
+
+`scripts/eval-retrieval.ts` replays every qualifying historical round (≥20-word prompt, stored prompt embedding, timestamp) through the production scoring path, restricting candidates to strictly-earlier rounds, and scores the top 5 against weak labels (`parentId` links plus `get_round_details` expansions mined from snapshot session JSONL files). Reports Hit@5, Recall@5, MRR, and a noise rate derived from `chain-read-stats.json`. Fully offline and deterministic for a given snapshot — never run it against the live rounds directory; snapshot first.
+
+The committed `docs/eval/baseline-weak.json` was built from a maintainer-private corpus. Users should compare against their own `docs/eval/baseline-weak.local.json` instead. See `docs/eval/README.md` for details.
+
 ## VISION.md
 
 For the full vision, design principles, architecture docs, and roadmap (with implemented items checked off), see [VISION.md](VISION.md).

@@ -1,3 +1,5 @@
+import { createRoundFilePath } from "./hash.ts";
+
 interface ParsedToolCallDetail {
 	index: number;
 	name: string;
@@ -44,6 +46,11 @@ interface SessionEntry {
 	};
 }
 
+export interface ReconstructedPiRound {
+	roundFile: string;
+	round: ParsedPiRound;
+}
+
 export function parsePiTextContent(content?: Array<{ type?: string; text?: unknown }>): string {
 	if (!content || !Array.isArray(content)) return "";
 	return content
@@ -64,7 +71,14 @@ export function parsePiSessionJsonl(raw: string, options: ParsePiSessionOptions 
 		.trim()
 		.split("\n")
 		.filter(Boolean)
-		.map((line) => JSON.parse(line));
+		.flatMap((line) => {
+			try {
+				const parsed = JSON.parse(line) as SessionEntry;
+				return parsed && typeof parsed === "object" ? [parsed] : [];
+			} catch {
+				return [];
+			}
+		});
 
 	const rounds: ParsedPiRound[] = [];
 	let currentUserMsg: SessionEntry | null = null;
@@ -144,4 +158,11 @@ export function parsePiSessionJsonl(raw: string, options: ParsePiSessionOptions 
 
 	flush(now(), true);
 	return rounds;
+}
+
+export function reconstructPiSessionRounds(rounds: readonly ParsedPiRound[]): ReconstructedPiRound[] {
+	return rounds.map((round) => ({
+		roundFile: createRoundFilePath(round.userPrompt, round.responseSequence, round.toolCalls),
+		round,
+	}));
 }
