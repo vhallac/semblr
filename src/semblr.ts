@@ -482,9 +482,14 @@ export default function (pi: ExtensionAPI) {
 
 	/** Compute the context-size warning level based on non-system tokens.
 	 *  Returns 0 (no warning), 1 (70% threshold), 2 (85%), or 3 (100%+).
-	 *  If the level is higher than the previously issued level, the
-	 *  warning message is appended after currentMessages (last thing the
-	 *  LLM sees, minimal KV-cache disruption). */
+	 *  The warning is appended after currentMessages (last thing the LLM
+	 *  sees, minimal KV-cache disruption).
+	 *
+	 *  Cache coherence: the prefix is snapshotted WITHOUT the warning (to
+	 *  keep the KV-cache hit across tool turns). On every call, the warning
+	 *  is ALWAYS re-appended when level > 0 — NOT just on escalation. This
+	 *  guarantees the warning never silently drops when the cache is reused.
+	 *  See https://github.com/vhallac/semblr/issues/72 */
 	function applyContextSizeWarning(
 		prefixMessages: unknown[],
 		currentMsgs: unknown[],
@@ -511,9 +516,15 @@ export default function (pi: ExtensionAPI) {
 			newLevel = 1;
 		}
 
-		// Only inject if level increased (escalation) or first warning
-		if (newLevel <= round.contextWarningIssued) return allMessages;
+		// Update the tracked level (so we know we've warned at this level).
+		// Even if the level hasn't escalated, we re-inject the warning below —
+		// the cache snapshot lacks the warning, so dropping it would be a bug.
 		round.contextWarningIssued = newLevel;
+
+		// Always inject when level > 0 — not just on escalation.
+		// Without this, the warning silently disappears on subsequent tool turns
+		// because the cached prefix was snapshotted before the warning was appended.
+		if (newLevel === 0) return allMessages;
 
 		// Build the warning message
 		const levelLabel = newLevel === 3 ? "3 — IMMEDIATE" : String(newLevel);
