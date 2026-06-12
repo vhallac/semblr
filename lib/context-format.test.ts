@@ -132,6 +132,11 @@ describe("context formatting", () => {
 		);
 
 		expect(list).toContain("--- RECENCY LIST (current session, by topic) ---");
+		expect(list).toContain("asks about past work, decisions, code, or findings from earlier in this\n  session");
+		expect(list).not.toContain("Higher score = stronger match.");
+		expect(list).toContain("Scan the group topics and prompts for relevance to the current prompt.");
+		expect(list).toContain("Prefer the most recent entry (lowest index) in the most related group.");
+		expect(list).not.toContain("cross-session");
 		expect(list).toContain("**Group 1**\n\n- [index: 1] new-b.json [n/a | 2 tools | 4KB]:");
 		expect(list).toContain("- [index: 2] new-a.json [n/a | 1 tools]:");
 		expect(list).toContain("**Group 2**\n\n- [index: 3] older.json [n/a | 0 tools]:");
@@ -158,6 +163,12 @@ describe("context formatting", () => {
 		);
 
 		expect(list).toContain("--- RELEVANCE LIST (all sessions, by similarity) ---");
+		expect(list).toContain(
+			"Use this list when the prompt asks about past work, decisions, or findings\nfrom prior sessions, or requires cross-session continuity (same project,\nrecurring topic, long-running task).",
+		);
+		expect(list).toContain(
+			"If nothing here matches but the query\nclearly needs past context, use search_interactions.",
+		);
 		expect(list).toContain("1. round.json [0.88 | 2 tools (read×1 (1KB), grep×1) | 10KB]:");
 		expect(buildRelevanceList([])).toBeNull();
 	});
