@@ -16,3 +16,4 @@ temp/
 coverage/
 .stryker-tmp/
 .direnv/
+CLAUDE.md
