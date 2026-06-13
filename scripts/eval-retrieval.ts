@@ -4,17 +4,19 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { pathToFileURL } from "node:url";
 import { countWordsInMessageContent, shouldDropEmbedding } from "../lib/context-messages.ts";
+import { gatherSessionFiles, readCorpusRounds } from "../lib/eval-corpus.ts";
 import { collectWeakLabelExpansionsFromSessionJsonl } from "../lib/eval-labels.ts";
 import { aggregateQueryMetrics, evaluateQueryMetrics, filterCandidatesAsOf, noiseRate } from "../lib/eval-metrics.ts";
 import { indexRoundFileFromPath } from "../lib/index-io.ts";
 import { type IndexEntry, loadIndexFromPath } from "../lib/index-storage.ts";
 import type { RoundData } from "../lib/round-data.ts";
-import { resolveScriptConfig, type ScriptConfigOptions } from "../lib/script-config.ts";
+import type { ScriptConfigOptions } from "../lib/script-config.ts";
 import { collectSearchRoundScores } from "../lib/search-interactions.ts";
 import { loadStatsFile } from "../lib/stats.ts";
+import type { GoldenLabelsFile } from "./ingest-golden-labels.ts";
 
-function defaultSessionsDir(agentDir: string): string {
-	return path.resolve(agentDir, "sessions");
+function defaultSessionsDir(corpusDir: string): string {
+	return path.resolve(corpusDir, "sessions");
 }
 
 function parseArgValue(args: readonly string[], name: string): string | null {
@@ -24,37 +26,6 @@ function parseArgValue(args: readonly string[], name: string): string | null {
 
 function sha256Json(value: unknown): string {
 	return crypto.createHash("sha256").update(JSON.stringify(value)).digest("hex");
-}
-
-function gatherSessionFiles(sessionsDir: string, fsImpl: typeof fs = fs): string[] {
-	if (!fsImpl.existsSync(sessionsDir)) return [];
-	const sessionDirs = fsImpl
-		.readdirSync(sessionsDir)
-		.filter((entry) => entry.startsWith("--"))
-		.map((entry) => path.join(sessionsDir, entry));
-
-	return sessionDirs
-		.flatMap((dir) =>
-			fsImpl
-				.readdirSync(dir)
-				.filter((entry) => entry.endsWith(".jsonl"))
-				.map((entry) => path.join(dir, entry)),
-		)
-		.sort();
-}
-
-function readCorpusRounds(roundsDir: string, fsImpl: typeof fs = fs): Map<string, RoundData> {
-	const roundFiles = fsImpl
-		.readdirSync(roundsDir)
-		.filter((entry) => entry.endsWith(".json") && entry !== "chain-read-stats.json")
-		.sort();
-
-	return new Map(
-		roundFiles.map((roundFile) => [
-			roundFile,
-			JSON.parse(fsImpl.readFileSync(path.join(roundsDir, roundFile), "utf-8")) as RoundData,
-		]),
-	);
 }
 
 function collectWeakLabelsByQuery(sessionsDir: string, fsImpl: typeof fs = fs): Map<string, string[]> {
@@ -89,7 +60,7 @@ export interface EvalRetrievalPerQuery {
 }
 
 export interface EvalRetrievalResult {
-	kind: "weak";
+	kind: "weak" | "golden";
 	config_hash: string;
 	corpus: string;
 	counts: EvalRetrievalCounts;
@@ -112,6 +83,10 @@ export interface RunEvalRetrievalOptions extends ScriptConfigOptions {
 	gitRev?: string;
 }
 
+function loadGoldenLabels(filePath: string, fsImpl: typeof fs = fs): GoldenLabelsFile {
+	return JSON.parse(fsImpl.readFileSync(filePath, "utf-8")) as GoldenLabelsFile;
+}
+
 export function evaluateRetrieval(options: {
 	corpusDir: string;
 	sessionsDir: string;
@@ -119,10 +94,11 @@ export function evaluateRetrieval(options: {
 	rounds: ReadonlyMap<string, RoundData>;
 	statsPath: string;
 	configHash: string;
+	goldenLabels?: GoldenLabelsFile | null;
 	fsImpl?: typeof fs;
 }): EvalRetrievalResult {
 	const fsImpl = options.fsImpl ?? fs;
-	const weakExpansions = collectWeakLabelsByQuery(options.sessionsDir, fsImpl);
+	const weakExpansions = options.goldenLabels ? null : collectWeakLabelsByQuery(options.sessionsDir, fsImpl);
 	const counts: EvalRetrievalCounts = {
 		total_rounds: options.rounds.size,
 		replayed: 0,
@@ -134,13 +110,17 @@ export function evaluateRetrieval(options: {
 	const metricQueries: Array<{ labels: string[]; ranked: string[] }> = [];
 	const perQuery: EvalRetrievalPerQuery[] = [];
 	const roundEntries = [...options.rounds.entries()].sort(([a], [b]) => a.localeCompare(b));
+	const goldenByQuery = new Map((options.goldenLabels?.queries ?? []).map((entry) => [entry.query, entry]));
+	const activeRoundEntries = options.goldenLabels
+		? roundEntries.filter(([roundFile]) => goldenByQuery.has(roundFile))
+		: roundEntries;
 
 	const readRound = (filePath: string): RoundData | null => {
 		const roundFile = path.basename(indexRoundFileFromPath(filePath));
 		return options.rounds.get(roundFile) ?? null;
 	};
 
-	for (const [roundFile, round] of roundEntries) {
+	for (const [roundFile, round] of activeRoundEntries) {
 		if (shouldDropEmbedding(countWordsInMessageContent(round.userPrompt ?? ""))) {
 			counts.skipped_short++;
 			continue;
@@ -157,17 +137,25 @@ export function evaluateRetrieval(options: {
 		counts.replayed++;
 		const filtered = filterCandidatesAsOf(options.index, options.rounds, roundFile, round.userTimestamp);
 		const rankedScores = collectSearchRoundScores(filtered.entries, round.promptEmbedding, readRound).slice(0, 5);
-		const labels = dedupe([
-			...(typeof round.parentId === "string" && round.parentId ? [round.parentId] : []),
-			...(weakExpansions.get(roundFile) ?? []),
-		]).filter((label) => label !== roundFile);
+		const ranked = rankedScores.map((entry) => entry.fileName);
+		const goldenEntry = goldenByQuery.get(roundFile);
+		const labels = dedupe(
+			goldenEntry
+				? goldenEntry.labels
+				: [
+						...(typeof round.parentId === "string" && round.parentId ? [round.parentId] : []),
+						...((weakExpansions?.get(roundFile) ?? []) as string[]),
+					],
+		).filter((label) => label !== roundFile);
 		if (labels.length === 0) {
 			counts.skipped_no_labels++;
 			continue;
 		}
 
-		const ranked = rankedScores.map((entry) => entry.fileName);
-		const metrics = evaluateQueryMetrics({ labels, ranked });
+		const metrics = evaluateQueryMetrics({
+			labels: goldenEntry?.primary ? [goldenEntry.primary] : labels,
+			ranked,
+		});
 		metricQueries.push({ labels, ranked });
 		perQuery.push({
 			query: roundFile,
@@ -177,9 +165,35 @@ export function evaluateRetrieval(options: {
 		});
 	}
 
-	const aggregates = aggregateQueryMetrics(metricQueries);
+	const aggregates = options.goldenLabels
+		? (() => {
+				const queryCount = perQuery.length;
+				if (queryCount === 0) return { hitAt5: 0, recallAt5: 0, mrr: 0 };
+				const totals = perQuery.reduce(
+					(acc, query) => {
+						const goldenEntry = goldenByQuery.get(query.query);
+						const ranked = query.top5.map((entry) => entry.file);
+						const recallMetrics = evaluateQueryMetrics({ labels: query.labels, ranked });
+						const mrrMetrics = evaluateQueryMetrics({
+							labels: goldenEntry?.primary ? [goldenEntry.primary] : query.labels.slice(0, 1),
+							ranked,
+						});
+						acc.hitAt5 += recallMetrics.hitAt5;
+						acc.recallAt5 += recallMetrics.recallAt5;
+						acc.mrr += mrrMetrics.mrr;
+						return acc;
+					},
+					{ hitAt5: 0, recallAt5: 0, mrr: 0 },
+				);
+				return {
+					hitAt5: totals.hitAt5 / queryCount,
+					recallAt5: totals.recallAt5 / queryCount,
+					mrr: totals.mrr / queryCount,
+				};
+			})()
+		: aggregateQueryMetrics(metricQueries);
 	return {
-		kind: "weak",
+		kind: options.goldenLabels ? "golden" : "weak",
 		config_hash: options.configHash,
 		corpus: path.basename(options.corpusDir),
 		counts,
@@ -193,25 +207,29 @@ export function evaluateRetrieval(options: {
 
 export async function runEvalRetrieval(options: RunEvalRetrievalOptions = {}): Promise<number> {
 	const args = options.args ?? process.argv.slice(2);
-	const config = resolveScriptConfig(options);
 	const fsImpl = options.fsImpl ?? fs;
 	const out = options.stdout ?? console;
 	const err = options.stderr ?? console;
 	const homedir = options.homedir ?? os.homedir;
 	const corpusDir = options.corpusDir ?? parseArgValue(args, "--corpus");
-	const sessionsDir = options.sessionsDir ?? parseArgValue(args, "--sessions") ?? defaultSessionsDir(config.agentDir);
 	const outFile = options.outFile ?? parseArgValue(args, "--out");
+	const goldenFile = parseArgValue(args, "--golden");
 
 	if (!corpusDir) {
-		err.error("Usage: npx tsx scripts/eval-retrieval.ts --corpus <dir> [--sessions <dir>] [--out <file>]");
+		err.error(
+			"Usage: npx tsx scripts/eval-retrieval.ts --corpus <dir> [--sessions <dir>] [--out <file>] [--golden <file>]",
+		);
 		return 1;
 	}
 
 	const resolvedCorpusDir = path.resolve(corpusDir.replace(/^~(?=$|\/)/, homedir()));
+	const sessionsDir =
+		options.sessionsDir ?? parseArgValue(args, "--sessions") ?? defaultSessionsDir(resolvedCorpusDir);
 	const resolvedSessionsDir = path.resolve(sessionsDir.replace(/^~(?=$|\/)/, homedir()));
 	const roundsDir = path.join(resolvedCorpusDir, "rounds");
 	const indexPath = path.join(roundsDir, "index.csv");
 	const statsPath = path.join(resolvedCorpusDir, "chain-read-stats.json");
+	const resolvedGoldenFile = goldenFile ? path.resolve(goldenFile.replace(/^~(?=$|\/)/, homedir())) : null;
 
 	if (!fsImpl.existsSync(roundsDir)) {
 		err.error(`Corpus rounds directory does not exist: ${roundsDir}`);
@@ -219,6 +237,10 @@ export async function runEvalRetrieval(options: RunEvalRetrievalOptions = {}): P
 	}
 	if (!fsImpl.existsSync(indexPath)) {
 		err.error(`Corpus index does not exist: ${indexPath}`);
+		return 1;
+	}
+	if (resolvedGoldenFile && !fsImpl.existsSync(resolvedGoldenFile)) {
+		err.error(`Golden labels file does not exist: ${resolvedGoldenFile}`);
 		return 1;
 	}
 
@@ -230,9 +252,20 @@ export async function runEvalRetrieval(options: RunEvalRetrievalOptions = {}): P
 		statsPath,
 		configHash: sha256Json({
 			git_rev: options.gitRev ?? "not_available_without_git",
-			cli_args: { corpus: resolvedCorpusDir, sessions: resolvedSessionsDir },
-			metric_params: { top_k: 5, min_words: 20, labels: "parentId+get_round_details", as_of: "strictly earlier" },
+			cli_args: {
+				corpus: resolvedCorpusDir,
+				sessions: resolvedSessionsDir,
+				golden: resolvedGoldenFile,
+			},
+			metric_params: {
+				top_k: 5,
+				min_words: 20,
+				labels: resolvedGoldenFile ? "golden" : "parentId+get_round_details",
+				mrr_target: resolvedGoldenFile ? "primary_else_first_label" : "first_relevant",
+				as_of: "strictly earlier",
+			},
 		}),
+		goldenLabels: resolvedGoldenFile ? loadGoldenLabels(resolvedGoldenFile, fsImpl) : null,
 		fsImpl,
 	});
 

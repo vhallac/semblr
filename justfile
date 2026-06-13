@@ -83,3 +83,15 @@ eval corpus out="docs/eval/baseline-weak.local.json":
 #        just build-baseline-weak /path/to/unpacked-snapshot /tmp/baseline.json
 build-baseline-weak corpus out="docs/eval/baseline-weak.local.json":
     npx tsx scripts/eval-retrieval.ts --corpus {{corpus}} --sessions {{corpus}}/sessions --out {{out}}
+
+# Build a local golden-label candidate pool plus editable worksheet from a snapshot
+# Usage: just build-golden-pool /path/to/unpacked-snapshot
+#        just build-golden-pool /path/to/unpacked-snapshot /tmp/golden-pool.local.json
+build-golden-pool corpus out="docs/eval/golden-pool.local.json":
+    npx tsx scripts/build-golden-pool.ts --corpus {{corpus}} --sessions {{corpus}}/sessions --out {{out}} --worksheet docs/eval/golden-worksheet.local.md
+
+# Ingest maintainer worksheet selections into the committed golden labels artifact
+# Usage: just ingest-golden-labels
+#        just ingest-golden-labels /tmp/golden-labels.json
+ingest-golden-labels out="docs/eval/golden-labels.json":
+    npx tsx scripts/ingest-golden-labels.ts --pool docs/eval/golden-pool.local.json --worksheet docs/eval/golden-worksheet.local.md --out {{out}}

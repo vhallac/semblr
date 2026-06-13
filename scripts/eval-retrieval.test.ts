@@ -108,7 +108,6 @@ describe("eval-retrieval script", () => {
 			),
 			responseSequence: "missing embedding response",
 			turnIndex: 4,
-			userTimestamp: 35,
 		} satisfies RoundData;
 		const query = {
 			userPrompt: prompt(
@@ -259,13 +258,188 @@ describe("eval-retrieval script", () => {
 		expect(third).toEqual(first);
 	});
 
+	it("uses primary for MRR and labels for Recall@5 when --golden is provided", async () => {
+		const root = tmpDir();
+		const corpusDir = path.join(root, "snapshot-a");
+		const roundsDir = path.join(corpusDir, "rounds");
+		const sessionsDir = path.join(corpusDir, "sessions");
+		const outFile = path.join(root, "out", "eval-golden.json");
+		const goldenFile = path.join(root, "docs", "eval", "golden-labels.json");
+		fs.mkdirSync(roundsDir, { recursive: true });
+		fs.mkdirSync(sessionsDir, { recursive: true });
+
+		const primaryRound = {
+			userPrompt: prompt(
+				"primary candidate prompt has enough words to stay in the corpus and act as the golden primary result for this test",
+			),
+			responseSequence: "primary response",
+			turnIndex: 0,
+			userTimestamp: 10,
+			promptEmbedding: [0.6, 0.8, 0, 0],
+		} satisfies RoundData;
+		const relevantRound = {
+			userPrompt: prompt(
+				"relevant candidate prompt has enough words to stay in the corpus and rank ahead of the primary in this test",
+			),
+			responseSequence: "relevant response",
+			turnIndex: 1,
+			userTimestamp: 20,
+			promptEmbedding: [0.9, 0.9, 0, 0],
+		} satisfies RoundData;
+		const queryRound = {
+			userPrompt: prompt(
+				"golden query prompt has enough words to produce deterministic retrieval ordering for the primary and supporting labels in this evaluation",
+			),
+			responseSequence: "golden query response",
+			turnIndex: 2,
+			userTimestamp: 30,
+			promptEmbedding: [1, 1, 0, 0],
+		} satisfies RoundData;
+
+		const primaryFile = writeRound(roundsDir, primaryRound);
+		const relevantFile = writeRound(roundsDir, relevantRound);
+		const queryFile = writeRound(roundsDir, queryRound);
+		fs.writeFileSync(
+			path.join(roundsDir, "index.csv"),
+			`${[
+				encodeEntry([0.6, 0.8, 0, 0], `${primaryFile}:prompt`),
+				encodeEntry([0.9, 0.9, 0, 0], `${relevantFile}:prompt`),
+				encodeEntry([1, 1, 0, 0], `${queryFile}:prompt`),
+			].join("\n")}
+`,
+		);
+		fs.writeFileSync(
+			path.join(corpusDir, "chain-read-stats.json"),
+			JSON.stringify(createDefaultStatsState("2026-06-12T03:01:09.000Z"), null, 2),
+		);
+		fs.mkdirSync(path.dirname(goldenFile), { recursive: true });
+		fs.writeFileSync(
+			goldenFile,
+			JSON.stringify(
+				{
+					kind: "golden-labels",
+					version: 1,
+					source_pool: "/tmp/golden-pool.local.json",
+					queries: [
+						{
+							query: queryFile,
+							prompt: queryRound.userPrompt,
+							difficulty: "hard",
+							primary: primaryFile,
+							labels: [primaryFile, relevantFile],
+						},
+					],
+				},
+				null,
+				2,
+			),
+		);
+
+		await expect(
+			runEvalRetrieval({
+				args: ["--corpus", corpusDir, "--out", outFile, "--golden", goldenFile],
+				outFile,
+				gitRev: "test-rev",
+			}),
+		).resolves.toBe(0);
+		const result = JSON.parse(fs.readFileSync(outFile, "utf-8"));
+		expect(result.kind).toBe("golden");
+		expect(result.recall_at_5).toBe(1);
+		expect(result.mrr).toBe(0.5);
+		expect(result.per_query).toEqual([
+			{
+				query: queryFile,
+				labels: [primaryFile, relevantFile],
+				top5: [
+					{ file: relevantFile, score: 1.8 },
+					{ file: primaryFile, score: 1.4 },
+				],
+				first_hit_rank: 2,
+			},
+		]);
+	});
+
+	it("defaults --sessions to <corpus>/sessions when omitted", async () => {
+		const root = tmpDir();
+		const corpusDir = path.join(root, "snapshot-a");
+		const roundsDir = path.join(corpusDir, "rounds");
+		const sessionsDir = path.join(corpusDir, "sessions");
+		const outFile = path.join(root, "out", "eval.json");
+		fs.mkdirSync(roundsDir, { recursive: true });
+		fs.mkdirSync(path.join(sessionsDir, "--session-a"), { recursive: true });
+
+		const older = {
+			userPrompt: prompt(
+				"alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu nu xi omicron pi rho sigma tau upsilon",
+			),
+			responseSequence: "older response",
+			turnIndex: 0,
+			userTimestamp: 10,
+			promptEmbedding: [1, 0, 0, 0],
+		} satisfies RoundData;
+		const query = {
+			userPrompt: prompt(
+				"query prompt has enough words to replay retrieval against earlier rounds and produce a stable deterministic ranking for this script test case",
+			),
+			responseSequence: "query response",
+			turnIndex: 1,
+			userTimestamp: 20,
+			promptEmbedding: [1, 0, 0, 0],
+			parentId: "",
+		} satisfies RoundData;
+
+		const olderFile = writeRound(roundsDir, older);
+		const queryFile = writeRound(roundsDir, {
+			...query,
+			parentId: olderFile,
+			toolCallCount: 1,
+			toolCallNames: ["get_round_details"],
+			toolCalls: [
+				{
+					index: 0,
+					name: "get_round_details",
+					arguments: JSON.stringify({ round: olderFile }),
+					result_summary: "",
+				},
+			],
+		});
+
+		fs.writeFileSync(
+			path.join(roundsDir, "index.csv"),
+			`${[encodeEntry([1, 0, 0, 0], `${olderFile}:prompt`), encodeEntry([1, 0, 0, 0], `${queryFile}:prompt`)].join("\n")}\n`,
+		);
+		fs.writeFileSync(
+			path.join(corpusDir, "chain-read-stats.json"),
+			JSON.stringify(createDefaultStatsState("2026-06-12T03:01:09.000Z"), null, 2),
+		);
+		writeSessionWithExpansion(
+			path.join(sessionsDir, "--session-a", "rounds.jsonl"),
+			query.userPrompt,
+			query.responseSequence,
+			olderFile,
+		);
+
+		await expect(
+			runEvalRetrieval({ args: ["--corpus", corpusDir, "--out", outFile], outFile, gitRev: "test-rev" }),
+		).resolves.toBe(0);
+		const result = JSON.parse(fs.readFileSync(outFile, "utf-8"));
+		expect(result.per_query).toEqual([
+			{
+				query: queryFile,
+				labels: [olderFile],
+				top5: [{ file: olderFile, score: 1 }],
+				first_hit_rank: 1,
+			},
+		]);
+	});
+
 	it("requires --corpus", async () => {
 		const stderr: string[] = [];
 		await expect(
 			runEvalRetrieval({ args: [], stderr: { error: (line: string) => stderr.push(line) } }),
 		).resolves.toBe(1);
 		expect(stderr).toEqual([
-			"Usage: npx tsx scripts/eval-retrieval.ts --corpus <dir> [--sessions <dir>] [--out <file>]",
+			"Usage: npx tsx scripts/eval-retrieval.ts --corpus <dir> [--sessions <dir>] [--out <file>] [--golden <file>]",
 		]);
 	});
 });
