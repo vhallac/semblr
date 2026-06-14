@@ -30,12 +30,12 @@ Pass an explicit output path if you want to store the report elsewhere.
 
 ## Golden labels workflow
 
-`golden-labels.json` is the committed maintainer artifact, parallel to `baseline-weak.json`.
-The intermediate selection pool and worksheet are local-only artifacts so the existing `*.local` gitignore rule excludes them:
+Golden labels are local maintainer artifacts. They include private prompt text and corpus-specific round hashes, so keep them out of git.
+The selection pool, worksheet, and ingested labels are local-only artifacts ignored by git:
 
 - `docs/eval/golden-pool.local.json`
 - `docs/eval/golden-worksheet.local.md`
-- `docs/eval/golden-labels.json`
+- `docs/eval/golden-labels.local.json`
 
 Build the local pool and worksheet from a snapshot:
 
@@ -45,13 +45,13 @@ just build-golden-pool ~/.pi/agent/semblr/snapshots/<snapshot-dir>
 
 Then edit `docs/eval/golden-worksheet.local.md`, marking true labels by changing `- [ ] candidate.json` to `- [x] candidate.json`.
 Each candidate now includes a short excerpt under the hash, and you may mark one selected candidate as primary by adding `(primary)` on its checkbox line.
-Finally ingest the local worksheet into the committed artifact:
+Finally ingest the local worksheet into local labels:
 
 ```sh
 just ingest-golden-labels
 ```
 
-`ingest-golden-labels` reads `golden-pool.local.json`, reads `golden-worksheet.local.md`, and writes the committed `golden-labels.json` with both `labels` and optional `primary` per query.
+`ingest-golden-labels` reads `golden-pool.local.json`, reads `golden-worksheet.local.md`, and writes `golden-labels.local.json` with both `labels` and optional `primary` per query.
 
 ## Committed maintainer baseline
 

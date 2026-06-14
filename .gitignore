@@ -2,6 +2,7 @@
 .pi/rounds/
 docs/eval/*.local.json
 docs/eval/*.local.md
+docs/eval/golden-labels.json
 
 # pi session data (auto-generated)
 .pi/agent/sessions/
