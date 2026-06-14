@@ -15,6 +15,8 @@ just snapshot
 just build-baseline-weak ~/.pi/agent/semblr/snapshots/<snapshot-dir>
 ```
 
+Both `just eval` and `just build-baseline-weak` pass `--sessions <corpus>/sessions`, matching the snapshot layout exactly. `scripts/eval-retrieval.ts` follows the same convention when `--sessions` is omitted.
+
 The snapshot layout is:
 
 ```text
@@ -25,6 +27,31 @@ The snapshot layout is:
 
 `just build-baseline-weak` writes `docs/eval/baseline-weak.local.json` by default, which is ignored by git.
 Pass an explicit output path if you want to store the report elsewhere.
+
+## Golden labels workflow
+
+`golden-labels.json` is the committed maintainer artifact, parallel to `baseline-weak.json`.
+The intermediate selection pool and worksheet are local-only artifacts so the existing `*.local` gitignore rule excludes them:
+
+- `docs/eval/golden-pool.local.json`
+- `docs/eval/golden-worksheet.local.md`
+- `docs/eval/golden-labels.json`
+
+Build the local pool and worksheet from a snapshot:
+
+```sh
+just build-golden-pool ~/.pi/agent/semblr/snapshots/<snapshot-dir>
+```
+
+Then edit `docs/eval/golden-worksheet.local.md`, marking true labels by changing `- [ ] candidate.json` to `- [x] candidate.json`.
+Each candidate now includes a short excerpt under the hash, and you may mark one selected candidate as primary by adding `(primary)` on its checkbox line.
+Finally ingest the local worksheet into the committed artifact:
+
+```sh
+just ingest-golden-labels
+```
+
+`ingest-golden-labels` reads `golden-pool.local.json`, reads `golden-worksheet.local.md`, and writes the committed `golden-labels.json` with both `labels` and optional `primary` per query.
 
 ## Committed maintainer baseline
 
