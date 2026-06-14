@@ -5,11 +5,11 @@ import { describe, expect, it } from "vitest";
 import { parseWorksheetSelections, runIngestGoldenLabels } from "./ingest-golden-labels.ts";
 
 describe("ingest-golden-labels script", () => {
-	it("reads the .local pool and worksheet and writes committed golden-labels.json with primary", async () => {
+	it("reads the .local pool and worksheet and writes local golden labels with primary", async () => {
 		const root = fs.mkdtempSync(path.join(os.tmpdir(), "semblr-ingest-golden-labels-test-"));
 		const poolFile = path.join(root, "docs", "eval", "golden-pool.local.json");
 		const worksheetFile = path.join(root, "docs", "eval", "golden-worksheet.local.md");
-		const outFile = path.join(root, "docs", "eval", "golden-labels.json");
+		const outFile = path.join(root, "docs", "eval", "golden-labels.local.json");
 		const warnings: string[] = [];
 		fs.mkdirSync(path.dirname(poolFile), { recursive: true });
 		fs.writeFileSync(
@@ -41,12 +41,18 @@ describe("ingest-golden-labels script", () => {
 			"# Golden worksheet\n\n## 1. query-a.json\n\n- [ ] older-a.json (primary)\n- [x] older-b.json\n",
 		);
 
-		await expect(
-			runIngestGoldenLabels({
-				args: ["--pool", poolFile, "--worksheet", worksheetFile, "--out", outFile],
-				stdout: { log: () => {}, warn: (line: string) => warnings.push(line) },
-			}),
-		).resolves.toBe(0);
+		const originalCwd = process.cwd();
+		try {
+			process.chdir(root);
+			await expect(
+				runIngestGoldenLabels({
+					args: ["--pool", poolFile, "--worksheet", worksheetFile],
+					stdout: { log: () => {}, warn: (line: string) => warnings.push(line) },
+				}),
+			).resolves.toBe(0);
+		} finally {
+			process.chdir(originalCwd);
+		}
 		const labels = JSON.parse(fs.readFileSync(outFile, "utf-8"));
 		expect(labels).toEqual({
 			kind: "golden-labels",
@@ -65,6 +71,22 @@ describe("ingest-golden-labels script", () => {
 		expect(warnings).toEqual([
 			"Primary label auto-selected for query-a.json: older-a.json was marked (primary) without [x]",
 		]);
+	});
+
+	it("accepts uppercase checked boxes", () => {
+		expect(
+			parseWorksheetSelections("# Golden worksheet\n\n## 1. query-a.json\n\n- [X] older-a.json\n").get(
+				"query-a.json",
+			)?.labels,
+		).toEqual(["older-a.json"]);
+	});
+
+	it("warns when checkbox-like candidate lines cannot be parsed", () => {
+		expect(
+			parseWorksheetSelections("# Golden worksheet\n\n## 1. query-a.json\n\n- [yes] older-a.json\n").get(
+				"query-a.json",
+			)?.warnings,
+		).toEqual(["Worksheet checkbox line could not be parsed for query-a.json: - [yes] older-a.json"]);
 	});
 
 	it("rejects multiple primary labels for one query", () => {

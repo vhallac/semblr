@@ -22,7 +22,7 @@ function defaultWorksheetPath(): string {
 }
 
 function defaultOutPath(): string {
-	return path.resolve("docs/eval/golden-labels.json");
+	return path.resolve("docs/eval/golden-labels.local.json");
 }
 
 interface WorksheetSelection {
@@ -42,10 +42,16 @@ export function parseWorksheetSelections(raw: string): Map<string, WorksheetSele
 			continue;
 		}
 		if (!currentQuery) continue;
-		const candidate = /^-\s+\[(?<checked>[ x])\]\s+(?<file>\S+)(?<rest>.*)$/.exec(line.trim());
-		if (!candidate?.groups) continue;
+		const trimmedLine = line.trim();
+		const candidate = /^-\s+\[(?<checked>[ xX])\]\s+(?<file>\S+)(?<rest>.*)$/.exec(trimmedLine);
 		const selection = selections.get(currentQuery);
 		if (!selection) continue;
+		if (!candidate?.groups) {
+			if (/^-\s+\[.*\]/.test(trimmedLine)) {
+				selection.warnings.push(`Worksheet checkbox line could not be parsed for ${currentQuery}: ${trimmedLine}`);
+			}
+			continue;
+		}
 		const file = candidate.groups.file;
 		const rest = candidate.groups.rest;
 		const isChecked = candidate.groups.checked.toLowerCase() === "x";

@@ -90,8 +90,8 @@ build-baseline-weak corpus out="docs/eval/baseline-weak.local.json":
 build-golden-pool corpus out="docs/eval/golden-pool.local.json":
     npx tsx scripts/build-golden-pool.ts --corpus {{corpus}} --sessions {{corpus}}/sessions --out {{out}} --worksheet docs/eval/golden-worksheet.local.md
 
-# Ingest maintainer worksheet selections into the committed golden labels artifact
+# Ingest maintainer worksheet selections into the local golden labels artifact
 # Usage: just ingest-golden-labels
 #        just ingest-golden-labels /tmp/golden-labels.json
-ingest-golden-labels out="docs/eval/golden-labels.json":
+ingest-golden-labels out="docs/eval/golden-labels.local.json":
     npx tsx scripts/ingest-golden-labels.ts --pool docs/eval/golden-pool.local.json --worksheet docs/eval/golden-worksheet.local.md --out {{out}}
