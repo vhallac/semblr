@@ -103,6 +103,8 @@ export interface RoundState {
 	phaseNote: string | null;
 	/** Model ID to switch to at agent_end, derived from the reported phase and the phase→model map. */
 	pendingModelSwitch: string | null;
+	/** Model ID of the model active when semblr_report_phase was first called (before any switch). */
+	originalModelId: string | null;
 }
 
 export function createRound(): RoundState {
@@ -126,5 +128,6 @@ export function createRound(): RoundState {
 		currentPhase: null,
 		phaseNote: null,
 		pendingModelSwitch: null,
+		originalModelId: null,
 	};
 }

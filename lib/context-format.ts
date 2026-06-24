@@ -395,8 +395,9 @@ Phases and when to report them:
 
 Call \`semblr_report_phase\` with the phase that describes what you will do
 NEXT (not what you just did). Call it once per round — the last call before
-your final response wins. Model switches happen at round boundaries, not
-mid-response.`;
+your final response wins. Model switches happen at turn end (after your final
+response), and the original model is restored at round end. This means the
+phase-specific model takes effect at the next round boundary — not mid-response.`;
 }
 
 export function splitCommandArgs(args: string): string[] {
