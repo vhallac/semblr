@@ -539,6 +539,64 @@ Expands a single collapsed tool call from a historical round — full arguments 
 
 This is what "drill down" means: from a stub like `Turn 2: read — [REDACTED: ...]`, the LLM calls `get_tool_details("a1b2c3d4.json", 2)` and sees exactly what file was read and what it contained.
 
+## Multi-Model Routing
+
+Semblr can automatically switch LLM models based on the development phase the agent reports.
+This is **opt-in** and disabled by default.
+
+### How it works
+
+1. The LLM calls the `semblr_report_phase` tool to declare its current phase
+   (e.g., `"exploring"`, `"planning"`, `"implementing"`).
+2. On the next `agent_end` boundary, Semblr looks up the phase in the configured
+   phase→model map and switches models if needed.
+3. A **switch counter** enforces a `maxSwitches` limit to prevent thrashing.
+4. Each switch is announced in the TUI via `[Multi-model]` notifications.
+
+### Configuration
+
+```bash
+# Enable multi-model routing
+export SEMBLR_ROUTING_ENABLED=true
+
+# Optional: set max switches per round (default: 3)
+export SEMBLR_MAX_SWITCHES=5
+```
+
+Or in `.pi/settings.json`:
+
+```json
+{
+  "semblr": {
+    "multiModelRouting": {
+      "enabled": true,
+      "maxSwitches": 5
+    }
+  }
+}
+```
+
+### Phases
+
+The default phase→model map (MVP, issue #86) maps six phases to Ollama Cloud models:
+
+| Phase | Model |
+|---|---|
+| `exploring` | (stay on current model) |
+| `planning` | `qwen3-coder-plus:cloud` |
+| `implementing` | `qwen3-coder-plus:cloud` |
+| `reviewing` | `qwen3-coder-plus:cloud` |
+| `testing` | `qwen3-coder-plus:cloud` |
+| `debugging` | `qwen3-coder-plus:cloud` |
+
+Custom phase→model maps can be set via the `phaseModelMap` config key.
+
+### Tools
+
+| Tool | Purpose |
+|---|---|
+| `semblr_report_phase` | Declare the current development phase (accepts `phase` + optional `note`) |
+
 ## License
 
 MIT

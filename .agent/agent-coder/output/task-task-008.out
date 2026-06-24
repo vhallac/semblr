@@ -1,0 +1,14 @@
+STATUS: COMPLETE
+
+SUMMARY: Fixed typecheck errors in `lib/context-messages.test.ts` (2 missing `routingInstructions` fields), wrote missing output summaries for tasks 4 & 5 (`temp/task-004-output.md`, `temp/task-005-output.md`), verified clean typecheck (0 errors) and full test suite (507 tests passing), and committed all work to the `feature/86-multi-model-routing` branch.
+
+FILES:
+- `lib/context-messages.test.ts` — fixed (2 lines)
+- `temp/task-004-output.md` — written (core extension: tool registration, handler, agent_end switching, context injection)
+- `temp/task-005-output.md` — written (54 routing behavior tests across 9 categories)
+- `temp/task-008-output.md` — written (this task's summary)
+
+CHANGES:
+- `npx tsc --noEmit` → 0 errors (was 2)
+- `npx vitest run` → 507 passed, 38 files
+- Committed: `edc9f07` — feat: multi-model routing foundation (issue #86)

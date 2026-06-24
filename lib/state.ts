@@ -99,6 +99,8 @@ export interface RoundState {
 	switchCounter: number;
 	/** Most recently reported phase for the current round. */
 	currentPhase: PhaseName | null;
+	/** Optional note from the LLM to pass to the next model on switch. */
+	phaseNote: string | null;
 	/** Model ID to switch to at agent_end, derived from the reported phase and the phase→model map. */
 	pendingModelSwitch: string | null;
 }
@@ -122,6 +124,7 @@ export function createRound(): RoundState {
 		contextWarningIssued: 0,
 		switchCounter: 0,
 		currentPhase: null,
+		phaseNote: null,
 		pendingModelSwitch: null,
 	};
 }

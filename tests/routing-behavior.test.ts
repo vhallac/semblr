@@ -3,10 +3,11 @@
  *
  * Tests are derived from the specification (issue #86, comments #1 and #2):
  * - MVP_PHASE_MODEL_MAP from comment #2 (Ollama-Cloud naming)
- * - Phase names from task-003 (thinking, executing, stuck, reporting, reviewing, verifying)
+ * - Phase names from issue #86 comment #1: exploring, planning, executing, stuck, verifying, reporting
  * - Switch limiter: maxSwitches = 3 per agent cycle
  * - Config gating: default enabled = false
  * - Switches happen at agent_end boundaries (tracked via pendingModelSwitch)
+ * - Optional note parameter on semblr_report_phase tool
  */
 
 import { describe, expect, it } from "vitest";
@@ -19,17 +20,17 @@ import { resolveModelId } from "../lib/resolve-model-id.ts";
 // Helpers
 // ─────────────────────────────────────────────
 
-/** All six valid phase names. */
-const ALL_PHASES: PhaseName[] = ["thinking", "executing", "stuck", "reporting", "reviewing", "verifying"];
+/** All six valid phase names (from issue #86 comment #1). */
+const ALL_PHASES: PhaseName[] = ["exploring", "planning", "executing", "stuck", "verifying", "reporting"];
 
-/** Known target model IDs from the MVP map, indexed by phase. */
+/** Known target model IDs from the MVP map, indexed by phase (from comment #2). */
 const PHASE_MODEL_MAP: Record<PhaseName, string | null> = {
-	thinking: null,
+	exploring: null,
+	planning: "deepseek-v4-flash:cloud",
 	executing: "glm-5.2:cloud",
 	stuck: "kimi-k2.6:cloud",
+	verifying: "minimax-m3:cloud",
 	reporting: "gemma4:12b:cloud",
-	reviewing: "deepseek-v4-pro:cloud",
-	verifying: "deepseek-v4-flash:cloud",
 };
 
 /** The default maxSwitches value. */
@@ -108,13 +109,13 @@ describe("resolveModelId behavioral edge cases", () => {
 // ─────────────────────────────────────────────
 
 describe("phase model map behavior", () => {
-	it("maps thinking to null (stay on current model)", () => {
-		expect(getModelForPhase("thinking", MVP_PHASE_MODEL_MAP)).toBeNull();
+	it("maps exploring to null (stay on current model)", () => {
+		expect(getModelForPhase("exploring", MVP_PHASE_MODEL_MAP)).toBeNull();
 	});
 
-	it("maps all non-thinking phases to a :cloud model ID", () => {
-		const nonThinkingPhases = ALL_PHASES.filter((p) => p !== "thinking");
-		for (const phase of nonThinkingPhases) {
+	it("maps all non-exploring phases to a :cloud model ID", () => {
+		const nonExploringPhases = ALL_PHASES.filter((p) => p !== "exploring");
+		for (const phase of nonExploringPhases) {
 			const modelId = getModelForPhase(phase, MVP_PHASE_MODEL_MAP);
 			expect(modelId).not.toBeNull();
 			expect(modelId).toMatch(/:cloud$/);
@@ -126,7 +127,7 @@ describe("phase model map behavior", () => {
 			.map((p) => getModelForPhase(p, MVP_PHASE_MODEL_MAP))
 			.filter((id): id is string => id !== null);
 		const uniqueIds = new Set(modelIds);
-		// All 5 non-thinking phases should have distinct models
+		// All 5 non-exploring phases should have distinct models
 		expect(uniqueIds.size).toBe(5);
 	});
 
@@ -140,21 +141,21 @@ describe("phase model map behavior", () => {
 
 	it("getModelForPhase returns null for arbitrary strings not in the phase union", () => {
 		// @ts-expect-error — deliberate runtime check
-		expect(getModelForPhase("planning", MVP_PHASE_MODEL_MAP)).toBeNull();
+		expect(getModelForPhase("thinking", MVP_PHASE_MODEL_MAP)).toBeNull();
 		// @ts-expect-error
-		expect(getModelForPhase("exploring", MVP_PHASE_MODEL_MAP)).toBeNull();
+		expect(getModelForPhase("reviewing", MVP_PHASE_MODEL_MAP)).toBeNull();
 		// @ts-expect-error
 		expect(getModelForPhase("", MVP_PHASE_MODEL_MAP)).toBeNull();
 	});
 
 	it("getModelForPhase with a custom map uses that map, not the MVP map", () => {
 		const customMap = {
-			thinking: null,
+			exploring: null,
 			executing: null, // override — no switch
 			stuck: "custom-model:cloud",
-			reporting: null,
-			reviewing: null,
+			planning: null,
 			verifying: null,
+			reporting: null,
 		} as const;
 		expect(getModelForPhase("executing", customMap)).toBeNull(); // overridden to null
 		expect(getModelForPhase("stuck", customMap)).toBe("custom-model:cloud");
@@ -167,19 +168,19 @@ describe("phase model map behavior", () => {
 
 describe("phase name type validation", () => {
 	it("accepts all six defined phase names", () => {
-		const validPhases: PhaseName[] = ["thinking", "executing", "stuck", "reporting", "reviewing", "verifying"];
+		const validPhases: PhaseName[] = ["exploring", "planning", "executing", "stuck", "verifying", "reporting"];
 		expect(validPhases).toHaveLength(6);
 		// Each should produce a non-null-ish result (null or string) from the map
 		for (const phase of validPhases) {
 			const result = getModelForPhase(phase, MVP_PHASE_MODEL_MAP);
-			// null is valid (thinking stays on current model)
+			// null is valid (exploring stays on current model)
 			expect(result === null || typeof result === "string").toBe(true);
 		}
 	});
 
 	it("rejects strings outside the PhaseName union when used with getModelForPhase", () => {
 		// @ts-expect-error — not a PhaseName
-		expect(getModelForPhase("planning", MVP_PHASE_MODEL_MAP)).toBeNull();
+		expect(getModelForPhase("thinking", MVP_PHASE_MODEL_MAP)).toBeNull();
 		// @ts-expect-error — not a PhaseName
 		expect(getModelForPhase("done", MVP_PHASE_MODEL_MAP)).toBeNull();
 		// @ts-expect-error — not a PhaseName
@@ -189,14 +190,14 @@ describe("phase name type validation", () => {
 	it("PhaseName type is a string literal union (no extra keys)", () => {
 		// Compile-time check: ALL_PHASES covers every PhaseName
 		const phaseSet = new Set<string>(ALL_PHASES);
-		expect(phaseSet.has("thinking")).toBe(true);
+		expect(phaseSet.has("exploring")).toBe(true);
+		expect(phaseSet.has("planning")).toBe(true);
 		expect(phaseSet.has("executing")).toBe(true);
 		expect(phaseSet.has("stuck")).toBe(true);
-		expect(phaseSet.has("reporting")).toBe(true);
-		expect(phaseSet.has("reviewing")).toBe(true);
 		expect(phaseSet.has("verifying")).toBe(true);
-		expect(phaseSet.has("planning")).toBe(false);
-		expect(phaseSet.has("exploring")).toBe(false);
+		expect(phaseSet.has("reporting")).toBe(true);
+		expect(phaseSet.has("thinking")).toBe(false);
+		expect(phaseSet.has("reviewing")).toBe(false);
 	});
 
 	it("maps have exactly the PhaseName keys", () => {
@@ -254,8 +255,8 @@ describe("switch counter behavior", () => {
 		expect(round2.switchCounter).toBe(0);
 	});
 
-	it("no-op phase (thinking) does not increment counter", () => {
-		const decision = simulateRoutingDecision("thinking", "current-model", 0, DEFAULT_MAX_SWITCHES, true);
+	it("no-op phase (exploring) does not increment counter", () => {
+		const decision = simulateRoutingDecision("exploring", "current-model", 0, DEFAULT_MAX_SWITCHES, true);
 		expect(decision.shouldSwitch).toBe(false);
 		expect(decision.newCounter).toBe(0);
 	});
@@ -298,8 +299,8 @@ describe("switch counter behavior", () => {
 
 		// Now try different phases — all blocked
 		expect(simulateRoutingDecision("reporting", "m4", counter, DEFAULT_MAX_SWITCHES, true).shouldSwitch).toBe(false);
-		expect(simulateRoutingDecision("reviewing", "m5", counter, DEFAULT_MAX_SWITCHES, true).shouldSwitch).toBe(false);
-		expect(simulateRoutingDecision("thinking", "m6", counter, DEFAULT_MAX_SWITCHES, true).shouldSwitch).toBe(false);
+		expect(simulateRoutingDecision("planning", "m5", counter, DEFAULT_MAX_SWITCHES, true).shouldSwitch).toBe(false);
+		expect(simulateRoutingDecision("exploring", "m6", counter, DEFAULT_MAX_SWITCHES, true).shouldSwitch).toBe(false);
 	});
 });
 
@@ -314,8 +315,8 @@ describe("model switching logic", () => {
 		expect(decision.target).toBeNull();
 	});
 
-	it("phase → null in map (thinking) → no switch", () => {
-		const decision = simulateRoutingDecision("thinking", "any-model", 0, DEFAULT_MAX_SWITCHES, true);
+	it("phase → null in map (exploring) → no switch", () => {
+		const decision = simulateRoutingDecision("exploring", "any-model", 0, DEFAULT_MAX_SWITCHES, true);
 		expect(decision.shouldSwitch).toBe(false);
 		expect(decision.target).toBeNull();
 	});
@@ -361,8 +362,8 @@ describe("model switching logic", () => {
 	it("multiple phase reports in same round → last reported phase wins", () => {
 		const round = createRound();
 		// Simulate multiple reports overwriting each other
-		round.currentPhase = "thinking";
-		round.pendingModelSwitch = getModelForPhase("thinking", MVP_PHASE_MODEL_MAP);
+		round.currentPhase = "exploring";
+		round.pendingModelSwitch = getModelForPhase("exploring", MVP_PHASE_MODEL_MAP);
 
 		// Later report overwrites
 		round.currentPhase = "executing";
@@ -372,13 +373,13 @@ describe("model switching logic", () => {
 		expect(round.pendingModelSwitch).toBe("glm-5.2:cloud");
 	});
 
-	it("switch to each non-thinking phase produces expected target model", () => {
-		const modelMap: Record<PhaseName, string> = {
+	it("switch to each non-exploring phase produces expected target model", () => {
+		const modelMap: Record<string, string> = {
+			planning: "deepseek-v4-flash:cloud",
 			executing: "glm-5.2:cloud",
 			stuck: "kimi-k2.6:cloud",
+			verifying: "minimax-m3:cloud",
 			reporting: "gemma4:12b:cloud",
-			reviewing: "deepseek-v4-pro:cloud",
-			verifying: "deepseek-v4-flash:cloud",
 		};
 
 		for (const [phase, expectedModel] of Object.entries(modelMap)) {
@@ -508,63 +509,63 @@ describe("config gating", () => {
 // ─────────────────────────────────────────────
 
 describe("integration: full agent cycle", () => {
-	it("thinking → executing → stuck → reporting → reviewing → verifying respects switch limit", () => {
+	it("exploring → planning → executing → stuck → verifying → reporting respects switch limit", () => {
 		// With maxSwitches = 3, only the first 3 non-null phases trigger switches.
-		// The remaining phases (reviewing, verifying) are blocked.
+		// The remaining phases (verifying, reporting) are blocked.
 		// When blocked, simulateRoutingDecision returns target=null.
 		let currentModel = "default-model";
 		let switchCounter = 0;
 
-		// Phase 1: thinking → no switch
-		let d = simulateRoutingDecision("thinking", currentModel, switchCounter, DEFAULT_MAX_SWITCHES, true);
+		// Phase 1: exploring → no switch
+		let d = simulateRoutingDecision("exploring", currentModel, switchCounter, DEFAULT_MAX_SWITCHES, true);
 		expect(d.target).toBeNull();
 		expect(d.shouldSwitch).toBe(false);
 
-		// Phase 2: executing → switch to glm-5.2:cloud (switch 1)
+		// Phase 2: planning → switch to deepseek-v4-flash:cloud (switch 1)
+		d = simulateRoutingDecision("planning", currentModel, switchCounter, DEFAULT_MAX_SWITCHES, true);
+		expect(d.target).toBe("deepseek-v4-flash:cloud");
+		expect(d.shouldSwitch).toBe(true);
+		switchCounter = d.newCounter;
+		currentModel = d.target!;
+
+		// Phase 3: executing → switch to glm-5.2:cloud (switch 2)
 		d = simulateRoutingDecision("executing", currentModel, switchCounter, DEFAULT_MAX_SWITCHES, true);
 		expect(d.target).toBe("glm-5.2:cloud");
 		expect(d.shouldSwitch).toBe(true);
 		switchCounter = d.newCounter;
 		currentModel = d.target!;
 
-		// Phase 3: stuck → switch to kimi-k2.6:cloud (switch 2)
+		// Phase 4: stuck → switch to kimi-k2.6:cloud (switch 3 — maxSwitches reached)
 		d = simulateRoutingDecision("stuck", currentModel, switchCounter, DEFAULT_MAX_SWITCHES, true);
 		expect(d.target).toBe("kimi-k2.6:cloud");
 		expect(d.shouldSwitch).toBe(true);
 		switchCounter = d.newCounter;
 		currentModel = d.target!;
 
-		// Phase 4: reporting → switch to gemma4:12b:cloud (switch 3 — maxSwitches reached)
-		d = simulateRoutingDecision("reporting", currentModel, switchCounter, DEFAULT_MAX_SWITCHES, true);
-		expect(d.target).toBe("gemma4:12b:cloud");
-		expect(d.shouldSwitch).toBe(true);
-		switchCounter = d.newCounter;
-		currentModel = d.target!;
-
-		// Phase 5: reviewing → blocked (switchCounter == 3 >= maxSwitches)
-		d = simulateRoutingDecision("reviewing", currentModel, switchCounter, DEFAULT_MAX_SWITCHES, true);
-		expect(d.shouldSwitch).toBe(false);
-		expect(switchCounter).toBe(3);
-
-		// Phase 6: verifying → blocked
+		// Phase 5: verifying → blocked (switchCounter == 3 >= maxSwitches)
 		d = simulateRoutingDecision("verifying", currentModel, switchCounter, DEFAULT_MAX_SWITCHES, true);
 		expect(d.shouldSwitch).toBe(false);
 		expect(switchCounter).toBe(3);
 
+		// Phase 6: reporting → blocked
+		d = simulateRoutingDecision("reporting", currentModel, switchCounter, DEFAULT_MAX_SWITCHES, true);
+		expect(d.shouldSwitch).toBe(false);
+		expect(switchCounter).toBe(3);
+
 		// After maxSwitches=3 switches, model is stuck at the 3rd target
-		expect(currentModel).toBe("gemma4:12b:cloud");
+		expect(currentModel).toBe("kimi-k2.6:cloud");
 	});
 
 	it("full cycle without switch limit (maxSwitches raised) verifies complete map coverage", () => {
 		// Use a high maxSwitches to bypass the limit and verify full map coverage
 		const unlimitedMax = 10;
 		const transitions: Array<{ phase: PhaseName; expectedTarget: string | null }> = [
-			{ phase: "thinking", expectedTarget: null },
+			{ phase: "exploring", expectedTarget: null },
+			{ phase: "planning", expectedTarget: "deepseek-v4-flash:cloud" },
 			{ phase: "executing", expectedTarget: "glm-5.2:cloud" },
 			{ phase: "stuck", expectedTarget: "kimi-k2.6:cloud" },
+			{ phase: "verifying", expectedTarget: "minimax-m3:cloud" },
 			{ phase: "reporting", expectedTarget: "gemma4:12b:cloud" },
-			{ phase: "reviewing", expectedTarget: "deepseek-v4-pro:cloud" },
-			{ phase: "verifying", expectedTarget: "deepseek-v4-flash:cloud" },
 		];
 
 		let currentModel = "model-0";
@@ -579,7 +580,7 @@ describe("integration: full agent cycle", () => {
 			}
 		}
 
-		expect(currentModel).toBe("deepseek-v4-flash:cloud");
+		expect(currentModel).toBe("gemma4:12b:cloud");
 		expect(counter).toBe(5);
 	})
 
@@ -604,7 +605,7 @@ describe("integration: full agent cycle", () => {
 		expect(decisions[2].shouldSwitch).toBe(false);  // already on glm
 		expect(decisions[3].shouldSwitch).toBe(true);   // switch to verifying model
 		expect(switchCounter).toBe(2);
-		expect(currentModel).toBe("deepseek-v4-flash:cloud");
+		expect(currentModel).toBe("minimax-m3:cloud");
 	});
 
 	it("switch counter respects maxSwitches (3) within a single cycle", () => {
@@ -612,9 +613,9 @@ describe("integration: full agent cycle", () => {
 		const phases: PhaseName[] = [
 			"executing",  // 1: switch to glm-5.2
 			"stuck",      // 2: switch to kimi-k2.6
-			"verifying",  // 3: switch to deepseek-v4-flash
+			"verifying",  // 3: switch to minimax-m3
 			"reporting",  // blocked (counter == maxSwitches)
-			"reviewing",  // blocked
+			"planning",   // blocked
 		];
 
 		let currentModel = "default-model";
@@ -629,7 +630,7 @@ describe("integration: full agent cycle", () => {
 		}
 
 		expect(switchCounter).toBe(DEFAULT_MAX_SWITCHES);
-		expect(currentModel).toBe("deepseek-v4-flash:cloud"); // stuck at verifying model
+		expect(currentModel).toBe("minimax-m3:cloud"); // stuck at verifying model
 	});
 
 	it("multiple cycles reset the switch counter each round", () => {
@@ -649,7 +650,7 @@ describe("integration: full agent cycle", () => {
 	});
 
 	it("integration: verify model IDs at each step are valid ollama-cloud IDs", () => {
-		const phaseSequence: PhaseName[] = ["executing", "stuck", "reporting", "reviewing", "verifying"];
+		const phaseSequence: PhaseName[] = ["planning", "executing", "stuck", "verifying", "reporting"];
 
 		for (const phase of phaseSequence) {
 			const modelId = getModelForPhase(phase, MVP_PHASE_MODEL_MAP);
@@ -676,6 +677,11 @@ describe("RoundState routing field behavior", () => {
 		expect(round.currentPhase).toBeNull();
 	});
 
+	it("fresh round has phaseNote = null", () => {
+		const round = createRound();
+		expect(round.phaseNote).toBeNull();
+	});
+
 	it("fresh round has pendingModelSwitch = null", () => {
 		const round = createRound();
 		expect(round.pendingModelSwitch).toBeNull();
@@ -687,6 +693,23 @@ describe("RoundState routing field behavior", () => {
 			round.currentPhase = phase;
 			expect(round.currentPhase).toBe(phase);
 		}
+	});
+
+	it("can set phaseNote to a string and reset to null", () => {
+		const round = createRound();
+		expect(round.phaseNote).toBeNull();
+		round.phaseNote = "Investigating database schema";
+		expect(round.phaseNote).toBe("Investigating database schema");
+		round.phaseNote = null;
+		expect(round.phaseNote).toBeNull();
+	});
+
+	it("phaseNote is preserved alongside currentPhase", () => {
+		const round = createRound();
+		round.currentPhase = "executing";
+		round.phaseNote = "Need to check edge cases";
+		expect(round.currentPhase).toBe("executing");
+		expect(round.phaseNote).toBe("Need to check edge cases");
 	});
 
 	it("can set pendingModelSwitch to a model ID", () => {

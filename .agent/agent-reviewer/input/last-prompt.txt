@@ -1,0 +1,72 @@
+You are the reviewer agent.
+
+TASK ID: task-006
+
+TASK: Integration, review, and acceptance verification
+
+DESCRIPTION:
+Review and integrate the multi-model routing implementation (issue #86). All implementation tasks are complete; you are the final gate.
+
+## Context
+Read all prior outputs:
+- `/home/vedat/work/personal/semblr/temp/issue-86-analysis.md` — the spec
+- `/home/vedat/work/personal/semblr/temp/task-003-output.md` — foundation implementation
+- `/home/vedat/work/personal/semblr/temp/task-004-output.md` — extension implementation
+- `/home/vedat/work/personal/semblr/temp/task-005-output.md` — test results
+
+Work on branch `feature/86-multi-model-routing`.
+
+## Steps
+
+### 1. Verify branch and code
+```bash
+git branch --show-current   # must be feature/86-multi-model-routing
+git status                  # check for uncommitted changes
+```
+
+### 2. Run the test suite
+```bash
+npx vitest run --coverage
+```
+- All tests must pass
+- Coverage must meet project threshold (80%)
+
+### 3. Run typecheck + lint
+```bash
+npx tsc --noEmit
+npx biome check .
+```
+
+### 4. Review against acceptance criteria
+From the issue spec:
+- [ ] `semblr_report_phase` tool registered with correct TypeBox schema
+- [ ] Tool captures phase and updates state
+- [ ] Model switching happens only at agent_end boundaries
+- [ ] Switch counter enforced (maxSwitches limit)
+- [ ] Config opt-in (disabled by default)
+- [ ] Stream announcements on model switch
+- [ ] Null phase → stay on current model
+- [ ] Hardcoded MVP_PHASE_MODEL_MAP matches comment #2 (Ollama-Cloud)
+- [ ] resolveModelId correctly strips ":cloud"
+
+### 5. Code quality review
+- [ ] Follows existing patterns in the codebase
+- [ ] Proper TypeScript types (no `any`)
+- [ ] Error handling for edge cases
+- [ ] No dead code or commented-out blocks
+- [ ] Imports are clean and minimal
+
+### 6. Fix issues or report
+- If minor issues: fix them directly
+- If major issues: report in output, do NOT silently pass
+
+### 7. Final verification
+```bash
+npm run verify   # typecheck + lint + knip + test:coverage
+```
+
+Write full review findings to `/home/vedat/work/personal/semblr/temp/task-006-output.md`.
+
+Status: DONE if all criteria pass. BLOCKED if major issues found.
+
+Complete this task using available tools. Report STATUS when finished.

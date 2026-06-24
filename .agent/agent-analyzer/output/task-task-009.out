@@ -1,0 +1,7 @@
+STATUS: COMPLETE
+
+SUMMARY: Diagnosed failed task-006 (reviewer agent). Root cause is orchestration timeout, not a code defect. Reviewer session was cut off after 46 LLM turns / 64 tool calls (~5 min, 68k tokens) mid-toolUse — never reached `stopReason=endTurn` and never wrote `temp/task-006-output.md` (file is absent, reviewer `.out` file is 0 bytes). All gates pass on the same checkout: tsc clean, biome clean, knip clean, vitest 507/507 green, coverage 89.05% statements / 81.13% branches (above 80% threshold). All 9 acceptance criteria from the task-006 spec are satisfied in the on-disk code: tool registered at `src/semblr.ts:1515`, 6-phase TypeBox schema, agent_end-only switching at `src/semblr.ts:1090`, `maxSwitches` enforcement at `src/semblr.ts:1589`, opt-in default-off at `lib/semblr-config.ts:217`, three `[Multi-model]` notifications at `src/semblr.ts:1100/1107/1112`, null-phase handling at `src/semblr.ts:1557`, `MVP_PHASE_MODEL_MAP` matches issue #86 comment #2 at `lib/phase-model-map.ts:11`, `resolveModelId` strips `:cloud` at `lib/resolve-model-id.ts:23`. **Verdict: feature branch `feature/86-multi-model-routing` is READY TO MERGE.** Three non-blocking follow-ups: (1) commit the unstaged post-review polish diffs, (2) add README/VISION sections documenting `SEMBLR_ROUTING_ENABLED` and `semblr_report_phase`, (3) optionally generate `temp/task-006-output.md` from this diagnosis.
+
+FILES: `temp/diagnosis-review.md`
+
+CHANGES: Created `temp/diagnosis-review.md` (270 lines, 12.2 KB). No project code modified.

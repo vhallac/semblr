@@ -380,18 +380,18 @@ generation phases. To route your next turn to the right model, call the
 \`semblr_report_phase\` tool BEFORE your final response.
 
 Phases and when to report them:
-- **thinking**: pulling in external data by reading, searching, exploring.
+- **exploring**: pulling in external data by reading, searching, exploring.
   No model switch (stays on current model).
+- **planning**: formulating a plan of response, structured thinking.
+  Routes to a fast distillation model.
 - **executing**: implementing a plan, writing code, making edits.
   Routes to a high-capability coding model.
 - **stuck**: underspecified task, insufficient data, need creative debugging.
   Routes to a deep-reasoning model.
+- **verifying**: execution done, validating output and created files.
+  Routes to a thorough verification model.
 - **reporting**: done with work, about to deliver final output or summary.
   Routes to a fast, lightweight model for formatting/summarization.
-- **reviewing**: reviewing code, verifying correctness, checking outputs.
-  Routes to a thorough verification model.
-- **verifying**: execution done, validating output and created files.
-  Routes to a fast verification model.
 
 Call \`semblr_report_phase\` with the phase that describes what you will do
 NEXT (not what you just did). Call it once per round — the last call before

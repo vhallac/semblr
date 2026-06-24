@@ -1,49 +1,46 @@
 You are the coder agent.
 
-TASK ID: task-008
+TASK ID: task-010
 
-TASK: Fix: type errors and missing output files from tasks 4 & 5
+TASK: Final polish: review output, docs, commit remaining diffs
 
 DESCRIPTION:
-Mechanical fixes to unblock review. The implementation work for task-004 and task-005 is complete and on disk. Two issues remain:
+Apply final polish to the feature/86-multi-model-routing branch.
 
-## 1. Fix typecheck errors in `lib/context-messages.test.ts`
-Run `npx tsc --noEmit` and fix the 2 errors (lines ~268 and ~336) where test fixtures are missing the `routingInstructions` field in `ContextBlocks`. Add the missing field with appropriate values.
+## 1. Write the missing review output file
+Read `/home/vedat/work/personal/semblr/temp/diagnosis-review.md` and use it to write a proper review summary to `/home/vedat/work/personal/semblr/temp/task-006-output.md`.
 
-## 2. Write missing output files
-Read the actual work done on disk and write summary files:
+The review output should summarize:
+- All 9 acceptance criteria verified with file locations
+- All gates (tsc, biome, knip, vitest, coverage) with results
+- Verdict: READY TO MERGE
 
-**`/home/vedat/work/personal/semblr/temp/task-004-output.md`** — summarize task-004 work:
-- Read `src/semblr.ts` and document: tool registration location, handler logic, model switching at agent_end, stream announcements
-- Read `lib/context-format.ts` and `lib/context-messages.ts` for context injection changes
-
-**`/home/vedat/work/personal/semblr/temp/task-005-output.md`** — summarize task-005 work:
-- Read `tests/routing-behavior.test.ts` and document: test categories, test count, coverage
-
-## 3. Verify
+## 2. Commit any unstaged changes
 ```bash
-npx tsc --noEmit   # must pass with 0 errors
-npx vitest run     # all 507+ tests pass
-```
-
-## 4. Commit all work
-```bash
+git status
 git add -A
-git commit -m "feat: multi-model routing foundation (issue #86)
+git diff --cached --stat
+```
+If there are staged changes, commit with message:
+```
+chore: final review polish for multi-model routing (issue #86)
 
-- Add PhaseName, PhaseModelMap, MultiModelRoutingConfig types
-- Add multiModelRouting config toggle (opt-in, default off)
-- Add resolve-model-id helper (strips :cloud suffix)
-- Add MVP phase→model map (Ollama-Cloud models)
-- Register semblr_report_phase tool with TypeBox schema
-- Implement model switching at agent_end boundaries
-- Add stream announcements on model switches
-- Add context injection for routing tool
-- Add 54 routing behavior tests
-
-🤖 LLM authored"
+🤖 LLM authored
 ```
 
-Write summary to `/home/vedat/work/personal/semblr/temp/task-008-output.md`.
+## 3. Update documentation
+- In `README.md`: add a brief section about the multi-model routing feature, mentioning:
+  - `semblr_report_phase` tool
+  - `SEMBLR_ROUTING_ENABLED` env var
+  - The MVP phase→model map
+- If appropriate, update `VISION.md` roadmap to mark issue #86 as complete
+
+## 4. Final verification
+```bash
+npm run verify
+```
+Must pass clean.
+
+Write summary to `/home/vedat/work/personal/semblr/temp/task-010-output.md`.
 
 Complete this task using available tools. Report STATUS when finished.

@@ -1,55 +1,43 @@
 You are the analyzer agent.
 
-TASK ID: task-007
+TASK ID: task-009
 
-TASK: Diagnose failed task-004 and task-005
+TASK: Diagnose failed task-006 (review)
 
 DESCRIPTION:
-Diagnose what happened with task-004 and task-005. Both reported FAILED but produced empty stdout.
+Diagnose what happened with task-006 (review). It reported FAILED with empty stdout.
 
-Do ALL of the following and write results to `/home/vedat/work/personal/semblr/temp/diagnosis.md`:
+Do ALL of the following and write results to `/home/vedat/work/personal/semblr/temp/diagnosis-review.md`:
 
-1. Check git status and current branch:
+1. Check git status:
 ```bash
 git status
-git branch --show-current
 git log --oneline -5
 ```
 
-2. Check if output files exist and read them:
+2. Check if review output file exists:
 ```bash
-ls -la temp/task-004-output.md temp/task-005-output.md 2>&1
-cat temp/task-004-output.md 2>&1 || echo "FILE NOT FOUND"
-cat temp/task-005-output.md 2>&1 || echo "FILE NOT FOUND"
+cat temp/task-006-output.md 2>&1 || echo "FILE NOT FOUND"
 ```
 
-3. Check what files were modified:
+3. Run the full verification suite:
 ```bash
-git diff --stat HEAD~3..HEAD 2>&1
-git diff --name-only 2>&1
+npx tsc --noEmit 2>&1 | tail -20
+npx vitest run 2>&1 | tail -20
 ```
 
-4. Check if src/semblr.ts has the new tool registration:
+4. Run project verify:
 ```bash
-grep -n "semblr_report_phase\|report_phase\|multiModel\|multi_model\|pendingModelSwitch" src/semblr.ts 2>&1 || echo "NOT FOUND"
+npm run verify 2>&1 | tail -50
 ```
 
-5. Check test files:
-```bash
-ls tests/ 2>&1
-find tests/ -name "*rout*" -o -name "*trinity*" -o -name "*phase*" -o -name "*model*" 2>&1
-```
+5. Check acceptance criteria manually:
+- Does semblr_report_phase tool exist in src/semblr.ts?
+- Are all 6 phases handled?
+- Is config opt-in (default off)?
+- Is there a switch limit?
+- Are there stream announcements?
 
-6. Try running tests:
-```bash
-npx vitest run 2>&1 | tail -40
-```
-
-7. Try typecheck:
-```bash
-npx tsc --noEmit 2>&1 | tail -30
-```
-
-Report ALL findings clearly — what was done, what's missing, and what needs fixing.
+Report complete state of the feature branch: is it ready to merge?
 
 Complete this task using available tools. Report STATUS when finished.

@@ -7,7 +7,7 @@ import * as path from "node:path";
 // ─────────────────────────────────────────────
 
 /** Phase names the LLM can self-report via semblr_report_phase tool. */
-export type PhaseName = "thinking" | "executing" | "stuck" | "reporting" | "reviewing" | "verifying";
+export type PhaseName = "exploring" | "planning" | "executing" | "stuck" | "verifying" | "reporting";
 
 /** Map from phase to model ID. `null` means stay on the current model. */
 export type PhaseModelMap = Record<PhaseName, string | null>;
@@ -205,14 +205,14 @@ function resolveRoundsDir(
 	return path.resolve(source === "project" ? cwd : agentDir, configured);
 }
 
-/** Hardcoded MVP phase → model map (Ollama-Cloud naming convention). */
+/** Hardcoded MVP phase → model map (Ollama-Cloud naming convention, from issue #86 comment #2). */
 const DEFAULT_PHASE_MODEL_MAP: PhaseModelMap = {
-	thinking: null,
+	exploring: null,
+	planning: "deepseek-v4-flash:cloud",
 	executing: "glm-5.2:cloud",
 	stuck: "kimi-k2.6:cloud",
+	verifying: "minimax-m3:cloud",
 	reporting: "gemma4:12b:cloud",
-	reviewing: "deepseek-v4-pro:cloud",
-	verifying: "deepseek-v4-flash:cloud",
 };
 
 function resolveBoolean(value: string | undefined, defaultValue: boolean): boolean {

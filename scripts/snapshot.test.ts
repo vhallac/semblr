@@ -29,12 +29,12 @@ function testConfig(root: string): SemblrConfig {
 			enabled: false,
 			maxSwitches: 3,
 			phaseModelMap: {
-				thinking: null,
+				exploring: null,
+				planning: "deepseek-v4-flash:cloud",
 				executing: "glm-5.2:cloud",
 				stuck: "kimi-k2.6:cloud",
+				verifying: "minimax-m3:cloud",
 				reporting: "gemma4:12b:cloud",
-				reviewing: "deepseek-v4-pro:cloud",
-				verifying: "deepseek-v4-flash:cloud",
 			},
 		},
 	};

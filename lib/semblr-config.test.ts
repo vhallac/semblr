@@ -36,12 +36,12 @@ describe("loadSemblrConfig", () => {
 				enabled: false,
 				maxSwitches: 3,
 				phaseModelMap: {
-					thinking: null,
+					exploring: null,
+					planning: "deepseek-v4-flash:cloud",
 					executing: "glm-5.2:cloud",
 					stuck: "kimi-k2.6:cloud",
+					verifying: "minimax-m3:cloud",
 					reporting: "gemma4:12b:cloud",
-					reviewing: "deepseek-v4-pro:cloud",
-					verifying: "deepseek-v4-flash:cloud",
 				},
 			},
 		});
@@ -226,11 +226,11 @@ describe("loadSemblrConfig", () => {
 	it("includes the hardcoded phase model map", () => {
 		const config = loadSemblrConfig({ cwd: "/repo", agentDir: "/agent", env: {}, fsImpl: fsFromFiles({}) });
 		const map = config.multiModelRouting.phaseModelMap;
-		expect(map.thinking).toBeNull();
+		expect(map.exploring).toBeNull();
+		expect(map.planning).toBe("deepseek-v4-flash:cloud");
 		expect(map.executing).toBe("glm-5.2:cloud");
 		expect(map.stuck).toBe("kimi-k2.6:cloud");
+		expect(map.verifying).toBe("minimax-m3:cloud");
 		expect(map.reporting).toBe("gemma4:12b:cloud");
-		expect(map.reviewing).toBe("deepseek-v4-pro:cloud");
-		expect(map.verifying).toBe("deepseek-v4-flash:cloud");
 	});
 });
