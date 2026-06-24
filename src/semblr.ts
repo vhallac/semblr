@@ -889,6 +889,46 @@ export default function (pi: ExtensionAPI) {
 		round.responseSegments = state.responseSegments;
 	});
 
+	// ── Multi-model routing: apply pending model switch at turn end ──
+	// This runs after each individual turn completes. If the LLM called
+	// semblr_report_phase during the turn, the pending switch is applied
+	// here so the next turn (or next round) starts on the correct model.
+	pi.on("turn_end", async (_event, ctx) => {
+		if (!SEMBLR_CONFIG.multiModelRouting.enabled) return;
+		if (!round.pendingModelSwitch) return;
+
+		const targetModel = round.pendingModelSwitch;
+		const phase = round.currentPhase ?? "unknown";
+		const { provider, model: resolvedId } = resolveModelId(targetModel);
+
+		// Skip if already on the target model
+		if (ctx.model?.id !== resolvedId) {
+			const modelObj = ctx.modelRegistry.find(provider, resolvedId);
+			if (!modelObj) {
+				ctx.ui.notify(
+					`[Multi-model] Model not found in registry: ${targetModel} (resolved: ${provider}/${resolvedId})`,
+					"error",
+				);
+			} else {
+				const ok = await pi.setModel(modelObj);
+				if (ok) {
+					ctx.ui.notify(
+						`[Multi-model] Switching to ${targetModel} for ${phase} phase (switch ${round.switchCounter}/${SEMBLR_CONFIG.multiModelRouting.maxSwitches})`,
+						"info",
+					);
+				} else {
+					ctx.ui.notify(
+						`[Multi-model] Failed to switch to ${targetModel} for ${phase} phase (no API key configured?)`,
+						"error",
+					);
+				}
+			}
+		}
+
+		// Reset pending switch regardless of success/failure
+		round.pendingModelSwitch = null;
+	});
+
 	pi.on("agent_end", async (event, ctx) => {
 		const { messages } = event;
 
@@ -1086,38 +1126,37 @@ export default function (pi: ExtensionAPI) {
 			`🧠 ${totalRounds} total indexed | ${formatGroupStats(session.roundGroups, SEMBLR_GROUP_THRESHOLD)}`,
 		);
 
-		// ── Multi-model routing: apply pending model switch at round boundary ──
-		if (SEMBLR_CONFIG.multiModelRouting.enabled && round.pendingModelSwitch) {
-			const targetModel = round.pendingModelSwitch;
-			const phase = round.currentPhase ?? "unknown";
-			const { provider, model: resolvedId } = resolveModelId(targetModel);
-
-			// Skip if already on the target model
-			if (ctx.model?.id !== resolvedId) {
-				const modelObj = ctx.modelRegistry.find(provider, resolvedId);
-				if (!modelObj) {
-					ctx.ui.notify(
-						`[Multi-model] Model not found in registry: ${targetModel} (resolved: ${provider}/${resolvedId})`,
-						"error",
-					);
-				} else {
-					const ok = await pi.setModel(modelObj);
+		// ── Multi-model routing: restore original model at round end ──
+		// The model switch was applied at turn_end. At agent_end we restore the
+		// original model because pi's model setting is sticky — it survives past
+		// the current round. Restoring ensures the next round starts on the
+		// user's original model, not the phase-specific model from this round.
+		if (SEMBLR_CONFIG.multiModelRouting.enabled && round.originalModelId) {
+			// Check if current model differs from original (i.e., a switch happened)
+			if (ctx.model?.id !== round.originalModelId) {
+				// Search all registered models for the original model by ID
+				const allModels = ctx.modelRegistry.getAll();
+				const originalModel = allModels.find((m) => m.id === round.originalModelId);
+				if (originalModel) {
+					const ok = await pi.setModel(originalModel);
 					if (ok) {
 						ctx.ui.notify(
-							`[Multi-model] Switching to ${targetModel} for ${phase} phase (switch ${round.switchCounter}/${SEMBLR_CONFIG.multiModelRouting.maxSwitches})`,
+							`[Multi-model] Restored original model: ${round.originalModelId}`,
 							"info",
 						);
 					} else {
 						ctx.ui.notify(
-							`[Multi-model] Failed to switch to ${targetModel} for ${phase} phase (no API key configured?)`,
+							`[Multi-model] Failed to restore original model: ${round.originalModelId}`,
 							"error",
 						);
 					}
+				} else {
+					ctx.ui.notify(
+						`[Multi-model] Original model not found in registry: ${round.originalModelId}`,
+						"error",
+					);
 				}
 			}
-
-			// Reset pending switch regardless of success/failure
-			round.pendingModelSwitch = null;
 		}
 	});
 
@@ -1549,6 +1588,11 @@ export default function (pi: ExtensionAPI) {
 						content: [{ type: "text", text: "Multi-model routing is not enabled. Phase report ignored." }],
 						details: {},
 					};
+				}
+
+				// Capture original model on first phase report (before any switch)
+				if (round.originalModelId === null && ctx2.model?.id) {
+					round.originalModelId = ctx2.model.id;
 				}
 
 				// Store the reported phase and optional note on round state

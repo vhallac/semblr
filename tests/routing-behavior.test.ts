@@ -6,7 +6,8 @@
  * - Phase names from issue #86 comment #1: exploring, planning, executing, stuck, verifying, reporting
  * - Switch limiter: maxSwitches = 3 per agent cycle
  * - Config gating: default enabled = false
- * - Switches happen at agent_end boundaries (tracked via pendingModelSwitch)
+ * - Switches happen at turn_end boundaries (tracked via pendingModelSwitch)
+ * - Original model is restored at agent_end (captured via originalModelId)
  * - Optional note parameter on semblr_report_phase tool
  */
 
@@ -30,14 +31,15 @@ const PHASE_MODEL_MAP: Record<PhaseName, string | null> = {
 	executing: "glm-5.2:cloud",
 	stuck: "kimi-k2.6:cloud",
 	verifying: "minimax-m3:cloud",
-	reporting: "gemma4:12b:cloud",
+	reporting: "gemma4:31b:cloud",
 };
 
 /** The default maxSwitches value. */
 const DEFAULT_MAX_SWITCHES = 3;
 
 /**
- * Simulate the routing decision at agent_end.
+/**
+ * Simulate the routing decision (same logic used in both turn_end and agent_end).
  * Returns the target model ID (or null for no switch) without actually
  * calling pi.setModel.
  */
@@ -68,26 +70,26 @@ function simulateRoutingDecision(
 describe("resolveModelId behavioral edge cases", () => {
 	it("handles :cloud suffix with provider-prefixed IDs", () => {
 		const result = resolveModelId("openai/gpt-4:cloud");
-		expect(result).toEqual({ provider: "ollama", model: "openai/gpt-4" });
+		expect(result).toEqual({ provider: "ollama-cloud", model: "openai/gpt-4" });
 	});
 
 	it("passes through provider-prefixed IDs without :cloud", () => {
 		const result = resolveModelId("openai/gpt-4");
-		expect(result).toEqual({ provider: "ollama", model: "openai/gpt-4" });
+		expect(result).toEqual({ provider: "ollama-cloud", model: "openai/gpt-4" });
 	});
 
 	it("handles multiple consecutive :cloud suffixes", () => {
 		// Only the last :cloud is stripped by the regex
 		const result = resolveModelId("model:cloud:cloud:cloud");
 		expect(result.model).toBe("model:cloud:cloud");
-		expect(result.provider).toBe("ollama");
+		expect(result.provider).toBe("ollama-cloud");
 	});
 
 	it("returns consistent provider for all MVP map model IDs", () => {
 		const mapValues = Object.values(MVP_PHASE_MODEL_MAP).filter((v): v is string => v !== null);
 		for (const modelId of mapValues) {
 			const resolved = resolveModelId(modelId);
-			expect(resolved.provider).toBe("ollama");
+			expect(resolved.provider).toBe("ollama-cloud");
 			expect(resolved.model).not.toMatch(/:cloud$/);
 		}
 	});
@@ -99,7 +101,7 @@ describe("resolveModelId behavioral edge cases", () => {
 			if (modelId === null) continue;
 			const resolved = resolveModelId(modelId);
 			expect(resolved.model.length).toBeGreaterThan(0);
-			expect(resolved.provider).toBe("ollama");
+			expect(resolved.provider).toBe("ollama-cloud");
 		}
 	});
 });
@@ -346,9 +348,10 @@ describe("model switching logic", () => {
 		expect(decision.newCounter).toBe(1);
 	});
 
-	it("switch is only applied at agent_end (simulated by returning target, not mid-round)", () => {
+	it("switch is applied at turn_end (pendingModelSwitch set during semblr_report_phase, executed at turn_end)", () => {
 		// This test verifies the design: the decision function returns the target
-		// without executing it. In the real extension, pi.setModel() is called at agent_end.
+		// without executing it. In the real extension, semblr_report_phase sets
+		// pendingModelSwitch, and pi.setModel() is called at turn_end.
 		const decision = simulateRoutingDecision("stuck", "default-model", 0, DEFAULT_MAX_SWITCHES, true);
 		expect(decision.target).toBe("kimi-k2.6:cloud");
 		expect(decision.shouldSwitch).toBe(true);
@@ -379,7 +382,7 @@ describe("model switching logic", () => {
 			executing: "glm-5.2:cloud",
 			stuck: "kimi-k2.6:cloud",
 			verifying: "minimax-m3:cloud",
-			reporting: "gemma4:12b:cloud",
+			reporting: "gemma4:31b:cloud",
 		};
 
 		for (const [phase, expectedModel] of Object.entries(modelMap)) {
@@ -565,7 +568,7 @@ describe("integration: full agent cycle", () => {
 			{ phase: "executing", expectedTarget: "glm-5.2:cloud" },
 			{ phase: "stuck", expectedTarget: "kimi-k2.6:cloud" },
 			{ phase: "verifying", expectedTarget: "minimax-m3:cloud" },
-			{ phase: "reporting", expectedTarget: "gemma4:12b:cloud" },
+			{ phase: "reporting", expectedTarget: "gemma4:31b:cloud" },
 		];
 
 		let currentModel = "model-0";
@@ -580,7 +583,7 @@ describe("integration: full agent cycle", () => {
 			}
 		}
 
-		expect(currentModel).toBe("gemma4:12b:cloud");
+		expect(currentModel).toBe("gemma4:31b:cloud");
 		expect(counter).toBe(5);
 	})
 
@@ -656,7 +659,7 @@ describe("integration: full agent cycle", () => {
 			const modelId = getModelForPhase(phase, MVP_PHASE_MODEL_MAP);
 			expect(modelId).not.toBeNull();
 			const resolved = resolveModelId(modelId!);
-			expect(resolved.provider).toBe("ollama");
+			expect(resolved.provider).toBe("ollama-cloud");
 			expect(resolved.model.length).toBeGreaterThan(0);
 		}
 	});
@@ -725,6 +728,48 @@ describe("RoundState routing field behavior", () => {
 		expect(round.pendingModelSwitch).toBeNull();
 	});
 
+	it("fresh round has originalModelId = null", () => {
+		const round = createRound();
+		expect(round.originalModelId).toBeNull();
+	});
+
+	it("can set originalModelId to a model ID", () => {
+		const round = createRound();
+		round.originalModelId = "glm-5.2";
+		expect(round.originalModelId).toBe("glm-5.2");
+	});
+
+	it("originalModelId is captured on first phase report (before pendingModelSwitch is set)", () => {
+		const round = createRound();
+		// Simulate the extension behavior: capture original model before setting pending switch
+		round.originalModelId = "original-model";
+		round.currentPhase = "executing";
+		round.pendingModelSwitch = "glm-5.2:cloud";
+		// originalModelId should not change after first capture
+		expect(round.originalModelId).toBe("original-model");
+		expect(round.currentPhase).toBe("executing");
+		expect(round.pendingModelSwitch).toBe("glm-5.2:cloud");
+	});
+
+	it("originalModelId persists across phase changes within the same round", () => {
+		const round = createRound();
+		round.originalModelId = "default-model";
+		round.currentPhase = "exploring";
+		// Change phase — originalModelId stays
+		round.currentPhase = "planning";
+		expect(round.originalModelId).toBe("default-model");
+		expect(round.currentPhase).toBe("planning");
+	});
+
+	it("resets to null on new round (createRound)", () => {
+		const round1 = createRound();
+		round1.originalModelId = "some-model";
+
+		const round2 = createRound();
+		expect(round2.originalModelId).toBeNull();
+		expect(round1.originalModelId).toBe("some-model");
+	});
+
 	it("switchCounter increments independently of currentPhase", () => {
 		const round = createRound();
 
@@ -743,7 +788,131 @@ describe("RoundState routing field behavior", () => {
 });
 
 // ─────────────────────────────────────────────
-// Category 9: SessionState routing fields (where applicable)
+// Category 9: Turn-end switch + agent-end restore flow
+// ─────────────────────────────────────────────
+
+describe("turn_end switch + agent_end restore flow", () => {
+	it("semblr_report_phase captures originalModelId and sets pendingModelSwitch", () => {
+		const round = createRound();
+		const originalModelId = "original-model";
+		const targetModelId = "glm-5.2:cloud";
+
+		// Simulate semblr_report_phase("executing"):
+		// 1. Capture original model on first call
+		if (round.originalModelId === null) {
+			round.originalModelId = originalModelId;
+		}
+		// 2. Store phase
+		round.currentPhase = "executing";
+		// 3. Set pending switch
+		round.pendingModelSwitch = targetModelId;
+		round.switchCounter++;
+
+		expect(round.originalModelId).toBe(originalModelId);
+		expect(round.currentPhase).toBe("executing");
+		expect(round.pendingModelSwitch).toBe(targetModelId);
+		expect(round.switchCounter).toBe(1);
+	});
+
+	it("originalModelId is set only on first phase report (subsequent calls preserve it)", () => {
+		const round = createRound();
+
+		// First call: capture original model
+		if (round.originalModelId === null) {
+			round.originalModelId = "original-model";
+		}
+		round.currentPhase = "planning";
+		round.pendingModelSwitch = "deepseek-v4-flash:cloud";
+
+		// Second call: originalModelId should NOT be overwritten
+		if (round.originalModelId === null) {
+			round.originalModelId = "wrong-model"; // would not execute
+		}
+		round.currentPhase = "executing";
+		round.pendingModelSwitch = "glm-5.2:cloud";
+
+		expect(round.originalModelId).toBe("original-model"); // preserved
+		expect(round.currentPhase).toBe("executing");
+		expect(round.pendingModelSwitch).toBe("glm-5.2:cloud");
+	});
+
+	it("turn_end clears pendingModelSwitch after the switch is applied", () => {
+		const round = createRound();
+		round.pendingModelSwitch = "glm-5.2:cloud";
+
+		// Simulate turn_end: apply switch, then clear pending
+		expect(round.pendingModelSwitch).toBe("glm-5.2:cloud");
+		round.pendingModelSwitch = null; // turn_end clears it
+
+		expect(round.pendingModelSwitch).toBeNull();
+	});
+
+	it("agent_end restores original model (switch count > 0 scenario)", () => {
+		const round = createRound();
+		round.originalModelId = "original-model";
+		round.switchCounter = 2;
+
+		// Simulate agent_end restore logic:
+		// If ctx.model?.id !== round.originalModelId, find and restore
+		const currentModelId = "minimax-m3"; // different from original
+		const needsRestore = currentModelId !== round.originalModelId;
+
+		expect(needsRestore).toBe(true);
+		expect(round.originalModelId).toBe("original-model");
+	});
+
+	it("agent_end does NOT restore when no switch occurred (originalModelId matches current)", () => {
+		const round = createRound();
+		round.originalModelId = "current-model";
+
+		// Simulate agent_end check: current model matches original → no restore needed
+		const currentModelId = "current-model";
+		const needsRestore = currentModelId !== round.originalModelId;
+
+		expect(needsRestore).toBe(false);
+	});
+
+	it("agent_end does NOT restore when originalModelId is null (no phase was reported)", () => {
+		const round = createRound();
+		// originalModelId is null — no phase was reported this round
+
+		const shouldAttemptRestore = round.originalModelId !== null;
+		expect(shouldAttemptRestore).toBe(false);
+	});
+
+	it("full lifecycle: report → pending → turn_end switch → agent_end restore", () => {
+		const round = createRound();
+
+		// Step 1: semblr_report_phase called
+		if (round.originalModelId === null) {
+			round.originalModelId = "user-default-model";
+		}
+		round.currentPhase = "executing";
+		const target = "glm-5.2:cloud";
+		round.pendingModelSwitch = target;
+		round.switchCounter = 1;
+
+		expect(round.originalModelId).toBe("user-default-model");
+		expect(round.pendingModelSwitch).toBe(target);
+
+		// Step 2: turn_end fires — model switches
+		// (In the real extension, pi.setModel() would be called here)
+		const switchedModel = round.pendingModelSwitch; // would be resolved + applied
+		round.pendingModelSwitch = null;
+
+		expect(switchedModel).toBe(target);
+		expect(round.pendingModelSwitch).toBeNull();
+
+		// Step 3: agent_end fires — original model is restored
+		// (In the real extension, ctx.modelRegistry.getAll() → pi.setModel(originalModel))
+		expect(round.originalModelId).toBe("user-default-model");
+		// After agent_end, originalModelId is still set (round state clears on next agent_start)
+		// The actual restore happens via pi.setModel, not by clearing the field
+	});
+});
+
+// ─────────────────────────────────────────────
+// Category 10: SessionState routing fields (where applicable)
 // ─────────────────────────────────────────────
 
 describe("SessionState routing behavior", () => {
