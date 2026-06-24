@@ -1,0 +1,11 @@
+STATUS: COMPLETE
+
+SUMMARY: Analyzed GitHub issue #86 ("Adapt sakana.ai's TRINITY into multi-model routing") and both follow-up comments. The issue proposes an MVP feature: a new `semblr_report_phase` tool that lets the LLM self-report its generation phase, with Semblr switching to a hardcoded phase→model map at `agent_end` boundaries. The two comments together form an authoritative MVP spec — the first comment defines the tool schema, in/out scope, config toggle, switch limit (3/cycle), output-stream announcements, and a phase→model example using Anthropic models; the second comment replaces the model map with an Ollama-Cloud version (`glm-5.2:cloud` for executing, `kimi-k2.6:cloud` for stuck, `gemma4:12b:cloud` for reporting, etc.) and provides detailed per-phase capability requirements.
+
+FILES: `/home/vedat/work/personal/semblr/temp/issue-86-analysis.md` (564 lines, ~31KB)
+
+CHANGES:
+- New file: `/home/vedat/work/personal/semblr/temp/issue-86-analysis.md` containing 8 sections: issue summary, extracted requirements (broken down by source — issue body, comment #1, comment #2), feature branch recommendation, codebase context with file-by-file relevance table, implementation approach in 11 ordered steps, risks/mitigations, 10 open questions, and a reviewer summary.
+- No project files modified.
+
+The analysis covers: tool signature (exact TypeBox schema from comment #1), hardcoded `MVP_PHASE_MODEL_MAP` (from comment #2), 9 acceptance criteria, recommended branch name `feature/86-multi-model-routing`, mapping of the new feature onto existing files (`src/semblr.ts`, `lib/state.ts`, `lib/semblr-config.ts`, `lib/context-format.ts`, `lib/context-messages.ts`), conventions to mirror from the existing extension, a phased implementation plan, and concrete open questions (notably the 3-vs-5 switch-limit tension, model-id parsing for Ollama-Cloud names, and a few unstated spec edges).

@@ -170,7 +170,7 @@ describe("import-claude-code script", () => {
 			}),
 		).resolves.toBe(0);
 
-		const roundFile = claudeRoundFileName({ userPrompt, responseSequence });
+		const roundFile = claudeRoundFileName({ userPrompt, responseSequence, toolCalls: [] });
 		expect(fs.existsSync(path.join(roundsDir, roundFile))).toBe(true);
 
 		const writtenRound = JSON.parse(fs.readFileSync(path.join(roundsDir, roundFile), "utf-8"));

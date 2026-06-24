@@ -1,0 +1,20 @@
+**STATUS: COMPLETE**
+
+**SUMMARY:** Read `temp/issue-86-analysis.md` and extracted a focused, plan-ready summary covering all six required dimensions: feature branch, scope, file changes, ordered implementation phases, design decisions, and risks/open questions. The output is 88 lines (under the 150-line cap) and designed for an orchestrator to decompose into tasks.
+
+**FILES:**
+- Input: `temp/issue-86-analysis.md` (~470 lines)
+- Output: `temp/issue-86-plan-summary.md` (88 lines, 7.4 KB)
+
+**CHANGES:** Created `temp/issue-86-plan-summary.md` with 7 sections:
+1. Feature branch: `feature/86-multi-model-routing`
+2. Scope: hardcoded `MVP_PHASE_MODEL_MAP` (6 phases, Ollama-Cloud), 3/5 switch limits, opt-in default
+3. 11 files to touch (2 new, 9 modified)
+4. 10 ordered implementation phases with explicit dependencies
+5. 8 key design decisions (switch-at-agent_end, null=stay, hardcoded map, opt-in, idempotent injection, etc.)
+6. 4 risks + 7 open questions (the 3-vs-5 limit ambiguity and model-id parsing flagged for the implementer)
+7. Out-of-scope list per comment #1
+
+Key flags raised for the orchestrator: (a) the 3 vs 5 switch-limit tension in comment #1 needs a pick, (b) `"glm-5.2:cloud"` model-id parsing is unspecified and should land as a testable `resolveModelId` helper, (c) the comment #2 Ollama-Cloud map supersedes the comment #1 Anthropic example.
+
+🤖 Content created by LLM

@@ -118,6 +118,11 @@ describe("createRound", () => {
 		// checkpoint
 		expect(r.lastCheckpointSummary).toBeNull();
 		expect(r.contextWarningIssued).toBe(0);
+
+		// multi-model routing
+		expect(r.switchCounter).toBe(0);
+		expect(r.currentPhase).toBeNull();
+		expect(r.pendingModelSwitch).toBeNull();
 	});
 
 	it("creates independent rounds (no shared array references)", () => {
@@ -165,5 +170,26 @@ describe("createRound", () => {
 		contextCacheStore(r1.contextCache, "env", ["msg"], "p");
 		expect(r1.contextCache.messages).toEqual(["msg"]);
 		expect(r2.contextCache.messages).toBeNull();
+	});
+
+	it("independent rounds have independent routing fields", () => {
+		const r1 = createRound();
+		const r2 = createRound();
+
+		r1.switchCounter = 2;
+		r1.currentPhase = "executing";
+		r1.pendingModelSwitch = "glm-5.2:cloud";
+
+		expect(r2.switchCounter).toBe(0);
+		expect(r2.currentPhase).toBeNull();
+		expect(r2.pendingModelSwitch).toBeNull();
+	});
+
+	it("routing fields start with sensible defaults", () => {
+		const r = createRound();
+
+		expect(r.switchCounter).toBe(0);
+		expect(r.currentPhase).toBeNull();
+		expect(r.pendingModelSwitch).toBeNull();
 	});
 });

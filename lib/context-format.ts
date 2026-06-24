@@ -368,6 +368,37 @@ MUST NOT wrap it in a code block.
 This contract applies only to your final response to the ACTIONABLE PROMPT, not to quoted examples, historical rounds, context references, or environment metadata.`;
 }
 
+/**
+ * Build routing instructions for the semblr_report_phase tool.
+ * Injected into context when multi-model routing is enabled.
+ * Teaches the LLM when to report each generation phase.
+ */
+export function buildRoutingInstructions(): string {
+	return `[MULTI-MODEL ROUTING]
+This session has multi-model routing enabled. Different models handle different
+generation phases. To route your next turn to the right model, call the
+\`semblr_report_phase\` tool BEFORE your final response.
+
+Phases and when to report them:
+- **thinking**: pulling in external data by reading, searching, exploring.
+  No model switch (stays on current model).
+- **executing**: implementing a plan, writing code, making edits.
+  Routes to a high-capability coding model.
+- **stuck**: underspecified task, insufficient data, need creative debugging.
+  Routes to a deep-reasoning model.
+- **reporting**: done with work, about to deliver final output or summary.
+  Routes to a fast, lightweight model for formatting/summarization.
+- **reviewing**: reviewing code, verifying correctness, checking outputs.
+  Routes to a thorough verification model.
+- **verifying**: execution done, validating output and created files.
+  Routes to a fast verification model.
+
+Call \`semblr_report_phase\` with the phase that describes what you will do
+NEXT (not what you just did). Call it once per round — the last call before
+your final response wins. Model switches happen at round boundaries, not
+mid-response.`;
+}
+
 export function splitCommandArgs(args: string): string[] {
 	const out: string[] = [];
 	let current = "";

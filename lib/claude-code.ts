@@ -1,5 +1,6 @@
-import crypto from "node:crypto";
 import * as path from "node:path";
+import { computeContentHash } from "./hash.ts";
+import { extractUserPromptText } from "./session-round-extract.ts";
 
 interface ClaudeToolCallDetail {
 	index: number;
@@ -74,14 +75,11 @@ export function isRealClaudeUserPrompt(entry: ClaudeEntry): boolean {
 	);
 }
 
-function claudeRoundId(round: Pick<ClaudeRound, "userPrompt" | "responseSequence">): string {
-	return crypto
-		.createHash("md5")
-		.update(round.userPrompt + round.responseSequence)
-		.digest("hex");
+function claudeRoundId(round: Pick<ClaudeRound, "userPrompt" | "responseSequence" | "toolCalls">): string {
+	return computeContentHash(round.userPrompt, round.responseSequence, round.toolCalls);
 }
 
-export function claudeRoundFileName(round: Pick<ClaudeRound, "userPrompt" | "responseSequence">): string {
+export function claudeRoundFileName(round: Pick<ClaudeRound, "userPrompt" | "responseSequence" | "toolCalls">): string {
 	return `${claudeRoundId(round)}.json`;
 }
 
@@ -110,13 +108,15 @@ export function parseClaudeCodeJsonl(raw: string, options: ParseClaudeCodeOption
 
 	function flush() {
 		if (!currentUser) return;
-		const userPrompt = textFromClaudeContent((currentUser.message as ClaudeEntry | undefined)?.content);
+		const userPrompt = extractUserPromptText(
+			textFromClaudeContent((currentUser.message as ClaudeEntry | undefined)?.content),
+		);
 		const responseSequence = responseParts.join("\n\n").trim();
 		if (!userPrompt || responseSequence.length < 20) return;
 		const cwd = currentUser.cwd as string | undefined;
 		const sessionLabel = path.relative(options.projectsDir, options.filePath) || path.basename(options.filePath);
 		const round: ClaudeRound = {
-			id: claudeRoundId({ userPrompt, responseSequence }),
+			id: claudeRoundId({ userPrompt, responseSequence, toolCalls }),
 			source: "claude-code",
 			userPrompt,
 			responseSequence,

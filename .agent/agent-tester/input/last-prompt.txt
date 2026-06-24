@@ -1,0 +1,65 @@
+You are the tester agent.
+
+TASK ID: task-005
+
+TASK: Behavior tests for multi-model routing
+
+DESCRIPTION:
+Write comprehensive behavior tests for the multi-model routing feature (issue #86). Tests must be derived from the specification, NOT from implementation code.
+
+## Context
+Read `/home/vedat/work/personal/semblr/temp/issue-86-analysis.md` for the full specification.
+Read task-003's output at `/home/vedat/work/personal/semblr/temp/task-003-output.md` for type definitions and helper signatures.
+You are working on branch `feature/86-multi-model-routing`.
+
+## Test Categories
+
+### 1. `resolveModelId` (lib/resolve-model-id.ts)
+- `"glm-5.2:cloud"` → `{ provider: "ollama", model: "glm-5.2" }`
+- `"kimi-k2.6:cloud"` → `{ provider: "ollama", model: "kimi-k2.6" }`
+- `"openai/gpt-4"` → `{ provider: "openai", model: "gpt-4" }` (no :cloud, pass through)
+- Edge: empty string, `":cloud"`, multiple `:cloud:cloud`
+
+### 2. `getModelForPhase` / phase map (lib/phase-model-map.ts)
+- Each phase maps to correct model (or null for thinking)
+- Unknown phase → returns null or throws
+- Map is immutable
+
+### 3. Tool schema validation
+- Valid phases ("thinking", "executing", "stuck", "reporting", "reviewing", "verifying") pass
+- Invalid phases ("planning", "", null) fail validation
+- Missing phase field fails validation
+
+### 4. Switch counter behavior
+- Tool call increments counter up to maxSwitches
+- After maxSwitches reached, further phase reports don't trigger switches
+- Counter resets at cycle boundaries (testable via state inspection)
+
+### 5. Model switching logic
+- Phase → null → stays on current model (no switch)
+- Phase → same model → no switch counted
+- Phase → different model → pending switch queued
+- Switch only applied at agent_end, not mid-generation
+
+### 6. Config gating
+- When disabled: tool calls are no-ops, no switches occur
+- When enabled: full routing active
+- Config defaults: enabled=false, maxSwitches=3
+
+### 7. Integration scenario
+- Full cycle: thinking→executing→stuck→reporting→verifying
+- Verify correct model transitions at each agent_end boundary
+
+## Requirements
+- Use vitest (matches project)
+- Follow existing test patterns in the project
+- Tests MUST pass against the implementation from task-003 and task-004
+- Write tests to files in `tests/` directory
+- Do NOT rely on stdout — write results to `/home/vedat/work/personal/semblr/temp/task-005-output.md`
+
+## Verification
+```bash
+npx vitest run
+```
+
+Complete this task using available tools. Report STATUS when finished.

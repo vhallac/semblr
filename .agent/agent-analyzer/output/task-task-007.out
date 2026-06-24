@@ -1,0 +1,20 @@
+Diagnosis written to `/home/vedat/work/personal/semblr/temp/diagnosis.md` (215 lines, ~13 KB).
+
+## STATUS: COMPLETE
+
+**SUMMARY**: task-004 and task-005 were declared FAILED because they didn't write their required `temp/task-XXX-output.md` summary files, but the **work itself was completed and is on disk**. The 0-byte stdout confirms the agent subprocesses were killed before they could write the report.
+
+**FILES**: 
+- `temp/diagnosis.md` (created)
+
+**CHANGES**: None to project files — diagnosis only. (Note: the only real defect discovered in the working tree is 2 typecheck errors in `lib/context-messages.test.ts` lines 268 and 336, missing `routingInstructions` field in `ContextBlocks` fixtures — these are mechanical fixes, not re-implementations.)
+
+**Key findings:**
+- ✅ `semblr_report_phase` tool fully registered in `src/semblr.ts` (line 1515) with correct TypeBox schema, all 6 phases, idempotency, maxSwitches enforcement, agent_end switch block (line 1090), and stream announcements
+- ✅ `tests/routing-behavior.test.ts` exists (732 lines, 54 tests, all passing)
+- ✅ `npx vitest run` → **507/507 tests pass, 38 files, 0 failures**
+- ❌ `npx tsc --noEmit` → **2 errors** in `lib/context-messages.test.ts` (missing `routingInstructions` field in test fixtures)
+- ❌ `temp/task-004-output.md` and `temp/task-005-output.md` **do not exist** — this is the literal cause of FAILED
+- ⚠️ All routing work sits in the working tree (14 modified + 7 untracked files), **no commit** has been made on `feature/86-multi-model-routing`
+
+**Recommended next action** (in the diagnosis): write the two missing output files summarizing the existing on-disk work and fix the 2 typecheck errors in one pass — this unblocks task-006 (reviewer) without re-running the killed agents.

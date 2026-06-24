@@ -1,0 +1,22 @@
+Those modifications are pre-existing (not from my changes). The untracked `session-round-extract.*` files were also pre-existing. My new files are exactly the 4 intended ones.
+
+---
+
+**STATUS:** ✅ Task complete
+
+**SUMMARY:** Created the foundation layer for multi-model routing on branch `feature/86-multi-model-routing`. All steps from the task spec are done.
+
+**FILES:**
+- **Modified:** `lib/semblr-config.ts`, `lib/semblr-config.test.ts`, `lib/state.ts`, `lib/state.test.ts`, `scripts/snapshot.test.ts`
+- **New:** `lib/resolve-model-id.ts`, `lib/resolve-model-id.test.ts`, `lib/phase-model-map.ts`, `lib/phase-model-map.test.ts`
+- **Output:** `temp/task-003-output.md`
+
+**CHANGES:**
+- Added `PhaseName`, `PhaseModelMap`, `MultiModelRoutingConfig` types to `lib/semblr-config.ts`
+- Added `multiModelRouting` nested config with `enabled` (default false), `maxSwitches` (3), `phaseModelMap` (hardcoded MVP map)
+- Added `SEMBLR_ROUTING_ENABLED` env var with boolean resolution (`"true"/"1"` → enabled)
+- Added `switchCounter`, `currentPhase`, `pendingModelSwitch` fields to `RoundState` in `lib/state.ts`
+- Created `lib/resolve-model-id.ts` — strips `:cloud` suffix and maps to `{provider: "ollama", model: ...}`
+- Created `lib/phase-model-map.ts` — exports `MVP_PHASE_MODEL_MAP` and `getModelForPhase()` lookup
+- 28 new tests across 4 test files (existing + new)
+- **Verification:** `npx tsc --noEmit` ✅ | `npx vitest run` ✅ (37 files, 439 tests)

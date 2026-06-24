@@ -2,6 +2,26 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 
+// ─────────────────────────────────────────────
+// Multi-Model Routing Types
+// ─────────────────────────────────────────────
+
+/** Phase names the LLM can self-report via semblr_report_phase tool. */
+export type PhaseName = "thinking" | "executing" | "stuck" | "reporting" | "reviewing" | "verifying";
+
+/** Map from phase to model ID. `null` means stay on the current model. */
+export type PhaseModelMap = Record<PhaseName, string | null>;
+
+/** Configuration for multi-model routing. */
+export interface MultiModelRoutingConfig {
+	/** Opt-in toggle. Default false. */
+	enabled: boolean;
+	/** Maximum model switches per agent cycle. */
+	maxSwitches: number;
+	/** Phase → model ID mapping. */
+	phaseModelMap: PhaseModelMap;
+}
+
 export interface SemblrConfig {
 	agentDir: string;
 	embeddingProvider: string;
@@ -17,6 +37,8 @@ export interface SemblrConfig {
 	embedBackoffMs: number;
 	/** 0 disables the automatic context-size warning; set a positive token count to enable it. */
 	summaryThresholdExtra: number;
+	/** Multi-model routing configuration (experimental). */
+	multiModelRouting: MultiModelRoutingConfig;
 }
 
 export interface SemblrConfigEnv {
@@ -32,6 +54,7 @@ export interface SemblrConfigEnv {
 	SEMBLR_EMBED_RETRIES?: string;
 	SEMBLR_EMBED_BACKOFF?: string;
 	SEMBLR_SUMMARY_THRESHOLD_EXTRA?: string;
+	SEMBLR_ROUTING_ENABLED?: string;
 }
 
 export interface SemblrConfigDeps {
@@ -42,7 +65,7 @@ export interface SemblrConfigDeps {
 	warn?: (message: string) => void;
 }
 
-type ConfigKey = keyof Omit<SemblrConfig, "agentDir" | "indexPath">;
+type ConfigKey = keyof Omit<SemblrConfig, "agentDir" | "indexPath" | "multiModelRouting">;
 type SettingValue = string | number | boolean | null | SettingRecord | SettingValue[];
 type SettingRecord = { [key: string]: SettingValue | undefined };
 
@@ -182,6 +205,33 @@ function resolveRoundsDir(
 	return path.resolve(source === "project" ? cwd : agentDir, configured);
 }
 
+/** Hardcoded MVP phase → model map (Ollama-Cloud naming convention). */
+const DEFAULT_PHASE_MODEL_MAP: PhaseModelMap = {
+	thinking: null,
+	executing: "glm-5.2:cloud",
+	stuck: "kimi-k2.6:cloud",
+	reporting: "gemma4:12b:cloud",
+	reviewing: "deepseek-v4-pro:cloud",
+	verifying: "deepseek-v4-flash:cloud",
+};
+
+function resolveBoolean(value: string | undefined, defaultValue: boolean): boolean {
+	if (value === undefined) return defaultValue;
+	const lower = value.trim().toLowerCase();
+	if (lower === "true" || lower === "1") return true;
+	if (lower === "false" || lower === "0") return false;
+	// Invalid values fall back to default silently (non-critical config).
+	return defaultValue;
+}
+
+function resolveMultiModelRouting(env: SemblrConfigEnv): MultiModelRoutingConfig {
+	return {
+		enabled: resolveBoolean(env.SEMBLR_ROUTING_ENABLED, false),
+		maxSwitches: 3,
+		phaseModelMap: DEFAULT_PHASE_MODEL_MAP,
+	};
+}
+
 export function loadSemblrConfig(deps: SemblrConfigDeps = {}): SemblrConfig {
 	const env = deps.env ?? process.env;
 	const cwd = deps.cwd ?? process.cwd();
@@ -229,6 +279,7 @@ export function loadSemblrConfig(deps: SemblrConfigDeps = {}): SemblrConfig {
 			{},
 			warn,
 		),
+		multiModelRouting: resolveMultiModelRouting(env),
 	};
 }
 

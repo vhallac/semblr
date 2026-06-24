@@ -1,5 +1,6 @@
 import type { SemanticGroup } from "./grouping.ts";
 import type { ChainEntry, CheckpointSummary, ResponseSegment, ToolCallDetail } from "./round-data.ts";
+import type { PhaseName } from "./semblr-config.ts";
 import { createMiniMemStore, type MiniMemStore } from "./working-memory.ts";
 
 export type { ChainEntry, CheckpointSummary, ResponseSegment, ToolCallDetail } from "./round-data.ts";
@@ -93,6 +94,13 @@ export interface RoundState {
 	// checkpoint
 	lastCheckpointSummary: CheckpointSummary | null;
 	contextWarningIssued: number;
+	// multi-model routing
+	/** Number of model switches that have occurred this agent cycle. Resets at agent_start. */
+	switchCounter: number;
+	/** Most recently reported phase for the current round. */
+	currentPhase: PhaseName | null;
+	/** Model ID to switch to at agent_end, derived from the reported phase and the phase→model map. */
+	pendingModelSwitch: string | null;
 }
 
 export function createRound(): RoundState {
@@ -112,5 +120,8 @@ export function createRound(): RoundState {
 		contextCache: createContextCache(),
 		lastCheckpointSummary: null,
 		contextWarningIssued: 0,
+		switchCounter: 0,
+		currentPhase: null,
+		pendingModelSwitch: null,
 	};
 }
