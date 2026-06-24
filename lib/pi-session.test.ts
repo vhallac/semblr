@@ -128,6 +128,91 @@ describe("pi session parsing", () => {
 		expect(parsePiSessionJsonl(raw, { now: () => 1 })).toHaveLength(1);
 	});
 
+	it("sanitizes user prompt containing a JSON-stringified prompt envelope", () => {
+		// Pi user message content containing the full prompt envelope as a text block
+		const envelope = JSON.stringify([
+			{ role: "system", content: "You are a helpful assistant." },
+			{ role: "user", content: "What is the capital of France?" },
+		]);
+		const raw = [
+			line({
+				type: "message",
+				id: "u1",
+				message: {
+					role: "user",
+					timestamp: 10,
+					content: [{ type: "text", text: envelope }],
+				},
+			}),
+			line({
+				type: "message",
+				message: {
+					role: "assistant",
+					content: [{ type: "text", text: "Long enough answer" }],
+				},
+			}),
+		].join("\n");
+
+		const [round] = parsePiSessionJsonl(raw, { now: () => 30 });
+
+		// Expected: the envelope is distilled to just the last user message's text
+		expect(round.userPrompt).toBe("What is the capital of France?");
+		expect(round.responseSequence).toBe("Long enough answer");
+		expect(round.toolCalls).toEqual([]);
+	});
+
+	it("sanitizes user prompt where envelope is the sole content block with extra whitespace", () => {
+		// Single text block that is just a JSON envelope — should be distilled
+		const envelope = JSON.stringify({ role: "user", content: "What is the weather?" });
+		const raw = [
+			line({
+				type: "message",
+				id: "u1",
+				message: {
+					role: "user",
+					timestamp: 10,
+					content: [{ type: "text", text: `  ${envelope}  ` }],
+				},
+			}),
+			line({
+				type: "message",
+				message: {
+					role: "assistant",
+					content: [{ type: "text", text: "Long enough answer" }],
+				},
+			}),
+		].join("\n");
+
+		const [round] = parsePiSessionJsonl(raw, { now: () => 30 });
+
+		// The envelope is distilled to just the user message's content
+		expect(round.userPrompt).toBe("What is the weather?");
+	});
+
+	it("preserves plain user prompt when no envelope is present", () => {
+		const raw = [
+			line({
+				type: "message",
+				id: "u1",
+				message: {
+					role: "user",
+					timestamp: 10,
+					content: [{ type: "text", text: "Just a normal question" }],
+				},
+			}),
+			line({
+				type: "message",
+				message: {
+					role: "assistant",
+					content: [{ type: "text", text: "Long enough answer" }],
+				},
+			}),
+		].join("\n");
+
+		const [round] = parsePiSessionJsonl(raw, { now: () => 30 });
+		expect(round.userPrompt).toBe("Just a normal question");
+	});
+
 	it("adds a session label when supplied", () => {
 		const raw = [
 			line({ type: "message", id: "u1", message: { role: "user", content: [{ type: "text", text: "Prompt" }] } }),

@@ -1,4 +1,5 @@
 import { createRoundFilePath } from "./hash.ts";
+import { extractUserPromptText } from "./session-round-extract.ts";
 
 interface ParsedToolCallDetail {
 	index: number;
@@ -95,7 +96,7 @@ export function parsePiSessionJsonl(raw: string, options: ParsePiSessionOptions 
 		if (isFinal && options.skipShortFinalResponse && responseSequence.length < 20 && roundIndex === 0) return;
 		const round: ParsedPiRound = {
 			id: currentUserMsg.id ?? "",
-			userPrompt: parsePiTextContent(currentUserMsg.message?.content),
+			userPrompt: extractUserPromptText(parsePiTextContent(currentUserMsg.message?.content)),
 			responseSequence,
 			responseSegments,
 			userTimestamp: currentUserMsg.message?.timestamp ?? 0,

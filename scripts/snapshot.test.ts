@@ -25,6 +25,18 @@ function testConfig(root: string): SemblrConfig {
 		embedMaxRetries: 3,
 		embedBackoffMs: 1000,
 		summaryThresholdExtra: 40_000,
+		multiModelRouting: {
+			enabled: false,
+			maxSwitches: 3,
+			phaseModelMap: {
+				thinking: null,
+				executing: "glm-5.2:cloud",
+				stuck: "kimi-k2.6:cloud",
+				reporting: "gemma4:12b:cloud",
+				reviewing: "deepseek-v4-pro:cloud",
+				verifying: "deepseek-v4-flash:cloud",
+			},
+		},
 	};
 }
 

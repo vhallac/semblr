@@ -113,6 +113,32 @@ describe("Claude Code parsing", () => {
 		expect(() => parseClaudeCodeJsonl("{}\nnot-json", options)).toThrow("session.jsonl:2: invalid JSON");
 	});
 
+	it("sanitizes user prompt containing a JSON-stringified prompt envelope", () => {
+		const envelope = JSON.stringify([
+			{ role: "system", content: "You are a helpful assistant." },
+			{ role: "user", content: "What is the capital of France?" },
+		]);
+
+		const raw = [
+			line({
+				type: "user",
+				timestamp: "2026-01-01T00:00:00.000Z",
+				sessionId: "s1",
+				message: { content: [{ type: "text", text: envelope }] },
+			}),
+			line({
+				type: "assistant",
+				timestamp: "2026-01-01T00:00:01.000Z",
+				message: { content: [{ type: "text", text: "Long enough assistant text here" }] },
+			}),
+		].join("\n");
+
+		const [round] = parseClaudeCodeJsonl(raw, options);
+
+		expect(round.userPrompt).toBe("What is the capital of France?");
+		expect(round.source).toBe("claude-code");
+	});
+
 	it("pairs anonymous tool results with the latest pending tool call", () => {
 		const raw = [
 			line({ type: "user", timestamp: "bad-date", message: { content: "Prompt" } }),

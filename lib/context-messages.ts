@@ -130,6 +130,7 @@ export interface ContextBlocks {
 	systemMsg: unknown | null;
 	sessionArchitecture: string | null;
 	workingMemory: string | null;
+	routingInstructions: string | null;
 	preamble: string | null;
 	recencyList: string | null;
 	relevanceList: string | null;
@@ -155,6 +156,7 @@ export function assembleContextPrefix(blocks: ContextBlocks): unknown[] {
 	if (blocks.systemMsg) out.push(blocks.systemMsg);
 	if (blocks.sessionArchitecture) out.push(userTextMsg(blocks.sessionArchitecture));
 	if (blocks.workingMemory) out.push(userTextMsg(blocks.workingMemory));
+	if (blocks.routingInstructions) out.push(userTextMsg(blocks.routingInstructions));
 	if (blocks.preamble) out.push(userTextMsg(blocks.preamble));
 	if (blocks.recencyList) out.push(userTextMsg(blocks.recencyList));
 	if (blocks.relevanceList) out.push(userTextMsg(blocks.relevanceList));

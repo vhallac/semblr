@@ -21,6 +21,7 @@ import {
 	buildFollowUpSectionContent,
 	buildGroupedRecencyList,
 	buildRelevanceList,
+	buildRoutingInstructions,
 	buildSessionArchitecture,
 	buildWorkingMemorySection,
 	splitCommandArgs,
@@ -72,7 +73,8 @@ import {
 	type SearchInteractionsParams,
 	selectContextRounds,
 } from "../lib/search-interactions.ts";
-import { loadSemblrConfig, type SemblrConfig } from "../lib/semblr-config.ts";
+import { loadSemblrConfig, type PhaseName, type SemblrConfig } from "../lib/semblr-config.ts";
+import { resolveModelId } from "../lib/resolve-model-id.ts";
 import type { CheckpointSummary, ToolCallDetail } from "../lib/state.ts";
 import {
 	contextCacheSnapshot,
@@ -151,6 +153,7 @@ const INDEX_PATH = SEMBLR_CONFIG.indexPath;
 const SEMBLR_DIR = path.dirname(ROUNDS_DIR);
 const STATS_PATH = path.join(SEMBLR_DIR, "chain-read-stats.json");
 const EMBEDDING_RESPONSE_MAX_BYTES = embeddingMaxTokensToResponseBytes(SEMBLR_CONFIG.embeddingMaxTokens);
+const ROUTING_INSTRUCTIONS = SEMBLR_CONFIG.multiModelRouting.enabled ? buildRoutingInstructions() : null;
 
 // ◈ Causal-chain read statistics — global, never injected into context
 //   Tracks all 5 causal-chain display positions (1-5, where 1 = most recent round).
@@ -662,6 +665,7 @@ export default function (pi: ExtensionAPI) {
 				systemMsg,
 				sessionArchitecture,
 				workingMemory: workingMem,
+				routingInstructions: ROUTING_INSTRUCTIONS,
 				preamble,
 				recencyList,
 				relevanceList: null,
@@ -694,6 +698,7 @@ export default function (pi: ExtensionAPI) {
 					systemMsg,
 					sessionArchitecture: buildSessionArchitecture(),
 					workingMemory: buildWorkingMemorySection(session.miniMemStore),
+					routingInstructions: ROUTING_INSTRUCTIONS,
 					preamble: null,
 					recencyList: null,
 					relevanceList: null,
@@ -731,6 +736,7 @@ export default function (pi: ExtensionAPI) {
 					systemMsg,
 					sessionArchitecture: buildSessionArchitecture(),
 					workingMemory: buildWorkingMemorySection(session.miniMemStore),
+					routingInstructions: ROUTING_INSTRUCTIONS,
 					preamble: null,
 					recencyList: null,
 					relevanceList: null,
@@ -774,6 +780,7 @@ export default function (pi: ExtensionAPI) {
 					systemMsg,
 					sessionArchitecture: buildSessionArchitecture(),
 					workingMemory: buildWorkingMemorySection(session.miniMemStore),
+					routingInstructions: ROUTING_INSTRUCTIONS,
 					preamble: null,
 					recencyList: null,
 					relevanceList: null,
@@ -833,6 +840,7 @@ export default function (pi: ExtensionAPI) {
 				systemMsg,
 				sessionArchitecture,
 				workingMemory: workingMem,
+				routingInstructions: ROUTING_INSTRUCTIONS,
 				preamble,
 				recencyList,
 				relevanceList,
@@ -1077,6 +1085,40 @@ export default function (pi: ExtensionAPI) {
 			"semblr",
 			`🧠 ${totalRounds} total indexed | ${formatGroupStats(session.roundGroups, SEMBLR_GROUP_THRESHOLD)}`,
 		);
+
+		// ── Multi-model routing: apply pending model switch at round boundary ──
+		if (SEMBLR_CONFIG.multiModelRouting.enabled && round.pendingModelSwitch) {
+			const targetModel = round.pendingModelSwitch;
+			const phase = round.currentPhase ?? "unknown";
+			const { provider, model: resolvedId } = resolveModelId(targetModel);
+
+			// Skip if already on the target model
+			if (ctx.model?.id !== resolvedId) {
+				const modelObj = ctx.modelRegistry.find(provider, resolvedId);
+				if (!modelObj) {
+					ctx.ui.notify(
+						`[Multi-model] Model not found in registry: ${targetModel} (resolved: ${provider}/${resolvedId})`,
+						"error",
+					);
+				} else {
+					const ok = await pi.setModel(modelObj);
+					if (ok) {
+						ctx.ui.notify(
+							`[Multi-model] Switching to ${targetModel} for ${phase} phase (switch ${round.switchCounter}/${SEMBLR_CONFIG.multiModelRouting.maxSwitches})`,
+							"info",
+						);
+					} else {
+						ctx.ui.notify(
+							`[Multi-model] Failed to switch to ${targetModel} for ${phase} phase (no API key configured?)`,
+							"error",
+						);
+					}
+				}
+			}
+
+			// Reset pending switch regardless of success/failure
+			round.pendingModelSwitch = null;
+		}
 	});
 
 	// ────────────────────────────────────────────
@@ -1465,6 +1507,92 @@ export default function (pi: ExtensionAPI) {
 				}
 				return {
 					content: [{ type: "text", text: formatMiniMemSlot(slot) }],
+					details: {},
+				};
+			},
+		});
+
+		// Register semblr_report_phase — multi-model routing phase reporter
+		pi.registerTool({
+			name: "semblr_report_phase",
+			label: "Report Phase",
+			description:
+				"Report your current generation phase for multi-model routing. Call this BEFORE your final response to route the next agent turn to a model specialized for that phase. See [MULTI-MODEL ROUTING] in the context for details on when to report each phase.",
+			promptSnippet: "Report your current generation phase for multi-model routing",
+			parameters: Type.Object({
+				phase: Type.Union(
+					[
+						Type.Literal("thinking"),
+						Type.Literal("executing"),
+						Type.Literal("stuck"),
+						Type.Literal("reporting"),
+						Type.Literal("reviewing"),
+						Type.Literal("verifying"),
+					],
+					{
+						description:
+							"Your current generation phase. 'thinking': pulling in external data by reading, searching, exploring. 'executing': implementing a plan, writing code, making edits. 'stuck': underspecified task, insufficient data, need creative debugging. 'reporting': done with work, about to deliver final output or summary. 'reviewing': reviewing code, verifying correctness, checking outputs. 'verifying': execution done, validating output and created files.",
+					},
+				),
+			}),
+			async execute(_toolCallId, params, _signal, _onUpdate, ctx2) {
+				const { phase } = params as { phase: PhaseName };
+
+				if (!SEMBLR_CONFIG.multiModelRouting.enabled) {
+					return {
+						content: [{ type: "text", text: "Multi-model routing is not enabled. Phase report ignored." }],
+						details: {},
+					};
+				}
+
+				// Store the reported phase on round state
+				round.currentPhase = phase;
+
+				// Look up the target model from the phase→model map
+				const targetModel = SEMBLR_CONFIG.multiModelRouting.phaseModelMap[phase];
+
+				// If target is null, no switch needed for this phase
+				if (targetModel === null) {
+					round.pendingModelSwitch = null;
+					return {
+						content: [{ type: "text", text: `Phase recorded: ${phase}.` }],
+						details: {},
+					};
+				}
+
+				// Idempotent: same pending switch already set, don't double-count
+				if (round.pendingModelSwitch === targetModel) {
+					return {
+						content: [{ type: "text", text: `Phase recorded: ${phase}.` }],
+						details: {},
+					};
+				}
+
+				// Check if already on the target model
+				const { model: resolvedId } = resolveModelId(targetModel);
+				if (ctx2.model?.id === resolvedId) {
+					round.pendingModelSwitch = null;
+					return {
+						content: [{ type: "text", text: `Phase recorded: ${phase}.` }],
+						details: {},
+					};
+				}
+
+				// Check switch limit — only count if we actually set a pending switch
+				if (round.switchCounter >= SEMBLR_CONFIG.multiModelRouting.maxSwitches) {
+					round.pendingModelSwitch = null;
+					return {
+						content: [{ type: "text", text: `Phase recorded: ${phase}.` }],
+						details: {},
+					};
+				}
+
+				// Set the pending model switch
+				round.pendingModelSwitch = targetModel;
+				round.switchCounter++;
+
+				return {
+					content: [{ type: "text", text: `Phase recorded: ${phase}.` }],
 					details: {},
 				};
 			},

@@ -32,6 +32,18 @@ describe("loadSemblrConfig", () => {
 			embedMaxRetries: 3,
 			embedBackoffMs: 1000,
 			summaryThresholdExtra: 0,
+			multiModelRouting: {
+				enabled: false,
+				maxSwitches: 3,
+				phaseModelMap: {
+					thinking: null,
+					executing: "glm-5.2:cloud",
+					stuck: "kimi-k2.6:cloud",
+					reporting: "gemma4:12b:cloud",
+					reviewing: "deepseek-v4-pro:cloud",
+					verifying: "deepseek-v4-flash:cloud",
+				},
+			},
 		});
 	});
 
@@ -159,5 +171,66 @@ describe("loadSemblrConfig", () => {
 		});
 
 		expect(config.roundsDir).toBe("/configured-agent/semblr/rounds");
+	});
+
+	it("defaults multiModelRouting.enabled to false", () => {
+		const config = loadSemblrConfig({ cwd: "/repo", agentDir: "/agent", env: {}, fsImpl: fsFromFiles({}) });
+		expect(config.multiModelRouting.enabled).toBe(false);
+	});
+
+	it("enables multiModelRouting via SEMBLR_ROUTING_ENABLED env var", () => {
+		const config = loadSemblrConfig({
+			cwd: "/repo",
+			agentDir: "/agent",
+			env: { SEMBLR_ROUTING_ENABLED: "true" },
+			fsImpl: fsFromFiles({}),
+		});
+		expect(config.multiModelRouting.enabled).toBe(true);
+	});
+
+	it("enables multiModelRouting via SEMBLR_ROUTING_ENABLED=1", () => {
+		const config = loadSemblrConfig({
+			cwd: "/repo",
+			agentDir: "/agent",
+			env: { SEMBLR_ROUTING_ENABLED: "1" },
+			fsImpl: fsFromFiles({}),
+		});
+		expect(config.multiModelRouting.enabled).toBe(true);
+	});
+
+	it("disables multiModelRouting via SEMBLR_ROUTING_ENABLED=false", () => {
+		const config = loadSemblrConfig({
+			cwd: "/repo",
+			agentDir: "/agent",
+			env: { SEMBLR_ROUTING_ENABLED: "false" },
+			fsImpl: fsFromFiles({}),
+		});
+		expect(config.multiModelRouting.enabled).toBe(false);
+	});
+
+	it("falls back to disabled for invalid SEMBLR_ROUTING_ENABLED values", () => {
+		const config = loadSemblrConfig({
+			cwd: "/repo",
+			agentDir: "/agent",
+			env: { SEMBLR_ROUTING_ENABLED: "invalid" },
+			fsImpl: fsFromFiles({}),
+		});
+		expect(config.multiModelRouting.enabled).toBe(false);
+	});
+
+	it("always defaults maxSwitches to 3", () => {
+		const config = loadSemblrConfig({ cwd: "/repo", agentDir: "/agent", env: {}, fsImpl: fsFromFiles({}) });
+		expect(config.multiModelRouting.maxSwitches).toBe(3);
+	});
+
+	it("includes the hardcoded phase model map", () => {
+		const config = loadSemblrConfig({ cwd: "/repo", agentDir: "/agent", env: {}, fsImpl: fsFromFiles({}) });
+		const map = config.multiModelRouting.phaseModelMap;
+		expect(map.thinking).toBeNull();
+		expect(map.executing).toBe("glm-5.2:cloud");
+		expect(map.stuck).toBe("kimi-k2.6:cloud");
+		expect(map.reporting).toBe("gemma4:12b:cloud");
+		expect(map.reviewing).toBe("deepseek-v4-pro:cloud");
+		expect(map.verifying).toBe("deepseek-v4-flash:cloud");
 	});
 });
