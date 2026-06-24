@@ -43,6 +43,7 @@ import {
 	loadIndexFromPath as loadIndexFromPathCore,
 	loadSessionStartIndex as loadSessionStartIndexCore,
 } from "../lib/index-storage.ts";
+import { resolveModelId } from "../lib/resolve-model-id.ts";
 import {
 	applyMessageEndToState,
 	buildAgentEndChainEntry,
@@ -74,7 +75,6 @@ import {
 	selectContextRounds,
 } from "../lib/search-interactions.ts";
 import { loadSemblrConfig, type PhaseName, type SemblrConfig } from "../lib/semblr-config.ts";
-import { resolveModelId } from "../lib/resolve-model-id.ts";
 import type { CheckpointSummary, ToolCallDetail } from "../lib/state.ts";
 import {
 	contextCacheSnapshot,
@@ -1522,21 +1522,27 @@ export default function (pi: ExtensionAPI) {
 			parameters: Type.Object({
 				phase: Type.Union(
 					[
-						Type.Literal("thinking"),
+						Type.Literal("exploring"),
+						Type.Literal("planning"),
 						Type.Literal("executing"),
 						Type.Literal("stuck"),
-						Type.Literal("reporting"),
-						Type.Literal("reviewing"),
 						Type.Literal("verifying"),
+						Type.Literal("reporting"),
 					],
 					{
 						description:
-							"Your current generation phase. 'thinking': pulling in external data by reading, searching, exploring. 'executing': implementing a plan, writing code, making edits. 'stuck': underspecified task, insufficient data, need creative debugging. 'reporting': done with work, about to deliver final output or summary. 'reviewing': reviewing code, verifying correctness, checking outputs. 'verifying': execution done, validating output and created files.",
+							"Your current generation phase. 'exploring': pulling in external data by reading, searching, exploring. 'planning': formulating a plan of response, structured thinking. 'executing': implementing a plan, writing code, making edits. 'stuck': underspecified task, insufficient data, need creative debugging. 'verifying': execution done, validating output and created files. 'reporting': done with work, about to deliver final output or summary.",
 					},
+				),
+				note: Type.Optional(
+					Type.String({
+						description:
+							"EXPERIMENTAL: A note to the next model that handles this task. Share context, decisions made, open questions, or suggestions for how to proceed. Keep it concise.",
+					}),
 				),
 			}),
 			async execute(_toolCallId, params, _signal, _onUpdate, ctx2) {
-				const { phase } = params as { phase: PhaseName };
+				const { phase, note } = params as { phase: PhaseName; note?: string };
 
 				if (!SEMBLR_CONFIG.multiModelRouting.enabled) {
 					return {
@@ -1545,8 +1551,9 @@ export default function (pi: ExtensionAPI) {
 					};
 				}
 
-				// Store the reported phase on round state
+				// Store the reported phase and optional note on round state
 				round.currentPhase = phase;
+				round.phaseNote = note ?? null;
 
 				// Look up the target model from the phase→model map
 				const targetModel = SEMBLR_CONFIG.multiModelRouting.phaseModelMap[phase];

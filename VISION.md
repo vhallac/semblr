@@ -135,6 +135,7 @@ Because context is assembled dynamically, every prompt is a fresh embedding API 
 - [ ] Expose retrieval quality metrics in TUI
 
 ### Phase 5 — Advanced
+- [x] Multi-model routing — `semblr_report_phase` tool, phase→model map, switch on `agent_end` boundaries (issue #86)
 - [ ] Multiple embedding strategies per round
 - [ ] Hybrid retrieval (semantic + keyword/BM25)
 - [ ] User-directed context curation (exclude, pin, boost)
