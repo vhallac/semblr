@@ -377,7 +377,8 @@ export function buildRoutingInstructions(): string {
 	return `[MULTI-MODEL ROUTING]
 This session has multi-model routing enabled. Different models handle different
 generation phases. To route your next turn to the right model, call the
-\`semblr_report_phase\` tool BEFORE your final response.
+\`semblr_report_phase\` tool BEFORE starting work in a new phase — not
+during, not after.
 
 Phases and when to report them:
 - **exploring**: pulling in external data by reading, searching, exploring.

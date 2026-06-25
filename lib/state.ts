@@ -75,6 +75,14 @@ export function createSession(): SessionState {
 // Round — state reset at each agent_start. Lives for one user prompt → full response.
 // ─────────────────────────────────────────────
 
+export type ThinkingLevel = "off" | "minimal" | "low" | "medium" | "high" | "xhigh";
+
+export interface OriginalModelState {
+	provider: string;
+	modelId: string;
+	thinkingLevel: ThinkingLevel | null;
+}
+
 export interface RoundState {
 	userPrompt: string | null;
 	turnIndex: number | null;
@@ -101,10 +109,10 @@ export interface RoundState {
 	currentPhase: PhaseName | null;
 	/** Optional note from the LLM to pass to the next model on switch. */
 	phaseNote: string | null;
-	/** Model ID to switch to at agent_end, derived from the reported phase and the phase→model map. */
+	/** Model ID to switch to at turn_end, derived from the reported phase and the phase→model map. */
 	pendingModelSwitch: string | null;
-	/** Model ID of the model active when semblr_report_phase was first called (before any switch). */
-	originalModelId: string | null;
+	/** Full model identity active when semblr_report_phase was first called (before any switch). */
+	originalModel: OriginalModelState | null;
 }
 
 export function createRound(): RoundState {
@@ -128,6 +136,6 @@ export function createRound(): RoundState {
 		currentPhase: null,
 		phaseNote: null,
 		pendingModelSwitch: null,
-		originalModelId: null,
+		originalModel: null,
 	};
 }
