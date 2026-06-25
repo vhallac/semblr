@@ -35,8 +35,8 @@ describe("MVP_PHASE_MODEL_MAP", () => {
 		expect(MVP_PHASE_MODEL_MAP.verifying).toBe("minimax-m3:cloud");
 	});
 
-	it("reporting maps to gemma4:12b:cloud", () => {
-		expect(MVP_PHASE_MODEL_MAP.reporting).toBe("gemma4:12b:cloud");
+	it("reporting maps to gemma4:31b:cloud", () => {
+		expect(MVP_PHASE_MODEL_MAP.reporting).toBe("gemma4:31b:cloud");
 	});
 
 	it("all values are either null or a non-empty string", () => {
@@ -84,7 +84,7 @@ describe("getModelForPhase", () => {
 			executing: "glm-5.2:cloud",
 			stuck: "kimi-k2.6:cloud",
 			verifying: "minimax-m3:cloud",
-			reporting: "gemma4:12b:cloud",
+			reporting: "gemma4:31b:cloud",
 		};
 		for (const phase of ALL_PHASES) {
 			expect(getModelForPhase(phase, MVP_PHASE_MODEL_MAP)).toBe(expected[phase]);

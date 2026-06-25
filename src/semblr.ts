@@ -929,6 +929,41 @@ export default function (pi: ExtensionAPI) {
 		round.pendingModelSwitch = null;
 	});
 
+	async function restoreOriginalModel(ctx: ExtensionContext): Promise<void> {
+		if (!SEMBLR_CONFIG.multiModelRouting.enabled || !round.originalModel) return;
+
+		const original = round.originalModel;
+		const originalDisplay = `${original.provider}/${original.modelId}`;
+		const currentModelMatchesOriginal =
+			ctx.model?.provider === original.provider && ctx.model?.id === original.modelId;
+		let originalModelIsActive = currentModelMatchesOriginal;
+
+		// Check if current model differs from original (i.e., a switch happened)
+		if (!currentModelMatchesOriginal) {
+			// Restore by full provider+model identity. Bare IDs are ambiguous (for example, gpt-5.5).
+			const originalModel = ctx.modelRegistry.find(original.provider, original.modelId);
+			if (originalModel) {
+				const ok = await pi.setModel(originalModel);
+				if (ok) {
+					originalModelIsActive = true;
+					ctx.ui.notify(`[Multi-model] Restored original model: ${originalDisplay}`, "info");
+				} else {
+					ctx.ui.notify(`[Multi-model] Failed to restore original model: ${originalDisplay}`, "error");
+				}
+			} else {
+				ctx.ui.notify(`[Multi-model] Original model not found in registry: ${originalDisplay}`, "error");
+			}
+		}
+
+		if (
+			originalModelIsActive &&
+			original.thinkingLevel !== null &&
+			pi.getThinkingLevel() !== original.thinkingLevel
+		) {
+			pi.setThinkingLevel(original.thinkingLevel);
+		}
+	}
+
 	pi.on("agent_end", async (event, ctx) => {
 		const { messages } = event;
 
@@ -937,6 +972,7 @@ export default function (pi: ExtensionAPI) {
 
 		if (!userPrompt) {
 			ctx.ui.setStatus("semblr", "\u{1f9e0} agent_end: no user prompt to save");
+			await restoreOriginalModel(ctx);
 			return;
 		}
 
@@ -945,6 +981,7 @@ export default function (pi: ExtensionAPI) {
 
 		if (!rawResponseText) {
 			ctx.ui.setStatus("semblr", "\u{1f9e0} agent_end: no response text");
+			await restoreOriginalModel(ctx);
 			return;
 		}
 
@@ -988,6 +1025,7 @@ export default function (pi: ExtensionAPI) {
 			round.userPrompt = null;
 			round.turnIndex = null;
 			flushStatsFile(statsState, STATS_PATH, SEMBLR_DIR); // causal chain was pushed, so position scores may have changed
+			await restoreOriginalModel(ctx);
 			return;
 		}
 
@@ -1015,6 +1053,7 @@ export default function (pi: ExtensionAPI) {
 			round.accumulatedText = [];
 			round.userPrompt = null;
 			round.turnIndex = null;
+			await restoreOriginalModel(ctx);
 			return;
 		}
 
@@ -1034,6 +1073,7 @@ export default function (pi: ExtensionAPI) {
 			round.accumulatedText = [];
 			round.userPrompt = null;
 			round.turnIndex = null;
+			await restoreOriginalModel(ctx);
 			return;
 		}
 
@@ -1131,33 +1171,7 @@ export default function (pi: ExtensionAPI) {
 		// original model because pi's model setting is sticky — it survives past
 		// the current round. Restoring ensures the next round starts on the
 		// user's original model, not the phase-specific model from this round.
-		if (SEMBLR_CONFIG.multiModelRouting.enabled && round.originalModelId) {
-			// Check if current model differs from original (i.e., a switch happened)
-			if (ctx.model?.id !== round.originalModelId) {
-				// Search all registered models for the original model by ID
-				const allModels = ctx.modelRegistry.getAll();
-				const originalModel = allModels.find((m) => m.id === round.originalModelId);
-				if (originalModel) {
-					const ok = await pi.setModel(originalModel);
-					if (ok) {
-						ctx.ui.notify(
-							`[Multi-model] Restored original model: ${round.originalModelId}`,
-							"info",
-						);
-					} else {
-						ctx.ui.notify(
-							`[Multi-model] Failed to restore original model: ${round.originalModelId}`,
-							"error",
-						);
-					}
-				} else {
-					ctx.ui.notify(
-						`[Multi-model] Original model not found in registry: ${round.originalModelId}`,
-						"error",
-					);
-				}
-			}
-		}
+		await restoreOriginalModel(ctx);
 	});
 
 	// ────────────────────────────────────────────
@@ -1556,7 +1570,7 @@ export default function (pi: ExtensionAPI) {
 			name: "semblr_report_phase",
 			label: "Report Phase",
 			description:
-				"Report your current generation phase for multi-model routing. Call this BEFORE your final response to route the next agent turn to a model specialized for that phase. See [MULTI-MODEL ROUTING] in the context for details on when to report each phase.",
+				"Report your current generation phase for multi-model routing. Call this BEFORE starting work in a new phase — not during, not after — to route the next agent turn to a model specialized for that phase. See [MULTI-MODEL ROUTING] in the context for details on when to report each phase.",
 			promptSnippet: "Report your current generation phase for multi-model routing",
 			parameters: Type.Object({
 				phase: Type.Union(
@@ -1591,8 +1605,12 @@ export default function (pi: ExtensionAPI) {
 				}
 
 				// Capture original model on first phase report (before any switch)
-				if (round.originalModelId === null && ctx2.model?.id) {
-					round.originalModelId = ctx2.model.id;
+				if (round.originalModel === null && ctx2.model?.id) {
+					round.originalModel = {
+						provider: ctx2.model.provider,
+						modelId: ctx2.model.id,
+						thinkingLevel: pi.getThinkingLevel(),
+					};
 				}
 
 				// Store the reported phase and optional note on round state

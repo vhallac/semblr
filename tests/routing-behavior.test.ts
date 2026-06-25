@@ -7,7 +7,7 @@
  * - Switch limiter: maxSwitches = 3 per agent cycle
  * - Config gating: default enabled = false
  * - Switches happen at turn_end boundaries (tracked via pendingModelSwitch)
- * - Original model is restored at agent_end (captured via originalModelId)
+ * - Original model is restored at agent_end (captured via provider+model ID)
  * - Optional note parameter on semblr_report_phase tool
  */
 
@@ -728,46 +728,62 @@ describe("RoundState routing field behavior", () => {
 		expect(round.pendingModelSwitch).toBeNull();
 	});
 
-	it("fresh round has originalModelId = null", () => {
+	it("fresh round has originalModel = null", () => {
 		const round = createRound();
-		expect(round.originalModelId).toBeNull();
+		expect(round.originalModel).toBeNull();
 	});
 
-	it("can set originalModelId to a model ID", () => {
+	it("can set originalModel to full provider/model identity", () => {
 		const round = createRound();
-		round.originalModelId = "glm-5.2";
-		expect(round.originalModelId).toBe("glm-5.2");
+		round.originalModel = { provider: "openai-codex", modelId: "gpt-5.5", thinkingLevel: "high" };
+		expect(round.originalModel).toEqual({
+			provider: "openai-codex",
+			modelId: "gpt-5.5",
+			thinkingLevel: "high",
+		});
 	});
 
-	it("originalModelId is captured on first phase report (before pendingModelSwitch is set)", () => {
+	it("originalModel is captured on first phase report (before pendingModelSwitch is set)", () => {
 		const round = createRound();
 		// Simulate the extension behavior: capture original model before setting pending switch
-		round.originalModelId = "original-model";
+		round.originalModel = { provider: "openai-codex", modelId: "gpt-5.5", thinkingLevel: "medium" };
 		round.currentPhase = "executing";
 		round.pendingModelSwitch = "glm-5.2:cloud";
-		// originalModelId should not change after first capture
-		expect(round.originalModelId).toBe("original-model");
+		// originalModel should not change after first capture
+		expect(round.originalModel).toEqual({
+			provider: "openai-codex",
+			modelId: "gpt-5.5",
+			thinkingLevel: "medium",
+		});
 		expect(round.currentPhase).toBe("executing");
 		expect(round.pendingModelSwitch).toBe("glm-5.2:cloud");
 	});
 
-	it("originalModelId persists across phase changes within the same round", () => {
+	it("originalModel persists across phase changes within the same round", () => {
 		const round = createRound();
-		round.originalModelId = "default-model";
+		round.originalModel = { provider: "openai-codex", modelId: "gpt-5.5", thinkingLevel: "medium" };
 		round.currentPhase = "exploring";
-		// Change phase — originalModelId stays
+		// Change phase — originalModel stays
 		round.currentPhase = "planning";
-		expect(round.originalModelId).toBe("default-model");
+		expect(round.originalModel).toEqual({
+			provider: "openai-codex",
+			modelId: "gpt-5.5",
+			thinkingLevel: "medium",
+		});
 		expect(round.currentPhase).toBe("planning");
 	});
 
 	it("resets to null on new round (createRound)", () => {
 		const round1 = createRound();
-		round1.originalModelId = "some-model";
+		round1.originalModel = { provider: "openai-codex", modelId: "gpt-5.5", thinkingLevel: "medium" };
 
 		const round2 = createRound();
-		expect(round2.originalModelId).toBeNull();
-		expect(round1.originalModelId).toBe("some-model");
+		expect(round2.originalModel).toBeNull();
+		expect(round1.originalModel).toEqual({
+			provider: "openai-codex",
+			modelId: "gpt-5.5",
+			thinkingLevel: "medium",
+		});
 	});
 
 	it("switchCounter increments independently of currentPhase", () => {
@@ -792,15 +808,15 @@ describe("RoundState routing field behavior", () => {
 // ─────────────────────────────────────────────
 
 describe("turn_end switch + agent_end restore flow", () => {
-	it("semblr_report_phase captures originalModelId and sets pendingModelSwitch", () => {
+	it("semblr_report_phase captures originalModel and sets pendingModelSwitch", () => {
 		const round = createRound();
-		const originalModelId = "original-model";
+		const originalModel = { provider: "openai-codex", modelId: "gpt-5.5", thinkingLevel: "medium" } as const;
 		const targetModelId = "glm-5.2:cloud";
 
 		// Simulate semblr_report_phase("executing"):
 		// 1. Capture original model on first call
-		if (round.originalModelId === null) {
-			round.originalModelId = originalModelId;
+		if (round.originalModel === null) {
+			round.originalModel = originalModel;
 		}
 		// 2. Store phase
 		round.currentPhase = "executing";
@@ -808,30 +824,34 @@ describe("turn_end switch + agent_end restore flow", () => {
 		round.pendingModelSwitch = targetModelId;
 		round.switchCounter++;
 
-		expect(round.originalModelId).toBe(originalModelId);
+		expect(round.originalModel).toEqual(originalModel);
 		expect(round.currentPhase).toBe("executing");
 		expect(round.pendingModelSwitch).toBe(targetModelId);
 		expect(round.switchCounter).toBe(1);
 	});
 
-	it("originalModelId is set only on first phase report (subsequent calls preserve it)", () => {
+	it("originalModel is set only on first phase report (subsequent calls preserve it)", () => {
 		const round = createRound();
 
 		// First call: capture original model
-		if (round.originalModelId === null) {
-			round.originalModelId = "original-model";
+		if (round.originalModel === null) {
+			round.originalModel = { provider: "openai-codex", modelId: "gpt-5.5", thinkingLevel: "medium" };
 		}
 		round.currentPhase = "planning";
 		round.pendingModelSwitch = "deepseek-v4-flash:cloud";
 
-		// Second call: originalModelId should NOT be overwritten
-		if (round.originalModelId === null) {
-			round.originalModelId = "wrong-model"; // would not execute
+		// Second call: originalModel should NOT be overwritten
+		if (round.originalModel === null) {
+			round.originalModel = { provider: "wrong-provider", modelId: "wrong-model", thinkingLevel: "high" }; // would not execute
 		}
 		round.currentPhase = "executing";
 		round.pendingModelSwitch = "glm-5.2:cloud";
 
-		expect(round.originalModelId).toBe("original-model"); // preserved
+		expect(round.originalModel).toEqual({
+			provider: "openai-codex",
+			modelId: "gpt-5.5",
+			thinkingLevel: "medium",
+		}); // preserved
 		expect(round.currentPhase).toBe("executing");
 		expect(round.pendingModelSwitch).toBe("glm-5.2:cloud");
 	});
@@ -847,36 +867,53 @@ describe("turn_end switch + agent_end restore flow", () => {
 		expect(round.pendingModelSwitch).toBeNull();
 	});
 
-	it("agent_end restores original model (switch count > 0 scenario)", () => {
+	it("agent_end restores original model when provider or model differs", () => {
 		const round = createRound();
-		round.originalModelId = "original-model";
+		round.originalModel = { provider: "openai-codex", modelId: "gpt-5.5", thinkingLevel: "medium" };
 		round.switchCounter = 2;
 
 		// Simulate agent_end restore logic:
-		// If ctx.model?.id !== round.originalModelId, find and restore
-		const currentModelId = "minimax-m3"; // different from original
-		const needsRestore = currentModelId !== round.originalModelId;
+		// If ctx.model does not match provider+id, find and restore by provider+id.
+		const currentModel = { provider: "ollama-cloud", id: "minimax-m3" }; // different from original
+		const needsRestore =
+			currentModel.provider !== round.originalModel.provider || currentModel.id !== round.originalModel.modelId;
 
 		expect(needsRestore).toBe(true);
-		expect(round.originalModelId).toBe("original-model");
+		expect(round.originalModel).toEqual({
+			provider: "openai-codex",
+			modelId: "gpt-5.5",
+			thinkingLevel: "medium",
+		});
 	});
 
-	it("agent_end does NOT restore when no switch occurred (originalModelId matches current)", () => {
+	it("agent_end restores when model ID matches but provider differs", () => {
 		const round = createRound();
-		round.originalModelId = "current-model";
+		round.originalModel = { provider: "openai-codex", modelId: "gpt-5.5", thinkingLevel: "medium" };
+
+		const currentModel = { provider: "azure-openai-responses", id: "gpt-5.5" };
+		const needsRestore =
+			currentModel.provider !== round.originalModel.provider || currentModel.id !== round.originalModel.modelId;
+
+		expect(needsRestore).toBe(true);
+	});
+
+	it("agent_end does NOT restore when no switch occurred (provider and model match current)", () => {
+		const round = createRound();
+		round.originalModel = { provider: "openai-codex", modelId: "gpt-5.5", thinkingLevel: "medium" };
 
 		// Simulate agent_end check: current model matches original → no restore needed
-		const currentModelId = "current-model";
-		const needsRestore = currentModelId !== round.originalModelId;
+		const currentModel = { provider: "openai-codex", id: "gpt-5.5" };
+		const needsRestore =
+			currentModel.provider !== round.originalModel.provider || currentModel.id !== round.originalModel.modelId;
 
 		expect(needsRestore).toBe(false);
 	});
 
-	it("agent_end does NOT restore when originalModelId is null (no phase was reported)", () => {
+	it("agent_end does NOT restore when originalModel is null (no phase was reported)", () => {
 		const round = createRound();
-		// originalModelId is null — no phase was reported this round
+		// originalModel is null — no phase was reported this round
 
-		const shouldAttemptRestore = round.originalModelId !== null;
+		const shouldAttemptRestore = round.originalModel !== null;
 		expect(shouldAttemptRestore).toBe(false);
 	});
 
@@ -884,15 +921,19 @@ describe("turn_end switch + agent_end restore flow", () => {
 		const round = createRound();
 
 		// Step 1: semblr_report_phase called
-		if (round.originalModelId === null) {
-			round.originalModelId = "user-default-model";
+		if (round.originalModel === null) {
+			round.originalModel = { provider: "openai-codex", modelId: "gpt-5.5", thinkingLevel: "medium" };
 		}
 		round.currentPhase = "executing";
 		const target = "glm-5.2:cloud";
 		round.pendingModelSwitch = target;
 		round.switchCounter = 1;
 
-		expect(round.originalModelId).toBe("user-default-model");
+		expect(round.originalModel).toEqual({
+			provider: "openai-codex",
+			modelId: "gpt-5.5",
+			thinkingLevel: "medium",
+		});
 		expect(round.pendingModelSwitch).toBe(target);
 
 		// Step 2: turn_end fires — model switches
@@ -904,9 +945,13 @@ describe("turn_end switch + agent_end restore flow", () => {
 		expect(round.pendingModelSwitch).toBeNull();
 
 		// Step 3: agent_end fires — original model is restored
-		// (In the real extension, ctx.modelRegistry.getAll() → pi.setModel(originalModel))
-		expect(round.originalModelId).toBe("user-default-model");
-		// After agent_end, originalModelId is still set (round state clears on next agent_start)
+		// (In the real extension, ctx.modelRegistry.find(provider, modelId) → pi.setModel(originalModel))
+		expect(round.originalModel).toEqual({
+			provider: "openai-codex",
+			modelId: "gpt-5.5",
+			thinkingLevel: "medium",
+		});
+		// After agent_end, originalModel is still set (round state clears on next agent_start)
 		// The actual restore happens via pi.setModel, not by clearing the field
 	});
 });

@@ -123,6 +123,7 @@ describe("createRound", () => {
 		expect(r.switchCounter).toBe(0);
 		expect(r.currentPhase).toBeNull();
 		expect(r.pendingModelSwitch).toBeNull();
+		expect(r.originalModel).toBeNull();
 	});
 
 	it("creates independent rounds (no shared array references)", () => {
@@ -179,10 +180,12 @@ describe("createRound", () => {
 		r1.switchCounter = 2;
 		r1.currentPhase = "executing";
 		r1.pendingModelSwitch = "glm-5.2:cloud";
+		r1.originalModel = { provider: "openai-codex", modelId: "gpt-5.5", thinkingLevel: "medium" };
 
 		expect(r2.switchCounter).toBe(0);
 		expect(r2.currentPhase).toBeNull();
 		expect(r2.pendingModelSwitch).toBeNull();
+		expect(r2.originalModel).toBeNull();
 	});
 
 	it("routing fields start with sensible defaults", () => {
@@ -191,5 +194,6 @@ describe("createRound", () => {
 		expect(r.switchCounter).toBe(0);
 		expect(r.currentPhase).toBeNull();
 		expect(r.pendingModelSwitch).toBeNull();
+		expect(r.originalModel).toBeNull();
 	});
 });

@@ -212,7 +212,7 @@ const DEFAULT_PHASE_MODEL_MAP: PhaseModelMap = {
 	executing: "glm-5.2:cloud",
 	stuck: "kimi-k2.6:cloud",
 	verifying: "minimax-m3:cloud",
-	reporting: "gemma4:12b:cloud",
+	reporting: "gemma4:31b:cloud",
 };
 
 function resolveBoolean(value: string | undefined, defaultValue: boolean): boolean {

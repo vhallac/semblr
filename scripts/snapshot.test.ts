@@ -34,7 +34,7 @@ function testConfig(root: string): SemblrConfig {
 				executing: "glm-5.2:cloud",
 				stuck: "kimi-k2.6:cloud",
 				verifying: "minimax-m3:cloud",
-				reporting: "gemma4:12b:cloud",
+				reporting: "gemma4:31b:cloud",
 			},
 		},
 	};
