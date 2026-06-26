@@ -388,7 +388,8 @@ Phases and when to report them:
 - **executing**: implementing a plan, writing code, making edits.
   Routes to a high-capability coding model.
 - **stuck**: underspecified task, insufficient data, need creative debugging.
-  Routes to a deep-reasoning model.
+  Routes to a deep-reasoning model. If stuck is reported consecutively, routing is
+  suspended and you must report the situation to the user for direction.
 - **verifying**: execution done, validating output and created files.
   Routes to a thorough verification model.
 - **reporting**: done with work, about to deliver final output or summary.

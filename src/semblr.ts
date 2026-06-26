@@ -1600,7 +1600,7 @@ export default function (pi: ExtensionAPI) {
 					],
 					{
 						description:
-							"Your current generation phase. 'exploring': pulling in external data by reading, searching, exploring. 'planning': formulating a plan of response, structured thinking. 'executing': implementing a plan, writing code, making edits. 'stuck': underspecified task, insufficient data, need creative debugging. 'verifying': execution done, validating output and created files. 'reporting': done with work, about to deliver final output or summary.",
+							"Your current generation phase. 'exploring': pulling in external data by reading, searching, exploring. 'planning': formulating a plan of response, structured thinking. 'executing': implementing a plan, writing code, making edits. 'stuck': underspecified task, insufficient data, need creative debugging. Routes to a deep-reasoning model; if stuck is reported consecutively, routing is suspended and you must report the situation to the user for direction. 'verifying': execution done, validating output and created files. 'reporting': done with work, about to deliver final output or summary.",
 					},
 				),
 				note: Type.Optional(
@@ -1660,7 +1660,12 @@ export default function (pi: ExtensionAPI) {
 						content: [
 							{
 								type: "text",
-								text: `Phase recorded: stuck (escalation — routing suspended, user intervention recommended).`,
+								text: `Stuck escalation triggered: you have reported \"stuck\" ${round.consecutiveStuckCount} consecutive time(s). ` +
+								`Routing is suspended — no further model switches will occur. ` +
+								`STOP attempting the task. Instead, provide the user with: ` +
+								`(1) a concise summary of what you have tried and where you are, ` +
+								`(2) why you are stuck, and ` +
+								`(3) what specific input or direction you need from them to proceed.`,
 							},
 						],
 						details: {},
