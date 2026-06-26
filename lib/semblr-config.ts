@@ -18,6 +18,9 @@ export interface MultiModelRoutingConfig {
 	enabled: boolean;
 	/** Maximum model switches per agent cycle. */
 	maxSwitches: number;
+	/** Maximum consecutive "stuck" phase reports before routing is suspended and the user is notified.
+	 *  The escalation path is: stuck → stronger model → still stuck → user intervention (not another model switch). */
+	maxConsecutiveStuck: number;
 	/** Phase → model ID mapping. */
 	phaseModelMap: PhaseModelMap;
 }
@@ -228,6 +231,7 @@ function resolveMultiModelRouting(env: SemblrConfigEnv): MultiModelRoutingConfig
 	return {
 		enabled: resolveBoolean(env.SEMBLR_ROUTING_ENABLED, false),
 		maxSwitches: 5,
+		maxConsecutiveStuck: 2,
 		phaseModelMap: DEFAULT_PHASE_MODEL_MAP,
 	};
 }

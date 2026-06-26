@@ -113,6 +113,11 @@ export interface RoundState {
 	pendingModelSwitch: string | null;
 	/** Full model identity active when semblr_report_phase was first called (before any switch). */
 	originalModel: OriginalModelState | null;
+	/** Number of consecutive "stuck" phase reports. Reset when a non-stuck phase is reported.
+	 *  When this reaches maxConsecutiveStuck, routing is suspended and the user is notified. */
+	consecutiveStuckCount: number;
+	/** Whether the stuck escalation has already fired this round (to prevent duplicate notifications). */
+	stuckEscalationFired: boolean;
 }
 
 export function createRound(): RoundState {
@@ -137,5 +142,7 @@ export function createRound(): RoundState {
 		phaseNote: null,
 		pendingModelSwitch: null,
 		originalModel: null,
+		consecutiveStuckCount: 0,
+		stuckEscalationFired: false,
 	};
 }

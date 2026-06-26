@@ -28,6 +28,7 @@ function testConfig(root: string): SemblrConfig {
 		multiModelRouting: {
 			enabled: false,
 			maxSwitches: 3,
+			maxConsecutiveStuck: 2,
 			phaseModelMap: {
 				exploring: null,
 				planning: "deepseek-v4-flash:cloud",

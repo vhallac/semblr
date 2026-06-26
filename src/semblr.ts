@@ -1633,6 +1633,40 @@ export default function (pi: ExtensionAPI) {
 				round.currentPhase = phase;
 				round.phaseNote = note ?? null;
 
+				// ── Stuck escalation tracking ──
+				// The escalation path is: stuck → stronger model → still stuck → user intervention.
+				// When the LLM reports "stuck", we increment a counter. If it reaches
+				// maxConsecutiveStuck, we stop trying to route and notify the user instead.
+				// Any non-stuck phase resets the counter.
+				if (phase === "stuck") {
+					round.consecutiveStuckCount++;
+				} else {
+					round.consecutiveStuckCount = 0;
+				}
+
+				// ── Stuck escalation: suspend routing and notify user ──
+				if (
+					round.consecutiveStuckCount >= SEMBLR_CONFIG.multiModelRouting.maxConsecutiveStuck &&
+					!round.stuckEscalationFired
+				) {
+					round.stuckEscalationFired = true;
+					round.pendingModelSwitch = null;
+					ctx2.ui.notify(
+						`[Multi-model] Stuck escalation: model reported \"stuck\" ${round.consecutiveStuckCount} consecutive times. ` +
+							`Suspending routing — user intervention recommended.`,
+						"warning",
+					);
+					return {
+						content: [
+							{
+								type: "text",
+								text: `Phase recorded: stuck (escalation — routing suspended, user intervention recommended).`,
+							},
+						],
+						details: {},
+					};
+				}
+
 				// Look up the target model from the phase→model map
 				const targetModel = SEMBLR_CONFIG.multiModelRouting.phaseModelMap[phase];
 

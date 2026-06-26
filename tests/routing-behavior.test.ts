@@ -979,3 +979,100 @@ describe("SessionState routing behavior", () => {
 		expect("totalPhaseSwitches" in session).toBe(false);
 	});
 });
+
+// ─────────────────────────────────────────────
+// Category 11: Stuck Escalation (stuck → stronger model → still stuck → user intervention)
+// ─────────────────────────────────────────────
+
+describe("Stuck escalation behavior", () => {
+	const MAX_CONSECUTIVE_STUCK = 2;
+
+	it("consecutiveStuckCount starts at 0 in a fresh round", () => {
+		const round = createRound();
+		expect(round.consecutiveStuckCount).toBe(0);
+		expect(round.stuckEscalationFired).toBe(false);
+	});
+
+	it("reporting 'stuck' increments consecutiveStuckCount", () => {
+		const round = createRound();
+		// Simulate first stuck report
+		round.consecutiveStuckCount = 0;
+		round.currentPhase = "stuck";
+		round.consecutiveStuckCount++;
+		expect(round.consecutiveStuckCount).toBe(1);
+		expect(round.stuckEscalationFired).toBe(false);
+	});
+
+	it("reporting a non-stuck phase resets consecutiveStuckCount to 0", () => {
+		const round = createRound();
+		round.consecutiveStuckCount = 1;
+		round.currentPhase = "executing";
+		round.consecutiveStuckCount = 0;
+		expect(round.consecutiveStuckCount).toBe(0);
+	});
+
+	it("escalation fires when consecutiveStuckCount reaches maxConsecutiveStuck", () => {
+		const round = createRound();
+		round.consecutiveStuckCount = MAX_CONSECUTIVE_STUCK;
+
+		const shouldEscalate = round.consecutiveStuckCount >= MAX_CONSECUTIVE_STUCK && !round.stuckEscalationFired;
+		expect(shouldEscalate).toBe(true);
+
+		// Simulate escalation: routing suspended, user notified
+		round.stuckEscalationFired = true;
+		round.pendingModelSwitch = null;
+
+		expect(round.stuckEscalationFired).toBe(true);
+		expect(round.pendingModelSwitch).toBeNull();
+	});
+
+	it("escalation does NOT fire on first stuck report (count=1)", () => {
+		const round = createRound();
+		round.consecutiveStuckCount = 1;
+
+		const shouldEscalate = round.consecutiveStuckCount >= MAX_CONSECUTIVE_STUCK && !round.stuckEscalationFired;
+		expect(shouldEscalate).toBe(false);
+	});
+
+	it("escalation fires only once per round (stuckEscalationFired prevents duplicate)", () => {
+		const round = createRound();
+		round.consecutiveStuckCount = 5; // way past threshold
+		round.stuckEscalationFired = true; // already fired
+
+		const shouldEscalate = round.consecutiveStuckCount >= MAX_CONSECUTIVE_STUCK && !round.stuckEscalationFired;
+		expect(shouldEscalate).toBe(false);
+	});
+
+	it("stuck → model switch → stuck again triggers escalation", () => {
+		const round = createRound();
+
+		// First stuck: count goes to 1, model switches to stuck model
+		round.consecutiveStuckCount = 1;
+		round.currentPhase = "stuck";
+		expect(round.consecutiveStuckCount).toBeLessThan(MAX_CONSECUTIVE_STUCK);
+		// Normal switch happens (pendingModelSwitch set)
+
+		// Second stuck: count goes to 2, escalation fires
+		round.consecutiveStuckCount = MAX_CONSECUTIVE_STUCK;
+		const shouldEscalate = round.consecutiveStuckCount >= MAX_CONSECUTIVE_STUCK && !round.stuckEscalationFired;
+		expect(shouldEscalate).toBe(true);
+	});
+
+	it("interleaving stuck with non-stuck phases resets escalation counter", () => {
+		const round = createRound();
+
+		// First stuck
+		round.consecutiveStuckCount = 1;
+
+		// Non-stuck phase resets counter
+		round.currentPhase = "executing";
+		round.consecutiveStuckCount = 0;
+
+		// Stuck again — counter starts from 1, not 2
+		round.currentPhase = "stuck";
+		round.consecutiveStuckCount = 1;
+
+		const shouldEscalate = round.consecutiveStuckCount >= MAX_CONSECUTIVE_STUCK && !round.stuckEscalationFired;
+		expect(shouldEscalate).toBe(false);
+	});
+});

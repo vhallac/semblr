@@ -35,6 +35,7 @@ describe("loadSemblrConfig", () => {
 			multiModelRouting: {
 				enabled: false,
 				maxSwitches: 5,
+				maxConsecutiveStuck: 2,
 				phaseModelMap: {
 					exploring: null,
 					planning: "deepseek-v4-flash:cloud",
