@@ -35,12 +35,10 @@ describe("loadSemblrConfig", () => {
 			multiModelRouting: {
 				enabled: false,
 				maxSwitches: 5,
-				maxConsecutiveStuck: 2,
 				phaseModelMap: {
 					exploring: null,
 					planning: "deepseek-v4-flash:cloud",
 					executing: "glm-5.2:cloud",
-					stuck: "kimi-k2.6:cloud",
 					verifying: "minimax-m3:cloud",
 					reporting: "gemma4:31b:cloud",
 				},
@@ -230,7 +228,7 @@ describe("loadSemblrConfig", () => {
 		expect(map.exploring).toBeNull();
 		expect(map.planning).toBe("deepseek-v4-flash:cloud");
 		expect(map.executing).toBe("glm-5.2:cloud");
-		expect(map.stuck).toBe("kimi-k2.6:cloud");
+
 		expect(map.verifying).toBe("minimax-m3:cloud");
 		expect(map.reporting).toBe("gemma4:31b:cloud");
 	});

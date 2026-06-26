@@ -951,8 +951,8 @@ export default function (pi: ExtensionAPI) {
 			}
 
 			// Fallback 2: match by provider only (any model from the same provider).
-			// A stuck phase-specific model (e.g. gemma) is more harmful than
-			// switching to a sibling model from the original provider.
+			// Switching to a sibling model from the original provider is safer
+			// than leaving a phase-specific model active across rounds.
 			if (!originalModel) {
 				const allModels = ctx.modelRegistry.getAll();
 				originalModel = allModels.find((m) => m.provider === original.provider);
@@ -1594,13 +1594,12 @@ export default function (pi: ExtensionAPI) {
 						Type.Literal("exploring"),
 						Type.Literal("planning"),
 						Type.Literal("executing"),
-						Type.Literal("stuck"),
 						Type.Literal("verifying"),
 						Type.Literal("reporting"),
 					],
 					{
 						description:
-							"Your current generation phase. 'exploring': pulling in external data by reading, searching, exploring. 'planning': formulating a plan of response, structured thinking. 'executing': implementing a plan, writing code, making edits. 'stuck': underspecified task, insufficient data, need creative debugging. Routes to a deep-reasoning model; if stuck is reported consecutively, routing is suspended and you must report the situation to the user for direction. 'verifying': execution done, validating output and created files. 'reporting': done with work, about to deliver final output or summary.",
+							"Your current generation phase. 'exploring': pulling in external data by reading, searching, exploring. 'planning': formulating a plan of response, structured thinking. 'executing': implementing a plan, writing code, making edits. 'verifying': execution done, validating output and created files. 'reporting': done with work, about to deliver final output or summary.",
 					},
 				),
 				note: Type.Optional(
@@ -1632,45 +1631,6 @@ export default function (pi: ExtensionAPI) {
 				// Store the reported phase and optional note on round state
 				round.currentPhase = phase;
 				round.phaseNote = note ?? null;
-
-				// ── Stuck escalation tracking ──
-				// The escalation path is: stuck → stronger model → still stuck → user intervention.
-				// When the LLM reports "stuck", we increment a counter. If it reaches
-				// maxConsecutiveStuck, we stop trying to route and notify the user instead.
-				// Any non-stuck phase resets the counter.
-				if (phase === "stuck") {
-					round.consecutiveStuckCount++;
-				} else {
-					round.consecutiveStuckCount = 0;
-				}
-
-				// ── Stuck escalation: suspend routing and notify user ──
-				if (
-					round.consecutiveStuckCount >= SEMBLR_CONFIG.multiModelRouting.maxConsecutiveStuck &&
-					!round.stuckEscalationFired
-				) {
-					round.stuckEscalationFired = true;
-					round.pendingModelSwitch = null;
-					ctx2.ui.notify(
-						`[Multi-model] Stuck escalation: model reported \"stuck\" ${round.consecutiveStuckCount} consecutive times. ` +
-							`Suspending routing — user intervention recommended.`,
-						"warning",
-					);
-					return {
-						content: [
-							{
-								type: "text",
-								text: `Stuck escalation triggered: you have reported \"stuck\" ${round.consecutiveStuckCount} consecutive time(s). ` +
-								`Routing is suspended — no further model switches will occur. ` +
-								`STOP attempting the task. Instead, provide the user with: ` +
-								`(1) a concise summary of what you have tried and where you are, ` +
-								`(2) why you are stuck, and ` +
-								`(3) what specific input or direction you need from them to proceed.`,
-							},
-						],
-						details: {},
-					};
-				}
 
 				// Look up the target model from the phase→model map
 				const targetModel = SEMBLR_CONFIG.multiModelRouting.phaseModelMap[phase];

@@ -2,14 +2,14 @@ import { describe, expect, it } from "vitest";
 import { getModelForPhase, MVP_PHASE_MODEL_MAP } from "./phase-model-map.ts";
 import type { PhaseModelMap, PhaseName } from "./semblr-config.ts";
 
-const ALL_PHASES: PhaseName[] = ["exploring", "planning", "executing", "stuck", "verifying", "reporting"];
+const ALL_PHASES: PhaseName[] = ["exploring", "planning", "executing", "verifying", "reporting"];
 
 describe("MVP_PHASE_MODEL_MAP", () => {
-	it("has exactly 6 phase entries", () => {
-		expect(Object.keys(MVP_PHASE_MODEL_MAP)).toHaveLength(6);
+	it("has exactly 5 phase entries", () => {
+		expect(Object.keys(MVP_PHASE_MODEL_MAP)).toHaveLength(5);
 	});
 
-	it("includes all six phase names as keys", () => {
+	it("includes all five phase names as keys", () => {
 		for (const phase of ALL_PHASES) {
 			expect(MVP_PHASE_MODEL_MAP).toHaveProperty(phase);
 		}
@@ -25,10 +25,6 @@ describe("MVP_PHASE_MODEL_MAP", () => {
 
 	it("executing maps to glm-5.2:cloud", () => {
 		expect(MVP_PHASE_MODEL_MAP.executing).toBe("glm-5.2:cloud");
-	});
-
-	it("stuck maps to kimi-k2.6:cloud", () => {
-		expect(MVP_PHASE_MODEL_MAP.stuck).toBe("kimi-k2.6:cloud");
 	});
 
 	it("verifying maps to minimax-m3:cloud", () => {
@@ -82,7 +78,6 @@ describe("getModelForPhase", () => {
 			exploring: null,
 			planning: "deepseek-v4-flash:cloud",
 			executing: "glm-5.2:cloud",
-			stuck: "kimi-k2.6:cloud",
 			verifying: "minimax-m3:cloud",
 			reporting: "gemma4:31b:cloud",
 		};
@@ -110,13 +105,11 @@ describe("getModelForPhase", () => {
 			exploring: "custom-explorer:cloud",
 			planning: null,
 			executing: null,
-			stuck: "custom-model:cloud",
 			verifying: null,
 			reporting: "custom-reporter:cloud",
 		};
 		expect(getModelForPhase("exploring", customMap)).toBe("custom-explorer:cloud");
 		expect(getModelForPhase("planning", customMap)).toBeNull();
-		expect(getModelForPhase("stuck", customMap)).toBe("custom-model:cloud");
 		expect(getModelForPhase("reporting", customMap)).toBe("custom-reporter:cloud");
 	});
 });

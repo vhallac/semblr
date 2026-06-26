@@ -7,7 +7,7 @@ import * as path from "node:path";
 // ─────────────────────────────────────────────
 
 /** Phase names the LLM can self-report via semblr_report_phase tool. */
-export type PhaseName = "exploring" | "planning" | "executing" | "stuck" | "verifying" | "reporting";
+export type PhaseName = "exploring" | "planning" | "executing" | "verifying" | "reporting";
 
 /** Map from phase to model ID. `null` means stay on the current model. */
 export type PhaseModelMap = Record<PhaseName, string | null>;
@@ -18,9 +18,6 @@ export interface MultiModelRoutingConfig {
 	enabled: boolean;
 	/** Maximum model switches per agent cycle. */
 	maxSwitches: number;
-	/** Maximum consecutive "stuck" phase reports before routing is suspended and the user is notified.
-	 *  The escalation path is: stuck → stronger model → still stuck → user intervention (not another model switch). */
-	maxConsecutiveStuck: number;
 	/** Phase → model ID mapping. */
 	phaseModelMap: PhaseModelMap;
 }
@@ -213,7 +210,6 @@ const DEFAULT_PHASE_MODEL_MAP: PhaseModelMap = {
 	exploring: null,
 	planning: "deepseek-v4-flash:cloud",
 	executing: "glm-5.2:cloud",
-	stuck: "kimi-k2.6:cloud",
 	verifying: "minimax-m3:cloud",
 	reporting: "gemma4:31b:cloud",
 };
@@ -231,7 +227,6 @@ function resolveMultiModelRouting(env: SemblrConfigEnv): MultiModelRoutingConfig
 	return {
 		enabled: resolveBoolean(env.SEMBLR_ROUTING_ENABLED, false),
 		maxSwitches: 5,
-		maxConsecutiveStuck: 2,
 		phaseModelMap: DEFAULT_PHASE_MODEL_MAP,
 	};
 }
