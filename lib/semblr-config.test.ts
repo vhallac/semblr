@@ -34,7 +34,7 @@ describe("loadSemblrConfig", () => {
 			summaryThresholdExtra: 0,
 			multiModelRouting: {
 				enabled: false,
-				maxSwitches: 3,
+				maxSwitches: 5,
 				phaseModelMap: {
 					exploring: null,
 					planning: "deepseek-v4-flash:cloud",
@@ -218,9 +218,9 @@ describe("loadSemblrConfig", () => {
 		expect(config.multiModelRouting.enabled).toBe(false);
 	});
 
-	it("always defaults maxSwitches to 3", () => {
+	it("always defaults maxSwitches to 5", () => {
 		const config = loadSemblrConfig({ cwd: "/repo", agentDir: "/agent", env: {}, fsImpl: fsFromFiles({}) });
-		expect(config.multiModelRouting.maxSwitches).toBe(3);
+		expect(config.multiModelRouting.maxSwitches).toBe(5);
 	});
 
 	it("includes the hardcoded phase model map", () => {

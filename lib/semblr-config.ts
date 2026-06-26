@@ -227,7 +227,7 @@ function resolveBoolean(value: string | undefined, defaultValue: boolean): boole
 function resolveMultiModelRouting(env: SemblrConfigEnv): MultiModelRoutingConfig {
 	return {
 		enabled: resolveBoolean(env.SEMBLR_ROUTING_ENABLED, false),
-		maxSwitches: 3,
+		maxSwitches: 5,
 		phaseModelMap: DEFAULT_PHASE_MODEL_MAP,
 	};
 }

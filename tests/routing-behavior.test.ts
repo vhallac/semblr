@@ -4,7 +4,7 @@
  * Tests are derived from the specification (issue #86, comments #1 and #2):
  * - MVP_PHASE_MODEL_MAP from comment #2 (Ollama-Cloud naming)
  * - Phase names from issue #86 comment #1: exploring, planning, executing, stuck, verifying, reporting
- * - Switch limiter: maxSwitches = 3 per agent cycle
+ * - Switch limiter: maxSwitches = 5 per agent cycle
  * - Config gating: default enabled = false
  * - Switches happen at turn_end boundaries (tracked via pendingModelSwitch)
  * - Original model is restored at agent_end (captured via provider+model ID)
@@ -35,7 +35,7 @@ const PHASE_MODEL_MAP: Record<PhaseName, string | null> = {
 };
 
 /** The default maxSwitches value. */
-const DEFAULT_MAX_SWITCHES = 3;
+const DEFAULT_MAX_SWITCHES = 5;
 
 /**
 /**
@@ -231,7 +231,7 @@ describe("switch counter behavior", () => {
 		expect(decision.newCounter).toBe(1);
 	});
 
-	it("increments up to maxSwitches (3) but not beyond", () => {
+	it("increments up to maxSwitches (5) but not beyond", () => {
 		const round = createRound();
 		let counter = 0;
 
@@ -285,24 +285,26 @@ describe("switch counter behavior", () => {
 		expect(round2.switchCounter).toBe(0);
 	});
 
-	it("maxSwitches value matches spec (3)", () => {
+	it("maxSwitches value matches spec (5)", () => {
 		// Verify via config
 		const config = loadSemblrConfig({ cwd: "/", agentDir: "/agent", env: {}, fsImpl: { existsSync: () => false, readFileSync: () => "{}" } });
-		expect(config.multiModelRouting.maxSwitches).toBe(3);
+		expect(config.multiModelRouting.maxSwitches).toBe(5);
 	});
 
 	it("switches blocked after maxSwitches even with different phases", () => {
 		let counter = 0;
 
-		// Burn through all 3 switches
+		// Burn through all 5 switches
 		counter = simulateRoutingDecision("executing", "m1", counter, DEFAULT_MAX_SWITCHES, true).newCounter;
 		counter = simulateRoutingDecision("stuck", "m2", counter, DEFAULT_MAX_SWITCHES, true).newCounter;
 		counter = simulateRoutingDecision("verifying", "m3", counter, DEFAULT_MAX_SWITCHES, true).newCounter;
+		counter = simulateRoutingDecision("reporting", "m4", counter, DEFAULT_MAX_SWITCHES, true).newCounter;
+		counter = simulateRoutingDecision("planning", "m5", counter, DEFAULT_MAX_SWITCHES, true).newCounter;
 
 		// Now try different phases — all blocked
-		expect(simulateRoutingDecision("reporting", "m4", counter, DEFAULT_MAX_SWITCHES, true).shouldSwitch).toBe(false);
-		expect(simulateRoutingDecision("planning", "m5", counter, DEFAULT_MAX_SWITCHES, true).shouldSwitch).toBe(false);
-		expect(simulateRoutingDecision("exploring", "m6", counter, DEFAULT_MAX_SWITCHES, true).shouldSwitch).toBe(false);
+		expect(simulateRoutingDecision("stuck", "m6", counter, DEFAULT_MAX_SWITCHES, true).shouldSwitch).toBe(false);
+		expect(simulateRoutingDecision("executing", "m7", counter, DEFAULT_MAX_SWITCHES, true).shouldSwitch).toBe(false);
+		expect(simulateRoutingDecision("exploring", "m8", counter, DEFAULT_MAX_SWITCHES, true).shouldSwitch).toBe(false);
 	});
 });
 
@@ -454,14 +456,14 @@ describe("config gating", () => {
 		expect(decision.target).toBe("glm-5.2:cloud");
 	});
 
-	it("default maxSwitches is 3 in config", () => {
+	it("default maxSwitches is 5 in config", () => {
 		const config = loadSemblrConfig({
 			cwd: "/",
 			agentDir: "/agent",
 			env: {},
 			fsImpl: { existsSync: () => false, readFileSync: () => "{}" },
 		});
-		expect(config.multiModelRouting.maxSwitches).toBe(3);
+		expect(config.multiModelRouting.maxSwitches).toBe(5);
 	});
 
 	it("env var with invalid value falls back to disabled", () => {
@@ -503,7 +505,7 @@ describe("config gating", () => {
 			fsImpl: { existsSync: () => false, readFileSync: () => "{}" },
 		});
 		expect(config2.multiModelRouting.enabled).toBe(false);
-		expect(config2.multiModelRouting.maxSwitches).toBe(3);
+		expect(config2.multiModelRouting.maxSwitches).toBe(5);
 	});
 });
 
@@ -513,9 +515,8 @@ describe("config gating", () => {
 
 describe("integration: full agent cycle", () => {
 	it("exploring → planning → executing → stuck → verifying → reporting respects switch limit", () => {
-		// With maxSwitches = 3, only the first 3 non-null phases trigger switches.
-		// The remaining phases (verifying, reporting) are blocked.
-		// When blocked, simulateRoutingDecision returns target=null.
+		// With maxSwitches = 5, all 5 non-null phases (planning…reporting)
+		// trigger switches. The 6th switch attempt is blocked.
 		let currentModel = "default-model";
 		let switchCounter = 0;
 
@@ -538,25 +539,34 @@ describe("integration: full agent cycle", () => {
 		switchCounter = d.newCounter;
 		currentModel = d.target!;
 
-		// Phase 4: stuck → switch to kimi-k2.6:cloud (switch 3 — maxSwitches reached)
+		// Phase 4: stuck → switch to kimi-k2.6:cloud (switch 3)
 		d = simulateRoutingDecision("stuck", currentModel, switchCounter, DEFAULT_MAX_SWITCHES, true);
 		expect(d.target).toBe("kimi-k2.6:cloud");
 		expect(d.shouldSwitch).toBe(true);
 		switchCounter = d.newCounter;
 		currentModel = d.target!;
 
-		// Phase 5: verifying → blocked (switchCounter == 3 >= maxSwitches)
+		// Phase 5: verifying → switch to minimax-m3:cloud (switch 4)
 		d = simulateRoutingDecision("verifying", currentModel, switchCounter, DEFAULT_MAX_SWITCHES, true);
-		expect(d.shouldSwitch).toBe(false);
-		expect(switchCounter).toBe(3);
+		expect(d.target).toBe("minimax-m3:cloud");
+		expect(d.shouldSwitch).toBe(true);
+		switchCounter = d.newCounter;
+		currentModel = d.target!;
 
-		// Phase 6: reporting → blocked
+		// Phase 6: reporting → switch to gemma4:31b:cloud (switch 5 — maxSwitches reached)
 		d = simulateRoutingDecision("reporting", currentModel, switchCounter, DEFAULT_MAX_SWITCHES, true);
-		expect(d.shouldSwitch).toBe(false);
-		expect(switchCounter).toBe(3);
+		expect(d.target).toBe("gemma4:31b:cloud");
+		expect(d.shouldSwitch).toBe(true);
+		switchCounter = d.newCounter;
+		currentModel = d.target!;
 
-		// After maxSwitches=3 switches, model is stuck at the 3rd target
-		expect(currentModel).toBe("kimi-k2.6:cloud");
+		// Phase 7: another planning attempt → blocked (switchCounter == 5 >= maxSwitches)
+		d = simulateRoutingDecision("planning", currentModel, switchCounter, DEFAULT_MAX_SWITCHES, true);
+		expect(d.shouldSwitch).toBe(false);
+		expect(switchCounter).toBe(5);
+
+		// After maxSwitches=5 switches, model is stuck at the 5th target
+		expect(currentModel).toBe("gemma4:31b:cloud");
 	});
 
 	it("full cycle without switch limit (maxSwitches raised) verifies complete map coverage", () => {
@@ -611,14 +621,16 @@ describe("integration: full agent cycle", () => {
 		expect(currentModel).toBe("minimax-m3:cloud");
 	});
 
-	it("switch counter respects maxSwitches (3) within a single cycle", () => {
+	it("switch counter respects maxSwitches (5) within a single cycle", () => {
 		// Simulate a long cycle with many phase changes
 		const phases: PhaseName[] = [
 			"executing",  // 1: switch to glm-5.2
 			"stuck",      // 2: switch to kimi-k2.6
 			"verifying",  // 3: switch to minimax-m3
-			"reporting",  // blocked (counter == maxSwitches)
-			"planning",   // blocked
+			"reporting",  // 4: switch to gemma4
+			"planning",   // 5: switch to deepseek (maxSwitches reached)
+			"exploring",  // no switch (null target)
+			"executing",  // blocked (counter == maxSwitches)
 		];
 
 		let currentModel = "default-model";
@@ -633,7 +645,7 @@ describe("integration: full agent cycle", () => {
 		}
 
 		expect(switchCounter).toBe(DEFAULT_MAX_SWITCHES);
-		expect(currentModel).toBe("minimax-m3:cloud"); // stuck at verifying model
+		expect(currentModel).toBe("deepseek-v4-flash:cloud"); // stuck at planning model
 	});
 
 	it("multiple cycles reset the switch counter each round", () => {
