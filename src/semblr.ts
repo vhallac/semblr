@@ -941,7 +941,23 @@ export default function (pi: ExtensionAPI) {
 		// Check if current model differs from original (i.e., a switch happened)
 		if (!currentModelMatchesOriginal) {
 			// Restore by full provider+model identity. Bare IDs are ambiguous (for example, gpt-5.5).
-			const originalModel = ctx.modelRegistry.find(original.provider, original.modelId);
+			let originalModel = ctx.modelRegistry.find(original.provider, original.modelId);
+
+			// Fallback 1: match by modelId only (ignore provider).
+			// The model may have been registered under a different provider alias.
+			if (!originalModel) {
+				const allModels = ctx.modelRegistry.getAll();
+				originalModel = allModels.find((m) => m.id === original.modelId);
+			}
+
+			// Fallback 2: match by provider only (any model from the same provider).
+			// A stuck phase-specific model (e.g. gemma) is more harmful than
+			// switching to a sibling model from the original provider.
+			if (!originalModel) {
+				const allModels = ctx.modelRegistry.getAll();
+				originalModel = allModels.find((m) => m.provider === original.provider);
+			}
+
 			if (originalModel) {
 				const ok = await pi.setModel(originalModel);
 				if (ok) {
