@@ -19,20 +19,20 @@ describe("MVP_PHASE_MODEL_MAP", () => {
 		expect(MVP_PHASE_MODEL_MAP.exploring).toBeNull();
 	});
 
-	it("planning maps to a :cloud model ID", () => {
-		expect(MVP_PHASE_MODEL_MAP.planning).toBe("deepseek-v4-flash:cloud");
+	it("planning maps to deepseek/deepseek-v4-flash@openrouter", () => {
+		expect(MVP_PHASE_MODEL_MAP.planning).toBe("deepseek/deepseek-v4-flash@openrouter");
 	});
 
-	it("executing maps to glm-5.2:cloud", () => {
-		expect(MVP_PHASE_MODEL_MAP.executing).toBe("glm-5.2:cloud");
+	it("executing maps to z-ai/glm-5.2@openrouter", () => {
+		expect(MVP_PHASE_MODEL_MAP.executing).toBe("z-ai/glm-5.2@openrouter");
 	});
 
-	it("verifying maps to minimax-m3:cloud", () => {
-		expect(MVP_PHASE_MODEL_MAP.verifying).toBe("minimax-m3:cloud");
+	it("verifying maps to minimax/minimax-m3@openrouter", () => {
+		expect(MVP_PHASE_MODEL_MAP.verifying).toBe("minimax/minimax-m3@openrouter");
 	});
 
-	it("reporting maps to gemma4:31b:cloud", () => {
-		expect(MVP_PHASE_MODEL_MAP.reporting).toBe("gemma4:31b:cloud");
+	it("reporting maps to google/gemma-4-31b-it@openrouter", () => {
+		expect(MVP_PHASE_MODEL_MAP.reporting).toBe("google/gemma-4-31b-it@openrouter");
 	});
 
 	it("all values are either null or a non-empty string", () => {
@@ -43,10 +43,10 @@ describe("MVP_PHASE_MODEL_MAP", () => {
 		}
 	});
 
-	it("all cloud model values end with :cloud", () => {
+	it("all non-null model values specify an explicit provider via @provider", () => {
 		for (const [, value] of Object.entries(MVP_PHASE_MODEL_MAP)) {
 			if (value === null) continue;
-			expect(value).toMatch(/:cloud$/);
+			expect(value).toMatch(/@\w+/);
 		}
 	});
 
@@ -69,17 +69,17 @@ describe("getModelForPhase", () => {
 		expect(getModelForPhase("exploring", MVP_PHASE_MODEL_MAP)).toBeNull();
 	});
 
-	it("maps planning to deepseek-v4-flash:cloud", () => {
-		expect(getModelForPhase("planning", MVP_PHASE_MODEL_MAP)).toBe("deepseek-v4-flash:cloud");
+	it("maps planning to deepseek/deepseek-v4-flash@openrouter", () => {
+		expect(getModelForPhase("planning", MVP_PHASE_MODEL_MAP)).toBe("deepseek/deepseek-v4-flash@openrouter");
 	});
 
 	it("maps all non-null phases to the correct model IDs", () => {
 		const expected: Record<string, string | null> = {
 			exploring: null,
-			planning: "deepseek-v4-flash:cloud",
-			executing: "glm-5.2:cloud",
-			verifying: "minimax-m3:cloud",
-			reporting: "gemma4:31b:cloud",
+			planning: "deepseek/deepseek-v4-flash@openrouter",
+			executing: "z-ai/glm-5.2@openrouter",
+			verifying: "minimax/minimax-m3@openrouter",
+			reporting: "google/gemma-4-31b-it@openrouter",
 		};
 		for (const phase of ALL_PHASES) {
 			expect(getModelForPhase(phase, MVP_PHASE_MODEL_MAP)).toBe(expected[phase]);

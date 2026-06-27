@@ -1,18 +1,18 @@
 import type { PhaseModelMap, PhaseName } from "./semblr-config.ts";
 
 /**
- * Hardcoded MVP phase → model map (Ollama-Cloud naming convention).
+ * Hardcoded MVP phase → model map.
  *
  * From issue #86 comment #2 (2026-06-24).
  * `null` → stay on the current model (no switch).
- * `"<model>:cloud"` → switch to the named Ollama Cloud model.
+ * `"<model>@<provider>"` → switch to the named model on the specified provider.
  */
 export const MVP_PHASE_MODEL_MAP: PhaseModelMap = {
 	exploring: null,
-	planning: "deepseek-v4-flash:cloud",
-	executing: "glm-5.2:cloud",
-	verifying: "minimax-m3:cloud",
-	reporting: "gemma4:31b:cloud",
+	planning: "deepseek/deepseek-v4-flash@openrouter",
+	executing: "z-ai/glm-5.2@openrouter",
+	verifying: "minimax/minimax-m3@openrouter",
+	reporting: "google/gemma-4-31b-it@openrouter",
 };
 
 /**

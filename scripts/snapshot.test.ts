@@ -27,7 +27,6 @@ function testConfig(root: string): SemblrConfig {
 		summaryThresholdExtra: 40_000,
 		routing: {
 			enabled: false,
-			preset: null,
 			phaseModels: {
 				exploring: null,
 				planning: null,

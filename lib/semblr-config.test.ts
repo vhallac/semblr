@@ -1,13 +1,7 @@
 import type * as fs from "node:fs";
 import * as path from "node:path";
 import { describe, expect, it } from "vitest";
-import {
-	collectPhaseModels,
-	getPresetDescription,
-	loadSemblrConfig,
-	resolvePreset,
-	validateRoutingConfig,
-} from "./semblr-config.ts";
+import { loadSemblrConfig, validateRoutingConfig } from "./semblr-config.ts";
 
 function fsFromFiles(files: Record<string, unknown>) {
 	const normalized = new Map(Object.entries(files).map(([filePath, content]) => [path.normalize(filePath), content]));
@@ -53,9 +47,8 @@ describe("loadSemblrConfig", () => {
 			summaryThresholdExtra: 0,
 			routing: {
 				enabled: false,
-				preset: null,
 				phaseModels: {},
-				maxSwitchesPerCycle: 3,
+				maxSwitchesPerCycle: 5,
 				minTurnsPerPhase: 1,
 				agentCycleTimeoutSec: 0,
 			},
@@ -233,82 +226,14 @@ describe("loadSemblrConfig", () => {
 		expect(config.routing.enabled).toBe(false);
 	});
 
-	it("defaults maxSwitchesPerCycle to 3", () => {
+	it("defaults maxSwitchesPerCycle to 5", () => {
 		const config = loadSemblrConfig({ cwd: "/repo", agentDir: "/agent", env: {}, fsImpl: fsFromFiles({}) });
-		expect(config.routing.maxSwitchesPerCycle).toBe(3);
+		expect(config.routing.maxSwitchesPerCycle).toBe(5);
 	});
 
-	it("defaults routing.phaseModels to empty when no preset", () => {
+	it("defaults routing.phaseModels to empty", () => {
 		const config = loadSemblrConfig({ cwd: "/repo", agentDir: "/agent", env: {}, fsImpl: fsFromFiles({}) });
 		expect(Object.keys(config.routing.phaseModels)).toHaveLength(0);
-	});
-});
-
-// ═══════════════════════════════════════════
-// Preset resolution tests
-// ═══════════════════════════════════════════
-
-describe("resolvePreset", () => {
-	it("resolves fast-sonnet to all nulls (all current)", () => {
-		const map = resolvePreset("fast-sonnet");
-		expect(map).not.toBeNull();
-		expect(map?.exploring).toBeNull();
-		expect(map?.planning).toBeNull();
-		expect(map?.executing).toBeNull();
-		expect(map?.verifying).toBeNull();
-		expect(map?.reporting).toBeNull();
-	});
-
-	it("resolves dual-model with actual model IDs", () => {
-		const map = resolvePreset("dual-model");
-		expect(map).not.toBeNull();
-		expect(map?.exploring).toBeNull();
-		expect(map?.planning).toBe("deepseek-v4-flash:cloud");
-		expect(map?.executing).toBe("glm-5.2:cloud");
-		expect(map?.verifying).toBe("minimax-m3:cloud");
-		expect(map?.reporting).toBe("gemma4:31b:cloud");
-	});
-
-	it("resolves escalation-only to all nulls", () => {
-		const resolved = resolvePreset("escalation-only");
-		expect(resolved).not.toBeNull();
-		if (!resolved) return;
-		for (const val of Object.values(resolved)) {
-			expect(val).toBeNull();
-		}
-	});
-
-	it("returns null for unknown preset name", () => {
-		expect(resolvePreset("nonexistent")).toBeNull();
-		expect(resolvePreset("")).toBeNull();
-	});
-
-	it("getPresetDescription returns descriptions for known presets", () => {
-		expect(getPresetDescription("fast-sonnet")).toContain("single fast model");
-		expect(getPresetDescription("dual-model")).toContain("Three tiers");
-		expect(getPresetDescription("escalation-only")).toContain("Minimal intervention");
-		expect(getPresetDescription("unknown")).toBeNull();
-	});
-
-	it("collectPhaseModels returns all non-null model IDs", () => {
-		const fastSonnet = resolvePreset("fast-sonnet");
-		expect(fastSonnet).not.toBeNull();
-		if (!fastSonnet) return;
-		expect(collectPhaseModels(fastSonnet)).toHaveLength(0);
-		const dualMap = resolvePreset("dual-model");
-		expect(dualMap).not.toBeNull();
-		if (!dualMap) return;
-		const dualModels = collectPhaseModels(dualMap);
-		expect(dualModels).toHaveLength(4);
-		expect(dualModels).toContain("deepseek-v4-flash:cloud");
-		expect(dualModels).toContain("glm-5.2:cloud");
-	});
-
-	it("resolvePreset is pure (same input, same output, different objects)", () => {
-		const a = resolvePreset("dual-model");
-		const b = resolvePreset("dual-model");
-		expect(a).toEqual(b);
-		expect(a).not.toBe(b);
 	});
 });
 
@@ -412,7 +337,7 @@ describe("autoInitSemblrSettings", () => {
 		expect(config.embeddingProvider).toBe("openrouter");
 	});
 
-	it("writes routing defaults into the auto-init section", () => {
+	it("writes routing defaults with phaseModels into the auto-init section", () => {
 		const fsImpl = fsFromFiles({
 			"/agent/settings.json": {},
 		});
@@ -423,25 +348,19 @@ describe("autoInitSemblrSettings", () => {
 		const routing = (settings.semblr as Record<string, unknown>).routing as Record<string, unknown>;
 		expect(routing).toBeDefined();
 		expect(routing.enabled).toBe(false);
-		expect(routing.maxSwitchesPerCycle).toBe(3);
+		expect(routing.maxSwitchesPerCycle).toBe(5);
 		expect(routing.minTurnsPerPhase).toBe(1);
+		expect(routing.phaseModels).toEqual({
+			exploring: null,
+			planning: "deepseek/deepseek-v4-flash@openrouter",
+			executing: "z-ai/glm-5.2@openrouter",
+			verifying: "minimax/minimax-m3@openrouter",
+			reporting: "google/gemma-4-31b-it@openrouter",
+		});
 	});
 });
 
 describe("routing config loading", () => {
-	it("loads routing.preset from settings.json", () => {
-		const config = loadSemblrConfig({
-			cwd: "/repo",
-			agentDir: "/agent",
-			env: {},
-			fsImpl: fsFromFiles({
-				"/repo/.pi/settings.json": { semblr: { routing: { preset: "dual-model" } } },
-			}),
-		});
-		expect(config.routing.preset).toBe("dual-model");
-		expect(config.routing.phaseModels.planning).toBe("deepseek-v4-flash:cloud");
-	});
-
 	it("loads routing.phaseModels from settings.json", () => {
 		const config = loadSemblrConfig({
 			cwd: "/repo",
@@ -466,50 +385,6 @@ describe("routing config loading", () => {
 		expect(config.routing.phaseModels.planning).toBe("custom-model:cloud");
 		expect(config.routing.phaseModels.reporting).toBe("custom-reporter:cloud");
 		expect(config.routing.phaseModels.exploring).toBeNull();
-	});
-
-	it("phaseModels takes precedence over preset with warning", () => {
-		const warnings: string[] = [];
-		const config = loadSemblrConfig({
-			cwd: "/repo",
-			agentDir: "/agent",
-			env: {},
-			fsImpl: fsFromFiles({
-				"/repo/.pi/settings.json": {
-					semblr: {
-						routing: {
-							preset: "dual-model",
-							phaseModels: {
-								exploring: null,
-								planning: "override:cloud",
-								executing: null,
-								verifying: null,
-								reporting: null,
-							},
-						},
-					},
-				},
-			}),
-			warn: (msg: string) => warnings.push(msg),
-		});
-		expect(config.routing.phaseModels.planning).toBe("override:cloud");
-		expect(warnings.some((w) => w.includes("preset") && w.includes("ignored"))).toBe(true);
-	});
-
-	it("warns on unknown preset name", () => {
-		const warnings: string[] = [];
-		const config = loadSemblrConfig({
-			cwd: "/repo",
-			agentDir: "/agent",
-			env: {},
-			fsImpl: fsFromFiles({
-				"/repo/.pi/settings.json": { semblr: { routing: { preset: "bogus-preset" } } },
-			}),
-			warn: (msg: string) => warnings.push(msg),
-		});
-		expect(config.routing.preset).toBeNull();
-		expect(Object.keys(config.routing.phaseModels)).toHaveLength(0);
-		expect(warnings.some((w) => w.includes("unknown preset"))).toBe(true);
 	});
 
 	it("loads numeric routing settings from settings.json", () => {
@@ -558,7 +433,7 @@ describe("routing config loading", () => {
 			fsImpl: fsFromFiles({}),
 			warn: (msg: string) => warnings.push(msg),
 		});
-		expect(config.routing.maxSwitchesPerCycle).toBe(3);
+		expect(config.routing.maxSwitchesPerCycle).toBe(5);
 		expect(warnings.some((w) => w.includes("maxSwitchesPerCycle"))).toBe(true);
 	});
 });
@@ -593,14 +468,13 @@ describe("validateRoutingConfig", () => {
 	it("falls back to defaults for negative numeric values", () => {
 		const warnings: string[] = [];
 		const result = validateRoutingConfig({ maxSwitchesPerCycle: -5 }, {}, (msg: string) => warnings.push(msg));
-		expect(result.maxSwitchesPerCycle).toBe(3);
+		expect(result.maxSwitchesPerCycle).toBe(5);
 		expect(warnings.length).toBeGreaterThan(0);
 	});
 
 	it("returns inert defaults for empty input", () => {
 		const result = validateRoutingConfig({}, {}, () => {});
 		expect(result.enabled).toBe(false);
-		expect(result.preset).toBeNull();
 		expect(Object.keys(result.phaseModels)).toHaveLength(0);
 	});
 
@@ -609,9 +483,22 @@ describe("validateRoutingConfig", () => {
 		expect(result.enabled).toBe(true);
 	});
 
-	it("resolves preset when no phaseModels are provided", () => {
-		const result = validateRoutingConfig({ preset: "dual-model" }, {}, () => {});
-		expect(result.phaseModels.planning).toBe("deepseek-v4-flash:cloud");
-		expect(result.phaseModels.executing).toBe("glm-5.2:cloud");
+	it("accepts phaseModels directly", () => {
+		const result = validateRoutingConfig(
+			{
+				phaseModels: {
+					exploring: null,
+					planning: "deepseek/deepseek-v4-flash@openrouter",
+					executing: "z-ai/glm-5.2@openrouter",
+					verifying: null,
+					reporting: "google/gemma-4-31b-it@openrouter",
+				},
+			},
+			{},
+			() => {},
+		);
+		expect(result.phaseModels.planning).toBe("deepseek/deepseek-v4-flash@openrouter");
+		expect(result.phaseModels.executing).toBe("z-ai/glm-5.2@openrouter");
+		expect(result.phaseModels.reporting).toBe("google/gemma-4-31b-it@openrouter");
 	});
 });

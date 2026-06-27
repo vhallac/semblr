@@ -2,7 +2,7 @@
  * routing-behavior.test.ts — Behavior tests for multi-model routing.
  *
  * Tests are derived from the specification (issue #86, comments #1 and #2):
- * - MVP_PHASE_MODEL_MAP from comment #2 (Ollama-Cloud naming)
+ * - MVP_PHASE_MODEL_MAP from comment #2 (explicit @provider syntax)
  * - Phase names from issue #86 comment #1: exploring, planning, executing, verifying, reporting
  * - Switch limiter: maxSwitches = 5 per agent cycle
  * - Config gating: default enabled = false
@@ -27,10 +27,10 @@ const ALL_PHASES: PhaseName[] = ["exploring", "planning", "executing", "verifyin
 /** Known target model IDs from the MVP map, indexed by phase (from comment #2). */
 const PHASE_MODEL_MAP: Record<PhaseName, string | null> = {
 	exploring: null,
-	planning: "deepseek-v4-flash:cloud",
-	executing: "glm-5.2:cloud",
-	verifying: "minimax-m3:cloud",
-	reporting: "gemma4:31b:cloud",
+	planning: "deepseek/deepseek-v4-flash@openrouter",
+	executing: "z-ai/glm-5.2@openrouter",
+	verifying: "minimax/minimax-m3@openrouter",
+	reporting: "google/gemma-4-31b-it@openrouter",
 };
 
 /** The default maxSwitchesPerCycle value. */
@@ -88,8 +88,8 @@ describe("resolveModelId behavioral edge cases", () => {
 		const mapValues = Object.values(MVP_PHASE_MODEL_MAP).filter((v): v is string => v !== null);
 		for (const modelId of mapValues) {
 			const resolved = resolveModelId(modelId);
-			expect(resolved.provider).toBe("ollama-cloud");
-			expect(resolved.model).not.toMatch(/:cloud$/);
+			expect(resolved.provider).toBe("openrouter");
+			expect(resolved.model.length).toBeGreaterThan(0);
 		}
 	});
 
@@ -100,7 +100,7 @@ describe("resolveModelId behavioral edge cases", () => {
 			if (modelId === null) continue;
 			const resolved = resolveModelId(modelId);
 			expect(resolved.model.length).toBeGreaterThan(0);
-			expect(resolved.provider).toBe("ollama-cloud");
+			expect(resolved.provider).toBe("openrouter");
 		}
 	});
 });
@@ -114,12 +114,12 @@ describe("phase model map behavior", () => {
 		expect(getModelForPhase("exploring", MVP_PHASE_MODEL_MAP)).toBeNull();
 	});
 
-	it("maps all non-exploring phases to a :cloud model ID", () => {
+	it("maps all non-exploring phases to an @provider model ID", () => {
 		const nonExploringPhases = ALL_PHASES.filter((p) => p !== "exploring");
 		for (const phase of nonExploringPhases) {
 			const modelId = getModelForPhase(phase, MVP_PHASE_MODEL_MAP);
 			expect(modelId).not.toBeNull();
-			expect(modelId).toMatch(/:cloud$/);
+			expect(modelId).toMatch(/@\w+$/);
 		}
 	});
 
@@ -262,7 +262,7 @@ describe("switch counter behavior", () => {
 
 	it("same-model phase does not increment counter", () => {
 		// If the current model already matches the target, no switch needed
-		const decision = simulateRoutingDecision("executing", "glm-5.2:cloud", 0, DEFAULT_MAX_SWITCHES, true);
+		const decision = simulateRoutingDecision("executing", "z-ai/glm-5.2@openrouter", 0, DEFAULT_MAX_SWITCHES, true);
 		expect(decision.shouldSwitch).toBe(false);
 		expect(decision.newCounter).toBe(0);
 	});
@@ -283,9 +283,9 @@ describe("switch counter behavior", () => {
 	});
 
 	it("maxSwitches value matches spec (5)", () => {
-		// Verify via config (note: actual default is 3; we simulate with 5 for test)
+		// Verify via config
 		const config = loadSemblrConfig({ cwd: "/", agentDir: "/agent", env: {}, fsImpl: { existsSync: () => false, readFileSync: () => "{}", writeFileSync: () => {} } });
-		expect(config.routing.maxSwitchesPerCycle).toBe(3);
+		expect(config.routing.maxSwitchesPerCycle).toBe(5);
 	});
 
 	it("switches blocked after maxSwitches even with different phases", () => {
@@ -325,7 +325,7 @@ describe("model switching logic", () => {
 	it("phase → same model → no switch, counter unchanged", () => {
 		const decision = simulateRoutingDecision(
 			"executing",
-			"glm-5.2:cloud", // already on the target
+			"z-ai/glm-5.2@openrouter", // already on the target
 			0,
 			DEFAULT_MAX_SWITCHES,
 			true,
@@ -337,13 +337,13 @@ describe("model switching logic", () => {
 	it("phase → different model → pending switch queued", () => {
 		const decision = simulateRoutingDecision(
 			"executing",
-			"default-model", // different from glm-5.2:cloud
+			"default-model", // different from z-ai/glm-5.2@openrouter
 			0,
 			DEFAULT_MAX_SWITCHES,
 			true,
 		);
 		expect(decision.shouldSwitch).toBe(true);
-		expect(decision.target).toBe("glm-5.2:cloud");
+		expect(decision.target).toBe("z-ai/glm-5.2@openrouter");
 		expect(decision.newCounter).toBe(1);
 	});
 
@@ -352,13 +352,13 @@ describe("model switching logic", () => {
 		// without executing it. In the real extension, semblr_report_phase sets
 		// pendingModelSwitch, and pi.setModel() is called at turn_end.
 		const decision = simulateRoutingDecision("verifying", "default-model", 0, DEFAULT_MAX_SWITCHES, true);
-		expect(decision.target).toBe("minimax-m3:cloud");
+		expect(decision.target).toBe("minimax/minimax-m3@openrouter");
 		expect(decision.shouldSwitch).toBe(true);
 		// The round's pendingModelSwitch would be set to the target
 		const round = createRound();
 		round.currentPhase = "verifying";
 		round.pendingModelSwitch = decision.target;
-		expect(round.pendingModelSwitch).toBe("minimax-m3:cloud");
+		expect(round.pendingModelSwitch).toBe("minimax/minimax-m3@openrouter");
 	});
 
 	it("multiple phase reports in same round → last reported phase wins", () => {
@@ -372,15 +372,15 @@ describe("model switching logic", () => {
 		round.pendingModelSwitch = getModelForPhase("executing", MVP_PHASE_MODEL_MAP);
 
 		expect(round.currentPhase).toBe("executing");
-		expect(round.pendingModelSwitch).toBe("glm-5.2:cloud");
+		expect(round.pendingModelSwitch).toBe("z-ai/glm-5.2@openrouter");
 	});
 
 	it("switch to each non-exploring phase produces expected target model", () => {
 		const modelMap: Record<string, string> = {
-			planning: "deepseek-v4-flash:cloud",
-			executing: "glm-5.2:cloud",
-			verifying: "minimax-m3:cloud",
-			reporting: "gemma4:31b:cloud",
+			planning: "deepseek/deepseek-v4-flash@openrouter",
+			executing: "z-ai/glm-5.2@openrouter",
+			verifying: "minimax/minimax-m3@openrouter",
+			reporting: "google/gemma-4-31b-it@openrouter",
 		};
 
 		for (const [phase, expectedModel] of Object.entries(modelMap)) {
@@ -449,7 +449,7 @@ describe("config gating", () => {
 			config.routing.enabled,
 		);
 		expect(decision.shouldSwitch).toBe(true);
-		expect(decision.target).toBe("glm-5.2:cloud");
+		expect(decision.target).toBe("z-ai/glm-5.2@openrouter");
 	});
 
 	it("default maxSwitches is 5 in config", () => {
@@ -459,7 +459,7 @@ describe("config gating", () => {
 			env: {},
 			fsImpl: { existsSync: () => false, readFileSync: () => "{}", writeFileSync: () => {} },
 		});
-		expect(config.routing.maxSwitchesPerCycle).toBe(3);
+		expect(config.routing.maxSwitchesPerCycle).toBe(5);
 	});
 
 	it("env var with invalid value falls back to disabled", () => {
@@ -501,7 +501,7 @@ describe("config gating", () => {
 			fsImpl: { existsSync: () => false, readFileSync: () => "{}", writeFileSync: () => {} },
 		});
 		expect(config2.routing.enabled).toBe(false);
-		expect(config2.routing.maxSwitchesPerCycle).toBe(3);
+		expect(config2.routing.maxSwitchesPerCycle).toBe(5);
 	});
 });
 
@@ -521,37 +521,37 @@ describe("integration: full agent cycle", () => {
 		expect(d.target).toBeNull();
 		expect(d.shouldSwitch).toBe(false);
 
-		// Phase 2: planning → switch to deepseek-v4-flash:cloud (switch 1)
+		// Phase 2: planning → switch to deepseek/deepseek-v4-flash@openrouter (switch 1)
 		d = simulateRoutingDecision("planning", currentModel, switchCounter, DEFAULT_MAX_SWITCHES, true);
-		expect(d.target).toBe("deepseek-v4-flash:cloud");
+		expect(d.target).toBe("deepseek/deepseek-v4-flash@openrouter");
 		expect(d.shouldSwitch).toBe(true);
 		switchCounter = d.newCounter;
 		currentModel = d.target!;
 
-		// Phase 3: executing → switch to glm-5.2:cloud (switch 2)
+		// Phase 3: executing → switch to z-ai/glm-5.2@openrouter (switch 2)
 		d = simulateRoutingDecision("executing", currentModel, switchCounter, DEFAULT_MAX_SWITCHES, true);
-		expect(d.target).toBe("glm-5.2:cloud");
+		expect(d.target).toBe("z-ai/glm-5.2@openrouter");
 		expect(d.shouldSwitch).toBe(true);
 		switchCounter = d.newCounter;
 		currentModel = d.target!;
 
-		// Phase 4: verifying → switch to minimax-m3:cloud (switch 3)
+		// Phase 4: verifying → switch to minimax/minimax-m3@openrouter (switch 3)
 		d = simulateRoutingDecision("verifying", currentModel, switchCounter, DEFAULT_MAX_SWITCHES, true);
-		expect(d.target).toBe("minimax-m3:cloud");
+		expect(d.target).toBe("minimax/minimax-m3@openrouter");
 		expect(d.shouldSwitch).toBe(true);
 		switchCounter = d.newCounter;
 		currentModel = d.target!;
 
-		// Phase 5: reporting → switch to gemma4:31b:cloud (switch 4)
+		// Phase 5: reporting → switch to google/gemma-4-31b-it@openrouter (switch 4)
 		d = simulateRoutingDecision("reporting", currentModel, switchCounter, DEFAULT_MAX_SWITCHES, true);
-		expect(d.target).toBe("gemma4:31b:cloud");
+		expect(d.target).toBe("google/gemma-4-31b-it@openrouter");
 		expect(d.shouldSwitch).toBe(true);
 		switchCounter = d.newCounter;
 		currentModel = d.target!;
 
-		// Phase 6: executing → switch to glm-5.2:cloud (switch 5 — maxSwitches reached)
+		// Phase 6: executing → switch to z-ai/glm-5.2@openrouter (switch 5 — maxSwitches reached)
 		d = simulateRoutingDecision("executing", currentModel, switchCounter, DEFAULT_MAX_SWITCHES, true);
-		expect(d.target).toBe("glm-5.2:cloud");
+		expect(d.target).toBe("z-ai/glm-5.2@openrouter");
 		expect(d.shouldSwitch).toBe(true);
 		switchCounter = d.newCounter;
 		currentModel = d.target!;
@@ -562,7 +562,7 @@ describe("integration: full agent cycle", () => {
 		expect(switchCounter).toBe(5);
 
 		// After maxSwitches=5 switches, model remains at the 5th target
-		expect(currentModel).toBe("glm-5.2:cloud");
+		expect(currentModel).toBe("z-ai/glm-5.2@openrouter");
 	});
 
 	it("full cycle without switch limit (maxSwitches raised) verifies complete map coverage", () => {
@@ -570,10 +570,10 @@ describe("integration: full agent cycle", () => {
 		const unlimitedMax = 10;
 		const transitions: Array<{ phase: PhaseName; expectedTarget: string | null }> = [
 			{ phase: "exploring", expectedTarget: null },
-			{ phase: "planning", expectedTarget: "deepseek-v4-flash:cloud" },
-			{ phase: "executing", expectedTarget: "glm-5.2:cloud" },
-			{ phase: "verifying", expectedTarget: "minimax-m3:cloud" },
-			{ phase: "reporting", expectedTarget: "gemma4:31b:cloud" },
+			{ phase: "planning", expectedTarget: "deepseek/deepseek-v4-flash@openrouter" },
+			{ phase: "executing", expectedTarget: "z-ai/glm-5.2@openrouter" },
+			{ phase: "verifying", expectedTarget: "minimax/minimax-m3@openrouter" },
+			{ phase: "reporting", expectedTarget: "google/gemma-4-31b-it@openrouter" },
 		];
 
 		let currentModel = "model-0";
@@ -588,7 +588,7 @@ describe("integration: full agent cycle", () => {
 			}
 		}
 
-		expect(currentModel).toBe("gemma4:31b:cloud");
+		expect(currentModel).toBe("google/gemma-4-31b-it@openrouter");
 		expect(counter).toBe(4);
 	})
 
@@ -613,16 +613,16 @@ describe("integration: full agent cycle", () => {
 		expect(decisions[2].shouldSwitch).toBe(false);  // already on glm
 		expect(decisions[3].shouldSwitch).toBe(true);   // switch to verifying model
 		expect(switchCounter).toBe(2);
-		expect(currentModel).toBe("minimax-m3:cloud");
+		expect(currentModel).toBe("minimax/minimax-m3@openrouter");
 	});
 
 	it("switch counter respects maxSwitches (5) within a single cycle", () => {
 		// Simulate a long cycle with many phase changes
 		const phases: PhaseName[] = [
-			"executing",  // 1: switch to glm-5.2
+			"executing",  // 1: switch to z-ai/glm-5.2
 			     // 2: switch to kimi-k2.6
-			"verifying",  // 3: switch to minimax-m3
-			"reporting",  // 4: switch to gemma4
+			"verifying",  // 3: switch to minimax/minimax-m3
+			"reporting",  // 4: switch to google/gemma-4-31b-it
 			"planning",   // 5: switch to deepseek (maxSwitches reached)
 			"exploring",  // no switch (null target)
 			"executing",  // blocked (counter == maxSwitches)
@@ -640,7 +640,7 @@ describe("integration: full agent cycle", () => {
 		}
 
 		expect(switchCounter).toBe(DEFAULT_MAX_SWITCHES);
-		expect(currentModel).toBe("glm-5.2:cloud"); // remains at executing model once switch limit is reached
+		expect(currentModel).toBe("z-ai/glm-5.2@openrouter"); // remains at executing model once switch limit is reached
 	});
 
 	it("multiple cycles reset the switch counter each round", () => {
@@ -648,9 +648,9 @@ describe("integration: full agent cycle", () => {
 		let currentModel = "model-0";
 		let switchCounter1 = 0;
 		switchCounter1 = simulateRoutingDecision("executing", currentModel, 0, DEFAULT_MAX_SWITCHES, true).newCounter;
-		currentModel = "glm-5.2:cloud";
+		currentModel = "z-ai/glm-5.2@openrouter";
 		switchCounter1 = simulateRoutingDecision(currentModel, switchCounter1, DEFAULT_MAX_SWITCHES, true).newCounter;
-		currentModel = "kimi-k2.6:cloud";
+		currentModel = "kimi-k2.6@ollama-cloud";
 
 		// Cycle 2 (new round) — counter resets
 		let switchCounter2 = 0;
@@ -659,14 +659,14 @@ describe("integration: full agent cycle", () => {
 		expect(d1.newCounter).toBe(1);
 	});
 
-	it("integration: verify model IDs at each step are valid ollama-cloud IDs", () => {
+	it("integration: verify model IDs at each step are valid openrouter IDs", () => {
 		const phaseSequence: PhaseName[] = ["planning", "executing", "verifying", "reporting"];
 
 		for (const phase of phaseSequence) {
 			const modelId = getModelForPhase(phase, MVP_PHASE_MODEL_MAP);
 			expect(modelId).not.toBeNull();
 			const resolved = resolveModelId(modelId!);
-			expect(resolved.provider).toBe("ollama-cloud");
+			expect(resolved.provider).toBe("openrouter");
 			expect(resolved.model.length).toBeGreaterThan(0);
 		}
 	});
@@ -724,8 +724,8 @@ describe("RoundState routing field behavior", () => {
 
 	it("can set pendingModelSwitch to a model ID", () => {
 		const round = createRound();
-		round.pendingModelSwitch = "glm-5.2:cloud";
-		expect(round.pendingModelSwitch).toBe("glm-5.2:cloud");
+		round.pendingModelSwitch = "z-ai/glm-5.2@openrouter";
+		expect(round.pendingModelSwitch).toBe("z-ai/glm-5.2@openrouter");
 	});
 
 	it("can reset pendingModelSwitch back to null", () => {
@@ -755,7 +755,7 @@ describe("RoundState routing field behavior", () => {
 		// Simulate the extension behavior: capture original model before setting pending switch
 		round.originalModel = { provider: "openai-codex", modelId: "gpt-5.5", thinkingLevel: "medium" };
 		round.currentPhase = "executing";
-		round.pendingModelSwitch = "glm-5.2:cloud";
+		round.pendingModelSwitch = "z-ai/glm-5.2@openrouter";
 		// originalModel should not change after first capture
 		expect(round.originalModel).toEqual({
 			provider: "openai-codex",
@@ -763,7 +763,7 @@ describe("RoundState routing field behavior", () => {
 			thinkingLevel: "medium",
 		});
 		expect(round.currentPhase).toBe("executing");
-		expect(round.pendingModelSwitch).toBe("glm-5.2:cloud");
+		expect(round.pendingModelSwitch).toBe("z-ai/glm-5.2@openrouter");
 	});
 
 	it("originalModel persists across phase changes within the same round", () => {
@@ -798,12 +798,12 @@ describe("RoundState routing field behavior", () => {
 
 		// Set up the round as the extension would
 		round.currentPhase = "executing";
-		round.pendingModelSwitch = "glm-5.2:cloud";
+		round.pendingModelSwitch = "z-ai/glm-5.2@openrouter";
 		round.switchCounter = 1;
 
 		// Now change phase without incrementing counter
 		round.currentPhase = "verifying";
-		round.pendingModelSwitch = "kimi-k2.6:cloud";
+		round.pendingModelSwitch = "kimi-k2.6@ollama-cloud";
 
 		expect(round.switchCounter).toBe(1); // unchanged
 		expect(round.currentPhase).toBe("verifying");
@@ -818,7 +818,7 @@ describe("turn_end switch + agent_end restore flow", () => {
 	it("semblr_report_phase captures originalModel and sets pendingModelSwitch", () => {
 		const round = createRound();
 		const originalModel = { provider: "openai-codex", modelId: "gpt-5.5", thinkingLevel: "medium" } as const;
-		const targetModelId = "glm-5.2:cloud";
+		const targetModelId = "z-ai/glm-5.2@openrouter";
 
 		// Simulate semblr_report_phase("executing"):
 		// 1. Capture original model on first call
@@ -845,14 +845,14 @@ describe("turn_end switch + agent_end restore flow", () => {
 			round.originalModel = { provider: "openai-codex", modelId: "gpt-5.5", thinkingLevel: "medium" };
 		}
 		round.currentPhase = "planning";
-		round.pendingModelSwitch = "deepseek-v4-flash:cloud";
+		round.pendingModelSwitch = "deepseek/deepseek-v4-flash@openrouter";
 
 		// Second call: originalModel should NOT be overwritten
 		if (round.originalModel === null) {
 			round.originalModel = { provider: "wrong-provider", modelId: "wrong-model", thinkingLevel: "high" }; // would not execute
 		}
 		round.currentPhase = "executing";
-		round.pendingModelSwitch = "glm-5.2:cloud";
+		round.pendingModelSwitch = "z-ai/glm-5.2@openrouter";
 
 		expect(round.originalModel).toEqual({
 			provider: "openai-codex",
@@ -860,15 +860,15 @@ describe("turn_end switch + agent_end restore flow", () => {
 			thinkingLevel: "medium",
 		}); // preserved
 		expect(round.currentPhase).toBe("executing");
-		expect(round.pendingModelSwitch).toBe("glm-5.2:cloud");
+		expect(round.pendingModelSwitch).toBe("z-ai/glm-5.2@openrouter");
 	});
 
 	it("turn_end clears pendingModelSwitch after the switch is applied", () => {
 		const round = createRound();
-		round.pendingModelSwitch = "glm-5.2:cloud";
+		round.pendingModelSwitch = "z-ai/glm-5.2@openrouter";
 
 		// Simulate turn_end: apply switch, then clear pending
-		expect(round.pendingModelSwitch).toBe("glm-5.2:cloud");
+		expect(round.pendingModelSwitch).toBe("z-ai/glm-5.2@openrouter");
 		round.pendingModelSwitch = null; // turn_end clears it
 
 		expect(round.pendingModelSwitch).toBeNull();
@@ -932,7 +932,7 @@ describe("turn_end switch + agent_end restore flow", () => {
 			round.originalModel = { provider: "openai-codex", modelId: "gpt-5.5", thinkingLevel: "medium" };
 		}
 		round.currentPhase = "executing";
-		const target = "glm-5.2:cloud";
+		const target = "z-ai/glm-5.2@openrouter";
 		round.pendingModelSwitch = target;
 		round.switchCounter = 1;
 

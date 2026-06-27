@@ -319,6 +319,127 @@ describe("getRelatedParentIdFromGroup", () => {
 });
 
 describe("applyMessageEndToState", () => {
+	/**
+	 * Helper: create a state seeded with tool calls created from a single
+	 * assistant message containing multiple tool_call blocks.
+	 */
+	function seedToolCalls(
+		calls: Array<{ name: string; id: string; args: Record<string, unknown> }>,
+	): MessageEndProcessingState {
+		const state: MessageEndProcessingState = {
+			accumulatedText: [],
+			toolCallCount: 0,
+			toolCallNames: [],
+			toolCalls: [],
+			responseSegments: [],
+		};
+		applyMessageEndToState(
+			{
+				role: "assistant",
+				content: calls.map((c) => ({
+					type: "toolCall",
+					name: c.name,
+					id: c.id,
+					arguments: c.args,
+				})),
+			},
+			state,
+		);
+		return state;
+	}
+
+	/**
+	 * Helper: deliver a tool result to the state.
+	 */
+	function deliverToolResult(state: MessageEndProcessingState, toolCallId: string, resultText: string): void {
+		applyMessageEndToState(
+			{
+				role: "toolResult",
+				toolCallId,
+				content: [{ type: "text", text: resultText }],
+			},
+			state,
+		);
+	}
+
+	it("BUG: mismatches results when they arrive in forward order for multiple calls", () => {
+		// Simulate 4 parallel bash calls from one assistant message.
+		// If results arrive in FORWARD (call) order, the backward sequential
+		// matcher pairs result[0] with the LAST empty call, causing a cascade
+		// of mismatches.
+		const state = seedToolCalls([
+			{ name: "bash", id: "tc-0", args: { command: "echo SSH" } },
+			{ name: "bash", id: "tc-1", args: { command: "echo DNS" } },
+			{ name: "bash", id: "tc-2", args: { command: "echo LOCAL" } },
+			{ name: "bash", id: "tc-3", args: { command: "echo WEB" } },
+		]);
+
+		// Results arrive in call order (or any order that isn't reverse)
+		deliverToolResult(state, "tc-0", "SSH config matches");
+		deliverToolResult(state, "tc-1", "DNS records");
+		deliverToolResult(state, "tc-2", "Local file matches");
+		deliverToolResult(state, "tc-3", "Web search results");
+
+		// The code uses backwards sequential matching — it assigns to the
+		// LAST call without a result. With forward-order results, every
+		// result goes to the wrong call.
+		// Expected: each call has its own result
+		// Actual: results are shifted due to position-based matching
+		expect(state.toolCalls[0].arguments).toContain("echo SSH");
+		expect(state.toolCalls[0].result_full).toBe("SSH config matches");
+
+		expect(state.toolCalls[1].arguments).toContain("echo DNS");
+		expect(state.toolCalls[1].result_full).toBe("DNS records");
+
+		expect(state.toolCalls[2].arguments).toContain("echo LOCAL");
+		expect(state.toolCalls[2].result_full).toBe("Local file matches");
+
+		expect(state.toolCalls[3].arguments).toContain("echo WEB");
+		expect(state.toolCalls[3].result_full).toBe("Web search results");
+	});
+
+	it("correctly pairs results when they arrive in reverse order", () => {
+		// The current sequential matcher happens to work for reverse-order
+		// results (last result first). This test confirms that case.
+		const state = seedToolCalls([
+			{ name: "bash", id: "tc-0", args: { command: "echo A" } },
+			{ name: "bash", id: "tc-1", args: { command: "echo B" } },
+			{ name: "bash", id: "tc-2", args: { command: "echo C" } },
+		]);
+
+		// Reverse order delivery
+		deliverToolResult(state, "tc-2", "Result C");
+		deliverToolResult(state, "tc-1", "Result B");
+		deliverToolResult(state, "tc-0", "Result A");
+
+		expect(state.toolCalls[0].result_full).toBe("Result A");
+		expect(state.toolCalls[1].result_full).toBe("Result B");
+		expect(state.toolCalls[2].result_full).toBe("Result C");
+	});
+
+	it("BUG: ignores toolCallId when pairing results", () => {
+		// The toolCallId is extracted from the toolResult message but never
+		// used for matching — the code always uses position-based lookup.
+		// Even when delivering results to calls with unambiguous IDs,
+		// forward-order delivery produces mismatches.
+		const state = seedToolCalls([
+			{ name: "bash", id: "aaa", args: { command: "cmd-aaa" } },
+			{ name: "bash", id: "bbb", args: { command: "cmd-bbb" } },
+		]);
+
+		// Forward order — the toolCallId is correct but ignored
+		deliverToolResult(state, "aaa", "output-of-aaa");
+		deliverToolResult(state, "bbb", "output-of-bbb");
+
+		// The backward sequential matcher assigns "output-of-aaa" to the
+		// last empty call (bbb), and "output-of-bbb" to aaa.
+		// This is wrong even though the IDs clearly disambiguate.
+		expect(state.toolCalls[0].arguments).toContain("cmd-aaa");
+		expect(state.toolCalls[0].result_full).toBe("output-of-aaa");
+
+		expect(state.toolCalls[1].arguments).toContain("cmd-bbb");
+		expect(state.toolCalls[1].result_full).toBe("output-of-bbb");
+	});
 	it("handles null/undefined message", () => {
 		const state: MessageEndProcessingState = {
 			accumulatedText: [],

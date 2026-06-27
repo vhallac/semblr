@@ -74,14 +74,7 @@ import {
 	type SearchInteractionsParams,
 	selectContextRounds,
 } from "../lib/search-interactions.ts";
-import {
-	getPresetDescription,
-	loadSemblrConfig,
-	type PhaseName,
-	PRESET_NAMES,
-	resolvePreset,
-	type SemblrConfig,
-} from "../lib/semblr-config.ts";
+import { loadSemblrConfig, type PhaseName, type SemblrConfig } from "../lib/semblr-config.ts";
 import type { CheckpointSummary, ToolCallDetail } from "../lib/state.ts";
 import {
 	contextCacheSnapshot,
@@ -1712,7 +1705,7 @@ export default function (pi: ExtensionAPI) {
 
 		// Register /semblr:routing — multi-model routing control
 		pi.registerCommand("semblr:routing", {
-			description: "Control multi-model routing: on, off, status, or preset <name>",
+			description: "Control multi-model routing: on, off, status",
 			handler: async (args, commandCtx) => {
 				const tokens = splitCommandArgs(args.trim());
 				const subcommand = tokens[0]?.toLowerCase() ?? "";
@@ -1734,18 +1727,12 @@ export default function (pi: ExtensionAPI) {
 						const lines: string[] = [];
 						lines.push(`\u{1f500} Semblr Routing — ${active ? "ACTIVE" : "INACTIVE"}`);
 
-						if (SEMBLR_CONFIG.routing.preset) {
-							lines.push(`   Preset:   ${SEMBLR_CONFIG.routing.preset}`);
-							const desc = getPresetDescription(SEMBLR_CONFIG.routing.preset);
-							if (desc) lines.push(`             ${desc}`);
-						}
-
 						const phases = Object.entries(SEMBLR_CONFIG.routing.phaseModels)
 							.filter(([, model]) => model !== null)
 							.map(([phase, model]) => `${phase}\u2192${model}`);
 						if (phases.length > 0) {
 							lines.push(`   Phases:   ${phases.join(", ")}`);
-						} else if (!SEMBLR_CONFIG.routing.preset) {
+						} else {
 							lines.push("   Phases:   (none configured — no switches will occur)");
 						}
 
@@ -1762,38 +1749,8 @@ export default function (pi: ExtensionAPI) {
 						commandCtx.ui.notify(lines.join("\n"), "info");
 						break;
 					}
-					case "preset": {
-						const presetName = tokens[1] ?? "";
-						if (!presetName) {
-							commandCtx.ui.notify(
-								"Usage: /semblr:routing preset <name>\nAvailable presets: " + PRESET_NAMES.join(", "),
-								"error",
-							);
-							break;
-						}
-						const resolved = resolvePreset(presetName);
-						if (!resolved) {
-							commandCtx.ui.notify(
-								`Unknown preset "${presetName}". Available: ${PRESET_NAMES.join(", ")}`,
-								"error",
-							);
-							break;
-						}
-						// Apply the preset: update both config and session state
-						(SEMBLR_CONFIG.routing as unknown as Record<string, unknown>).preset = presetName;
-						(SEMBLR_CONFIG.routing as unknown as Record<string, unknown>).phaseModels = resolved;
-						const desc = getPresetDescription(presetName);
-						const phases = Object.entries(resolved)
-							.filter(([, model]) => model !== null)
-							.map(([phase, model]) => `${phase}\u2192${model}`);
-						commandCtx.ui.notify(
-							`\u{1f500} Preset set to "${presetName}"${desc ? ` — ${desc}` : ""}\n   ${phases.join(", ") || "(no switches — all 'current')"}`,
-							"info",
-						);
-						break;
-					}
 					default: {
-						commandCtx.ui.notify("Usage: /semblr:routing [on|off|status|preset <name>]", "error");
+						commandCtx.ui.notify("Usage: /semblr:routing [on|off|status]", "error");
 						break;
 					}
 				}

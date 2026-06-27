@@ -12,19 +12,11 @@ export type PhaseName = "exploring" | "planning" | "executing" | "verifying" | "
 /** Map from phase to model ID. `null` means stay on the current model. */
 export type PhaseModelMap = Record<PhaseName, string | null>;
 
-/** Named preset identifiers. */
-export type PresetName = "fast-sonnet" | "dual-model" | "escalation-only";
-
-/** All known preset names. */
-export const PRESET_NAMES: readonly PresetName[] = ["fast-sonnet", "dual-model", "escalation-only"] as const;
-
 /** Configuration for multi-model routing. */
 export interface RoutingConfig {
 	/** Opt-in toggle. Default false. */
 	enabled: boolean;
-	/** Named preset. Null = use phaseModels directly. */
-	preset: PresetName | null;
-	/** Per-phase model mapping. Overrides preset if both are set. */
+	/** Per-phase model mapping. */
 	phaseModels: PhaseModelMap;
 	/** Max model switches per agent cycle. */
 	maxSwitchesPerCycle: number;
@@ -37,50 +29,15 @@ export interface RoutingConfig {
 /** Inert routing config (disabled, no switches). Used when config validation fails. */
 const DISABLED_ROUTING_CONFIG: RoutingConfig = {
 	enabled: false,
-	preset: null,
 	phaseModels: {} as PhaseModelMap,
 	maxSwitchesPerCycle: 0,
 	minTurnsPerPhase: 0,
 	agentCycleTimeoutSec: 0,
 };
 
-/** Preset phase→model mappings. "current" values are resolved to null at load time. */
-const PRESET_REGISTRY: Record<PresetName, Record<PhaseName, string | "current">> = {
-	"fast-sonnet": {
-		exploring: "current",
-		planning: "current",
-		executing: "current",
-		verifying: "current",
-		reporting: "current",
-	},
-	"dual-model": {
-		exploring: "current",
-		planning: "deepseek-v4-flash:cloud",
-		executing: "glm-5.2:cloud",
-		verifying: "minimax-m3:cloud",
-		reporting: "gemma4:31b:cloud",
-	},
-	"escalation-only": {
-		exploring: "current",
-		planning: "current",
-		executing: "current",
-		verifying: "current",
-		reporting: "current",
-	},
-};
-
-/** Preset descriptions (for documentation and command output). */
-const PRESET_DESCRIPTIONS: Record<PresetName, string> = {
-	"fast-sonnet": "Route everything through a single fast model. Zero switching cost, zero overhead.",
-	"dual-model":
-		"Exploration and reporting on a cheap/fast model, execution on a mid-tier model, escalation when stuck. Three tiers, cost-conscious.",
-	"escalation-only":
-		"Minimal intervention. Only switches when the LLM reports it's stuck — otherwise stays on the user's chosen model.",
-};
-
 /** Default routing config values. */
 const ROUTING_DEFAULTS = {
-	maxSwitchesPerCycle: 3,
+	maxSwitchesPerCycle: 5,
 	minTurnsPerPhase: 1,
 	agentCycleTimeoutSec: 0,
 } as const;
@@ -296,33 +253,6 @@ function parseNonNegativeInt(
 	return defaultValue;
 }
 
-/** Resolves a preset name into a PhaseModelMap. Handles "current" → null mapping. */
-export function resolvePreset(presetName: string): PhaseModelMap | null {
-	if (!isPresetName(presetName)) return null;
-	const preset = PRESET_REGISTRY[presetName];
-	const map: Partial<PhaseModelMap> = {};
-	for (const phase of Object.keys(preset) as PhaseName[]) {
-		const val = preset[phase];
-		map[phase] = val === "current" ? null : val;
-	}
-	return map as PhaseModelMap;
-}
-
-function isPresetName(name: string): name is PresetName {
-	return (PRESET_NAMES as readonly string[]).includes(name);
-}
-
-/** Returns the preset description for a given preset name, or null if unknown. */
-export function getPresetDescription(name: string): string | null {
-	if (!isPresetName(name)) return null;
-	return PRESET_DESCRIPTIONS[name];
-}
-
-/** Returns the set of all model IDs referenced in a PhaseModelMap (excluding nulls). */
-export function collectPhaseModels(map: PhaseModelMap): string[] {
-	return Object.values(map).filter((v): v is string => v !== null);
-}
-
 /**
  * Validate routing config at load time. Returns validated RoutingConfig and a
  * list of warnings. If the config is unrecoverable, returns the inert disabled config.
@@ -339,30 +269,11 @@ export function validateRoutingConfig(
 	// ── Resolve enabled ──
 	const enabled = resolveBoolean(env.SEMBLR_ROUTING_ENABLED, raw.enabled ?? DISABLED_ROUTING_CONFIG.enabled);
 
-	// ── Resolve preset vs phaseModels ──
-	let preset: PresetName | null = raw.preset ?? null;
-	let phaseModels: PhaseModelMap =
+	// ── Resolve phaseModels directly (no preset layer) ──
+	const phaseModels: PhaseModelMap =
 		raw.phaseModels && Object.keys(raw.phaseModels).length > 0
 			? (raw.phaseModels as PhaseModelMap)
 			: ({} as PhaseModelMap);
-
-	// If both preset and phaseModels are set, phaseModels takes precedence
-	if (preset !== null && Object.keys(phaseModels).length > 0) {
-		warn(`Routing config: both 'preset' ("${preset}") and 'phaseModels' are set — 'preset' will be ignored.`);
-		preset = null;
-	}
-
-	// Resolve preset if set (and not overridden by phaseModels)
-	if (preset !== null && Object.keys(phaseModels).length === 0) {
-		const resolved = resolvePreset(preset);
-		if (resolved === null) {
-			warn(`Routing config: unknown preset "${preset}" — falling back to empty phaseModels.`);
-			preset = null;
-			phaseModels = {} as PhaseModelMap;
-		} else {
-			phaseModels = resolved;
-		}
-	}
 
 	// ── Validate numeric settings ──
 	const maxSwitchesPerCycle = parseNonNegativeInt(
@@ -399,7 +310,6 @@ export function validateRoutingConfig(
 
 	return {
 		enabled,
-		preset,
 		phaseModels,
 		maxSwitchesPerCycle,
 		minTurnsPerPhase,
@@ -457,8 +367,13 @@ function autoInitSemblrSettings(
 		summaryThresholdExtra: DEFAULTS.summaryThresholdExtra,
 		routing: {
 			enabled: false,
-			preset: null,
-			phaseModels: {},
+			phaseModels: {
+				exploring: null,
+				planning: "deepseek/deepseek-v4-flash@openrouter",
+				executing: "z-ai/glm-5.2@openrouter",
+				verifying: "minimax/minimax-m3@openrouter",
+				reporting: "google/gemma-4-31b-it@openrouter",
+			},
 			maxSwitchesPerCycle: ROUTING_DEFAULTS.maxSwitchesPerCycle,
 			minTurnsPerPhase: ROUTING_DEFAULTS.minTurnsPerPhase,
 			agentCycleTimeoutSec: ROUTING_DEFAULTS.agentCycleTimeoutSec,
@@ -543,7 +458,6 @@ function resolveRouting(
 	return validateRoutingConfig(
 		{
 			enabled: typeof routingSettings.enabled === "boolean" ? routingSettings.enabled : undefined,
-			preset: typeof routingSettings.preset === "string" ? (routingSettings.preset as PresetName | null) : null,
 			phaseModels: isRecord(routingSettings.phaseModels)
 				? (routingSettings.phaseModels as unknown as PhaseModelMap)
 				: undefined,
