@@ -2,6 +2,41 @@ import { describe, expect, it } from "vitest";
 import { resolveModelId } from "./resolve-model-id.ts";
 
 describe("resolveModelId", () => {
+	// ── New {model}@{provider} syntax ──
+
+	it("parses {model}@{provider} syntax", () => {
+		expect(resolveModelId("glm-5.2@ollama-cloud")).toEqual({ provider: "ollama-cloud", model: "glm-5.2" });
+		expect(resolveModelId("kimi-k2.6@ollama-cloud")).toEqual({ provider: "ollama-cloud", model: "kimi-k2.6" });
+		expect(resolveModelId("anthropic/claude-sonnet@openai")).toEqual({
+			provider: "openai",
+			model: "anthropic/claude-sonnet",
+		});
+	});
+
+	it("parses @ syntax with arbitrary providers", () => {
+		expect(resolveModelId("gpt-4@openai")).toEqual({ provider: "openai", model: "gpt-4" });
+		expect(resolveModelId("claude@anthropic")).toEqual({ provider: "anthropic", model: "claude" });
+		expect(resolveModelId("gemma@local")).toEqual({ provider: "local", model: "gemma" });
+	});
+
+	it("handles @ at start (empty model)", () => {
+		expect(resolveModelId("@provider")).toEqual({ provider: "provider", model: "" });
+	});
+
+	it("handles @ at end (empty provider)", () => {
+		expect(resolveModelId("model@")).toEqual({ provider: "", model: "model" });
+	});
+
+	it("handles only @", () => {
+		expect(resolveModelId("@")).toEqual({ provider: "", model: "" });
+	});
+
+	it("splits on first @ only", () => {
+		expect(resolveModelId("model@provider@extra")).toEqual({ provider: "provider@extra", model: "model" });
+	});
+
+	// ── Backward-compat: :cloud suffix ──
+
 	it("strips :cloud suffix and returns ollama provider", () => {
 		expect(resolveModelId("glm-5.2:cloud")).toEqual({ provider: "ollama-cloud", model: "glm-5.2" });
 		expect(resolveModelId("kimi-k2.6:cloud")).toEqual({ provider: "ollama-cloud", model: "kimi-k2.6" });
@@ -73,5 +108,12 @@ describe("resolveModelId", () => {
 		expect(nonCloudResult.provider).toBe("ollama-cloud");
 		expect(cloudResult.model).toBe("gpt-4");
 		expect(nonCloudResult.model).toBe("gpt-4");
+	});
+
+	// ── @ syntax takes priority over :cloud ──
+
+	it("@ syntax takes priority over :cloud when both are present", () => {
+		expect(resolveModelId("model@provider:cloud")).toEqual({ provider: "provider:cloud", model: "model" });
+		expect(resolveModelId("model:cloud@provider")).toEqual({ provider: "provider", model: "model:cloud" });
 	});
 });

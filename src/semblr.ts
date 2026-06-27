@@ -74,7 +74,14 @@ import {
 	type SearchInteractionsParams,
 	selectContextRounds,
 } from "../lib/search-interactions.ts";
-import { loadSemblrConfig, type PhaseName, type SemblrConfig } from "../lib/semblr-config.ts";
+import {
+	getPresetDescription,
+	loadSemblrConfig,
+	type PhaseName,
+	PRESET_NAMES,
+	resolvePreset,
+	type SemblrConfig,
+} from "../lib/semblr-config.ts";
 import type { CheckpointSummary, ToolCallDetail } from "../lib/state.ts";
 import {
 	contextCacheSnapshot,
@@ -153,7 +160,7 @@ const INDEX_PATH = SEMBLR_CONFIG.indexPath;
 const SEMBLR_DIR = path.dirname(ROUNDS_DIR);
 const STATS_PATH = path.join(SEMBLR_DIR, "chain-read-stats.json");
 const EMBEDDING_RESPONSE_MAX_BYTES = embeddingMaxTokensToResponseBytes(SEMBLR_CONFIG.embeddingMaxTokens);
-const ROUTING_INSTRUCTIONS = SEMBLR_CONFIG.multiModelRouting.enabled ? buildRoutingInstructions() : null;
+const ROUTING_INSTRUCTIONS = SEMBLR_CONFIG.routing.enabled ? buildRoutingInstructions() : null;
 
 // ◈ Causal-chain read statistics — global, never injected into context
 //   Tracks all 5 causal-chain display positions (1-5, where 1 = most recent round).
@@ -894,7 +901,8 @@ export default function (pi: ExtensionAPI) {
 	// semblr_report_phase during the turn, the pending switch is applied
 	// here so the next turn (or next round) starts on the correct model.
 	pi.on("turn_end", async (_event, ctx) => {
-		if (!SEMBLR_CONFIG.multiModelRouting.enabled) return;
+		const routingActive = session.routingEnabled ?? SEMBLR_CONFIG.routing.enabled;
+		if (!routingActive) return;
 		if (!round.pendingModelSwitch) return;
 
 		const targetModel = round.pendingModelSwitch;
@@ -913,7 +921,7 @@ export default function (pi: ExtensionAPI) {
 				const ok = await pi.setModel(modelObj);
 				if (ok) {
 					ctx.ui.notify(
-						`[Multi-model] Switching to ${targetModel} for ${phase} phase (switch ${round.switchCounter}/${SEMBLR_CONFIG.multiModelRouting.maxSwitches})`,
+						`[Multi-model] Switching to ${targetModel} for ${phase} phase (switch ${round.switchCounter}/${SEMBLR_CONFIG.routing.maxSwitchesPerCycle})`,
 						"info",
 					);
 				} else {
@@ -930,7 +938,8 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	async function restoreOriginalModel(ctx: ExtensionContext): Promise<void> {
-		if (!SEMBLR_CONFIG.multiModelRouting.enabled || !round.originalModel) return;
+		const routingActive = session.routingEnabled ?? SEMBLR_CONFIG.routing.enabled;
+		if (!routingActive || !round.originalModel) return;
 
 		const original = round.originalModel;
 		const originalDisplay = `${original.provider}/${original.modelId}`;
@@ -1612,7 +1621,8 @@ export default function (pi: ExtensionAPI) {
 			async execute(_toolCallId, params, _signal, _onUpdate, ctx2) {
 				const { phase, note } = params as { phase: PhaseName; note?: string };
 
-				if (!SEMBLR_CONFIG.multiModelRouting.enabled) {
+				const routingActive = session.routingEnabled ?? SEMBLR_CONFIG.routing.enabled;
+				if (!routingActive) {
 					return {
 						content: [{ type: "text", text: "Multi-model routing is not enabled. Phase report ignored." }],
 						details: {},
@@ -1631,9 +1641,17 @@ export default function (pi: ExtensionAPI) {
 				// Store the reported phase and optional note on round state
 				round.currentPhase = phase;
 				round.phaseNote = note ?? null;
+				round.phaseHistory.push(phase);
+
+				// Update status bar with routing indicator
+				const modelShortName = ctx2.model?.id ?? "?";
+				ctx2.ui.setStatus(
+					"semblr-routing",
+					`\u{1f500} ${phase} (${modelShortName}) | Sw: ${round.switchCounter}/${SEMBLR_CONFIG.routing.maxSwitchesPerCycle}`,
+				);
 
 				// Look up the target model from the phase→model map
-				const targetModel = SEMBLR_CONFIG.multiModelRouting.phaseModelMap[phase];
+				const targetModel = SEMBLR_CONFIG.routing.phaseModels[phase];
 
 				// If target is null, no switch needed for this phase
 				if (targetModel === null) {
@@ -1663,8 +1681,9 @@ export default function (pi: ExtensionAPI) {
 				}
 
 				// Check switch limit — only count if we actually set a pending switch
-				if (round.switchCounter >= SEMBLR_CONFIG.multiModelRouting.maxSwitches) {
+				if (round.switchCounter >= SEMBLR_CONFIG.routing.maxSwitchesPerCycle) {
 					round.pendingModelSwitch = null;
+					round.switchLimitReached = true;
 					return {
 						content: [{ type: "text", text: `Phase recorded: ${phase}.` }],
 						details: {},
@@ -1688,6 +1707,96 @@ export default function (pi: ExtensionAPI) {
 			handler: async (_args, commandCtx) => {
 				const report = formatChainReadStatsReport(statsState, TRACK_POSITIONS);
 				commandCtx.ui.notify(report, "info");
+			},
+		});
+
+		// Register /semblr:routing — multi-model routing control
+		pi.registerCommand("semblr:routing", {
+			description: "Control multi-model routing: on, off, status, or preset <name>",
+			handler: async (args, commandCtx) => {
+				const tokens = splitCommandArgs(args.trim());
+				const subcommand = tokens[0]?.toLowerCase() ?? "";
+
+				switch (subcommand) {
+					case "on": {
+						session.routingEnabled = true;
+						commandCtx.ui.notify("\u{1f500} Multi-model routing: ON", "info");
+						break;
+					}
+					case "off": {
+						session.routingEnabled = false;
+						round.pendingModelSwitch = null;
+						commandCtx.ui.notify("\u{1f500} Multi-model routing: OFF", "info");
+						break;
+					}
+					case "status": {
+						const active = session.routingEnabled ?? SEMBLR_CONFIG.routing.enabled;
+						const lines: string[] = [];
+						lines.push(`\u{1f500} Semblr Routing — ${active ? "ACTIVE" : "INACTIVE"}`);
+
+						if (SEMBLR_CONFIG.routing.preset) {
+							lines.push(`   Preset:   ${SEMBLR_CONFIG.routing.preset}`);
+							const desc = getPresetDescription(SEMBLR_CONFIG.routing.preset);
+							if (desc) lines.push(`             ${desc}`);
+						}
+
+						const phases = Object.entries(SEMBLR_CONFIG.routing.phaseModels)
+							.filter(([, model]) => model !== null)
+							.map(([phase, model]) => `${phase}\u2192${model}`);
+						if (phases.length > 0) {
+							lines.push(`   Phases:   ${phases.join(", ")}`);
+						} else if (!SEMBLR_CONFIG.routing.preset) {
+							lines.push("   Phases:   (none configured — no switches will occur)");
+						}
+
+						lines.push(
+							`   Switches: ${round.switchCounter}/${SEMBLR_CONFIG.routing.maxSwitchesPerCycle} this cycle`,
+						);
+						if (round.phaseHistory.length > 0) {
+							lines.push(`   History:  ${round.phaseHistory.join(" \u2192 ")}`);
+						}
+						if (round.switchLimitReached) {
+							lines.push("   Limit:    switch limit reached this cycle");
+						}
+
+						commandCtx.ui.notify(lines.join("\n"), "info");
+						break;
+					}
+					case "preset": {
+						const presetName = tokens[1] ?? "";
+						if (!presetName) {
+							commandCtx.ui.notify(
+								"Usage: /semblr:routing preset <name>\nAvailable presets: " + PRESET_NAMES.join(", "),
+								"error",
+							);
+							break;
+						}
+						const resolved = resolvePreset(presetName);
+						if (!resolved) {
+							commandCtx.ui.notify(
+								`Unknown preset "${presetName}". Available: ${PRESET_NAMES.join(", ")}`,
+								"error",
+							);
+							break;
+						}
+						// Apply the preset: update both config and session state
+						(SEMBLR_CONFIG.routing as unknown as Record<string, unknown>).preset = presetName;
+						(SEMBLR_CONFIG.routing as unknown as Record<string, unknown>).phaseModels = resolved;
+						const desc = getPresetDescription(presetName);
+						const phases = Object.entries(resolved)
+							.filter(([, model]) => model !== null)
+							.map(([phase, model]) => `${phase}\u2192${model}`);
+						commandCtx.ui.notify(
+							`\u{1f500} Preset set to "${presetName}"${desc ? ` — ${desc}` : ""}\n   ${phases.join(", ") || "(no switches — all 'current')"}`,
+							"info",
+						);
+						break;
+					}
+					default: {
+						commandCtx.ui.notify("Usage: /semblr:routing [on|off|status|preset <name>]", "error");
+						break;
+					}
+				}
 			},
 		});
 	});

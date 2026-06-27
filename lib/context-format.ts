@@ -382,15 +382,10 @@ during, not after.
 
 Phases and when to report them:
 - **exploring**: pulling in external data by reading, searching, exploring.
-  No model switch (stays on current model).
 - **planning**: formulating a plan of response, structured thinking.
-  Routes to a fast distillation model.
 - **executing**: implementing a plan, writing code, making edits.
-  Routes to a high-capability coding model.
 - **verifying**: execution done, validating output and created files.
-  Routes to a thorough verification model.
 - **reporting**: done with work, about to deliver final output or summary.
-  Routes to a fast, lightweight model for formatting/summarization.
 
 Call \`semblr_report_phase\` with the phase that describes what you will do
 NEXT (not what you just did). Call it once per round — the last call before

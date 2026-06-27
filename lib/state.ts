@@ -58,6 +58,9 @@ export interface SessionState {
 	lastFollowupGroupIdx: number | null;
 	injectedFollowupRounds: Set<string>;
 	injectedCheckpointRounds: Set<string>;
+	/** Whether multi-model routing has been enabled for the current session.
+	 *  null = use config default; true/false = session override. */
+	routingEnabled: boolean | null;
 }
 
 export function createSession(): SessionState {
@@ -68,6 +71,7 @@ export function createSession(): SessionState {
 		lastFollowupGroupIdx: null,
 		injectedFollowupRounds: new Set(),
 		injectedCheckpointRounds: new Set(),
+		routingEnabled: null,
 	};
 }
 
@@ -113,6 +117,10 @@ export interface RoundState {
 	pendingModelSwitch: string | null;
 	/** Full model identity active when semblr_report_phase was first called (before any switch). */
 	originalModel: OriginalModelState | null;
+	/** Ordered history of reported phases this agent cycle (for status display). */
+	phaseHistory: PhaseName[];
+	/** Whether the switch limit has been reached this cycle. */
+	switchLimitReached: boolean;
 }
 
 export function createRound(): RoundState {
@@ -137,5 +145,7 @@ export function createRound(): RoundState {
 		phaseNote: null,
 		pendingModelSwitch: null,
 		originalModel: null,
+		phaseHistory: [],
+		switchLimitReached: false,
 	};
 }

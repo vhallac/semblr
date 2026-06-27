@@ -25,16 +25,19 @@ function testConfig(root: string): SemblrConfig {
 		embedMaxRetries: 3,
 		embedBackoffMs: 1000,
 		summaryThresholdExtra: 40_000,
-		multiModelRouting: {
+		routing: {
 			enabled: false,
-			maxSwitches: 3,
-			phaseModelMap: {
+			preset: null,
+			phaseModels: {
 				exploring: null,
-				planning: "deepseek-v4-flash:cloud",
-				executing: "glm-5.2:cloud",
-				verifying: "minimax-m3:cloud",
-				reporting: "gemma4:31b:cloud",
+				planning: null,
+				executing: null,
+				verifying: null,
+				reporting: null,
 			},
+			maxSwitchesPerCycle: 3,
+			minTurnsPerPhase: 1,
+			agentCycleTimeoutSec: 0,
 		},
 	};
 }
