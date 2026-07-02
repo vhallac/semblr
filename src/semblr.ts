@@ -894,12 +894,6 @@ export default function (pi: ExtensionAPI) {
 
 		// Build response text from accumulated assistant text across all tool iterations
 		const rawResponseText = extractAgentEndResponseText(round.accumulatedText, messages);
-
-		if (!rawResponseText) {
-			ctx.ui.setStatus("semblr", "\u{1f9e0} agent_end: no response text");
-			return;
-		}
-
 		// Detect and strip the round_needs_followup marker, flagging for follow-up
 		// injection on the next context assembly.
 		const { cleanedText: responseText, needsFollowup } = extractAndStripFollowupMarker(rawResponseText);

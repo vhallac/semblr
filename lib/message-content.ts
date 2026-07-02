@@ -5,7 +5,7 @@ export interface TextContentBlock {
 
 export function extractText(content: readonly TextContentBlock[]): string {
 	return content
-		.filter((c) => c.type === "text" && c.text)
-		.map((c) => c.text ?? "")
+		.filter((c) => (c.type === "text" || c.type === "thinking") && c.text)
+		.map((c) => (c.type === "thinking" ? `[thinking] ${c.text ?? ""} [/thinking]` : (c.text ?? "")))
 		.join(" ");
 }

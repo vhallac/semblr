@@ -31,4 +31,26 @@ describe("extractText", () => {
 	it("returns empty string for empty array", () => {
 		expect(extractText([])).toBe("");
 	});
+
+	// Bug #94: thinking-only blocks are silently dropped
+	it("extracts text from thinking blocks with [thinking] marker", () => {
+		const result = extractText([{ type: "thinking", text: "Let me reason about this..." }]);
+		expect(result).toBe("[thinking] Let me reason about this... [/thinking]");
+	});
+
+	it("extracts from mixed text and thinking blocks", () => {
+		const result = extractText([
+			{ type: "thinking", text: "I need to check something..." },
+			{ type: "text", text: "The answer is 42." },
+			{ type: "thinking", text: "Actually, double-checking..." },
+		]);
+		expect(result).toBe(
+			"[thinking] I need to check something... [/thinking] The answer is 42. [thinking] Actually, double-checking... [/thinking]",
+		);
+	});
+
+	it("skips thinking blocks without text", () => {
+		const result = extractText([{ type: "thinking" }]);
+		expect(result).toBe("");
+	});
 });
