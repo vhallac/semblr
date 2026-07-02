@@ -211,6 +211,56 @@ describe("pi session parsing", () => {
 		expect(parsePiSessionJsonl(raw, { now: () => 1 })).toHaveLength(1);
 	});
 
+	it("handles thinking blocks in assistant responses", () => {
+		const raw = [
+			line({
+				type: "message",
+				id: "u1",
+				message: { role: "user", timestamp: 10, content: [{ type: "text", text: "Think about it" }] },
+			}),
+			line({
+				type: "message",
+				message: {
+					role: "assistant",
+					content: [{ type: "thinking", text: "Hmm, let me think" }],
+				},
+			}),
+		].join("\n");
+
+		const [round] = parsePiSessionJsonl(raw, { now: () => 99 });
+
+		expect(round.responseSequence).toBe("[thinking] Hmm, let me think [/thinking]");
+		expect(round.responseSegments).toEqual([{ type: "text", text: "[thinking] Hmm, let me think [/thinking]" }]);
+	});
+
+	it("handles mixed text and thinking blocks", () => {
+		const raw = [
+			line({ type: "message", id: "u1", message: { role: "user", content: [{ type: "text", text: "Go" }] } }),
+			line({
+				type: "message",
+				message: {
+					role: "assistant",
+					content: [
+						{ type: "thinking", text: "Analyzing..." },
+						{ type: "text", text: "Here's the answer" },
+						{ type: "thinking", text: "Double-checking..." },
+					],
+				},
+			}),
+		].join("\n");
+
+		const [round] = parsePiSessionJsonl(raw, { now: () => 99 });
+
+		expect(round.responseSequence).toBe(
+			"[thinking] Analyzing... [/thinking]\n\nHere's the answer\n\n[thinking] Double-checking... [/thinking]",
+		);
+		expect(round.responseSegments).toEqual([
+			{ type: "text", text: "[thinking] Analyzing... [/thinking]" },
+			{ type: "text", text: "Here's the answer" },
+			{ type: "text", text: "[thinking] Double-checking... [/thinking]" },
+		]);
+	});
+
 	it("adds a session label when supplied", () => {
 		const raw = [
 			line({ type: "message", id: "u1", message: { role: "user", content: [{ type: "text", text: "Prompt" }] } }),

@@ -168,6 +168,20 @@ describe("extractAgentEndResponseText", () => {
 	it("returns empty string when nothing available", () => {
 		expect(extractAgentEndResponseText([])).toBe("");
 	});
+
+	// Bug #94: thinking-only messages fallback path must not return empty
+	it("extracts from messages with only thinking blocks", () => {
+		const messages = [
+			{ role: "user", content: "prompt" },
+			{
+				role: "assistant",
+				content: [{ type: "thinking", text: "Let me reason about this carefully..." }],
+			},
+		];
+		expect(extractAgentEndResponseText([], messages)).toBe(
+			"[thinking] Let me reason about this carefully... [/thinking]",
+		);
+	});
 });
 
 describe("buildAgentEndToolSummary", () => {
@@ -514,6 +528,84 @@ describe("applyMessageEndToState", () => {
 		// Instead, #0 should have "output-of-aaa" and #1 should have "output-of-bbb"
 		expect(state.toolCalls[0].result_summary).toBe("output-of-aaa");
 		expect(state.toolCalls[1].result_summary).toBe("output-of-bbb");
+	});
+
+	// Bug #94: thinking-only blocks are silently dropped
+	it("extracts text from assistant thinking blocks with [thinking] marker", () => {
+		const state: MessageEndProcessingState = {
+			accumulatedText: [],
+			toolCallCount: 0,
+			toolCallNames: [],
+			toolCalls: [],
+			responseSegments: [],
+		};
+		applyMessageEndToState(
+			{
+				role: "assistant",
+				content: [{ type: "thinking", text: "Let me reason about this..." }],
+			},
+			state,
+		);
+		expect(state.accumulatedText).toEqual(["[thinking] Let me reason about this... [/thinking]"]);
+		expect(state.responseSegments).toEqual([
+			{ type: "text", text: "[thinking] Let me reason about this... [/thinking]" },
+		]);
+	});
+
+	it("handles assistant messages with only thinking blocks (no text blocks)", () => {
+		const state: MessageEndProcessingState = {
+			accumulatedText: [],
+			toolCallCount: 0,
+			toolCallNames: [],
+			toolCalls: [],
+			responseSegments: [],
+		};
+		applyMessageEndToState(
+			{
+				role: "assistant",
+				content: [
+					{ type: "thinking", text: "Step 1: analyze..." },
+					{ type: "thinking", text: "Step 2: conclude..." },
+				],
+			},
+			state,
+		);
+		expect(state.accumulatedText).toEqual([
+			"[thinking] Step 1: analyze... [/thinking]",
+			"[thinking] Step 2: conclude... [/thinking]",
+		]);
+		expect(state.toolCallCount).toBe(0);
+	});
+
+	it("handles mixed text, thinking, and toolCall blocks", () => {
+		const state: MessageEndProcessingState = {
+			accumulatedText: [],
+			toolCallCount: 0,
+			toolCallNames: [],
+			toolCalls: [],
+			responseSegments: [],
+		};
+		applyMessageEndToState(
+			{
+				role: "assistant",
+				content: [
+					{ type: "thinking", text: "I should check..." },
+					{ type: "text", text: "Let me check." },
+					{ type: "toolCall", name: "bash", id: "tc1", arguments: { command: "ls" } },
+					{ type: "thinking", text: "Results look good." },
+					{ type: "text", text: "Done." },
+				],
+			},
+			state,
+		);
+		expect(state.accumulatedText).toEqual([
+			"[thinking] I should check... [/thinking]",
+			"Let me check.",
+			"[thinking] Results look good. [/thinking]",
+			"Done.",
+		]);
+		expect(state.toolCallCount).toBe(1);
+		expect(state.toolCalls).toHaveLength(1);
 	});
 
 	it("does not add duplicate tool call names", () => {

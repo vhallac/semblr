@@ -196,9 +196,10 @@ export function applyMessageEndToState(message: unknown, state: MessageEndProces
 		const content = msg.content as Array<{ type: string; text?: string }> | undefined;
 		if (Array.isArray(content)) {
 			for (const block of content) {
-				if (block.type === "text" && block.text) {
-					state.accumulatedText.push(block.text);
-					state.responseSegments.push({ type: "text", text: block.text });
+				if ((block.type === "text" || block.type === "thinking") && block.text) {
+					const text = block.type === "thinking" ? `[thinking] ${block.text} [/thinking]` : block.text;
+					state.accumulatedText.push(text);
+					state.responseSegments.push({ type: "text", text });
 				} else if (block.type === "toolCall") {
 					state.toolCallCount++;
 					const blockRec = block as Record<string, unknown>;
