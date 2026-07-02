@@ -127,9 +127,10 @@ export function parsePiSessionJsonl(raw: string, options: ParsePiSessionOptions 
 			toolCalls = [];
 		} else if (role === "assistant" && currentUserMsg && content) {
 			for (const block of content) {
-				if (block.type === "text" && typeof block.text === "string" && block.text) {
-					responseParts.push(block.text);
-					responseSegments.push({ type: "text", text: block.text });
+				if ((block.type === "text" || block.type === "thinking") && typeof block.text === "string" && block.text) {
+					const wrappedText = block.type === "thinking" ? `[thinking] ${block.text} [/thinking]` : block.text;
+					responseParts.push(wrappedText);
+					responseSegments.push({ type: "text", text: wrappedText });
 				} else if (block.type === "toolCall") {
 					toolCallCount++;
 					const name = typeof block.name === "string" ? block.name : undefined;
