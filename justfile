@@ -28,6 +28,12 @@ digest-session path:
     SEMBLR_ROUNDS_DIR="{{SEMBLR_ROUNDS_DIR}}" \
         npx tsx scripts/digest-session.ts {{path}}
 
+# Rebuild the tool-call fulltext index (index-tools.fulltext.csv) from existing
+# round files, without re-embedding. Safe to re-run.
+index-tools:
+    SEMBLR_ROUNDS_DIR="{{SEMBLR_ROUNDS_DIR}}" \
+        npx tsx scripts/digest-all.ts --tools-only
+
 # Import Claude Code history from ~/.claude/projects into the same Semblr index
 # Usage: just import-claude
 #        just import-claude --dry-run

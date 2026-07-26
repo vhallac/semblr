@@ -4,6 +4,7 @@ import * as path from "node:path";
 import { describe, expect, it, vi } from "vitest";
 import { computeContentHash } from "../lib/hash.ts";
 import { encodeVectorIndexLine, loadVectorIndex, readIndexLines } from "../lib/index-io.ts";
+import { loadToolIndex, toolIndexPathForRoundsDir } from "../lib/search-tools.ts";
 import { isMainModule, runDigestAll } from "./digest-all.ts";
 
 function tmpDir(): string {
@@ -558,5 +559,167 @@ describe("digest-all script", () => {
 		expect(isMainModule("file:///tmp/digest-all.ts", "/tmp/digest-all.ts")).toBe(true);
 		expect(isMainModule("file:///tmp/digest-all.ts", "/tmp/other.ts")).toBe(false);
 		expect(isMainModule("file:///tmp/digest-all.ts", "")).toBe(false);
+	});
+
+	describe("tool index", () => {
+		function writeSessionWithToolCall(filePath: string, userPrompt: string, finalText: string): void {
+			const entries: unknown[] = [
+				{ type: "message", id: "u0", message: { role: "user", content: [{ type: "text", text: userPrompt }] } },
+				{
+					type: "message",
+					id: "a0",
+					message: {
+						role: "assistant",
+						content: [
+							{
+								type: "toolCall",
+								id: "t1",
+								name: "bash",
+								arguments: { command: "curl https://api.github.com/repos/vhallac/semblr" },
+							},
+						],
+					},
+				},
+				{
+					type: "message",
+					id: "r0",
+					message: {
+						role: "toolResult",
+						toolName: "bash",
+						toolCallId: "t1",
+						content: [{ type: "text", text: "200 OK" }],
+					},
+				},
+				{
+					type: "message",
+					id: "a1",
+					message: { role: "assistant", content: [{ type: "text", text: finalText }] },
+				},
+			];
+			fs.writeFileSync(filePath, entries.map(line).join("\n"));
+		}
+
+		it("appends tool-call rows to the tool index while embedding", async () => {
+			const root = tmpDir();
+			const sessionsDir = path.join(root, "sessions");
+			const sDir = path.join(sessionsDir, "--test");
+			fs.mkdirSync(sDir, { recursive: true });
+			const roundsDir = path.join(root, "rounds");
+			const indexPath = path.join(roundsDir, "index.csv");
+
+			writeSessionWithToolCall(
+				path.join(sDir, "session.jsonl"),
+				"Please curl the repo",
+				"Done, fetched the repo info.",
+			);
+
+			await expect(
+				runDigestAll({
+					sessionsDir,
+					roundsDir,
+					indexPath,
+					apiKey: "key",
+					fetchImpl: embeddingFetch([
+						[1, 0],
+						[0, 1],
+					]),
+					stdout: logger().out,
+				}),
+			).resolves.toBe(0);
+
+			const toolIndexPath = toolIndexPathForRoundsDir(roundsDir);
+			const rows = loadToolIndex(toolIndexPath);
+			expect(rows).toHaveLength(1);
+			expect(rows[0]).toMatchObject({ toolIndex: 0, toolName: "bash" });
+			expect(rows[0].searchableText).toContain("curl https://api.github.com/repos/vhallac/semblr");
+		});
+
+		it("does not duplicate tool index rows when a round is re-processed (model mismatch)", async () => {
+			const root = tmpDir();
+			const sessionsDir = path.join(root, "sessions");
+			const sDir = path.join(sessionsDir, "--test");
+			fs.mkdirSync(sDir, { recursive: true });
+			const roundsDir = path.join(root, "rounds");
+			fs.mkdirSync(roundsDir, { recursive: true });
+			const indexPath = path.join(roundsDir, "index.csv");
+
+			writeSessionWithToolCall(
+				path.join(sDir, "session.jsonl"),
+				"Please curl the repo",
+				"Done, fetched the repo info.",
+			);
+
+			await runDigestAll({
+				sessionsDir,
+				roundsDir,
+				indexPath,
+				apiKey: "key",
+				fetchImpl: embeddingFetch([
+					[1, 0],
+					[0, 1],
+				]),
+				stdout: logger().out,
+			});
+
+			const toolIndexPath = toolIndexPathForRoundsDir(roundsDir);
+			expect(loadToolIndex(toolIndexPath)).toHaveLength(1);
+
+			// Force a model mismatch so the round is re-processed on the next run.
+			const lines = fs.readFileSync(indexPath, "utf-8").trim().split("\n");
+			fs.writeFileSync(indexPath, `${lines.map((l) => `${l},old-model`).join("\n")}\n`);
+
+			await runDigestAll({
+				sessionsDir,
+				roundsDir,
+				indexPath,
+				apiKey: "key",
+				fetchImpl: embeddingFetch([
+					[1, 0],
+					[0, 1],
+				]),
+				stdout: logger().out,
+			});
+
+			expect(loadToolIndex(toolIndexPath)).toHaveLength(1);
+		});
+
+		it("--tools-only rebuilds the tool index from existing round files without embedding", async () => {
+			const roundsDir = tmpDir();
+			fs.writeFileSync(
+				path.join(roundsDir, "abc.json"),
+				JSON.stringify({
+					userPrompt: "hi",
+					responseSequence: "hi",
+					toolCalls: [{ index: 0, name: "bash", arguments: JSON.stringify({ command: "curl x" }) }],
+				}),
+			);
+			const logs = logger();
+			const fetchImpl = vi.fn(async () => new Response("should not be called")) as typeof fetch;
+
+			await expect(
+				runDigestAll({
+					roundsDir,
+					toolsOnly: true,
+					fetchImpl,
+					stdout: logs.out,
+					stderr: logs.err,
+				}),
+			).resolves.toBe(0);
+
+			expect(fetchImpl).not.toHaveBeenCalled();
+			const toolIndexPath = toolIndexPathForRoundsDir(roundsDir);
+			expect(loadToolIndex(toolIndexPath)).toEqual([
+				{ hash: "abc.json", toolIndex: 0, toolName: "bash", searchableText: "bash curl x" },
+			]);
+			expect(logs.stdout.join("\n")).toContain("Rebuilt tool index: 1 rows across 1 rounds");
+		});
+
+		it("--tools-only handles a missing rounds directory", async () => {
+			const roundsDir = path.join(tmpDir(), "nonexistent");
+			const logs = logger();
+
+			await expect(runDigestAll({ roundsDir, toolsOnly: true, stdout: logs.out })).resolves.toBe(0);
+			expect(logs.stdout.join("\n")).toContain("Rebuilt tool index: 0 rows across 0 rounds");
+		});
 	});
 });
