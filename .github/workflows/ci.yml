@@ -1,0 +1,27 @@
+name: CI
+on:
+  pull_request:
+    branches: [main]
+jobs:
+  ci:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Reject Marshal control-plane and scaffolding paths in PR diff
+        shell: bash
+        run: |
+          set -euo pipefail
+          bad="$(git diff --name-only "origin/${{ github.base_ref }}...HEAD" | grep -E '((^gastown/|^\.github/|^marshal\.forge\.yaml|^\.gt-guardrails\.json|^directives/|^\.beads/|^\.claude/settings)|^(CLAUDE\.md$|\.runtime/|\.beads/))' | grep -vE '^$' || true)"
+          if [ -n "$bad" ]; then
+            echo "Marshal-protected paths must not be committed by agents:"
+            echo "$bad"
+            exit 1
+          fi
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - run: npm ci
+      - run: npm test --if-present
+      - run: npm run lint --if-present
