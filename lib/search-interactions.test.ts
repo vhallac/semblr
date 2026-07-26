@@ -18,6 +18,7 @@ describe("normalizeSearchInteractionsParams", () => {
 		expect(result.query).toBe("test");
 		expect(result.threshold).toBe(0.25);
 		expect(result.scopeRounds).toBeNull();
+		expect(result.mode).toBe("similarity");
 	});
 
 	it("preserves all provided params", () => {
@@ -25,10 +26,12 @@ describe("normalizeSearchInteractionsParams", () => {
 			query: "something",
 			minSimilarity: 0.5,
 			rounds: ["abc.json", "def.json"],
+			mode: "tool",
 		});
 		expect(result.query).toBe("something");
 		expect(result.threshold).toBe(0.5);
 		expect(result.scopeRounds).toEqual(["abc.json", "def.json"]);
+		expect(result.mode).toBe("tool");
 	});
 
 	it("handles empty query", () => {
@@ -366,5 +369,33 @@ describe("renderSearchInteractionsToolResult", () => {
 		});
 		const result = renderSearchInteractionsToolResult([round], 0.3, () => null);
 		expect(result.content[0].text).not.toContain("tools");
+	});
+
+	it("inserts the annotation line when getAnnotationFn returns text", () => {
+		const round = makeRoundScore();
+		const result = renderSearchInteractionsToolResult(
+			[round],
+			0.3,
+			() => null,
+			() => "Matched tool: bash(index 0)",
+		);
+		expect(result.content[0].text).toContain("Matched tool: bash(index 0)");
+	});
+
+	it("omits the annotation line when getAnnotationFn returns null", () => {
+		const round = makeRoundScore();
+		const result = renderSearchInteractionsToolResult(
+			[round],
+			0.3,
+			() => null,
+			() => null,
+		);
+		expect(result.content[0].text).not.toContain("Matched tool:");
+	});
+
+	it("works without a getAnnotationFn (backward compatible)", () => {
+		const round = makeRoundScore();
+		const result = renderSearchInteractionsToolResult([round], 0.3, () => null);
+		expect(result.content[0].text).not.toContain("Matched tool:");
 	});
 });

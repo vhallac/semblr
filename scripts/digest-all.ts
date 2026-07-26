@@ -133,6 +133,7 @@ export async function runDigestAll(options: DigestAllOptions = {}): Promise<numb
 	if (options.toolsOnly) {
 		const toolIndexPath = toolIndexPathForRoundsDir(roundsDir);
 		const rows = f.existsSync(roundsDir) ? buildToolIndexRowsFromRoundsDir(roundsDir, f) : [];
+		f.mkdirSync(roundsDir, { recursive: true });
 		writeToolIndexRows(toolIndexPath, rows, f);
 		out.log(
 			`✅ Rebuilt tool index: ${rows.length} rows across ${new Set(rows.map((r) => r.hash)).size} rounds at ${toolIndexPath}`,
@@ -219,7 +220,9 @@ export async function runDigestAll(options: DigestAllOptions = {}): Promise<numb
 			const toolIndexPath = toolIndexPathForRoundsDir(roundsDir);
 			const alreadyToolIndexed = loadToolIndexedRoundFiles(toolIndexPath, f);
 			if (!alreadyToolIndexed.has(roundFile)) {
-				appendToolIndexRows(toolIndexPath, roundsDir, buildToolIndexRows(roundFile, round.toolCalls), { fsImpl: f });
+				appendToolIndexRows(toolIndexPath, roundsDir, buildToolIndexRows(roundFile, round.toolCalls), {
+					fsImpl: f,
+				});
 			}
 		}
 

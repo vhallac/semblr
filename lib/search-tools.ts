@@ -92,11 +92,7 @@ export function readToolIndexLines(
 	fsImpl: Pick<typeof fs, "existsSync" | "readFileSync"> = fs,
 ): string[] {
 	if (!fsImpl.existsSync(indexPath)) return [];
-	return fsImpl
-		.readFileSync(indexPath, "utf-8")
-		.trim()
-		.split("\n")
-		.filter(Boolean);
+	return fsImpl.readFileSync(indexPath, "utf-8").trim().split("\n").filter(Boolean);
 }
 
 export function loadToolIndex(
@@ -150,9 +146,7 @@ export function buildToolIndexRowsFromRoundsDir(
 	roundsDir: string,
 	fsImpl: Pick<typeof fs, "readdirSync" | "readFileSync"> = fs,
 ): ToolIndexRow[] {
-	const files = fsImpl
-		.readdirSync(roundsDir)
-		.filter((f) => f.endsWith(".json") && !f.startsWith("index"));
+	const files = fsImpl.readdirSync(roundsDir).filter((f) => f.endsWith(".json") && !f.startsWith("index"));
 
 	const rows: ToolIndexRow[] = [];
 	for (const file of files) {
@@ -180,10 +174,7 @@ export function searchToolIndex(
 	query: string,
 	scopeRounds?: readonly string[] | null,
 ): ToolSearchMatch[] {
-	const keywords = query
-		.toLowerCase()
-		.split(/\s+/)
-		.filter(Boolean);
+	const keywords = query.toLowerCase().split(/\s+/).filter(Boolean);
 	if (keywords.length === 0) return [];
 
 	const scopeSet = scopeRounds && scopeRounds.length > 0 ? new Set(scopeRounds) : null;

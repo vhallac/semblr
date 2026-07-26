@@ -1119,14 +1119,14 @@ export default function (pi: ExtensionAPI) {
 			name: "search_interactions",
 			label: "Search Interactions",
 			description:
-				"Search all past user interactions for topics, questions, or discussions. Unlike the built-in search_memory (which searches within the current session), this searches across ALL sessions the user has ever had — every conversation round ever indexed. Use this when you need to find something from a past session, recall prior discussions, or reconnect with knowledge that was established a long time ago.\n\nYou can optionally scope the search to specific round files by passing the `rounds` parameter. This is useful when you want to drill down into a specific subset of rounds.\n\nBy default this searches by semantic similarity (mode: \"similarity\"). Set mode to \"tool\" to instead search by tool-use specifics — e.g. a bash command, a file path, a URL — via case-insensitive substring matching over past tool calls.",
+				'Search all past user interactions for topics, questions, or discussions. Unlike the built-in search_memory (which searches within the current session), this searches across ALL sessions the user has ever had — every conversation round ever indexed. Use this when you need to find something from a past session, recall prior discussions, or reconnect with knowledge that was established a long time ago.\n\nYou can optionally scope the search to specific round files by passing the `rounds` parameter. This is useful when you want to drill down into a specific subset of rounds.\n\nBy default this searches by semantic similarity (mode: "similarity"). Set mode to "tool" to instead search by tool-use specifics — e.g. a bash command, a file path, a URL — via case-insensitive substring matching over past tool calls.',
 			promptSnippet: "Search past interactions for relevant context",
 			parameters: Type.Object({
 				query: Type.String({ description: "The search query — what you want to find in past conversations" }),
 				minSimilarity: Type.Optional(
 					Type.Number({
 						description:
-							"Minimum similarity threshold (0.0 to 1.0). Default 0.25. Lower to get broader matches. Ignored in mode: \"tool\".",
+							'Minimum similarity threshold (0.0 to 1.0). Default 0.25. Lower to get broader matches. Ignored in mode: "tool".',
 					}),
 				),
 				rounds: Type.Optional(
@@ -1172,7 +1172,11 @@ export default function (pi: ExtensionAPI) {
 							match.hash,
 							`Matched tool: ${match.matchedTools.map((t) => `${t.name}(index ${t.index})`).join(", ")}`,
 						);
-						sorted.push({ fileName: match.hash, data, bestScore: match.matchedKeywordCount / match.totalKeywords });
+						sorted.push({
+							fileName: match.hash,
+							data,
+							bestScore: match.matchedKeywordCount / match.totalKeywords,
+						});
 					}
 
 					return renderSearchInteractionsToolResult(

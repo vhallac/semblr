@@ -366,6 +366,9 @@ just import-claude
 # Run all pending round migrations (idempotent)
 just migrate
 
+# Rebuild the tool-call fulltext index from existing round files (no re-embedding)
+just index-tools
+
 # Search the index from the command line
 just query "what did we discuss about caching"
 ```
@@ -434,6 +437,7 @@ just query "what did we discuss about caching"
 │   ├── round-tool-results.ts      # get_round_details/get_tool_details result rendering
 │   ├── script-config.ts           # Shared config/auth setup for scripts
 │   ├── search-interactions.ts     # search_interactions scoring, selection, and rendering
+│   ├── search-tools.ts            # Tool-call fulltext index build/append/search (mode: "tool")
 │   └── semblr-config.ts           # Semblr settings/env resolution
 ├── scripts/
 │   ├── digest-all.ts               # Bulk-embed all historical sessions
@@ -503,20 +507,26 @@ Semblr registers three tools that the LLM can call to explore historical rounds.
 
 ### `search_interactions`
 
-Searches all past conversations by semantic similarity.
+Searches all past conversations. Two modes:
 
 | Parameter | Type | Description |
 |---|---|---|
-| `query` | string | What to find — natural language, not keywords |
-| `minSimilarity` | number (0–1) | Minimum similarity threshold. Default 0.25. Lower for broader matches |
-| `turns` | string[] | Optional — scope search to specific round files (drill into compaction summaries) |
+| `query` | string | What to find. Natural language for `mode: "similarity"`, keywords for `mode: "tool"` |
+| `minSimilarity` | number (0–1) | Minimum similarity threshold. Default 0.25. Lower for broader matches. Ignored in `mode: "tool"` |
+| `rounds` | string[] | Optional — scope search to specific round files (drill into compaction summaries) |
+| `mode` | `"similarity"` \| `"tool"` | Default `"similarity"` (semantic search via embeddings). `"tool"` searches tool-call history instead |
 
 ```
-# The LLM calls this to find past discussions
+# Semantic search (default)
 search_interactions(query: "why did we pick PostgreSQL over MySQL")
+
+# Tool-use search — "did I ever curl this host?"
+search_interactions(query: "curl thinkerer", mode: "tool")
 ```
 
 Returns a list of matching round IDs with scores and previews.
+
+**`mode: "tool"`** does a case-insensitive substring match over an index of past tool calls (tool name + all string argument values), not semantic similarity — no embedding API call involved. The query is split on whitespace into keywords; a round's score is the fraction of keywords matched anywhere across its tool calls (unique keyword coverage, not row count). Results include a `Matched tool: <name>(index <n>), ...` annotation so the LLM knows which tool calls to drill into with `get_tool_details`. The index lives at `$SEMBLR_ROUNDS_DIR/index-tools.fulltext.csv`, built incrementally at runtime and via `just index-tools` (or `digest-all.ts --tools-only`) for bulk/backfill rebuilds. Full-text search of prompts/responses (as opposed to tool calls) is a separate, not-yet-implemented mode.
 
 ### `get_round_details`
 
