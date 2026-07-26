@@ -34,6 +34,12 @@ index-tools:
     SEMBLR_ROUNDS_DIR="{{SEMBLR_ROUNDS_DIR}}" \
         npx tsx scripts/digest-all.ts --tools-only
 
+# Rebuild the BM25 keyword index (index.bm25.json) from existing round files,
+# without re-embedding. Safe to re-run.
+rebuild-bm25:
+    SEMBLR_ROUNDS_DIR="{{SEMBLR_ROUNDS_DIR}}" \
+        npx tsx scripts/rebuild-bm25.ts
+
 # Import Claude Code history from ~/.claude/projects into the same Semblr index
 # Usage: just import-claude
 #        just import-claude --dry-run

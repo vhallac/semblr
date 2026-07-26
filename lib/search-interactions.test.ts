@@ -153,6 +153,42 @@ describe("collectSearchRoundScores", () => {
 		expect(ghiEntry).toBeDefined();
 		expect(ghiEntry?.bestScore).toBeCloseTo(1.0, 5);
 	});
+
+	it("fuses semantic and BM25 scores so exact keyword matches can outrank vector-only matches", () => {
+		const queryVec = [1, 0, 0];
+		const localIndex: IndexEntry[] = [
+			{ filePath: "rounds/semantic.json:prompt", vector: [1, 0, 0] },
+			{ filePath: "rounds/exact.json:prompt", vector: [0.2, 0.8, 0] },
+		];
+		const localRounds: Record<string, RoundData> = {
+			"rounds/semantic.json": {
+				userPrompt: "conceptual memory",
+				responseSequence: "architecture notes",
+				turnIndex: 0,
+			},
+			"rounds/exact.json": {
+				userPrompt: "search_interactions cannot find get_round_details",
+				responseSequence: "Investigate native tool names.",
+				turnIndex: 0,
+			},
+		};
+		const results = collectSearchRoundScores(
+			localIndex,
+			queryVec,
+			(filePath) => localRounds[indexRoundFileFromPath(filePath)] ?? null,
+			{
+				bm25Scores: new Map([
+					["rounds/semantic.json", 0],
+					["rounds/exact.json", 1],
+				]),
+				semanticWeight: 0.3,
+			},
+		);
+
+		expect(results.map((result) => result.fileName)).toEqual(["rounds/exact.json", "rounds/semantic.json"]);
+		expect(results[0].semanticScore).toBeLessThan(results[1].semanticScore ?? 0);
+		expect(results[0].bm25Score).toBe(1);
+	});
 });
 
 describe("computeContextBudget", () => {

@@ -24,6 +24,7 @@ function testConfig(root: string): SemblrConfig {
 		embedTimeoutMs: 15_000,
 		embedMaxRetries: 3,
 		embedBackoffMs: 1000,
+		hybridSemanticWeight: 0.7,
 		summaryThresholdExtra: 40_000,
 	};
 }

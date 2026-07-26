@@ -15,6 +15,15 @@ import * as path from "node:path";
 import type { ContextEvent, ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Type } from "@sinclair/typebox";
 import {
+	bm25IndexPathForRoundsDir,
+	loadBm25Index,
+	normalizeBm25Scores,
+	roundTextForBm25,
+	scoreBm25Query,
+	upsertBm25Round,
+	writeBm25Index,
+} from "../lib/bm25-index.ts";
+import {
 	buildCheckpointSectionContent,
 	buildContextPreamble,
 	buildFinalResponseContract,
@@ -156,6 +165,7 @@ export {
 const SEMBLR_CONFIG = loadSemblrConfig();
 const ROUNDS_DIR = SEMBLR_CONFIG.roundsDir;
 const INDEX_PATH = SEMBLR_CONFIG.indexPath;
+const BM25_INDEX_PATH = bm25IndexPathForRoundsDir(ROUNDS_DIR);
 const TOOLS_INDEX_PATH = toolIndexPathForRoundsDir(ROUNDS_DIR);
 const SEMBLR_DIR = path.dirname(ROUNDS_DIR);
 const STATS_PATH = path.join(SEMBLR_DIR, "chain-read-stats.json");
@@ -348,6 +358,12 @@ const _agentPendingToolCallIds: Map<string, ToolCallDetail> = new Map(); // tool
 
 function appendToIndex(filePath: string, vector: number[], model?: string) {
 	appendToIndexPath(INDEX_PATH, ROUNDS_DIR, filePath, vector, {}, model);
+}
+
+function upsertRoundInBm25Index(fileName: string, roundData: RoundData): void {
+	const index = loadBm25Index(BM25_INDEX_PATH);
+	upsertBm25Round(index, fileName, roundTextForBm25(roundData));
+	writeBm25Index(BM25_INDEX_PATH, index);
 }
 
 function embeddingClientDeps(ctx: ExtensionContext) {
@@ -759,7 +775,11 @@ export default function (pi: ExtensionAPI) {
 				return { messages: finalMessages } as any;
 			}
 
-			const scoredRounds = collectSearchRoundScores(index, queryVec, readRoundFile);
+			const bm25Scores = normalizeBm25Scores(scoreBm25Query(loadBm25Index(BM25_INDEX_PATH), userPrompt));
+			const scoredRounds = collectSearchRoundScores(index, queryVec, readRoundFile, {
+				bm25Scores,
+				semanticWeight: SEMBLR_CONFIG.hybridSemanticWeight,
+			});
 			const bestScore = scoredRounds.length > 0 ? scoredRounds[0].bestScore : 0;
 
 			// --- Dynamic budget ---
@@ -965,6 +985,7 @@ export default function (pi: ExtensionAPI) {
 
 		try {
 			fs.writeFileSync(roundPath, JSON.stringify(roundData, null, 2));
+			upsertRoundInBm25Index(roundFileName, roundData as unknown as RoundData);
 		} catch (err) {
 			ctx.ui.setStatus("semblr", `\u{1f9e0} write error: ${(err as Error).message}`);
 			round.accumulatedText = [];
@@ -1221,7 +1242,15 @@ export default function (pi: ExtensionAPI) {
 					};
 				}
 
-				const sorted = collectSearchRoundScores(scopedIndex, queryVec, readRoundFile);
+				let bm25Scores = normalizeBm25Scores(scoreBm25Query(loadBm25Index(BM25_INDEX_PATH), query));
+				if (scopeRounds && scopeRounds.length > 0) {
+					const scopeSet = new Set(scopeRounds);
+					bm25Scores = new Map(Array.from(bm25Scores.entries()).filter(([fileName]) => scopeSet.has(fileName)));
+				}
+				const sorted = collectSearchRoundScores(scopedIndex, queryVec, readRoundFile, {
+					bm25Scores,
+					semanticWeight: SEMBLR_CONFIG.hybridSemanticWeight,
+				});
 				return renderSearchInteractionsToolResult(sorted, threshold, getRoundSize);
 			},
 		});

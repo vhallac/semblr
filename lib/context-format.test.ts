@@ -162,7 +162,8 @@ describe("context formatting", () => {
 			() => "10KB",
 		);
 
-		expect(list).toContain("--- RELEVANCE LIST (all sessions, by similarity) ---");
+		expect(list).toContain("--- RELEVANCE LIST (all sessions, by hybrid relevance) ---");
+		expect(list).toContain("They combine semantic vector similarity with exact keyword matching.");
 		expect(list).toContain(
 			"Use this list when the prompt asks about past work, decisions, or findings\nfrom prior sessions, or requires cross-session continuity (same project,\nrecurring topic, long-running task).",
 		);

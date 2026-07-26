@@ -369,6 +369,9 @@ just migrate
 # Rebuild the tool-call fulltext index from existing round files (no re-embedding)
 just index-tools
 
+# Rebuild the BM25 keyword index from existing round files (no re-embedding)
+just rebuild-bm25
+
 # Search the index from the command line
 just query "what did we discuss about caching"
 ```
@@ -383,6 +386,8 @@ The index is a CSV with no schema header:
 ```
 
 Legacy two-column rows without the model column are still readable and are assumed to use the current configured embedding model. Each round produces two rows: one for the prompt embedding and one for the clipped-response embedding. The combined prompt+response embedding is stored in the round JSON file for grouping, not in the index CSV. The vector dimensions match the configured embedding model (1536 for the default `openai/text-embedding-3-small`). `just index` rewrites rows for rounds that were explicitly embedded with a different model so the index converges to the configured model. Cosine similarity is used for retrieval.
+
+Semblr also maintains `index.bm25.json` beside `index.csv`. It stores a local BM25 keyword index over each round's prompt, response, and tool text. Retrieval fuses semantic cosine score with normalized BM25 score using `SEMBLR_HYBRID_SEMANTIC_WEIGHT` / `hybridSemanticWeight` (default `0.7`). Run `just rebuild-bm25` to recreate it from existing round files without calling the embedding API.
 
 ## Known Problems
 

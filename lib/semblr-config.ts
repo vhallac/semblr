@@ -15,6 +15,7 @@ export interface SemblrConfig {
 	embedTimeoutMs: number;
 	embedMaxRetries: number;
 	embedBackoffMs: number;
+	hybridSemanticWeight: number;
 	/** 0 disables the automatic context-size warning; set a positive token count to enable it. */
 	summaryThresholdExtra: number;
 }
@@ -31,6 +32,7 @@ export interface SemblrConfigEnv {
 	SEMBLR_EMBED_TIMEOUT?: string;
 	SEMBLR_EMBED_RETRIES?: string;
 	SEMBLR_EMBED_BACKOFF?: string;
+	SEMBLR_HYBRID_SEMANTIC_WEIGHT?: string;
 	SEMBLR_SUMMARY_THRESHOLD_EXTRA?: string;
 }
 
@@ -56,6 +58,7 @@ const DEFAULTS = {
 	embedTimeoutMs: 15_000,
 	embedMaxRetries: 3,
 	embedBackoffMs: 1000,
+	hybridSemanticWeight: 0.7,
 	summaryThresholdExtra: 0,
 };
 
@@ -70,6 +73,7 @@ const ENV_KEYS = {
 	embedTimeoutMs: "SEMBLR_EMBED_TIMEOUT",
 	embedMaxRetries: "SEMBLR_EMBED_RETRIES",
 	embedBackoffMs: "SEMBLR_EMBED_BACKOFF",
+	hybridSemanticWeight: "SEMBLR_HYBRID_SEMANTIC_WEIGHT",
 	summaryThresholdExtra: "SEMBLR_SUMMARY_THRESHOLD_EXTRA",
 } satisfies Record<ConfigKey, keyof SemblrConfigEnv>;
 
@@ -221,6 +225,13 @@ export function loadSemblrConfig(deps: SemblrConfigDeps = {}): SemblrConfig {
 		embedTimeoutMs: resolveNumber("embedTimeoutMs", DEFAULTS.embedTimeoutMs, env, mergedSettings, {}, warn),
 		embedMaxRetries: resolveNumber("embedMaxRetries", DEFAULTS.embedMaxRetries, env, mergedSettings, {}, warn),
 		embedBackoffMs: resolveNumber("embedBackoffMs", DEFAULTS.embedBackoffMs, env, mergedSettings, {}, warn),
+		hybridSemanticWeight: Math.max(
+			0,
+			Math.min(
+				1,
+				resolveNumber("hybridSemanticWeight", DEFAULTS.hybridSemanticWeight, env, mergedSettings, {}, warn),
+			),
+		),
 		summaryThresholdExtra: resolveNumber(
 			"summaryThresholdExtra",
 			DEFAULTS.summaryThresholdExtra,
