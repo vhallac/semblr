@@ -69,6 +69,15 @@ describe("bm25 index", () => {
 	it.each([
 		["missing", undefined],
 		["corrupt", "{not json"],
+		[
+			"structurally malformed",
+			JSON.stringify({
+				version: 1,
+				documentCount: 1,
+				averageDocumentLength: 1,
+				documents: { "broken.json": { length: "one", termFrequencies: null } },
+			}),
+		],
 	])("backfills a %s sidecar from existing rounds", (_case, sidecarContents) => {
 		const roundsDir = tmpDir();
 		const indexPath = bm25IndexPathForRoundsDir(roundsDir);

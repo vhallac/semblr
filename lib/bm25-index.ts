@@ -76,6 +76,28 @@ function refreshStats(index: Bm25Index): Bm25Index {
 	return index;
 }
 
+function isBm25Document(value: unknown): value is Bm25Document {
+	if (value === null || typeof value !== "object" || Array.isArray(value)) return false;
+	const document = value as Partial<Bm25Document>;
+	if (typeof document.length !== "number" || !Number.isFinite(document.length) || document.length < 0) return false;
+	if (
+		document.termFrequencies === null ||
+		typeof document.termFrequencies !== "object" ||
+		Array.isArray(document.termFrequencies)
+	) {
+		return false;
+	}
+	return Object.values(document.termFrequencies).every(
+		(frequency) => typeof frequency === "number" && Number.isFinite(frequency) && frequency >= 0,
+	);
+}
+
+function isBm25Documents(value: unknown): value is Record<string, Bm25Document> {
+	return (
+		value !== null && typeof value === "object" && !Array.isArray(value) && Object.values(value).every(isBm25Document)
+	);
+}
+
 export function buildBm25Index(rounds: Array<{ fileName: string; text: string }>): Bm25Index {
 	const index: Bm25Index = {
 		version: BM25_VERSION,
@@ -106,7 +128,7 @@ export function loadBm25Index(
 	if (!fsImpl.existsSync(indexPath)) return buildBm25Index([]);
 	try {
 		const parsed = JSON.parse(fsImpl.readFileSync(indexPath, "utf-8")) as Partial<Bm25Index>;
-		if (!parsed.documents || typeof parsed.documents !== "object") return buildBm25Index([]);
+		if (!isBm25Documents(parsed.documents)) return buildBm25Index([]);
 		return refreshStats({
 			version: parsed.version ?? BM25_VERSION,
 			documentCount: parsed.documentCount ?? 0,
@@ -126,7 +148,7 @@ export function loadOrRebuildBm25Index(
 	if (fsImpl.existsSync(indexPath)) {
 		try {
 			const parsed = JSON.parse(fsImpl.readFileSync(indexPath, "utf-8")) as Partial<Bm25Index>;
-			if (parsed.documents && typeof parsed.documents === "object") return loadBm25Index(indexPath, fsImpl);
+			if (isBm25Documents(parsed.documents)) return loadBm25Index(indexPath, fsImpl);
 		} catch {
 			// Rebuild invalid sidecars from the source round files below.
 		}
