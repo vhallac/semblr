@@ -7,6 +7,7 @@ import {
 	buildBm25Index,
 	deleteBm25Round,
 	loadBm25Index,
+	loadOrRebuildBm25Index,
 	scoreBm25Query,
 	upsertBm25Round,
 	writeBm25Index,
@@ -63,5 +64,26 @@ describe("bm25 index", () => {
 
 		expect(scoreBm25Query(index, "stale").get("old.json") ?? 0).toBe(0);
 		expect(index.documentCount).toBe(1);
+	});
+
+	it.each([
+		["missing", undefined],
+		["corrupt", "{not json"],
+	])("backfills a %s sidecar from existing rounds", (_case, sidecarContents) => {
+		const roundsDir = tmpDir();
+		const indexPath = bm25IndexPathForRoundsDir(roundsDir);
+		fs.writeFileSync(
+			path.join(roundsDir, "existing.json"),
+			JSON.stringify({
+				userPrompt: "Find exact_identifier",
+				responseSequence: "Recovered from a saved round.",
+			}),
+		);
+		if (sidecarContents !== undefined) fs.writeFileSync(indexPath, sidecarContents);
+
+		const index = loadOrRebuildBm25Index(indexPath, roundsDir);
+
+		expect(scoreBm25Query(index, "exact_identifier").get("existing.json")).toBeGreaterThan(0);
+		expect(loadBm25Index(indexPath).documentCount).toBe(1);
 	});
 });

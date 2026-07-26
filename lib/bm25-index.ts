@@ -118,6 +118,39 @@ export function loadBm25Index(
 	}
 }
 
+export function loadOrRebuildBm25Index(
+	indexPath: string,
+	roundsDir: string,
+	fsImpl: Pick<typeof fs, "existsSync" | "mkdirSync" | "readFileSync" | "readdirSync" | "writeFileSync"> = fs,
+): Bm25Index {
+	if (fsImpl.existsSync(indexPath)) {
+		try {
+			const parsed = JSON.parse(fsImpl.readFileSync(indexPath, "utf-8")) as Partial<Bm25Index>;
+			if (parsed.documents && typeof parsed.documents === "object") return loadBm25Index(indexPath, fsImpl);
+		} catch {
+			// Rebuild invalid sidecars from the source round files below.
+		}
+	}
+
+	const rounds: Array<{ fileName: string; text: string }> = [];
+	if (fsImpl.existsSync(roundsDir)) {
+		for (const fileName of fsImpl
+			.readdirSync(roundsDir)
+			.filter((file) => file.endsWith(".json") && !file.startsWith("index"))) {
+			try {
+				const round = JSON.parse(fsImpl.readFileSync(path.join(roundsDir, fileName), "utf-8")) as RoundData;
+				rounds.push({ fileName, text: roundTextForBm25(round) });
+			} catch {
+				// Ignore unreadable round files, matching the standalone rebuild command.
+			}
+		}
+	}
+
+	const index = buildBm25Index(rounds);
+	writeBm25Index(indexPath, index, fsImpl);
+	return index;
+}
+
 export function writeBm25Index(
 	indexPath: string,
 	index: Bm25Index,
