@@ -70,8 +70,16 @@ import {
 	normalizeSearchInteractionsParams,
 	renderSearchInteractionsToolResult,
 	type SearchInteractionsParams,
+	type SearchRoundScore,
 	selectContextRounds,
 } from "../lib/search-interactions.ts";
+import {
+	appendToolIndexRows,
+	buildToolIndexRows,
+	loadToolIndex,
+	searchToolIndex,
+	toolIndexPathForRoundsDir,
+} from "../lib/search-tools.ts";
 import { loadSemblrConfig, type SemblrConfig } from "../lib/semblr-config.ts";
 import type { CheckpointSummary, ToolCallDetail } from "../lib/state.ts";
 import {
@@ -148,6 +156,7 @@ export {
 const SEMBLR_CONFIG = loadSemblrConfig();
 const ROUNDS_DIR = SEMBLR_CONFIG.roundsDir;
 const INDEX_PATH = SEMBLR_CONFIG.indexPath;
+const TOOLS_INDEX_PATH = toolIndexPathForRoundsDir(ROUNDS_DIR);
 const SEMBLR_DIR = path.dirname(ROUNDS_DIR);
 const STATS_PATH = path.join(SEMBLR_DIR, "chain-read-stats.json");
 const EMBEDDING_RESPONSE_MAX_BYTES = embeddingMaxTokensToResponseBytes(SEMBLR_CONFIG.embeddingMaxTokens);
@@ -964,6 +973,16 @@ export default function (pi: ExtensionAPI) {
 			return;
 		}
 
+		// Tool-call fulltext index — independent of embedding availability, so this
+		// runs even when no API key is configured below.
+		if (round.toolCalls.length > 0) {
+			try {
+				appendToolIndexRows(TOOLS_INDEX_PATH, ROUNDS_DIR, buildToolIndexRows(roundFileName, round.toolCalls));
+			} catch (err) {
+				ctx.ui.setStatus("semblr", `\u{1f9e0} tool index error: ${(err as Error).message}`);
+			}
+		}
+
 		// Three embeddings for each round:
 		//   1. prompt embedding → index.csv as :prompt
 		//   2. response (truncated, REDACTED dropped) embedding → index.csv as :response
@@ -1100,13 +1119,14 @@ export default function (pi: ExtensionAPI) {
 			name: "search_interactions",
 			label: "Search Interactions",
 			description:
-				"Search all past user interactions for topics, questions, or discussions. Unlike the built-in search_memory (which searches within the current session), this searches across ALL sessions the user has ever had — every conversation round ever indexed. Use this when you need to find something from a past session, recall prior discussions, or reconnect with knowledge that was established a long time ago.\n\nYou can optionally scope the search to specific round files by passing the `turns` parameter. This is useful when you want to drill down into a specific subset of rounds.",
+				"Search all past user interactions for topics, questions, or discussions. Unlike the built-in search_memory (which searches within the current session), this searches across ALL sessions the user has ever had — every conversation round ever indexed. Use this when you need to find something from a past session, recall prior discussions, or reconnect with knowledge that was established a long time ago.\n\nYou can optionally scope the search to specific round files by passing the `rounds` parameter. This is useful when you want to drill down into a specific subset of rounds.\n\nBy default this searches by semantic similarity (mode: \"similarity\"). Set mode to \"tool\" to instead search by tool-use specifics — e.g. a bash command, a file path, a URL — via case-insensitive substring matching over past tool calls.",
 			promptSnippet: "Search past interactions for relevant context",
 			parameters: Type.Object({
 				query: Type.String({ description: "The search query — what you want to find in past conversations" }),
 				minSimilarity: Type.Optional(
 					Type.Number({
-						description: "Minimum similarity threshold (0.0 to 1.0). Default 0.25. Lower to get broader matches.",
+						description:
+							"Minimum similarity threshold (0.0 to 1.0). Default 0.25. Lower to get broader matches. Ignored in mode: \"tool\".",
 					}),
 				),
 				rounds: Type.Optional(
@@ -1115,9 +1135,15 @@ export default function (pi: ExtensionAPI) {
 							"Optional list of round filenames to scope the search to (e.g., ['abc.json', 'def.json']). When provided, only these round files are searched.",
 					}),
 				),
+				mode: Type.Optional(
+					Type.Union([Type.Literal("similarity"), Type.Literal("tool")], {
+						description:
+							'"similarity" (default) searches by semantic similarity. "tool" searches by tool-use specifics — case-insensitive substring match over past tool call names and argument text (e.g. "did I ever curl this host", "when did I read this file").',
+					}),
+				),
 			}),
 			async execute(_toolCallId, params, _signal, _onUpdate, ctx2) {
-				const { query, threshold, scopeRounds } = normalizeSearchInteractionsParams(
+				const { query, threshold, scopeRounds, mode } = normalizeSearchInteractionsParams(
 					params as SearchInteractionsParams,
 				);
 				if (!query) {
@@ -1125,6 +1151,36 @@ export default function (pi: ExtensionAPI) {
 						content: [{ type: "text", text: "No query provided." }],
 						details: {},
 					};
+				}
+
+				if (mode === "tool") {
+					const toolRows = loadToolIndex(TOOLS_INDEX_PATH);
+					if (toolRows.length === 0) {
+						return {
+							content: [{ type: "text", text: "The tool index is empty. No tool calls have been indexed yet." }],
+							details: {},
+						};
+					}
+
+					const matches = searchToolIndex(toolRows, query, scopeRounds);
+					const annotations = new Map<string, string>();
+					const sorted: SearchRoundScore[] = [];
+					for (const match of matches) {
+						const data = readRoundFile(match.hash);
+						if (!data) continue;
+						annotations.set(
+							match.hash,
+							`Matched tool: ${match.matchedTools.map((t) => `${t.name}(index ${t.index})`).join(", ")}`,
+						);
+						sorted.push({ fileName: match.hash, data, bestScore: match.matchedKeywordCount / match.totalKeywords });
+					}
+
+					return renderSearchInteractionsToolResult(
+						sorted,
+						0,
+						getRoundSize,
+						(fileName) => annotations.get(fileName) ?? null,
+					);
 				}
 
 				const apiKey = await getApiKey(ctx2, { config: SEMBLR_CONFIG });

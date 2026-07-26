@@ -34,6 +34,14 @@ import {
 	type ScriptConfigOptions,
 	scriptEmbeddingConfig,
 } from "../lib/script-config.ts";
+import {
+	appendToolIndexRows,
+	buildToolIndexRows,
+	buildToolIndexRowsFromRoundsDir,
+	loadToolIndexedRoundFiles,
+	toolIndexPathForRoundsDir,
+	writeToolIndexRows,
+} from "../lib/search-tools.ts";
 
 // ─────────────────────────────────────────────
 // Config (matches digest-session.ts)
@@ -109,6 +117,8 @@ export interface DigestAllOptions extends ScriptConfigOptions {
 	stdout?: Pick<typeof console, "log">;
 	stderr?: Pick<typeof console, "error">;
 	fsImpl?: typeof fs;
+	/** Rebuild the tool-call fulltext index from existing round files only — no re-embedding. */
+	toolsOnly?: boolean;
 }
 
 export async function runDigestAll(options: DigestAllOptions = {}): Promise<number> {
@@ -116,12 +126,23 @@ export async function runDigestAll(options: DigestAllOptions = {}): Promise<numb
 	const sessionsDir = options.sessionsDir ?? defaultSessionsDir(config.agentDir);
 	const roundsDir = options.roundsDir ?? config.roundsDir;
 	const indexPath = resolveScriptIndexPath(config, roundsDir, options.indexPath);
-	const modelRegistry = resolveScriptModelRegistry(config, options);
-	const embeddingConfig = scriptEmbeddingConfig(config);
-	const concurrency = Math.max(1, options.concurrency ?? CONCURRENCY);
 	const out = options.stdout ?? console;
 	const err = options.stderr ?? console;
 	const f = options.fsImpl ?? fs;
+
+	if (options.toolsOnly) {
+		const toolIndexPath = toolIndexPathForRoundsDir(roundsDir);
+		const rows = f.existsSync(roundsDir) ? buildToolIndexRowsFromRoundsDir(roundsDir, f) : [];
+		writeToolIndexRows(toolIndexPath, rows, f);
+		out.log(
+			`✅ Rebuilt tool index: ${rows.length} rows across ${new Set(rows.map((r) => r.hash)).size} rounds at ${toolIndexPath}`,
+		);
+		return 0;
+	}
+
+	const modelRegistry = resolveScriptModelRegistry(config, options);
+	const embeddingConfig = scriptEmbeddingConfig(config);
+	const concurrency = Math.max(1, options.concurrency ?? CONCURRENCY);
 
 	const rawApiKey = await resolveScriptApiKey(config, { ...options, modelRegistry });
 	if (!rawApiKey) {
@@ -190,6 +211,16 @@ export async function runDigestAll(options: DigestAllOptions = {}): Promise<numb
 		for (const staleFile of staleFiles) {
 			f.unlinkSync(path.join(roundsDir, staleFile));
 			err.error(`  ♻️  Migrated stale: ${staleFile} → ${roundFile}`);
+		}
+
+		// Tool-call fulltext index — independent of embedding, so re-run it even if
+		// this round only needs re-embedding due to a model change.
+		if (round.toolCalls.length > 0) {
+			const toolIndexPath = toolIndexPathForRoundsDir(roundsDir);
+			const alreadyToolIndexed = loadToolIndexedRoundFiles(toolIndexPath, f);
+			if (!alreadyToolIndexed.has(roundFile)) {
+				appendToolIndexRows(toolIndexPath, roundsDir, buildToolIndexRows(roundFile, round.toolCalls), { fsImpl: f });
+			}
 		}
 
 		// Skip embedding if already indexed under the correct hash and current model
@@ -288,7 +319,8 @@ export function isMainModule(metaUrl: string, argv1 = process.argv[1]): boolean 
 }
 
 async function main() {
-	const exitCode = await runDigestAll();
+	const toolsOnly = process.argv.includes("--tools-only");
+	const exitCode = await runDigestAll({ toolsOnly });
 	if (exitCode !== 0) process.exit(exitCode);
 }
 

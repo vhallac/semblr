@@ -7,16 +7,20 @@ import { cosineSimilarity } from "./vector.ts";
 
 const DEFAULT_CONTEXT_BUDGET_RATIO = 0.5;
 
+export type SearchInteractionsMode = "similarity" | "tool";
+
 export interface SearchInteractionsParams {
 	query?: string;
 	minSimilarity?: number;
 	rounds?: string[];
+	mode?: SearchInteractionsMode;
 }
 
 export interface NormalizedSearchInteractionsParams {
 	query: string | null;
 	threshold: number;
 	scopeRounds: string[] | null;
+	mode: SearchInteractionsMode;
 }
 
 export interface SearchRoundScore {
@@ -34,6 +38,7 @@ export function normalizeSearchInteractionsParams(
 		query: params.query || null,
 		threshold: params.minSimilarity ?? 0.25,
 		scopeRounds: params.rounds ?? null,
+		mode: params.mode ?? "similarity",
 	};
 }
 
@@ -118,6 +123,7 @@ export function renderSearchInteractionsToolResult(
 	sorted: readonly SearchRoundScore[],
 	threshold: number,
 	getRoundSizeFn: (fileName: string) => string | null,
+	getAnnotationFn?: (fileName: string) => string | null,
 ): SearchInteractionsToolResult {
 	if (sorted.length === 0) {
 		return {
@@ -142,6 +148,10 @@ export function renderSearchInteractionsToolResult(
 		const roundSizeStr = getRoundSizeFn(round.fileName);
 		const sizeTag = roundSizeStr ? ` | ${roundSizeStr}` : "";
 		lines.push(`--- Round ${round.fileName} (score: ${round.bestScore.toFixed(3)}${toolStr}${sizeTag}) ---`);
+
+		const annotation = getAnnotationFn?.(round.fileName);
+		if (annotation) lines.push(annotation);
+
 		lines.push(`User: ${round.data.userPrompt}`);
 
 		if (

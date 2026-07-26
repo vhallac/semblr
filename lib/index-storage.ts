@@ -43,7 +43,7 @@ export function buildSessionStartStatus(index: readonly { filePath: string }[]):
 	return `🧠 semblr loaded — ${countUniqueIndexedRounds(index)} rounds indexed`;
 }
 
-type IndexStorageFs = Pick<
+export type IndexStorageFs = Pick<
 	typeof fs,
 	| "appendFileSync"
 	| "closeSync"
@@ -57,7 +57,7 @@ type IndexStorageFs = Pick<
 	| "writeFileSync"
 >;
 
-export interface AppendIndexDeps {
+export interface LockedAppendDeps {
 	fsImpl?: IndexStorageFs;
 	lockRetries?: number;
 	lockBackoffMs?: number;
@@ -67,14 +67,13 @@ export interface AppendIndexDeps {
 	wait?: (ms: number) => void;
 }
 
-export function appendToIndexPath(
-	indexPath: string,
-	roundsDir: string,
-	filePath: string,
-	vector: number[],
-	deps: AppendIndexDeps = {},
-	model?: string,
-) {
+/**
+ * Append `line` to `targetPath` using a lockfile-based read-modify-write so
+ * concurrent writers (multiple pi sessions) don't clobber each other. Falls
+ * back to a plain (unsynchronized) append if the lock can't be acquired
+ * after all retries.
+ */
+export function appendLineWithLock(targetPath: string, dir: string, line: string, deps: LockedAppendDeps = {}): void {
 	const fsImpl = deps.fsImpl ?? fs;
 	const lockRetries = deps.lockRetries ?? 15;
 	const lockBackoffMs = deps.lockBackoffMs ?? 50;
@@ -82,11 +81,9 @@ export function appendToIndexPath(
 	const staleLockMs = deps.staleLockMs ?? 10_000;
 	const wait = deps.wait ?? ((ms: number) => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms));
 	const processId = deps.processId ?? process.pid;
-	const b64 = Buffer.from(JSON.stringify(vector)).toString("base64url");
-	const line = model !== undefined ? `${b64},${filePath},${model}\n` : `${b64},${filePath}\n`;
-	fsImpl.mkdirSync(roundsDir, { recursive: true });
+	fsImpl.mkdirSync(dir, { recursive: true });
 
-	const lockPath = `${indexPath}.lock`;
+	const lockPath = `${targetPath}.lock`;
 
 	let lockFd: number | null = null;
 	for (let attempt = 0; attempt < lockRetries; attempt++) {
@@ -110,7 +107,7 @@ export function appendToIndexPath(
 				wait(waitMs);
 			} else {
 				try {
-					fsImpl.appendFileSync(indexPath, line);
+					fsImpl.appendFileSync(targetPath, line);
 				} catch {}
 				return;
 			}
@@ -118,11 +115,11 @@ export function appendToIndexPath(
 	}
 
 	try {
-		const existing = fsImpl.existsSync(indexPath) ? fsImpl.readFileSync(indexPath, "utf-8") : "";
+		const existing = fsImpl.existsSync(targetPath) ? fsImpl.readFileSync(targetPath, "utf-8") : "";
 		const newContent = existing + line;
-		const tmp = `${indexPath}.tmp.${processId}`;
+		const tmp = `${targetPath}.tmp.${processId}`;
 		fsImpl.writeFileSync(tmp, newContent);
-		fsImpl.renameSync(tmp, indexPath);
+		fsImpl.renameSync(tmp, targetPath);
 	} finally {
 		if (lockFd !== null) {
 			fsImpl.closeSync(lockFd);
@@ -131,4 +128,27 @@ export function appendToIndexPath(
 			} catch {}
 		}
 	}
+}
+
+export interface AppendIndexDeps {
+	fsImpl?: IndexStorageFs;
+	lockRetries?: number;
+	lockBackoffMs?: number;
+	now?: () => number;
+	processId?: number;
+	staleLockMs?: number;
+	wait?: (ms: number) => void;
+}
+
+export function appendToIndexPath(
+	indexPath: string,
+	roundsDir: string,
+	filePath: string,
+	vector: number[],
+	deps: AppendIndexDeps = {},
+	model?: string,
+) {
+	const b64 = Buffer.from(JSON.stringify(vector)).toString("base64url");
+	const line = model !== undefined ? `${b64},${filePath},${model}\n` : `${b64},${filePath}\n`;
+	appendLineWithLock(indexPath, roundsDir, line, deps);
 }
