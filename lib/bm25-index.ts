@@ -146,20 +146,28 @@ export function loadOrRebuildBm25Index(
 	roundsDir: string,
 	fsImpl: Pick<typeof fs, "existsSync" | "mkdirSync" | "readFileSync" | "readdirSync" | "writeFileSync"> = fs,
 ): Bm25Index {
+	const roundFileNames = fsImpl.existsSync(roundsDir)
+		? fsImpl.readdirSync(roundsDir).filter((file) => file.endsWith(".json") && !file.startsWith("index"))
+		: [];
 	if (fsImpl.existsSync(indexPath)) {
 		try {
 			const parsed = JSON.parse(fsImpl.readFileSync(indexPath, "utf-8")) as Partial<Bm25Index>;
-			if (isBm25Documents(parsed.documents)) return loadBm25Index(indexPath, fsImpl);
+			const documents = parsed.documents;
+			if (
+				isBm25Documents(documents) &&
+				roundFileNames.length === Object.keys(documents).length &&
+				roundFileNames.every((fileName) => fileName in documents)
+			) {
+				return loadBm25Index(indexPath, fsImpl);
+			}
 		} catch {
 			// Rebuild invalid sidecars from the source round files below.
 		}
 	}
 
 	const rounds: Array<{ fileName: string; text: string }> = [];
-	if (fsImpl.existsSync(roundsDir)) {
-		for (const fileName of fsImpl
-			.readdirSync(roundsDir)
-			.filter((file) => file.endsWith(".json") && !file.startsWith("index"))) {
+	if (roundFileNames.length > 0) {
+		for (const fileName of roundFileNames) {
 			try {
 				const round = JSON.parse(fsImpl.readFileSync(path.join(roundsDir, fileName), "utf-8")) as RoundData;
 				rounds.push({ fileName, text: roundTextForBm25(round) });
@@ -214,9 +222,16 @@ export function scoreBm25Query(index: Bm25Index, query: string): Map<string, num
 }
 
 export function normalizeBm25Scores(scores: ReadonlyMap<string, number>): Map<string, number> {
+	const topScores = Array.from(scores.values())
+		.filter((score) => score > 0)
+		.sort((a, b) => b - a)
+		.slice(0, 10);
+	if (topScores.length === 0) return new Map();
+	const middle = Math.floor(topScores.length / 2);
+	const scale = topScores.length % 2 === 0 ? (topScores[middle - 1] + topScores[middle]) / 2 : topScores[middle] || 1;
 	return new Map(
 		Array.from(scores.entries())
 			.filter(([, score]) => score > 0)
-			.map(([fileName, score]) => [fileName, 1 / (1 + Math.exp(-score))]),
+			.map(([fileName, score]) => [fileName, 1 / (1 + Math.exp(-score / scale))]),
 	);
 }

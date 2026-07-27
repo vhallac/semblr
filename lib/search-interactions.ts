@@ -7,7 +7,7 @@ import { cosineSimilarity } from "./vector.ts";
 
 const DEFAULT_CONTEXT_BUDGET_RATIO = 0.5;
 
-export type SearchInteractionsMode = "similarity" | "tool";
+export type SearchInteractionsMode = "similarity" | "text-match" | "hybrid" | "tool";
 
 export interface SearchInteractionsParams {
 	query?: string;
@@ -36,11 +36,14 @@ export type SearchInteractionsToolResult = ToolResult;
 export function normalizeSearchInteractionsParams(
 	params: SearchInteractionsParams,
 ): NormalizedSearchInteractionsParams {
+	const validModes: readonly SearchInteractionsMode[] = ["similarity", "text-match", "hybrid", "tool"];
 	return {
 		query: params.query || null,
 		threshold: params.minSimilarity ?? 0.25,
 		scopeRounds: params.rounds ?? null,
-		mode: params.mode === "tool" ? "tool" : "similarity",
+		mode: validModes.includes(params.mode as SearchInteractionsMode)
+			? (params.mode as SearchInteractionsMode)
+			: "similarity",
 	};
 }
 

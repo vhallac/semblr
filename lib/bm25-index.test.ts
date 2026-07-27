@@ -24,15 +24,17 @@ describe("bm25 index", () => {
 		expect(tokenizeBm25("queries")).toEqual(["query"]);
 	});
 
-	it("normalizes scores independently with a sigmoid", () => {
+	it("normalizes scores with a sigmoid scaled by the median top score", () => {
 		const normalized = normalizeBm25Scores(
 			new Map([
 				["low.json", 1],
-				["high.json", 2],
+				["middle.json", 2],
+				["high.json", 4],
 			]),
 		);
 
-		expect(normalized.get("low.json")).toBeCloseTo(1 / (1 + Math.exp(-1)));
+		expect(normalized.get("low.json")).toBeCloseTo(1 / (1 + Math.exp(-0.5)));
+		expect(normalized.get("middle.json")).toBeCloseTo(1 / (1 + Math.exp(-1)));
 		expect(normalized.get("high.json")).toBeCloseTo(1 / (1 + Math.exp(-2)));
 	});
 
@@ -112,5 +114,20 @@ describe("bm25 index", () => {
 
 		expect(scoreBm25Query(index, "exact_identifier").get("existing.json")).toBeGreaterThan(0);
 		expect(loadBm25Index(indexPath).documentCount).toBe(1);
+	});
+
+	it("rebuilds a valid sidecar that omits saved rounds", () => {
+		const roundsDir = tmpDir();
+		const indexPath = bm25IndexPathForRoundsDir(roundsDir);
+		fs.writeFileSync(
+			path.join(roundsDir, "existing.json"),
+			JSON.stringify({ userPrompt: "historical exact_identifier", responseSequence: "saved response" }),
+		);
+		writeBm25Index(indexPath, buildBm25Index([{ fileName: "new.json", text: "new round" }]));
+
+		const index = loadOrRebuildBm25Index(indexPath, roundsDir);
+
+		expect(scoreBm25Query(index, "exact_identifier").get("existing.json")).toBeGreaterThan(0);
+		expect(index.documentCount).toBe(1);
 	});
 });

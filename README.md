@@ -310,6 +310,8 @@ Relative `roundsDir` values in project settings resolve under the project cwd. R
 | `embedTimeoutMs` | `SEMBLR_EMBED_TIMEOUT` | `15000` | Embedding request timeout |
 | `embedMaxRetries` | `SEMBLR_EMBED_RETRIES` | `3` | Embedding request retry count |
 | `embedBackoffMs` | `SEMBLR_EMBED_BACKOFF` | `1000` | Base retry backoff in milliseconds |
+| `hybridSemanticWeight` | `SEMBLR_HYBRID_SEMANTIC_WEIGHT` | `0.7` | Semantic-score weight (`alpha`) in hybrid retrieval; BM25 receives `1 - alpha` |
+| `summaryThresholdExtra` | `SEMBLR_SUMMARY_THRESHOLD_EXTRA` | `0` | Additional token threshold for the automatic context-size warning; `0` disables it |
 
 Additional runtime-only switches:
 

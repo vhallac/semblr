@@ -53,6 +53,11 @@ describe("normalizeSearchInteractionsParams", () => {
 		const result = normalizeSearchInteractionsParams({ query: "test", mode: "invalid" as never });
 		expect(result.mode).toBe("similarity");
 	});
+
+	it.each(["text-match", "hybrid"] as const)("preserves the %s mode", (mode) => {
+		const result = normalizeSearchInteractionsParams({ query: "test", mode });
+		expect(result.mode).toBe(mode);
+	});
 });
 
 describe("filterSearchIndexByRounds", () => {

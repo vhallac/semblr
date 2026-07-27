@@ -1147,7 +1147,7 @@ export default function (pi: ExtensionAPI) {
 			name: "search_interactions",
 			label: "Search Interactions",
 			description:
-				'Search all past user interactions for topics, questions, or discussions. Unlike the built-in search_memory (which searches within the current session), this searches across ALL sessions the user has ever had — every conversation round ever indexed. Use this when you need to find something from a past session, recall prior discussions, or reconnect with knowledge that was established a long time ago.\n\nYou can optionally scope the search to specific round files by passing the `rounds` parameter. This is useful when you want to drill down into a specific subset of rounds.\n\nBy default this searches by semantic similarity (mode: "similarity"). Set mode to "tool" to instead search by tool-use specifics — e.g. a bash command, a file path, a URL — via case-insensitive substring matching over past tool calls.',
+				'Search all past user interactions for topics, questions, or discussions. Unlike the built-in search_memory (which searches within the current session), this searches across ALL sessions the user has ever had — every conversation round ever indexed. Use this when you need to find something from a past session, recall prior discussions, or reconnect with knowledge that was established a long time ago.\n\nYou can optionally scope the search to specific round files by passing the `rounds` parameter. This is useful when you want to drill down into a specific subset of rounds.\n\nBy default this searches by semantic similarity (mode: "similarity"). Use "text-match" for BM25 keyword search without an embedding call, "hybrid" to blend semantic and BM25 scores, or "tool" to search tool-use specifics via case-insensitive substring matching.',
 			promptSnippet: "Search past interactions for relevant context",
 			parameters: Type.Object({
 				query: Type.String({ description: "The search query — what you want to find in past conversations" }),
@@ -1164,10 +1164,18 @@ export default function (pi: ExtensionAPI) {
 					}),
 				),
 				mode: Type.Optional(
-					Type.Union([Type.Literal("similarity"), Type.Literal("tool")], {
-						description:
-							'"similarity" (default) searches by semantic similarity. "tool" searches by tool-use specifics — case-insensitive substring match over past tool call names and argument text (e.g. "did I ever curl this host", "when did I read this file").',
-					}),
+					Type.Union(
+						[
+							Type.Literal("similarity"),
+							Type.Literal("text-match"),
+							Type.Literal("hybrid"),
+							Type.Literal("tool"),
+						],
+						{
+							description:
+								'"similarity" (default) searches semantic vectors; "text-match" searches round text with BM25; "hybrid" blends both using hybridSemanticWeight; "tool" searches tool call names and argument text.',
+						},
+					),
 				),
 			}),
 			async execute(_toolCallId, params, _signal, _onUpdate, ctx2) {
@@ -1215,6 +1223,28 @@ export default function (pi: ExtensionAPI) {
 					);
 				}
 
+				let rawBm25Scores =
+					mode === "text-match" || mode === "hybrid"
+						? scoreBm25Query(loadSearchBm25Index(), query)
+						: new Map<string, number>();
+				if (scopeRounds && scopeRounds.length > 0) {
+					const scopeSet = new Set(scopeRounds);
+					rawBm25Scores = new Map(
+						Array.from(rawBm25Scores.entries()).filter(([fileName]) => scopeSet.has(fileName)),
+					);
+				}
+				const bm25Scores = normalizeBm25Scores(rawBm25Scores);
+
+				if (mode === "text-match") {
+					const sorted = Array.from(bm25Scores.entries())
+						.flatMap(([fileName, bm25Score]): SearchRoundScore[] => {
+							const data = readRoundFile(fileName);
+							return data ? [{ fileName, data, bestScore: bm25Score, bm25Score }] : [];
+						})
+						.sort((a, b) => b.bestScore - a.bestScore);
+					return renderSearchInteractionsToolResult(sorted, threshold, getRoundSize);
+				}
+
 				const apiKey = await getApiKey(ctx2, { config: SEMBLR_CONFIG });
 				if (!apiKey) {
 					return {
@@ -1249,16 +1279,8 @@ export default function (pi: ExtensionAPI) {
 					};
 				}
 
-				let rawBm25Scores = scoreBm25Query(loadSearchBm25Index(), query);
-				if (scopeRounds && scopeRounds.length > 0) {
-					const scopeSet = new Set(scopeRounds);
-					rawBm25Scores = new Map(
-						Array.from(rawBm25Scores.entries()).filter(([fileName]) => scopeSet.has(fileName)),
-					);
-				}
-				const bm25Scores = normalizeBm25Scores(rawBm25Scores);
 				const sorted = collectSearchRoundScores(scopedIndex, queryVec, readRoundFile, {
-					bm25Scores,
+					bm25Scores: mode === "hybrid" ? bm25Scores : undefined,
 					semanticWeight: SEMBLR_CONFIG.hybridSemanticWeight,
 				});
 				return renderSearchInteractionsToolResult(sorted, threshold, getRoundSize);
