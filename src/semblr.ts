@@ -16,7 +16,6 @@ import type { ContextEvent, ExtensionAPI, ExtensionContext } from "@earendil-wor
 import { Type } from "@sinclair/typebox";
 import {
 	bm25IndexPathForRoundsDir,
-	loadBm25Index,
 	loadOrRebuildBm25Index,
 	normalizeBm25Scores,
 	roundTextForBm25,
@@ -361,14 +360,17 @@ function appendToIndex(filePath: string, vector: number[], model?: string) {
 	appendToIndexPath(INDEX_PATH, ROUNDS_DIR, filePath, vector, {}, model);
 }
 
+let searchBm25Index: ReturnType<typeof loadOrRebuildBm25Index> | null = null;
+
 function upsertRoundInBm25Index(fileName: string, roundData: RoundData): void {
-	const index = loadBm25Index(BM25_INDEX_PATH);
+	const index = loadSearchBm25Index();
 	upsertBm25Round(index, fileName, roundTextForBm25(roundData));
 	writeBm25Index(BM25_INDEX_PATH, index);
 }
 
 function loadSearchBm25Index() {
-	return loadOrRebuildBm25Index(BM25_INDEX_PATH, ROUNDS_DIR);
+	searchBm25Index ??= loadOrRebuildBm25Index(BM25_INDEX_PATH, ROUNDS_DIR);
+	return searchBm25Index;
 }
 
 function embeddingClientDeps(ctx: ExtensionContext) {
@@ -1247,11 +1249,14 @@ export default function (pi: ExtensionAPI) {
 					};
 				}
 
-				let bm25Scores = normalizeBm25Scores(scoreBm25Query(loadSearchBm25Index(), query));
+				let rawBm25Scores = scoreBm25Query(loadSearchBm25Index(), query);
 				if (scopeRounds && scopeRounds.length > 0) {
 					const scopeSet = new Set(scopeRounds);
-					bm25Scores = new Map(Array.from(bm25Scores.entries()).filter(([fileName]) => scopeSet.has(fileName)));
+					rawBm25Scores = new Map(
+						Array.from(rawBm25Scores.entries()).filter(([fileName]) => scopeSet.has(fileName)),
+					);
 				}
+				const bm25Scores = normalizeBm25Scores(rawBm25Scores);
 				const sorted = collectSearchRoundScores(scopedIndex, queryVec, readRoundFile, {
 					bm25Scores,
 					semanticWeight: SEMBLR_CONFIG.hybridSemanticWeight,

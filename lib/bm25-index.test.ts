@@ -8,7 +8,9 @@ import {
 	deleteBm25Round,
 	loadBm25Index,
 	loadOrRebuildBm25Index,
+	normalizeBm25Scores,
 	scoreBm25Query,
+	tokenizeBm25,
 	upsertBm25Round,
 	writeBm25Index,
 } from "./bm25-index.ts";
@@ -18,6 +20,22 @@ function tmpDir() {
 }
 
 describe("bm25 index", () => {
+	it("stems plural words ending in ies to y", () => {
+		expect(tokenizeBm25("queries")).toEqual(["query"]);
+	});
+
+	it("normalizes scores independently with a sigmoid", () => {
+		const normalized = normalizeBm25Scores(
+			new Map([
+				["low.json", 1],
+				["high.json", 2],
+			]),
+		);
+
+		expect(normalized.get("low.json")).toBeCloseTo(1 / (1 + Math.exp(-1)));
+		expect(normalized.get("high.json")).toBeCloseTo(1 / (1 + Math.exp(-2)));
+	});
+
 	it("scores exact identifier matches higher than unrelated text", () => {
 		const index = buildBm25Index([
 			{

@@ -25,6 +25,7 @@ export function bm25IndexPathForRoundsDir(roundsDir: string): string {
 function stemToken(token: string): string {
 	if (token.length > 5 && token.endsWith("ing")) return token.slice(0, -3);
 	if (token.length > 4 && token.endsWith("ed")) return token.slice(0, -2);
+	if (token.length > 4 && token.endsWith("ies")) return `${token.slice(0, -3)}y`;
 	if (token.length > 4 && token.endsWith("es")) return token.slice(0, -2);
 	if (token.length > 3 && token.endsWith("s")) return token.slice(0, -1);
 	return token;
@@ -213,7 +214,9 @@ export function scoreBm25Query(index: Bm25Index, query: string): Map<string, num
 }
 
 export function normalizeBm25Scores(scores: ReadonlyMap<string, number>): Map<string, number> {
-	const maxScore = Math.max(0, ...scores.values());
-	if (maxScore <= 0) return new Map();
-	return new Map(Array.from(scores.entries()).map(([fileName, score]) => [fileName, score / maxScore]));
+	return new Map(
+		Array.from(scores.entries())
+			.filter(([, score]) => score > 0)
+			.map(([fileName, score]) => [fileName, 1 / (1 + Math.exp(-score))]),
+	);
 }

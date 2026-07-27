@@ -48,6 +48,11 @@ describe("normalizeSearchInteractionsParams", () => {
 		const result = normalizeSearchInteractionsParams({ rounds: [] });
 		expect(result.scopeRounds).toEqual([]);
 	});
+
+	it("falls back to similarity for an invalid runtime mode", () => {
+		const result = normalizeSearchInteractionsParams({ query: "test", mode: "invalid" as never });
+		expect(result.mode).toBe("similarity");
+	});
 });
 
 describe("filterSearchIndexByRounds", () => {
@@ -188,6 +193,16 @@ describe("collectSearchRoundScores", () => {
 		expect(results.map((result) => result.fileName)).toEqual(["rounds/exact.json", "rounds/semantic.json"]);
 		expect(results[0].semanticScore).toBeLessThan(results[1].semanticScore ?? 0);
 		expect(results[0].bm25Score).toBe(1);
+	});
+
+	it("uses semantic scores unchanged when BM25 has no matches", () => {
+		const results = collectSearchRoundScores(index, [1, 0, 0], readRound, {
+			bm25Scores: new Map(),
+			semanticWeight: 0.3,
+		});
+
+		expect(results[0].bestScore).toBeCloseTo(1);
+		expect(results[0].fileName).toBe("rounds/abc.json");
 	});
 });
 

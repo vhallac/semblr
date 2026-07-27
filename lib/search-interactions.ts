@@ -40,7 +40,7 @@ export function normalizeSearchInteractionsParams(
 		query: params.query || null,
 		threshold: params.minSimilarity ?? 0.25,
 		scopeRounds: params.rounds ?? null,
-		mode: params.mode ?? "similarity",
+		mode: params.mode === "tool" ? "tool" : "similarity",
 	};
 }
 
@@ -65,7 +65,8 @@ export function collectSearchRoundScores(
 		semanticWeight?: number;
 	} = {},
 ): SearchRoundScore[] {
-	const semanticWeight = options.bm25Scores ? Math.max(0, Math.min(1, options.semanticWeight ?? 0.7)) : 1;
+	const semanticWeight =
+		options.bm25Scores && options.bm25Scores.size > 0 ? Math.max(0, Math.min(1, options.semanticWeight ?? 0.7)) : 1;
 	const scored = index
 		.map((entry) => {
 			const semanticScore = cosineSimilarity(queryVec, entry.vector);
