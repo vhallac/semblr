@@ -1177,9 +1177,15 @@ export default function (pi: ExtensionAPI) {
 						},
 					),
 				),
+				alpha: Type.Optional(
+					Type.Number({
+						description:
+							"Blend weight for hybrid mode (0 = pure BM25, 1 = pure semantic, default 0.7). Ignored in all other modes.",
+					}),
+				),
 			}),
 			async execute(_toolCallId, params, _signal, _onUpdate, ctx2) {
-				const { query, threshold, scopeRounds, mode } = normalizeSearchInteractionsParams(
+				const { query, threshold, scopeRounds, mode, alpha } = normalizeSearchInteractionsParams(
 					params as SearchInteractionsParams,
 				);
 				if (!query) {
@@ -1281,7 +1287,7 @@ export default function (pi: ExtensionAPI) {
 
 				const sorted = collectSearchRoundScores(scopedIndex, queryVec, readRoundFile, {
 					bm25Scores: mode === "hybrid" ? bm25Scores : undefined,
-					semanticWeight: SEMBLR_CONFIG.hybridSemanticWeight,
+					semanticWeight: alpha,
 				});
 				return renderSearchInteractionsToolResult(sorted, threshold, getRoundSize);
 			},

@@ -19,6 +19,7 @@ describe("normalizeSearchInteractionsParams", () => {
 		expect(result.threshold).toBe(0.25);
 		expect(result.scopeRounds).toBeNull();
 		expect(result.mode).toBe("similarity");
+		expect(result.alpha).toBe(0.7);
 	});
 
 	it("preserves all provided params", () => {
@@ -27,11 +28,13 @@ describe("normalizeSearchInteractionsParams", () => {
 			minSimilarity: 0.5,
 			rounds: ["abc.json", "def.json"],
 			mode: "tool",
+			alpha: 0.4,
 		});
 		expect(result.query).toBe("something");
 		expect(result.threshold).toBe(0.5);
 		expect(result.scopeRounds).toEqual(["abc.json", "def.json"]);
 		expect(result.mode).toBe("tool");
+		expect(result.alpha).toBe(0.4);
 	});
 
 	it("handles empty query", () => {
@@ -57,6 +60,13 @@ describe("normalizeSearchInteractionsParams", () => {
 	it.each(["text-match", "hybrid"] as const)("preserves the %s mode", (mode) => {
 		const result = normalizeSearchInteractionsParams({ query: "test", mode });
 		expect(result.mode).toBe(mode);
+	});
+
+	it.each([
+		[-0.5, 0],
+		[1.5, 1],
+	])("clamps alpha %s to %s", (alpha, expected) => {
+		expect(normalizeSearchInteractionsParams({ alpha }).alpha).toBe(expected);
 	});
 });
 

@@ -14,6 +14,7 @@ export interface SearchInteractionsParams {
 	minSimilarity?: number;
 	rounds?: string[];
 	mode?: SearchInteractionsMode;
+	alpha?: number;
 }
 
 export interface NormalizedSearchInteractionsParams {
@@ -21,6 +22,7 @@ export interface NormalizedSearchInteractionsParams {
 	threshold: number;
 	scopeRounds: string[] | null;
 	mode: SearchInteractionsMode;
+	alpha: number;
 }
 
 export interface SearchRoundScore {
@@ -44,6 +46,7 @@ export function normalizeSearchInteractionsParams(
 		mode: validModes.includes(params.mode as SearchInteractionsMode)
 			? (params.mode as SearchInteractionsMode)
 			: "similarity",
+		alpha: Math.max(0, Math.min(1, params.alpha ?? 0.7)),
 	};
 }
 
