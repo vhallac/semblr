@@ -98,6 +98,22 @@ snapshot *args:
 eval corpus out="docs/eval/baseline-weak.local.json":
     npx tsx scripts/eval-retrieval.ts --corpus {{corpus}} --sessions {{corpus}}/sessions --out {{out}}
 
+# Evaluate retrieval against local golden labels across all declared modes
+# Usage: just eval-golden /path/to/unpacked-snapshot
+#        just eval-golden /path/to/unpacked-snapshot /tmp/golden-eval.json
+eval-golden corpus out="docs/eval/golden-eval.local.json":
+    npx tsx scripts/eval-retrieval.ts --corpus {{corpus}} --sessions {{corpus}}/sessions --golden docs/eval/golden-labels.local.json --out {{out}}
+
+# Evaluate only similarity-mode golden labels
+# Usage: just eval-golden-similarity /path/to/unpacked-snapshot
+eval-golden-similarity corpus out="docs/eval/golden-eval-similarity.local.json":
+    npx tsx scripts/eval-retrieval.ts --corpus {{corpus}} --sessions {{corpus}}/sessions --golden docs/eval/golden-labels.local.json --mode similarity --out {{out}}
+
+# Evaluate only tool-mode golden labels
+# Usage: just eval-golden-tool /path/to/unpacked-snapshot
+eval-golden-tool corpus out="docs/eval/golden-eval-tool.local.json":
+    npx tsx scripts/eval-retrieval.ts --corpus {{corpus}} --sessions {{corpus}}/sessions --golden docs/eval/golden-labels.local.json --mode tool --out {{out}}
+
 # Build a local weak baseline from a snapshot without overwriting the committed maintainer baseline
 # Usage: just build-baseline-weak /path/to/unpacked-snapshot
 #        just build-baseline-weak /path/to/unpacked-snapshot /tmp/baseline.json

@@ -72,8 +72,9 @@ Existing entries default to similarity retrieval. To evaluate a curated tool-use
 `tool_query` is passed verbatim to the production tool-index matcher and is required for tool mode. The origin round remains the provenance and timestamp anchor. Run all declared modes, or filter to one:
 
 ```sh
-npx tsx scripts/eval-retrieval.ts --corpus <snapshot> --golden docs/eval/golden-labels.local.json
-npx tsx scripts/eval-retrieval.ts --corpus <snapshot> --golden docs/eval/golden-labels.local.json --mode tool
+just eval-golden <snapshot>
+just eval-golden-similarity <snapshot>
+just eval-golden-tool <snapshot>
 ```
 
 Golden reports expose each mode's metrics and query rows under `by_mode`. The existing top-level `hit_at_5`, `recall_at_5`, `mrr`, and `per_query` fields remain similarity-only so older baselines stay directly comparable.
