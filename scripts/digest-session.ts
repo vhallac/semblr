@@ -13,6 +13,14 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { pathToFileURL } from "node:url";
+import {
+	bm25IndexPathForRoundsDir,
+	deleteBm25Round,
+	loadBm25Index,
+	roundTextForBm25,
+	upsertBm25Round,
+	writeBm25Index,
+} from "../lib/bm25-index.ts";
 import { type EmbeddingModelRegistry, embedText, normalize } from "../lib/embed.ts";
 import {
 	appendVectorIndexEntry,
@@ -86,6 +94,7 @@ export async function runDigestSession(options: DigestSessionOptions = {}): Prom
 	const config = resolveScriptConfig(options);
 	const roundsDir = options.roundsDir ?? config.roundsDir;
 	const indexPath = resolveScriptIndexPath(config, roundsDir, options.indexPath);
+	const bm25IndexPath = bm25IndexPathForRoundsDir(roundsDir);
 	const modelRegistry = resolveScriptModelRegistry(config, options);
 	const embeddingConfig = scriptEmbeddingConfig(config);
 	const out = options.stdout ?? console;
@@ -117,6 +126,12 @@ export async function runDigestSession(options: DigestSessionOptions = {}): Prom
 
 		// Always write the round file (idempotent) before deleting stale copies.
 		fs.writeFileSync(path.resolve(roundsDir, roundFile), JSON.stringify(round, null, 2));
+		const bm25Index = loadBm25Index(bm25IndexPath);
+		upsertBm25Round(bm25Index, roundFile, roundTextForBm25(round));
+		for (const staleFile of staleFiles) {
+			deleteBm25Round(bm25Index, staleFile);
+		}
+		writeBm25Index(bm25IndexPath, bm25Index);
 		for (const staleFile of staleFiles) {
 			fs.unlinkSync(path.join(roundsDir, staleFile));
 			out.log(`  ♻️  Migrated stale: ${staleFile} → ${roundFile}`);

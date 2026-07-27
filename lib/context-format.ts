@@ -166,11 +166,12 @@ export function buildRelevanceList(
 ): string | null {
 	if (rounds.length === 0) return null;
 	const lines: string[] = [];
-	const header = `--- RELEVANCE LIST (all sessions, by similarity) ---
+	const header = `--- RELEVANCE LIST (all sessions, by hybrid relevance) ---
 These rounds have numeric similarity scores (0.0–1.0). Higher = stronger
-semantic match. They come from ALL past sessions, not just the current one.
+match. They combine semantic vector similarity with exact keyword matching.
+They come from ALL past sessions, not just the current one.
 
-The extension has pre-run a semantic search against your prompt. The results
+The extension has pre-run a hybrid search against your prompt. The results
 are below. If something here rings a bell, expand it via get_round_details.
 If nothing rings a bell, ignore this list — it's a pre-filter, not a map.
 

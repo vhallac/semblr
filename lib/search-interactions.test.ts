@@ -19,6 +19,7 @@ describe("normalizeSearchInteractionsParams", () => {
 		expect(result.threshold).toBe(0.25);
 		expect(result.scopeRounds).toBeNull();
 		expect(result.mode).toBe("similarity");
+		expect(result.alpha).toBe(0.7);
 	});
 
 	it("preserves all provided params", () => {
@@ -27,11 +28,13 @@ describe("normalizeSearchInteractionsParams", () => {
 			minSimilarity: 0.5,
 			rounds: ["abc.json", "def.json"],
 			mode: "tool",
+			alpha: 0.4,
 		});
 		expect(result.query).toBe("something");
 		expect(result.threshold).toBe(0.5);
 		expect(result.scopeRounds).toEqual(["abc.json", "def.json"]);
 		expect(result.mode).toBe("tool");
+		expect(result.alpha).toBe(0.4);
 	});
 
 	it("handles empty query", () => {
@@ -47,6 +50,23 @@ describe("normalizeSearchInteractionsParams", () => {
 	it("handles empty rounds array", () => {
 		const result = normalizeSearchInteractionsParams({ rounds: [] });
 		expect(result.scopeRounds).toEqual([]);
+	});
+
+	it("falls back to similarity for an invalid runtime mode", () => {
+		const result = normalizeSearchInteractionsParams({ query: "test", mode: "invalid" as never });
+		expect(result.mode).toBe("similarity");
+	});
+
+	it.each(["text-match", "hybrid"] as const)("preserves the %s mode", (mode) => {
+		const result = normalizeSearchInteractionsParams({ query: "test", mode });
+		expect(result.mode).toBe(mode);
+	});
+
+	it.each([
+		[-0.5, 0],
+		[1.5, 1],
+	])("clamps alpha %s to %s", (alpha, expected) => {
+		expect(normalizeSearchInteractionsParams({ alpha }).alpha).toBe(expected);
 	});
 });
 
@@ -152,6 +172,52 @@ describe("collectSearchRoundScores", () => {
 		const ghiEntry = results.find((r) => r.fileName === "rounds/ghi.json");
 		expect(ghiEntry).toBeDefined();
 		expect(ghiEntry?.bestScore).toBeCloseTo(1.0, 5);
+	});
+
+	it("fuses semantic and BM25 scores so exact keyword matches can outrank vector-only matches", () => {
+		const queryVec = [1, 0, 0];
+		const localIndex: IndexEntry[] = [
+			{ filePath: "rounds/semantic.json:prompt", vector: [1, 0, 0] },
+			{ filePath: "rounds/exact.json:prompt", vector: [0.2, 0.8, 0] },
+		];
+		const localRounds: Record<string, RoundData> = {
+			"rounds/semantic.json": {
+				userPrompt: "conceptual memory",
+				responseSequence: "architecture notes",
+				turnIndex: 0,
+			},
+			"rounds/exact.json": {
+				userPrompt: "search_interactions cannot find get_round_details",
+				responseSequence: "Investigate native tool names.",
+				turnIndex: 0,
+			},
+		};
+		const results = collectSearchRoundScores(
+			localIndex,
+			queryVec,
+			(filePath) => localRounds[indexRoundFileFromPath(filePath)] ?? null,
+			{
+				bm25Scores: new Map([
+					["rounds/semantic.json", 0],
+					["rounds/exact.json", 1],
+				]),
+				semanticWeight: 0.3,
+			},
+		);
+
+		expect(results.map((result) => result.fileName)).toEqual(["rounds/exact.json", "rounds/semantic.json"]);
+		expect(results[0].semanticScore).toBeLessThan(results[1].semanticScore ?? 0);
+		expect(results[0].bm25Score).toBe(1);
+	});
+
+	it("uses semantic scores unchanged when BM25 has no matches", () => {
+		const results = collectSearchRoundScores(index, [1, 0, 0], readRound, {
+			bm25Scores: new Map(),
+			semanticWeight: 0.3,
+		});
+
+		expect(results[0].bestScore).toBeCloseTo(1);
+		expect(results[0].fileName).toBe("rounds/abc.json");
 	});
 });
 

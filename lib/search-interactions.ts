@@ -7,13 +7,14 @@ import { cosineSimilarity } from "./vector.ts";
 
 const DEFAULT_CONTEXT_BUDGET_RATIO = 0.5;
 
-export type SearchInteractionsMode = "similarity" | "tool";
+export type SearchInteractionsMode = "similarity" | "text-match" | "hybrid" | "tool";
 
 export interface SearchInteractionsParams {
 	query?: string;
 	minSimilarity?: number;
 	rounds?: string[];
 	mode?: SearchInteractionsMode;
+	alpha?: number;
 }
 
 export interface NormalizedSearchInteractionsParams {
@@ -21,12 +22,15 @@ export interface NormalizedSearchInteractionsParams {
 	threshold: number;
 	scopeRounds: string[] | null;
 	mode: SearchInteractionsMode;
+	alpha: number;
 }
 
 export interface SearchRoundScore {
 	fileName: string;
 	data: RoundData;
 	bestScore: number;
+	semanticScore?: number;
+	bm25Score?: number;
 }
 
 export type SearchInteractionsToolResult = ToolResult;
@@ -34,11 +38,15 @@ export type SearchInteractionsToolResult = ToolResult;
 export function normalizeSearchInteractionsParams(
 	params: SearchInteractionsParams,
 ): NormalizedSearchInteractionsParams {
+	const validModes: readonly SearchInteractionsMode[] = ["similarity", "text-match", "hybrid", "tool"];
 	return {
 		query: params.query || null,
 		threshold: params.minSimilarity ?? 0.25,
 		scopeRounds: params.rounds ?? null,
-		mode: params.mode ?? "similarity",
+		mode: validModes.includes(params.mode as SearchInteractionsMode)
+			? (params.mode as SearchInteractionsMode)
+			: "similarity",
+		alpha: Math.max(0, Math.min(1, params.alpha ?? 0.7)),
 	};
 }
 
@@ -58,9 +66,20 @@ export function collectSearchRoundScores(
 	index: readonly IndexEntry[],
 	queryVec: number[],
 	readRound: (filePath: string) => RoundData | null,
+	options: {
+		bm25Scores?: ReadonlyMap<string, number>;
+		semanticWeight?: number;
+	} = {},
 ): SearchRoundScore[] {
+	const semanticWeight =
+		options.bm25Scores && options.bm25Scores.size > 0 ? Math.max(0, Math.min(1, options.semanticWeight ?? 0.7)) : 1;
 	const scored = index
-		.map((entry) => ({ ...entry, similarity: cosineSimilarity(queryVec, entry.vector) }))
+		.map((entry) => {
+			const semanticScore = cosineSimilarity(queryVec, entry.vector);
+			const bm25Score = options.bm25Scores?.get(indexRoundFileFromPath(entry.filePath)) ?? 0;
+			const similarity = semanticWeight * semanticScore + (1 - semanticWeight) * bm25Score;
+			return { ...entry, similarity, semanticScore, bm25Score };
+		})
 		.sort((a, b) => b.similarity - a.similarity);
 
 	const roundScores = new Map<string, SearchRoundScore>();
@@ -70,7 +89,13 @@ export function collectSearchRoundScores(
 		if (roundScores.has(roundFile)) continue;
 		const roundData = readRound(entry.filePath);
 		if (!roundData) continue;
-		roundScores.set(roundFile, { fileName: roundFile, data: roundData, bestScore: entry.similarity });
+		roundScores.set(roundFile, {
+			fileName: roundFile,
+			data: roundData,
+			bestScore: entry.similarity,
+			semanticScore: entry.semanticScore,
+			bm25Score: entry.bm25Score,
+		});
 	}
 
 	return Array.from(roundScores.values()).sort((a, b) => b.bestScore - a.bestScore);

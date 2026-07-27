@@ -310,6 +310,8 @@ Relative `roundsDir` values in project settings resolve under the project cwd. R
 | `embedTimeoutMs` | `SEMBLR_EMBED_TIMEOUT` | `15000` | Embedding request timeout |
 | `embedMaxRetries` | `SEMBLR_EMBED_RETRIES` | `3` | Embedding request retry count |
 | `embedBackoffMs` | `SEMBLR_EMBED_BACKOFF` | `1000` | Base retry backoff in milliseconds |
+| `hybridSemanticWeight` | `SEMBLR_HYBRID_SEMANTIC_WEIGHT` | `0.7` | Semantic-score weight (`alpha`) in hybrid retrieval; BM25 receives `1 - alpha` |
+| `summaryThresholdExtra` | `SEMBLR_SUMMARY_THRESHOLD_EXTRA` | `0` | Additional token threshold for the automatic context-size warning; `0` disables it |
 
 Additional runtime-only switches:
 
@@ -369,6 +371,9 @@ just migrate
 # Rebuild the tool-call fulltext index from existing round files (no re-embedding)
 just index-tools
 
+# Rebuild the BM25 keyword index from existing round files (no re-embedding)
+just rebuild-bm25
+
 # Search the index from the command line
 just query "what did we discuss about caching"
 ```
@@ -383,6 +388,8 @@ The index is a CSV with no schema header:
 ```
 
 Legacy two-column rows without the model column are still readable and are assumed to use the current configured embedding model. Each round produces two rows: one for the prompt embedding and one for the clipped-response embedding. The combined prompt+response embedding is stored in the round JSON file for grouping, not in the index CSV. The vector dimensions match the configured embedding model (1536 for the default `openai/text-embedding-3-small`). `just index` rewrites rows for rounds that were explicitly embedded with a different model so the index converges to the configured model. Cosine similarity is used for retrieval.
+
+Semblr also maintains `index.bm25.json` beside `index.csv`. It stores a local BM25 keyword index over each round's prompt, response, and tool text. Retrieval fuses semantic cosine score with normalized BM25 score using `SEMBLR_HYBRID_SEMANTIC_WEIGHT` / `hybridSemanticWeight` (default `0.7`). Run `just rebuild-bm25` to recreate it from existing round files without calling the embedding API.
 
 ## Known Problems
 
@@ -507,18 +514,25 @@ Semblr registers three tools that the LLM can call to explore historical rounds.
 
 ### `search_interactions`
 
-Searches all past conversations. Two modes:
+Searches all past conversations. Four modes:
 
 | Parameter | Type | Description |
 |---|---|---|
-| `query` | string | What to find. Natural language for `mode: "similarity"`, keywords for `mode: "tool"` |
-| `minSimilarity` | number (0–1) | Minimum similarity threshold. Default 0.25. Lower for broader matches. Ignored in `mode: "tool"` |
+| `query` | string | What to find. Natural language for `mode: "similarity"`, keywords for `mode: "text-match"` or `"tool"` |
+| `minSimilarity` | number (0–1) | Minimum score threshold. Default 0.25. Lower for broader matches. Ignored in `mode: "tool"` |
 | `rounds` | string[] | Optional — scope search to specific round files (drill into compaction summaries) |
-| `mode` | `"similarity"` \| `"tool"` | Default `"similarity"` (semantic search via embeddings). `"tool"` searches tool-call history instead |
+| `mode` | `"similarity"` \| `"text-match"` \| `"hybrid"` \| `"tool"` | Default `"similarity"`. Select semantic vectors, BM25 text, fused semantic/BM25, or tool-call history |
+| `alpha` | number (0–1) | Semantic blend weight in `"hybrid"` mode; default 0.7 and clamped to 0–1. Ignored in other modes |
 
-```
+```text
 # Semantic search (default)
 search_interactions(query: "why did we pick PostgreSQL over MySQL")
+
+# Exact keyword search without an embedding call
+search_interactions(query: "get_round_details", mode: "text-match")
+
+# Hybrid search biased toward exact text
+search_interactions(query: "cache invalidation", mode: "hybrid", alpha: 0.4)
 
 # Tool-use search — "did I ever curl this host?"
 search_interactions(query: "curl thinkerer", mode: "tool")
@@ -526,7 +540,9 @@ search_interactions(query: "curl thinkerer", mode: "tool")
 
 Returns a list of matching round IDs with scores and previews.
 
-**`mode: "tool"`** does a case-insensitive substring match over an index of past tool calls (tool name + all string argument values), not semantic similarity — no embedding API call involved. The query is split on whitespace into keywords; a round's score is the fraction of keywords matched anywhere across its tool calls (unique keyword coverage, not row count). Results include a `Matched tool: <name>(index <n>), ...` annotation so the LLM knows which tool calls to drill into with `get_tool_details`. The index lives at `$SEMBLR_ROUNDS_DIR/index-tools.fulltext.csv`, built incrementally at runtime and via `just index-tools` (or `digest-all.ts --tools-only`) for bulk/backfill rebuilds. Full-text search of prompts/responses (as opposed to tool calls) is a separate, not-yet-implemented mode.
+**`mode: "tool"`** does a case-insensitive substring match over an index of past tool calls (tool name + all string argument values), not semantic similarity — no embedding API call involved. The query is split on whitespace into keywords; a round's score is the fraction of keywords matched anywhere across its tool calls (unique keyword coverage, not row count). Results include a `Matched tool: <name>(index <n>), ...` annotation so the LLM knows which tool calls to drill into with `get_tool_details`. The index lives at `$SEMBLR_ROUNDS_DIR/index-tools.fulltext.csv`, built incrementally at runtime and via `just index-tools` (or `digest-all.ts --tools-only`) for bulk/backfill rebuilds.
+
+**`mode: "text-match"`** searches prompt, response, and tool text with the local BM25 index and makes no embedding API call. **`mode: "hybrid"`** combines semantic and normalized BM25 scores using `alpha`.
 
 ### `get_round_details`
 

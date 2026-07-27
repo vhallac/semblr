@@ -63,6 +63,7 @@ function testConfig(overrides: Partial<SemblrConfig> = {}): SemblrConfig {
 		embedTimeoutMs: 15000,
 		embedMaxRetries: 3,
 		embedBackoffMs: 1000,
+		hybridSemanticWeight: 0.7,
 		summaryThresholdExtra: 0,
 		...overrides,
 	};

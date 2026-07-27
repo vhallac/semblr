@@ -15,6 +15,15 @@ import * as path from "node:path";
 import type { ContextEvent, ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Type } from "@sinclair/typebox";
 import {
+	bm25IndexPathForRoundsDir,
+	loadOrRebuildBm25Index,
+	normalizeBm25Scores,
+	roundTextForBm25,
+	scoreBm25Query,
+	upsertBm25Round,
+	writeBm25Index,
+} from "../lib/bm25-index.ts";
+import {
 	buildCheckpointSectionContent,
 	buildContextPreamble,
 	buildFinalResponseContract,
@@ -156,6 +165,7 @@ export {
 const SEMBLR_CONFIG = loadSemblrConfig();
 const ROUNDS_DIR = SEMBLR_CONFIG.roundsDir;
 const INDEX_PATH = SEMBLR_CONFIG.indexPath;
+const BM25_INDEX_PATH = bm25IndexPathForRoundsDir(ROUNDS_DIR);
 const TOOLS_INDEX_PATH = toolIndexPathForRoundsDir(ROUNDS_DIR);
 const SEMBLR_DIR = path.dirname(ROUNDS_DIR);
 const STATS_PATH = path.join(SEMBLR_DIR, "chain-read-stats.json");
@@ -348,6 +358,19 @@ const _agentPendingToolCallIds: Map<string, ToolCallDetail> = new Map(); // tool
 
 function appendToIndex(filePath: string, vector: number[], model?: string) {
 	appendToIndexPath(INDEX_PATH, ROUNDS_DIR, filePath, vector, {}, model);
+}
+
+let searchBm25Index: ReturnType<typeof loadOrRebuildBm25Index> | null = null;
+
+function upsertRoundInBm25Index(fileName: string, roundData: RoundData): void {
+	const index = loadSearchBm25Index();
+	upsertBm25Round(index, fileName, roundTextForBm25(roundData));
+	writeBm25Index(BM25_INDEX_PATH, index);
+}
+
+function loadSearchBm25Index() {
+	searchBm25Index ??= loadOrRebuildBm25Index(BM25_INDEX_PATH, ROUNDS_DIR);
+	return searchBm25Index;
 }
 
 function embeddingClientDeps(ctx: ExtensionContext) {
@@ -759,7 +782,11 @@ export default function (pi: ExtensionAPI) {
 				return { messages: finalMessages } as any;
 			}
 
-			const scoredRounds = collectSearchRoundScores(index, queryVec, readRoundFile);
+			const bm25Scores = normalizeBm25Scores(scoreBm25Query(loadSearchBm25Index(), userPrompt));
+			const scoredRounds = collectSearchRoundScores(index, queryVec, readRoundFile, {
+				bm25Scores,
+				semanticWeight: SEMBLR_CONFIG.hybridSemanticWeight,
+			});
 			const bestScore = scoredRounds.length > 0 ? scoredRounds[0].bestScore : 0;
 
 			// --- Dynamic budget ---
@@ -965,6 +992,7 @@ export default function (pi: ExtensionAPI) {
 
 		try {
 			fs.writeFileSync(roundPath, JSON.stringify(roundData, null, 2));
+			upsertRoundInBm25Index(roundFileName, roundData as unknown as RoundData);
 		} catch (err) {
 			ctx.ui.setStatus("semblr", `\u{1f9e0} write error: ${(err as Error).message}`);
 			round.accumulatedText = [];
@@ -1119,7 +1147,7 @@ export default function (pi: ExtensionAPI) {
 			name: "search_interactions",
 			label: "Search Interactions",
 			description:
-				'Search all past user interactions for topics, questions, or discussions. Unlike the built-in search_memory (which searches within the current session), this searches across ALL sessions the user has ever had — every conversation round ever indexed. Use this when you need to find something from a past session, recall prior discussions, or reconnect with knowledge that was established a long time ago.\n\nYou can optionally scope the search to specific round files by passing the `rounds` parameter. This is useful when you want to drill down into a specific subset of rounds.\n\nBy default this searches by semantic similarity (mode: "similarity"). Set mode to "tool" to instead search by tool-use specifics — e.g. a bash command, a file path, a URL — via case-insensitive substring matching over past tool calls.',
+				'Search all past user interactions for topics, questions, or discussions. Unlike the built-in search_memory (which searches within the current session), this searches across ALL sessions the user has ever had — every conversation round ever indexed. Use this when you need to find something from a past session, recall prior discussions, or reconnect with knowledge that was established a long time ago.\n\nYou can optionally scope the search to specific round files by passing the `rounds` parameter. This is useful when you want to drill down into a specific subset of rounds.\n\nBy default this searches by semantic similarity (mode: "similarity"). Use "text-match" for BM25 keyword search without an embedding call, "hybrid" to blend semantic and BM25 scores, or "tool" to search tool-use specifics via case-insensitive substring matching.',
 			promptSnippet: "Search past interactions for relevant context",
 			parameters: Type.Object({
 				query: Type.String({ description: "The search query — what you want to find in past conversations" }),
@@ -1136,14 +1164,28 @@ export default function (pi: ExtensionAPI) {
 					}),
 				),
 				mode: Type.Optional(
-					Type.Union([Type.Literal("similarity"), Type.Literal("tool")], {
+					Type.Union(
+						[
+							Type.Literal("similarity"),
+							Type.Literal("text-match"),
+							Type.Literal("hybrid"),
+							Type.Literal("tool"),
+						],
+						{
+							description:
+								'"similarity" (default) searches semantic vectors; "text-match" searches round text with BM25; "hybrid" blends both using hybridSemanticWeight; "tool" searches tool call names and argument text.',
+						},
+					),
+				),
+				alpha: Type.Optional(
+					Type.Number({
 						description:
-							'"similarity" (default) searches by semantic similarity. "tool" searches by tool-use specifics — case-insensitive substring match over past tool call names and argument text (e.g. "did I ever curl this host", "when did I read this file").',
+							"Blend weight for hybrid mode (0 = pure BM25, 1 = pure semantic, default 0.7). Ignored in all other modes.",
 					}),
 				),
 			}),
 			async execute(_toolCallId, params, _signal, _onUpdate, ctx2) {
-				const { query, threshold, scopeRounds, mode } = normalizeSearchInteractionsParams(
+				const { query, threshold, scopeRounds, mode, alpha } = normalizeSearchInteractionsParams(
 					params as SearchInteractionsParams,
 				);
 				if (!query) {
@@ -1187,6 +1229,28 @@ export default function (pi: ExtensionAPI) {
 					);
 				}
 
+				let rawBm25Scores =
+					mode === "text-match" || mode === "hybrid"
+						? scoreBm25Query(loadSearchBm25Index(), query)
+						: new Map<string, number>();
+				if (scopeRounds && scopeRounds.length > 0) {
+					const scopeSet = new Set(scopeRounds);
+					rawBm25Scores = new Map(
+						Array.from(rawBm25Scores.entries()).filter(([fileName]) => scopeSet.has(fileName)),
+					);
+				}
+				const bm25Scores = normalizeBm25Scores(rawBm25Scores);
+
+				if (mode === "text-match") {
+					const sorted = Array.from(bm25Scores.entries())
+						.flatMap(([fileName, bm25Score]): SearchRoundScore[] => {
+							const data = readRoundFile(fileName);
+							return data ? [{ fileName, data, bestScore: bm25Score, bm25Score }] : [];
+						})
+						.sort((a, b) => b.bestScore - a.bestScore);
+					return renderSearchInteractionsToolResult(sorted, threshold, getRoundSize);
+				}
+
 				const apiKey = await getApiKey(ctx2, { config: SEMBLR_CONFIG });
 				if (!apiKey) {
 					return {
@@ -1221,7 +1285,10 @@ export default function (pi: ExtensionAPI) {
 					};
 				}
 
-				const sorted = collectSearchRoundScores(scopedIndex, queryVec, readRoundFile);
+				const sorted = collectSearchRoundScores(scopedIndex, queryVec, readRoundFile, {
+					bm25Scores: mode === "hybrid" ? bm25Scores : undefined,
+					semanticWeight: alpha,
+				});
 				return renderSearchInteractionsToolResult(sorted, threshold, getRoundSize);
 			},
 		});
