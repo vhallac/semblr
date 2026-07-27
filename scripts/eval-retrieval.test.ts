@@ -359,6 +359,190 @@ describe("eval-retrieval script", () => {
 		]);
 	});
 
+	it("routes golden queries by mode and keeps top-level metrics similarity-only", async () => {
+		const root = tmpDir();
+		const corpusDir = path.join(root, "snapshot-a");
+		const roundsDir = path.join(corpusDir, "rounds");
+		const sessionsDir = path.join(corpusDir, "sessions");
+		const outFile = path.join(root, "out", "eval-golden.json");
+		const toolOnlyOutFile = path.join(root, "out", "eval-tool.json");
+		const goldenFile = path.join(root, "docs", "eval", "golden-labels.json");
+		fs.mkdirSync(roundsDir, { recursive: true });
+		fs.mkdirSync(sessionsDir, { recursive: true });
+
+		const similarityTarget = {
+			userPrompt: prompt(
+				"similarity target has enough words to qualify as an earlier candidate in this golden retrieval evaluation test with stable deterministic ranking today",
+			),
+			responseSequence: "similarity target response",
+			turnIndex: 0,
+			userTimestamp: 10,
+			promptEmbedding: [1, 0],
+		} satisfies RoundData;
+		const toolTarget = {
+			userPrompt: prompt(
+				"tool target has enough words to qualify as an earlier candidate in this golden retrieval evaluation test with stable deterministic ranking today",
+			),
+			responseSequence: "tool target response",
+			turnIndex: 1,
+			userTimestamp: 20,
+			promptEmbedding: [0, 1],
+		} satisfies RoundData;
+		const similarityQuery = {
+			userPrompt: prompt(
+				"similarity query has enough words to replay the existing semantic retrieval behavior without a mode field and preserve the historical baseline output today",
+			),
+			responseSequence: "similarity query response",
+			turnIndex: 2,
+			userTimestamp: 30,
+			promptEmbedding: [1, 0],
+		} satisfies RoundData;
+		const toolQuery = {
+			userPrompt: prompt(
+				"tool query has enough words but deliberately uses an unrelated embedding because explicit tool query text drives retrieval in this golden evaluation case",
+			),
+			responseSequence: "tool query response",
+			turnIndex: 3,
+			userTimestamp: 40,
+			promptEmbedding: [1, 0],
+		} satisfies RoundData;
+		const futureToolTarget = {
+			userPrompt: prompt(
+				"future tool target has enough words and must be excluded by strict timestamp filtering in tool mode during this deterministic golden evaluation case",
+			),
+			responseSequence: "future tool target response",
+			turnIndex: 4,
+			userTimestamp: 50,
+			promptEmbedding: [0, 1],
+		} satisfies RoundData;
+
+		const similarityTargetFile = writeRound(roundsDir, similarityTarget);
+		const toolTargetFile = writeRound(roundsDir, toolTarget);
+		const similarityQueryFile = writeRound(roundsDir, similarityQuery);
+		const toolQueryFile = writeRound(roundsDir, toolQuery);
+		const futureToolTargetFile = writeRound(roundsDir, futureToolTarget);
+		fs.writeFileSync(
+			path.join(roundsDir, "index.csv"),
+			`${[
+				encodeEntry([1, 0], `${similarityTargetFile}:prompt`),
+				encodeEntry([0, 1], `${toolTargetFile}:prompt`),
+				encodeEntry([1, 0], `${similarityQueryFile}:prompt`),
+				encodeEntry([1, 0], `${toolQueryFile}:prompt`),
+				encodeEntry([0, 1], `${futureToolTargetFile}:prompt`),
+			].join("\n")}\n`,
+		);
+		fs.writeFileSync(
+			path.join(roundsDir, "index-tools.fulltext.csv"),
+			[`${toolTargetFile},0,bash,bash ssh prod-db-2`, `${futureToolTargetFile},0,bash,bash ssh prod-db-2`].join(
+				"\n",
+			),
+		);
+		fs.writeFileSync(
+			path.join(corpusDir, "chain-read-stats.json"),
+			JSON.stringify(createDefaultStatsState("2026-06-12T03:01:09.000Z"), null, 2),
+		);
+		fs.mkdirSync(path.dirname(goldenFile), { recursive: true });
+		fs.writeFileSync(
+			goldenFile,
+			JSON.stringify({
+				kind: "golden-labels",
+				version: 1,
+				source_pool: "/tmp/golden-pool.local.json",
+				queries: [
+					{
+						query: similarityQueryFile,
+						prompt: similarityQuery.userPrompt,
+						difficulty: "control",
+						primary: similarityTargetFile,
+						labels: [similarityTargetFile],
+					},
+					{
+						query: toolQueryFile,
+						prompt: toolQuery.userPrompt,
+						mode: "tool",
+						tool_query: "ssh prod-db-2",
+						difficulty: "tool",
+						primary: toolTargetFile,
+						labels: [toolTargetFile],
+					},
+				],
+			}),
+		);
+
+		await expect(
+			runEvalRetrieval({
+				args: ["--corpus", corpusDir, "--out", outFile, "--golden", goldenFile],
+				outFile,
+				gitRev: "test-rev",
+			}),
+		).resolves.toBe(0);
+		const result = JSON.parse(fs.readFileSync(outFile, "utf-8"));
+		expect(result.per_query).toHaveLength(1);
+		expect(result.per_query[0].query).toBe(similarityQueryFile);
+		expect(result.hit_at_5).toBe(1);
+		expect(result.by_mode.similarity.per_query).toEqual(result.per_query);
+		expect(result.by_mode.tool).toMatchObject({ hit_at_5: 1, recall_at_5: 1, mrr: 1 });
+		expect(result.by_mode.tool.per_query[0]).toEqual({
+			query: toolQueryFile,
+			labels: [toolTargetFile],
+			top5: [{ file: toolTargetFile, score: 1 }],
+			first_hit_rank: 1,
+		});
+
+		await expect(
+			runEvalRetrieval({
+				args: ["--corpus", corpusDir, "--out", toolOnlyOutFile, "--golden", goldenFile, "--mode", "tool"],
+				outFile: toolOnlyOutFile,
+				gitRev: "test-rev",
+			}),
+		).resolves.toBe(0);
+		const toolOnly = JSON.parse(fs.readFileSync(toolOnlyOutFile, "utf-8"));
+		expect(Object.keys(toolOnly.by_mode)).toEqual(["tool"]);
+		expect(toolOnly.per_query).toEqual([]);
+		expect(toolOnly.hit_at_5).toBe(0);
+	});
+
+	it("rejects a tool-mode golden query without tool_query", async () => {
+		const root = tmpDir();
+		const corpusDir = path.join(root, "snapshot-a");
+		const roundsDir = path.join(corpusDir, "rounds");
+		const goldenFile = path.join(root, "golden.json");
+		fs.mkdirSync(roundsDir, { recursive: true });
+		const query = {
+			userPrompt: prompt(
+				"tool query has enough words to qualify but lacks the required explicit tool query text for matching in this deterministic golden evaluation test case",
+			),
+			responseSequence: "query response",
+			turnIndex: 0,
+			userTimestamp: 20,
+			promptEmbedding: [1, 0],
+		} satisfies RoundData;
+		const queryFile = writeRound(roundsDir, query);
+		fs.writeFileSync(path.join(roundsDir, "index.csv"), `${encodeEntry([1, 0], `${queryFile}:prompt`)}\n`);
+		fs.writeFileSync(path.join(roundsDir, "index-tools.fulltext.csv"), "");
+		fs.writeFileSync(
+			goldenFile,
+			JSON.stringify({
+				kind: "golden-labels",
+				version: 1,
+				source_pool: "test",
+				queries: [
+					{
+						query: queryFile,
+						prompt: query.userPrompt,
+						mode: "tool",
+						difficulty: "tool",
+						primary: "target",
+						labels: ["target"],
+					},
+				],
+			}),
+		);
+		await expect(
+			runEvalRetrieval({ args: ["--corpus", corpusDir, "--golden", goldenFile], gitRev: "test-rev" }),
+		).rejects.toThrow(`Tool-mode golden query ${queryFile} is missing tool_query`);
+	});
+
 	it("defaults --sessions to <corpus>/sessions when omitted", async () => {
 		const root = tmpDir();
 		const corpusDir = path.join(root, "snapshot-a");
@@ -439,7 +623,7 @@ describe("eval-retrieval script", () => {
 			runEvalRetrieval({ args: [], stderr: { error: (line: string) => stderr.push(line) } }),
 		).resolves.toBe(1);
 		expect(stderr).toEqual([
-			"Usage: npx tsx scripts/eval-retrieval.ts --corpus <dir> [--sessions <dir>] [--out <file>] [--golden <file>]",
+			"Usage: npx tsx scripts/eval-retrieval.ts --corpus <dir> [--sessions <dir>] [--out <file>] [--golden <file>] [--mode <similarity|tool>]",
 		]);
 	});
 });

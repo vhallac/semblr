@@ -80,7 +80,15 @@ export interface GoldenLabelsFile {
 	kind: "golden-labels";
 	version: 1;
 	source_pool: string;
-	queries: Array<{ query: string; prompt: string; difficulty: string; primary: string | null; labels: string[] }>;
+	queries: Array<{
+		query: string;
+		prompt: string;
+		difficulty: string;
+		primary: string | null;
+		labels: string[];
+		mode?: "similarity" | "tool";
+		tool_query?: string;
+	}>;
 }
 
 export interface RunIngestGoldenLabelsOptions {

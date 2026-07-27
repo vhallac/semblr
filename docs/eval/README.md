@@ -21,9 +21,12 @@ The snapshot layout is:
 
 ```text
 <snapshot>/rounds/index.csv
+<snapshot>/rounds/index-tools.fulltext.csv
 <snapshot>/chain-read-stats.json
 <snapshot>/sessions/
 ```
+
+`index-tools.fulltext.csv` is required only when golden labels contain tool-mode queries.
 
 `just build-baseline-weak` writes `docs/eval/baseline-weak.local.json` by default, which is ignored by git.
 Pass an explicit output path if you want to store the report elsewhere.
@@ -52,6 +55,28 @@ just ingest-golden-labels
 ```
 
 `ingest-golden-labels` reads `golden-pool.local.json`, reads `golden-worksheet.local.md`, and writes `golden-labels.local.json` with both `labels` and optional `primary` per query.
+
+Existing entries default to similarity retrieval. To evaluate a curated tool-use signal, extend a local entry with:
+
+```json
+{
+  "query": "<origin-round>.json",
+  "mode": "tool",
+  "tool_query": "ssh prod-db-2",
+  "difficulty": "tool",
+  "labels": ["<relevant-round>.json"],
+  "primary": "<relevant-round>.json"
+}
+```
+
+`tool_query` is passed verbatim to the production tool-index matcher and is required for tool mode. The origin round remains the provenance and timestamp anchor. Run all declared modes, or filter to one:
+
+```sh
+npx tsx scripts/eval-retrieval.ts --corpus <snapshot> --golden docs/eval/golden-labels.local.json
+npx tsx scripts/eval-retrieval.ts --corpus <snapshot> --golden docs/eval/golden-labels.local.json --mode tool
+```
+
+Golden reports expose each mode's metrics and query rows under `by_mode`. The existing top-level `hit_at_5`, `recall_at_5`, `mrr`, and `per_query` fields remain similarity-only so older baselines stay directly comparable.
 
 ## Committed maintainer baseline
 
