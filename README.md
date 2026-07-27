@@ -524,7 +524,7 @@ Searches all past conversations. Four modes:
 | `mode` | `"similarity"` \| `"text-match"` \| `"hybrid"` \| `"tool"` | Default `"similarity"`. Select semantic vectors, BM25 text, fused semantic/BM25, or tool-call history |
 | `alpha` | number (0–1) | Semantic blend weight in `"hybrid"` mode; default 0.7 and clamped to 0–1. Ignored in other modes |
 
-```
+```text
 # Semantic search (default)
 search_interactions(query: "why did we pick PostgreSQL over MySQL")
 
