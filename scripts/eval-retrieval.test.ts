@@ -502,6 +502,56 @@ describe("eval-retrieval script", () => {
 		expect(toolOnly.hit_at_5).toBe(0);
 	});
 
+	it("rejects an invalid --mode value", async () => {
+		const stderr: string[] = [];
+
+		await expect(
+			runEvalRetrieval({
+				args: ["--corpus", "/tmp/unused", "--mode", "bogus"],
+				stderr: { error: (message: string) => stderr.push(message) },
+			}),
+		).resolves.toBe(1);
+		expect(stderr[0]).toContain("Invalid --mode: bogus");
+	});
+
+	it("rejects tool-mode golden labels when the tool index is missing", async () => {
+		const root = tmpDir();
+		const corpusDir = path.join(root, "snapshot-a");
+		const roundsDir = path.join(corpusDir, "rounds");
+		const goldenFile = path.join(root, "golden.json");
+		const stderr: string[] = [];
+		fs.mkdirSync(roundsDir, { recursive: true });
+		fs.writeFileSync(path.join(roundsDir, "index.csv"), "");
+		fs.writeFileSync(
+			goldenFile,
+			JSON.stringify({
+				kind: "golden-labels",
+				version: 1,
+				source_pool: "test",
+				queries: [
+					{
+						query: "query.json",
+						prompt: "tool query",
+						mode: "tool",
+						tool_query: "ssh prod-db-2",
+						difficulty: "tool",
+						primary: "target.json",
+						labels: ["target.json"],
+					},
+				],
+			}),
+		);
+
+		await expect(
+			runEvalRetrieval({
+				args: ["--corpus", corpusDir, "--golden", goldenFile],
+				gitRev: "test-rev",
+				stderr: { error: (message: string) => stderr.push(message) },
+			}),
+		).resolves.toBe(1);
+		expect(stderr[0]).toBe(`Corpus tool index does not exist: ${path.join(roundsDir, "index-tools.fulltext.csv")}`);
+	});
+
 	it("rejects a tool-mode golden query without tool_query", async () => {
 		const root = tmpDir();
 		const corpusDir = path.join(root, "snapshot-a");

@@ -315,6 +315,11 @@ export async function runEvalRetrieval(options: RunEvalRetrievalOptions = {}): P
 		err.error(`Golden labels file does not exist: ${resolvedGoldenFile}`);
 		return 1;
 	}
+	const goldenLabels = resolvedGoldenFile ? loadGoldenLabels(resolvedGoldenFile, fsImpl) : null;
+	if (goldenLabels?.queries.some((query) => query.mode === "tool") && !fsImpl.existsSync(toolIndexPath)) {
+		err.error(`Corpus tool index does not exist: ${toolIndexPath}`);
+		return 1;
+	}
 
 	const result = evaluateRetrieval({
 		corpusDir: resolvedCorpusDir,
@@ -338,7 +343,7 @@ export async function runEvalRetrieval(options: RunEvalRetrievalOptions = {}): P
 				as_of: "strictly earlier",
 			},
 		}),
-		goldenLabels: resolvedGoldenFile ? loadGoldenLabels(resolvedGoldenFile, fsImpl) : null,
+		goldenLabels,
 		toolIndex: loadToolIndex(toolIndexPath, fsImpl),
 		modeFilter,
 		fsImpl,
