@@ -82,7 +82,7 @@ Current AI agent sessions degrade as they accumulate context. Pi's compaction me
 
 1. **Save every round permanently.** Each user prompt + full assistant response sequence (tool calls, thinking, final answer) is saved as an individual JSON file.
 2. **Embed prompt, response, and combined text.** Three texts are sent to the configured embedding API: the user prompt, the clipped response (by default truncated to ~24KB, context-injection artifacts stripped), and the concatenation of both (`prompt + "\n\n" + clippedResponse`). The prompt and response vectors are stored in an append-only CSV index. The combined vector is stored in the round file for semantic grouping.
-3. **Retrieve by relevance.** On every user prompt, the prompt is embedded and compared against all stored vectors via cosine similarity. The closest rounds are injected into context — up to a dynamic token budget.
+3. **Retrieve by relevance.** On every user prompt, the prompt is embedded and compared against stored vectors via cosine similarity. Separately, `search_interactions` embeds its query once with each distinct model represented in the searched index; within that tool search, every stored vector is compared only with a query vector from the same model. The closest rounds are injected into context — up to a dynamic token budget.
 4. **Drill-down via tools.** By default, rounds are shown as a compact numbered index. The LLM uses `get_round_details()` to expand a round and `get_tool_details()` to inspect individual tool calls within it.
 
 The result: context that is **always roughly the same size, always the most relevant, and never lossy** — even across sessions.
@@ -232,7 +232,7 @@ Semblr has two sources of API cost:
 |---|---|
 | **Saving a round** | 2–3 embedding API calls (prompt, clipped response, combined) |
 | **Context assembly** | 1 embedding API call (the current prompt) |
-| **Index search** (via `search_interactions` tool) | 1 embedding API call per search |
+| **Index search** (via `search_interactions` tool) | 1 embedding API call per distinct model in the searched index |
 
 By default, embeddings go to OpenRouter → `openai/text-embedding-3-small`. If you configure another embedding provider/model or `embeddingApiUrl`, pricing and vector dimensions follow that endpoint/model instead.
 

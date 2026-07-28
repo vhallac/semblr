@@ -73,10 +73,11 @@ import {
 	type ToolDetailsParams,
 } from "../lib/round-tool-results.ts";
 import {
+	collectMultiModelSearchRoundScores,
 	collectSearchRoundScores,
 	computeContextBudget,
-	filterSearchIndexByRounds,
 	normalizeSearchInteractionsParams,
+	prepareMultiModelQueryVectors,
 	renderSearchInteractionsToolResult,
 	type SearchInteractionsParams,
 	type SearchRoundScore,
@@ -373,8 +374,11 @@ function loadSearchBm25Index() {
 	return searchBm25Index;
 }
 
-function embeddingClientDeps(ctx: ExtensionContext) {
-	return { config: SEMBLR_CONFIG, modelRegistry: ctx.modelRegistry };
+export function embeddingClientDeps(ctx: ExtensionContext, embeddingModel = SEMBLR_CONFIG.embeddingModel) {
+	return {
+		config: { ...SEMBLR_CONFIG, embeddingModel },
+		modelRegistry: ctx.modelRegistry,
+	};
 }
 
 function extensionRoot(): string {
@@ -1259,10 +1263,7 @@ export default function (pi: ExtensionAPI) {
 					};
 				}
 
-				// Embed the query
-				const queryVec = normalize(await embedText(query, apiKey, embeddingClientDeps(ctx2)));
-
-				// Load index and score
+				// Load and scope the index before discovering which query models are needed.
 				const index = loadIndex();
 				if (index.length === 0) {
 					return {
@@ -1272,7 +1273,13 @@ export default function (pi: ExtensionAPI) {
 				}
 
 				// If rounds[] is provided, scope the search to only those round files
-				const scopedIndex = filterSearchIndexByRounds(index, scopeRounds);
+				const { scopedIndex, queryVectorsByModel } = await prepareMultiModelQueryVectors(
+					index,
+					scopeRounds,
+					query,
+					SEMBLR_CONFIG.embeddingModel,
+					(queryText, model) => embedText(queryText, apiKey, embeddingClientDeps(ctx2, model)),
+				);
 				if (scopeRounds && scopeRounds.length > 0 && scopedIndex.length === 0) {
 					return {
 						content: [
@@ -1285,10 +1292,16 @@ export default function (pi: ExtensionAPI) {
 					};
 				}
 
-				const sorted = collectSearchRoundScores(scopedIndex, queryVec, readRoundFile, {
-					bm25Scores: mode === "hybrid" ? bm25Scores : undefined,
-					semanticWeight: alpha,
-				});
+				const sorted = collectMultiModelSearchRoundScores(
+					scopedIndex,
+					queryVectorsByModel,
+					SEMBLR_CONFIG.embeddingModel,
+					readRoundFile,
+					{
+						bm25Scores: mode === "hybrid" ? bm25Scores : undefined,
+						semanticWeight: alpha,
+					},
+				);
 				return renderSearchInteractionsToolResult(sorted, threshold, getRoundSize);
 			},
 		});

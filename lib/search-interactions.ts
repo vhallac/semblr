@@ -3,7 +3,7 @@ import { indexRoundFileFromPath } from "./index-io.ts";
 import type { IndexEntry } from "./index-storage.ts";
 import type { RoundData, ToolCallDetail, ToolResult } from "./round-data.ts";
 import { estimateTokens } from "./tokens.ts";
-import { cosineSimilarity } from "./vector.ts";
+import { cosineSimilarity, normalize } from "./vector.ts";
 
 const DEFAULT_CONTEXT_BUDGET_RATIO = 0.5;
 
@@ -62,9 +62,29 @@ export function filterSearchIndexByRounds(
 	});
 }
 
-export function collectSearchRoundScores(
+export function getIndexEmbeddingModels(index: readonly IndexEntry[], fallbackModel: string): string[] {
+	return [...new Set(index.map((entry) => entry.model ?? fallbackModel))];
+}
+
+export async function prepareMultiModelQueryVectors(
 	index: readonly IndexEntry[],
-	queryVec: number[],
+	scopeRounds: readonly string[] | null,
+	query: string,
+	fallbackModel: string,
+	embedQuery: (query: string, model: string) => Promise<number[]>,
+): Promise<{ scopedIndex: IndexEntry[]; queryVectorsByModel: Map<string, number[]> }> {
+	const scopedIndex = filterSearchIndexByRounds(index, scopeRounds);
+	const embeddings = await Promise.all(
+		getIndexEmbeddingModels(scopedIndex, fallbackModel).map(
+			async (model) => [model, normalize(await embedQuery(query, model))] as const,
+		),
+	);
+	return { scopedIndex, queryVectorsByModel: new Map(embeddings) };
+}
+
+function collectSearchRoundScoresWithVector(
+	index: readonly IndexEntry[],
+	queryVectorForEntry: (entry: IndexEntry) => number[],
 	readRound: (filePath: string) => RoundData | null,
 	options: {
 		bm25Scores?: ReadonlyMap<string, number>;
@@ -75,7 +95,7 @@ export function collectSearchRoundScores(
 		options.bm25Scores && options.bm25Scores.size > 0 ? Math.max(0, Math.min(1, options.semanticWeight ?? 0.7)) : 1;
 	const scored = index
 		.map((entry) => {
-			const semanticScore = cosineSimilarity(queryVec, entry.vector);
+			const semanticScore = cosineSimilarity(queryVectorForEntry(entry), entry.vector);
 			const bm25Score = options.bm25Scores?.get(indexRoundFileFromPath(entry.filePath)) ?? 0;
 			const similarity = semanticWeight * semanticScore + (1 - semanticWeight) * bm25Score;
 			return { ...entry, similarity, semanticScore, bm25Score };
@@ -99,6 +119,41 @@ export function collectSearchRoundScores(
 	}
 
 	return Array.from(roundScores.values()).sort((a, b) => b.bestScore - a.bestScore);
+}
+
+export function collectSearchRoundScores(
+	index: readonly IndexEntry[],
+	queryVec: number[],
+	readRound: (filePath: string) => RoundData | null,
+	options: {
+		bm25Scores?: ReadonlyMap<string, number>;
+		semanticWeight?: number;
+	} = {},
+): SearchRoundScore[] {
+	return collectSearchRoundScoresWithVector(index, () => queryVec, readRound, options);
+}
+
+export function collectMultiModelSearchRoundScores(
+	index: readonly IndexEntry[],
+	queryVectorsByModel: ReadonlyMap<string, number[]>,
+	fallbackModel: string,
+	readRound: (filePath: string) => RoundData | null,
+	options: {
+		bm25Scores?: ReadonlyMap<string, number>;
+		semanticWeight?: number;
+	} = {},
+): SearchRoundScore[] {
+	return collectSearchRoundScoresWithVector(
+		index,
+		(entry) => {
+			const model = entry.model ?? fallbackModel;
+			const queryVec = queryVectorsByModel.get(model);
+			if (!queryVec) throw new Error(`Missing query embedding for index model: ${model}`);
+			return queryVec;
+		},
+		readRound,
+		options,
+	);
 }
 
 export function computeContextBudget(
