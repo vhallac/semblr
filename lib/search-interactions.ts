@@ -74,11 +74,14 @@ export async function prepareMultiModelQueryVectors(
 	embedQuery: (query: string, model: string) => Promise<number[]>,
 ): Promise<{ scopedIndex: IndexEntry[]; queryVectorsByModel: Map<string, number[]> }> {
 	const scopedIndex = filterSearchIndexByRounds(index, scopeRounds);
-	const embeddings = await Promise.all(
+	const embeddingResults = await Promise.allSettled(
 		getIndexEmbeddingModels(scopedIndex, fallbackModel).map(
 			async (model) => [model, normalize(await embedQuery(query, model))] as const,
 		),
 	);
+	const embeddings = embeddingResults
+		.filter((result): result is PromiseFulfilledResult<readonly [string, number[]]> => result.status === "fulfilled")
+		.map((result) => result.value);
 	return { scopedIndex, queryVectorsByModel: new Map(embeddings) };
 }
 

@@ -57,13 +57,25 @@ describe("multi-model query preparation", () => {
 		);
 	});
 
-	it("rejects the whole operation when any model embedding fails", async () => {
-		await expect(
-			prepareMultiModelQueryVectors(index, null, "find this", "current-model", async (_query, model) => {
+	it("keeps successful query vectors when an individual model embedding fails", async () => {
+		const result = await prepareMultiModelQueryVectors(
+			index,
+			null,
+			"find this",
+			"current-model",
+			async (_query, model) => {
 				if (model === "model-b") throw new Error("model unavailable");
 				return [1, 0];
-			}),
-		).rejects.toThrow("model unavailable");
+			},
+		);
+
+		expect(result.scopedIndex).toEqual(index);
+		expect(result.queryVectorsByModel).toEqual(
+			new Map([
+				["model-a", [1, 0]],
+				["current-model", [1, 0]],
+			]),
+		);
 	});
 });
 
@@ -332,6 +344,21 @@ describe("collectMultiModelSearchRoundScores", () => {
 		expect(results[0].semanticScore).toBe(1);
 		expect(results[0].bestScore).toBe(1);
 		expect(results[1].bestScore).toBe(0);
+	});
+
+	it("throws when an indexed model has no prepared query vector", () => {
+		const index: IndexEntry[] = [
+			{ filePath: "rounds/a.json:prompt", vector: [1, 0], model: "model-a" },
+		];
+
+		expect(() =>
+			collectMultiModelSearchRoundScores(
+				index,
+				new Map([["current-model", [1, 0]]]),
+				"current-model",
+				readRound,
+			),
+		).toThrow("Missing query embedding for index model: model-a");
 	});
 });
 
