@@ -3,14 +3,69 @@ import { indexRoundFileFromPath } from "./index-io.ts";
 import type { IndexEntry } from "./index-storage.ts";
 import type { RoundData } from "./round-data.ts";
 import {
+	collectMultiModelSearchRoundScores,
 	collectSearchRoundScores,
 	computeContextBudget,
 	filterSearchIndexByRounds,
+	getIndexEmbeddingModels,
 	normalizeSearchInteractionsParams,
+	prepareMultiModelQueryVectors,
 	renderSearchInteractionsToolResult,
 	type SearchRoundScore,
 	selectContextRounds,
 } from "./search-interactions.ts";
+
+describe("multi-model query preparation", () => {
+	const index: IndexEntry[] = [
+		{ filePath: "rounds/abc.json:prompt", vector: [1, 0], model: "model-a" },
+		{ filePath: "rounds/abc.json:response", vector: [0, 1], model: "model-a" },
+		{ filePath: "rounds/def.json:prompt", vector: [1, 0], model: "model-b" },
+		{ filePath: "rounds/legacy.json:prompt", vector: [1, 0] },
+	];
+
+	it("deduplicates explicit models and maps missing metadata to the configured model", () => {
+		expect(getIndexEmbeddingModels(index, "current-model")).toEqual(["model-a", "model-b", "current-model"]);
+	});
+
+	it("scopes before embedding and normalizes one query vector per effective model", async () => {
+		const calls: Array<{ query: string; model: string }> = [];
+		const result = await prepareMultiModelQueryVectors(
+			index,
+			["rounds/abc.json", "rounds/legacy.json"],
+			"find this",
+			"current-model",
+			async (query, model) => {
+				calls.push({ query, model });
+				return model === "model-a" ? [3, 4] : [0, 2];
+			},
+		);
+
+		expect(result.scopedIndex.map((entry) => entry.filePath)).toEqual([
+			"rounds/abc.json:prompt",
+			"rounds/abc.json:response",
+			"rounds/legacy.json:prompt",
+		]);
+		expect(calls).toEqual([
+			{ query: "find this", model: "model-a" },
+			{ query: "find this", model: "current-model" },
+		]);
+		expect(result.queryVectorsByModel).toEqual(
+			new Map([
+				["model-a", [0.6, 0.8]],
+				["current-model", [0, 1]],
+			]),
+		);
+	});
+
+	it("rejects the whole operation when any model embedding fails", async () => {
+		await expect(
+			prepareMultiModelQueryVectors(index, null, "find this", "current-model", async (_query, model) => {
+				if (model === "model-b") throw new Error("model unavailable");
+				return [1, 0];
+			}),
+		).rejects.toThrow("model unavailable");
+	});
+});
 
 describe("normalizeSearchInteractionsParams", () => {
 	it("uses defaults for missing optional params", () => {
@@ -218,6 +273,65 @@ describe("collectSearchRoundScores", () => {
 
 		expect(results[0].bestScore).toBeCloseTo(1);
 		expect(results[0].fileName).toBe("rounds/abc.json");
+	});
+});
+
+describe("collectMultiModelSearchRoundScores", () => {
+	const rounds: Record<string, RoundData> = {
+		"rounds/a.json": { userPrompt: "a", responseSequence: "a response", turnIndex: 0 },
+		"rounds/b.json": { userPrompt: "b", responseSequence: "b response", turnIndex: 0 },
+		"rounds/legacy.json": { userPrompt: "legacy", responseSequence: "legacy response", turnIndex: 0 },
+	};
+	const readRound = (filePath: string) => rounds[indexRoundFileFromPath(filePath)] ?? null;
+
+	it("scores every entry with the query vector for its effective model", () => {
+		const index: IndexEntry[] = [
+			{ filePath: "rounds/a.json:prompt", vector: [1, 0], model: "model-a" },
+			{ filePath: "rounds/b.json:prompt", vector: [0, 1], model: "model-b" },
+			{ filePath: "rounds/legacy.json:prompt", vector: [0, 1] },
+		];
+		const results = collectMultiModelSearchRoundScores(
+			index,
+			new Map([
+				["model-a", [1, 0]],
+				["model-b", [0, 1]],
+				["current-model", [0, 1]],
+			]),
+			"current-model",
+			readRound,
+		);
+
+		expect(results).toHaveLength(3);
+		expect(results.every((result) => result.bestScore === 1)).toBe(true);
+	});
+
+	it("preserves BM25 fusion and the best entry per round across models", () => {
+		const index: IndexEntry[] = [
+			{ filePath: "rounds/a.json:prompt", vector: [1, 0], model: "model-a" },
+			{ filePath: "rounds/a.json:response", vector: [0, 1], model: "model-b" },
+			{ filePath: "rounds/b.json:prompt", vector: [1, 0], model: "model-b" },
+		];
+		const results = collectMultiModelSearchRoundScores(
+			index,
+			new Map([
+				["model-a", [0, 1]],
+				["model-b", [0, 1]],
+			]),
+			"current-model",
+			readRound,
+			{
+				bm25Scores: new Map([
+					["rounds/a.json", 1],
+					["rounds/b.json", 0],
+				]),
+				semanticWeight: 0.5,
+			},
+		);
+
+		expect(results.map((result) => result.fileName)).toEqual(["rounds/a.json", "rounds/b.json"]);
+		expect(results[0].semanticScore).toBe(1);
+		expect(results[0].bestScore).toBe(1);
+		expect(results[1].bestScore).toBe(0);
 	});
 });
 
