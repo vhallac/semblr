@@ -347,17 +347,10 @@ describe("collectMultiModelSearchRoundScores", () => {
 	});
 
 	it("throws when an indexed model has no prepared query vector", () => {
-		const index: IndexEntry[] = [
-			{ filePath: "rounds/a.json:prompt", vector: [1, 0], model: "model-a" },
-		];
+		const index: IndexEntry[] = [{ filePath: "rounds/a.json:prompt", vector: [1, 0], model: "model-a" }];
 
 		expect(() =>
-			collectMultiModelSearchRoundScores(
-				index,
-				new Map([["current-model", [1, 0]]]),
-				"current-model",
-				readRound,
-			),
+			collectMultiModelSearchRoundScores(index, new Map([["current-model", [1, 0]]]), "current-model", readRound),
 		).toThrow("Missing query embedding for index model: model-a");
 	});
 });
