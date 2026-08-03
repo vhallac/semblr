@@ -57,6 +57,22 @@ describe("multi-model query preparation", () => {
 		);
 	});
 
+	it("surfaces every rejection reason when all model embeddings fail", async () => {
+		const result = await prepareMultiModelQueryVectors(
+			index,
+			null,
+			"find this",
+			"current-model",
+			async (_query, model) => {
+				throw new Error(`embedding service down for ${model}`);
+			},
+		);
+
+		expect(result.queryVectorsByModel.size).toBe(0);
+		expect(result.failedModels.map(({ model }) => model).sort()).toEqual(["current-model", "model-a", "model-b"]);
+		expect(result.failedModels.every(({ reason }) => reason.startsWith("embedding service down for"))).toBe(true);
+	});
+
 	it("keeps successful query vectors when an individual model embedding fails", async () => {
 		const result = await prepareMultiModelQueryVectors(
 			index,
@@ -346,12 +362,47 @@ describe("collectMultiModelSearchRoundScores", () => {
 		expect(results[1].bestScore).toBe(0);
 	});
 
-	it("throws when an indexed model has no prepared query vector", () => {
-		const index: IndexEntry[] = [{ filePath: "rounds/a.json:prompt", vector: [1, 0], model: "model-a" }];
+	it("scores with surviving models and skips entries of failed models end to end", async () => {
+		const localIndex: IndexEntry[] = [
+			{ filePath: "rounds/a.json:prompt", vector: [1, 0], model: "model-a" },
+			{ filePath: "rounds/b.json:prompt", vector: [0, 1], model: "model-b" },
+			{ filePath: "rounds/legacy.json:prompt", vector: [0, 1] },
+		];
+		const prepared = await prepareMultiModelQueryVectors(
+			localIndex,
+			null,
+			"find this",
+			"current-model",
+			async (_query, model) => {
+				if (model === "model-b") throw new Error("model unavailable");
+				return [1, 0];
+			},
+		);
 
-		expect(() =>
-			collectMultiModelSearchRoundScores(index, new Map([["current-model", [1, 0]]]), "current-model", readRound),
-		).toThrow("Missing query embedding for index model: model-a");
+		const results = collectMultiModelSearchRoundScores(
+			prepared.scopedIndex,
+			prepared.queryVectorsByModel,
+			"current-model",
+			readRound,
+		);
+
+		expect(results.map((result) => result.fileName).sort()).toEqual(["rounds/a.json", "rounds/legacy.json"]);
+	});
+
+	it("skips entries whose model has no prepared query vector", () => {
+		const index: IndexEntry[] = [
+			{ filePath: "rounds/a.json:prompt", vector: [1, 0], model: "model-a" },
+			{ filePath: "rounds/b.json:prompt", vector: [0, 1], model: "model-b" },
+		];
+
+		const results = collectMultiModelSearchRoundScores(
+			index,
+			new Map([["model-a", [1, 0]]]),
+			"current-model",
+			readRound,
+		);
+
+		expect(results.map((result) => result.fileName)).toEqual(["rounds/a.json"]);
 	});
 });
 

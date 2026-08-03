@@ -1273,7 +1273,7 @@ export default function (pi: ExtensionAPI) {
 				}
 
 				// If rounds[] is provided, scope the search to only those round files
-				const { scopedIndex, queryVectorsByModel } = await prepareMultiModelQueryVectors(
+				const { scopedIndex, queryVectorsByModel, failedModels } = await prepareMultiModelQueryVectors(
 					index,
 					scopeRounds,
 					query,
@@ -1286,6 +1286,26 @@ export default function (pi: ExtensionAPI) {
 							{
 								type: "text",
 								text: `No indexed vectors found for the specified rounds: ${scopeRounds.join(", ")}. They may not be embedded yet.`,
+							},
+						],
+						details: {},
+					};
+				}
+
+				// All embedding calls rejected (e.g. the embedding service is down, or the
+				// only configured model is unavailable). Degrade gracefully instead of
+				// letting the missing-vector case surface as a hard tool failure, and
+				// surface the real rejection reasons rather than swallowing them.
+				if (queryVectorsByModel.size === 0) {
+					const detail =
+						failedModels.length > 0
+							? failedModels.map(({ model, reason }) => `${model}: ${reason}`).join("; ")
+							: "no embedding models in the index";
+					return {
+						content: [
+							{
+								type: "text",
+								text: `Search unavailable: every query embedding attempt failed (${detail}). Skipping search.`,
 							},
 						],
 						details: {},
