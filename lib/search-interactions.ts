@@ -66,25 +66,45 @@ export function getIndexEmbeddingModels(index: readonly IndexEntry[], fallbackMo
 	return [...new Set(index.map((entry) => entry.model ?? fallbackModel))];
 }
 
+export interface PreparedMultiModelQueryVectors {
+	scopedIndex: IndexEntry[];
+	queryVectorsByModel: Map<string, number[]>;
+	/** Models whose query embedding call rejected, with the reason — never swallowed. */
+	failedModels: Array<{ model: string; reason: string }>;
+}
+
 export async function prepareMultiModelQueryVectors(
 	index: readonly IndexEntry[],
 	scopeRounds: readonly string[] | null,
 	query: string,
 	fallbackModel: string,
 	embedQuery: (query: string, model: string) => Promise<number[]>,
-): Promise<{ scopedIndex: IndexEntry[]; queryVectorsByModel: Map<string, number[]> }> {
+): Promise<PreparedMultiModelQueryVectors> {
 	const scopedIndex = filterSearchIndexByRounds(index, scopeRounds);
-	const embeddings = await Promise.all(
-		getIndexEmbeddingModels(scopedIndex, fallbackModel).map(
-			async (model) => [model, normalize(await embedQuery(query, model))] as const,
-		),
+	const models = getIndexEmbeddingModels(scopedIndex, fallbackModel);
+	const embeddingResults = await Promise.allSettled(
+		models.map(async (model) => [model, normalize(await embedQuery(query, model))] as const),
 	);
-	return { scopedIndex, queryVectorsByModel: new Map(embeddings) };
+	const queryVectorsByModel = new Map<string, number[]>();
+	const failedModels: Array<{ model: string; reason: string }> = [];
+	for (let i = 0; i < models.length; i++) {
+		const result = embeddingResults[i];
+		if (result.status === "fulfilled") {
+			queryVectorsByModel.set(result.value[0], result.value[1]);
+		} else {
+			failedModels.push({ model: models[i], reason: embeddingFailureReason(result.reason) });
+		}
+	}
+	return { scopedIndex, queryVectorsByModel, failedModels };
+}
+
+function embeddingFailureReason(reason: unknown): string {
+	return reason instanceof Error ? reason.message : String(reason);
 }
 
 function collectSearchRoundScoresWithVector(
 	index: readonly IndexEntry[],
-	queryVectorForEntry: (entry: IndexEntry) => number[],
+	queryVectorForEntry: (entry: IndexEntry) => number[] | null,
 	readRound: (filePath: string) => RoundData | null,
 	options: {
 		bm25Scores?: ReadonlyMap<string, number>;
@@ -95,11 +115,14 @@ function collectSearchRoundScoresWithVector(
 		options.bm25Scores && options.bm25Scores.size > 0 ? Math.max(0, Math.min(1, options.semanticWeight ?? 0.7)) : 1;
 	const scored = index
 		.map((entry) => {
-			const semanticScore = cosineSimilarity(queryVectorForEntry(entry), entry.vector);
+			const queryVector = queryVectorForEntry(entry);
+			if (!queryVector) return null;
+			const semanticScore = cosineSimilarity(queryVector, entry.vector);
 			const bm25Score = options.bm25Scores?.get(indexRoundFileFromPath(entry.filePath)) ?? 0;
 			const similarity = semanticWeight * semanticScore + (1 - semanticWeight) * bm25Score;
 			return { ...entry, similarity, semanticScore, bm25Score };
 		})
+		.filter((scoredEntry): scoredEntry is NonNullable<typeof scoredEntry> => scoredEntry !== null)
 		.sort((a, b) => b.similarity - a.similarity);
 
 	const roundScores = new Map<string, SearchRoundScore>();
@@ -147,9 +170,7 @@ export function collectMultiModelSearchRoundScores(
 		index,
 		(entry) => {
 			const model = entry.model ?? fallbackModel;
-			const queryVec = queryVectorsByModel.get(model);
-			if (!queryVec) throw new Error(`Missing query embedding for index model: ${model}`);
-			return queryVec;
+			return queryVectorsByModel.get(model) ?? null;
 		},
 		readRound,
 		options,
