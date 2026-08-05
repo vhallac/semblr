@@ -25,7 +25,7 @@ Semblr runs as a [pi coding agent](https://pi.dev) extension.
 
 - **[Node.js](https://nodejs.org/)** >= 22 with npm
 - **TypeScript** (`typescript`) — type checking the extension and scripts
-- **Biome** (`@biomejs/biome`) — linting and formatting (version 1.9.x; installed via npm or Nix)
+- **Biome** — linting and formatting (version >= 2.4.0; provided by the environment, not installed via npm)
 - **`@earendil-works/pi-coding-agent`** — pi SDK types for type checking
 - **`@types/node`** — Node.js type declarations
 
@@ -485,7 +485,7 @@ Configuration:
 - `tsconfig.json` — TypeScript with strict mode, ES2022 target, Node16 modules
 - `biome.json` — Biome linter and formatter (recommended rules, tabs, 120 char width)
 
-> **NixOS note:** The npm-installed Biome binary is dynamically linked and won't run. Use the nix-provided one via `nix-shell -p biome --command "biome check"` or add it to `shell.nix`.
+> **NixOS note:** Biome must come from the environment, not npm — the npm-installed binary is dynamically linked and won't run on NixOS. Add `biome` to `shell.nix` (or the user profile) so `biome check` resolves from PATH. When the environment's Biome version changes, run `biome migrate` to keep `biome.json` in sync.
 
 ### Retrieval evaluation
 

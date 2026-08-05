@@ -2,6 +2,7 @@
 	"entry": ["src/semblr.ts", "scripts/*.ts"],
 	"project": ["src/**/*.ts", "scripts/**/*.ts", "*.ts"],
 	"ignoreDependencies": ["tsx"],
+	"ignoreBinaries": ["biome"],
 	"vitest": {
 		"config": ["vitest.config.ts"]
 	}
