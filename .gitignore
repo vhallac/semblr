@@ -10,7 +10,8 @@ docs/eval/golden-labels.json
 # Dependencies
 node_modules/
 
-# Per-project direnv / Nix dev shell files
+# Local environment files and per-project direnv / Nix dev shell files
+.env
 .envrc
 shell.nix
 
