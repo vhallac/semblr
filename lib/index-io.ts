@@ -6,6 +6,12 @@ export interface VectorIndexEntry {
 	vector: number[];
 	filePath: string;
 	model?: string;
+	/**
+	 * Optional 4th CSV column: sha256-base64url of the exact prompt-side embedding
+	 * input text the vector was computed from (issue #106 re-embed migration stamp).
+	 * Only meaningful on :prompt rows; consumers must treat it as opaque metadata.
+	 */
+	embeddingInputHash?: string;
 }
 
 interface RoundHashContent {
@@ -14,29 +20,56 @@ interface RoundHashContent {
 	toolCalls?: HashToolCallDetail[];
 }
 
-export function encodeVectorIndexLine(vector: number[], filePath: string, model?: string): string {
+export function encodeVectorIndexLine(
+	vector: number[],
+	filePath: string,
+	model?: string,
+	embeddingInputHash?: string,
+): string {
 	const b64 = Buffer.from(JSON.stringify(vector)).toString("base64url");
-	if (model !== undefined) {
-		return `${b64},${filePath},${model}`;
+	const parts = [b64, filePath];
+	if (model !== undefined) parts.push(model);
+	if (embeddingInputHash !== undefined) parts.push(embeddingInputHash);
+	return parts.join(",");
+}
+
+/**
+ * Split an index line's metadata columns (everything after the vector column).
+ * Metadata columns (filePath, model, embeddingInputHash) contain no commas
+ * themselves (round filenames are content hashes; model slugs and hashes are
+ * comma-free), so the trailing segments map positionally from the right:
+ *   [filePath] | [filePath, model] | [filePath, model, embeddingInputHash]
+ */
+export function splitVectorIndexMetadata(rest: string): {
+	filePath: string;
+	model?: string;
+	embeddingInputHash?: string;
+} {
+	const segments = rest.split(",");
+	if (segments.length >= 3) {
+		return {
+			filePath: segments.slice(0, segments.length - 2).join(","),
+			model: segments[segments.length - 2],
+			embeddingInputHash: segments[segments.length - 1],
+		};
 	}
-	return `${b64},${filePath}`;
+	if (segments.length === 2) {
+		return { filePath: segments[0], model: segments[1] };
+	}
+	return { filePath: segments[0] ?? "" };
 }
 
 function parseVectorIndexLine(line: string): VectorIndexEntry {
 	const firstComma = line.indexOf(",");
 	const b64 = line.slice(0, firstComma);
-	const rest = line.slice(firstComma + 1);
-	const lastComma = rest.lastIndexOf(",");
-	if (lastComma === -1) {
-		// 2-column format: vector,filePath
-		const vector = JSON.parse(Buffer.from(b64, "base64url").toString("utf-8"));
-		return { vector, filePath: rest };
-	}
-	// 3-column format: vector,filePath,model
-	const filePath = rest.slice(0, lastComma);
-	const model = rest.slice(lastComma + 1);
 	const vector = JSON.parse(Buffer.from(b64, "base64url").toString("utf-8"));
-	return { vector, filePath, model };
+	// Metadata columns are parsed right-to-left so the optional 4th column
+	// (embeddingInputHash) does not corrupt the model or filePath fields.
+	const { filePath, model, embeddingInputHash } = splitVectorIndexMetadata(line.slice(firstComma + 1));
+	const entry: VectorIndexEntry = { vector, filePath };
+	if (model !== undefined) entry.model = model;
+	if (embeddingInputHash !== undefined) entry.embeddingInputHash = embeddingInputHash;
+	return entry;
 }
 
 export function readIndexLines(indexPath: string): string[] {
@@ -48,8 +81,14 @@ export function writeIndexLines(indexPath: string, entries: string[]): void {
 	fs.writeFileSync(indexPath, entries.join("\n") + (entries.length > 0 ? "\n" : ""));
 }
 
-export function appendVectorIndexEntry(indexPath: string, vector: number[], filePath: string, model?: string): void {
-	fs.appendFileSync(indexPath, `${encodeVectorIndexLine(vector, filePath, model)}\n`);
+export function appendVectorIndexEntry(
+	indexPath: string,
+	vector: number[],
+	filePath: string,
+	model?: string,
+	embeddingInputHash?: string,
+): void {
+	fs.appendFileSync(indexPath, `${encodeVectorIndexLine(vector, filePath, model, embeddingInputHash)}\n`);
 }
 
 export function loadVectorIndex(indexPath: string): VectorIndexEntry[] {
@@ -80,25 +119,21 @@ export function replaceIndexEntriesForRoundFile(
 		const filename = indexEntryFilename(line);
 		return !filename || path.basename(filename) !== roundFile;
 	});
-	const replacement = entries.map((entry) => encodeVectorIndexLine(entry.vector, entry.filePath, entry.model));
+	const replacement = entries.map((entry) =>
+		encodeVectorIndexLine(entry.vector, entry.filePath, entry.model, entry.embeddingInputHash),
+	);
 	writeIndexLines(indexPath, [...remaining, ...replacement]);
 }
 
 export function migrateIndexEntryLine(line: string, oldRoundFile: string, newRoundFile: string): string {
 	const firstComma = line.indexOf(",");
-	const rest = line.slice(firstComma + 1);
-	// rest is "filePath" (2-col) or "filePath,model" (3-col)
-	const lastComma = rest.lastIndexOf(",");
-	if (lastComma === -1) {
-		// 2-column: rest is the filePath
-		if (!rest.startsWith(oldRoundFile)) return line;
-		return `${line.slice(0, firstComma + 1)}${newRoundFile}${rest.slice(oldRoundFile.length)}`;
-	}
-	// 3-column: rest is "filePath,model"
-	const fp = rest.slice(0, lastComma);
-	const model = rest.slice(lastComma);
-	if (!fp.startsWith(oldRoundFile)) return line;
-	return `${line.slice(0, firstComma + 1)}${newRoundFile}${fp.slice(oldRoundFile.length)}${model}`;
+	if (firstComma === -1) return line;
+	// First metadata segment is "filePath[:suffix]"; trailing model/embeddingInputHash
+	// columns (comma-free) are preserved verbatim.
+	const segments = line.slice(firstComma + 1).split(",");
+	if (!segments[0].startsWith(oldRoundFile)) return line;
+	segments[0] = newRoundFile + segments[0].slice(oldRoundFile.length);
+	return `${line.slice(0, firstComma + 1)}${segments.join(",")}`;
 }
 
 export function migrateIndexEntries(indexPath: string, oldRoundFile: string, newRoundFile: string): void {
@@ -110,15 +145,11 @@ export function migrateIndexEntries(indexPath: string, oldRoundFile: string, new
 export function indexEntryFilename(line: string): string | null {
 	const commaIdx = line.indexOf(",");
 	if (commaIdx === -1) return null;
-	let entry = line.slice(commaIdx + 1);
-	// Strip model column if present (3-column format: vector,filePath,model)
-	const lastComma = entry.lastIndexOf(",");
-	if (lastComma !== -1) {
-		entry = entry.slice(0, lastComma);
-	}
-	const colonIdx = entry.lastIndexOf(":");
+	// First metadata segment is "filePath[:suffix]"; trailing model/hash columns are ignored.
+	const filePath = line.slice(commaIdx + 1).split(",")[0];
+	const colonIdx = filePath.lastIndexOf(":");
 	if (colonIdx === -1) return null;
-	return entry.slice(0, colonIdx);
+	return filePath.slice(0, colonIdx);
 }
 
 export function readIndexByFilename(indexPath: string): Map<string, string[]> {
@@ -134,19 +165,12 @@ export function readIndexByFilename(indexPath: string): Map<string, string[]> {
 
 export function replaceIndexLineFilename(line: string, newFilename: string): string {
 	const commaIdx = line.indexOf(",");
-	const rest = line.slice(commaIdx + 1);
-	// rest is "filePath:prompt" (2-col) or "filePath:prompt,model" (3-col)
-	const lastComma = rest.lastIndexOf(",");
-	if (lastComma === -1) {
-		// 2-column
-		const namePart = rest.replace(/^[^:]+/, newFilename);
-		return line.slice(0, commaIdx + 1) + namePart;
-	}
-	// 3-column: replace filename in the filePath portion only
-	const fp = rest.slice(0, lastComma);
-	const model = rest.slice(lastComma);
-	const namePart = fp.replace(/^[^:]+/, newFilename);
-	return line.slice(0, commaIdx + 1) + namePart + model;
+	if (commaIdx === -1) return line;
+	// Replace the filename in the first metadata segment ("filePath[:suffix]");
+	// trailing model/embeddingInputHash columns are preserved verbatim.
+	const segments = line.slice(commaIdx + 1).split(",");
+	segments[0] = segments[0].replace(/^[^:]+/, newFilename);
+	return line.slice(0, commaIdx + 1) + segments.join(",");
 }
 
 export function filterIndexLinesExcludingFilenames(lines: string[], filenames: Set<string>): string[] {

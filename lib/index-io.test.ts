@@ -145,3 +145,70 @@ describe("index I/O helpers", () => {
 		expect(findStaleContentMatches(tempDir, roundFile)).toEqual(["stale.json"]);
 	});
 });
+
+describe("4th-column embedding-input hash (issue #106 re-embed migration)", () => {
+	it("round-trips 2/3/4-column lines through loadVectorIndex", () => {
+		writeIndexLines(indexPath(), [
+			encodeVectorIndexLine([1], "a.json:prompt"),
+			encodeVectorIndexLine([2], "b.json:prompt", "model-x"),
+			encodeVectorIndexLine([3], "c.json:prompt", "model-x", "abc123"),
+		]);
+
+		expect(loadVectorIndex(indexPath())).toEqual([
+			{ vector: [1], filePath: "a.json:prompt" },
+			{ vector: [2], filePath: "b.json:prompt", model: "model-x" },
+			{ vector: [3], filePath: "c.json:prompt", model: "model-x", embeddingInputHash: "abc123" },
+		]);
+	});
+
+	it("appends entries with a hash column", () => {
+		appendVectorIndexEntry(indexPath(), [0.5], "r.json:prompt", "model-x", "hash-1");
+		appendVectorIndexEntry(indexPath(), [0.6], "r.json:response", "model-x");
+
+		expect(loadVectorIndex(indexPath())).toEqual([
+			{ vector: [0.5], filePath: "r.json:prompt", model: "model-x", embeddingInputHash: "hash-1" },
+			{ vector: [0.6], filePath: "r.json:response", model: "model-x" },
+		]);
+	});
+
+	it("keeps filename helpers correct for 4-column lines", () => {
+		const line = encodeVectorIndexLine([1], "dir/one.json:prompt", "model-x", "abc123");
+
+		expect(indexEntryFilename(line)).toBe("dir/one.json");
+		expect(indexRoundFileFromPath("dir/one.json:prompt")).toBe("dir/one.json");
+		expect(replaceIndexLineFilename(line, "two.json")).toBe(
+			encodeVectorIndexLine([1], "two.json:prompt", "model-x", "abc123"),
+		);
+		expect(migrateIndexEntryLine(line, "dir/one.json", "dir/moved.json")).toBe(
+			encodeVectorIndexLine([1], "dir/moved.json:prompt", "model-x", "abc123"),
+		);
+		expect(migrateIndexEntryLine(line, "other.json", "dir/moved.json")).toBe(line);
+	});
+
+	it("preserves the hash column when replacing rows for a round", () => {
+		const keep = encodeVectorIndexLine([1], "keep.json:prompt", "model-x", "keep-hash");
+		const oldPrompt = encodeVectorIndexLine([2], "old.json:prompt", "model-x", "old-hash");
+		const oldResponse = encodeVectorIndexLine([3], "old.json:response", "model-x");
+		writeIndexLines(indexPath(), [keep, oldPrompt, oldResponse]);
+
+		replaceIndexEntriesForRoundFile(indexPath(), "old.json", [
+			{ vector: [4], filePath: "old.json:prompt", model: "model-y", embeddingInputHash: "new-hash" },
+			{ vector: [5], filePath: "old.json:response", model: "model-y" },
+		]);
+
+		expect(loadVectorIndex(indexPath())).toEqual([
+			{ vector: [1], filePath: "keep.json:prompt", model: "model-x", embeddingInputHash: "keep-hash" },
+			{ vector: [4], filePath: "old.json:prompt", model: "model-y", embeddingInputHash: "new-hash" },
+			{ vector: [5], filePath: "old.json:response", model: "model-y" },
+		]);
+	});
+
+	it("detects model mismatches on 4-column rows without treating the hash as model", () => {
+		writeIndexLines(indexPath(), [
+			encodeVectorIndexLine([1], "same.json:prompt", "current-model", "hash-1"),
+			encodeVectorIndexLine([2], "different.json:prompt", "old-model", "hash-2"),
+		]);
+
+		expect(loadRoundFilesWithDifferentModel(indexPath(), "current-model")).toEqual(new Set(["different.json"]));
+	});
+});

@@ -1,10 +1,12 @@
 import * as fs from "node:fs";
-import { indexRoundFileFromPath } from "./index-io.ts";
+import { indexRoundFileFromPath, splitVectorIndexMetadata } from "./index-io.ts";
 
 export interface IndexEntry {
 	filePath: string;
 	vector: number[];
 	model?: string;
+	/** Optional 4th CSV column: embedding-input hash stamp (see lib/index-io.ts). */
+	embeddingInputHash?: string;
 }
 
 export function loadIndexFromPath(
@@ -17,12 +19,14 @@ export function loadIndexFromPath(
 	return raw.split("\n").map((line) => {
 		const firstComma = line.indexOf(",");
 		const b64 = line.slice(0, firstComma);
-		const rest = line.slice(firstComma + 1);
-		const lastComma = rest.lastIndexOf(",");
-		const filePath = lastComma === -1 ? rest : rest.slice(0, lastComma);
-		const model = lastComma === -1 ? undefined : rest.slice(lastComma + 1);
 		const decoded = JSON.parse(Buffer.from(b64, "base64url").toString("utf-8"));
-		return { filePath, vector: Array.isArray(decoded) ? decoded : [], model };
+		// Metadata parsed right-to-left so the optional 4th column (embeddingInputHash)
+		// does not corrupt the model field (search groups entries by model).
+		const { filePath, model, embeddingInputHash } = splitVectorIndexMetadata(line.slice(firstComma + 1));
+		const entry: IndexEntry = { filePath, vector: Array.isArray(decoded) ? decoded : [] };
+		if (model !== undefined) entry.model = model;
+		if (embeddingInputHash !== undefined) entry.embeddingInputHash = embeddingInputHash;
+		return entry;
 	});
 }
 
@@ -147,8 +151,11 @@ export function appendToIndexPath(
 	vector: number[],
 	deps: AppendIndexDeps = {},
 	model?: string,
+	embeddingInputHash?: string,
 ) {
 	const b64 = Buffer.from(JSON.stringify(vector)).toString("base64url");
-	const line = model !== undefined ? `${b64},${filePath},${model}\n` : `${b64},${filePath}\n`;
-	appendLineWithLock(indexPath, roundsDir, line, deps);
+	const parts = [b64, filePath];
+	if (model !== undefined) parts.push(model);
+	if (embeddingInputHash !== undefined) parts.push(embeddingInputHash);
+	appendLineWithLock(indexPath, roundsDir, `${parts.join(",")}\n`, deps);
 }

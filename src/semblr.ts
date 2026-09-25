@@ -57,7 +57,7 @@ import {
 	buildAgentEndChainEntry,
 	buildAgentEndEmbeddingTexts,
 	buildAgentEndRoundData,
-	cleanPromptNoise,
+	buildPromptEmbeddingInput,
 	embeddingMaxTokensToResponseBytes,
 	extractAgentEndResponseText,
 	extractAgentEndUserPrompt,
@@ -138,7 +138,7 @@ export {
 	buildAgentEndEmbeddingTexts,
 	buildAgentEndRoundData,
 	buildAgentEndToolSummary,
-	cleanPromptNoise,
+	buildPromptEmbeddingInput,
 	extractAgentEndResponseText,
 	extractAgentEndUserPrompt,
 	getAgentEndParentId,
@@ -374,8 +374,8 @@ function buildCheckpointContext(fileName: string): string | null {
 // Thread-local pending tool call IDs — cleared per tool call, not per round
 const _agentPendingToolCallIds: Map<string, ToolCallDetail> = new Map(); // toolCallId → partial detail
 
-function appendToIndex(filePath: string, vector: number[], model?: string) {
-	appendToIndexPath(INDEX_PATH, ROUNDS_DIR, filePath, vector, {}, model);
+function appendToIndex(filePath: string, vector: number[], model?: string, embeddingInputHash?: string) {
+	appendToIndexPath(INDEX_PATH, ROUNDS_DIR, filePath, vector, {}, model, embeddingInputHash);
 }
 
 let searchBm25Index: ReturnType<typeof loadOrRebuildBm25Index> | null = null;
@@ -1119,7 +1119,10 @@ export default function (pi: ExtensionAPI) {
 			try {
 				// Embedding-input noise cleanup (issue #106 Stage 1, derived-not-stored): collapse large
 				// code fences and JSON dumps before embedding. The round file keeps the raw prompt.
-				const cleanedPrompt = cleanPromptNoise(userPrompt, PROMPT_NOISE_CLEANUP);
+				const { text: cleanedPrompt, hash: promptInputHash } = buildPromptEmbeddingInput(
+					userPrompt,
+					PROMPT_NOISE_CLEANUP,
+				);
 				const { clippedResponse, combinedText } = buildAgentEndEmbeddingTexts(
 					cleanedPrompt,
 					responseText,
@@ -1138,8 +1141,14 @@ export default function (pi: ExtensionAPI) {
 					embedText(combinedText, apiKey, embeddingClientDeps(ctx)),
 				]);
 
-				// Save to index: :prompt and :response (normalized for cosine similarity)
-				appendToIndex(`${roundFileName}:prompt`, normalize(promptVec), SEMBLR_CONFIG.embeddingModel);
+				// Save to index: :prompt and :response (normalized for cosine similarity).
+				// The :prompt row carries the embedding-input hash stamp (issue #106 migration).
+				appendToIndex(
+					`${roundFileName}:prompt`,
+					normalize(promptVec),
+					SEMBLR_CONFIG.embeddingModel,
+					promptInputHash,
+				);
 				appendToIndex(`${roundFileName}:response`, normalize(responseVec), SEMBLR_CONFIG.embeddingModel);
 
 				// Embed checkpoint summary if present

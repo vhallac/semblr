@@ -54,6 +54,28 @@ describe("loadIndexFromPath", () => {
 		expect(result[0].filePath).toBe("rounds/test.json");
 	});
 
+	it("parses the optional 4th column as embeddingInputHash, keeping model intact", () => {
+		const vector = [0.5, 0.5];
+		const b64 = Buffer.from(JSON.stringify(vector)).toString("base64url");
+		const content = `${b64},rounds/stamped.json:prompt,mymodel,abc123\n${b64},rounds/legacy.json:prompt,model-x\n`;
+		const fsMock = {
+			existsSync: () => true,
+			readFileSync: () => content,
+		} as unknown as Pick<typeof import("node:fs"), "existsSync" | "readFileSync">;
+		const result = loadIndexFromPath("/fake.csv", fsMock);
+		expect(result[0]).toEqual({
+			filePath: "rounds/stamped.json:prompt",
+			vector,
+			model: "mymodel",
+			embeddingInputHash: "abc123",
+		});
+		expect(result[1]).toEqual({
+			filePath: "rounds/legacy.json:prompt",
+			vector,
+			model: "model-x",
+		});
+	});
+
 	it("returns empty vector for non-array decoded data", () => {
 		const b64 = Buffer.from(JSON.stringify("not-array")).toString("base64url");
 		const fsMock = {

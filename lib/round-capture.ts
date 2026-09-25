@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import * as fs from "node:fs";
 import { computeContentHash } from "./hash.ts";
 import { extractText } from "./message-content.ts";
@@ -294,6 +295,28 @@ export function buildAgentEndEmbeddingTexts(
 		clippedResponse,
 		combinedText: `${userPrompt}\n\n${clippedResponse}`,
 	};
+}
+
+/**
+ * Hash the exact embedding input text (sha256, base64url). Used as the 4th index
+ * CSV column on :prompt rows so the re-embed migration can detect when cleanup
+ * heuristics or thresholds change what would be embedded (issue #106).
+ */
+export function hashEmbeddingInput(text: string): string {
+	return createHash("sha256").update(text, "utf-8").digest("base64url");
+}
+
+/**
+ * The current prompt-side embedding-input convention (issue #106, single source
+ * of truth for capture and the re-embed migration): the full noise-cleaned prompt
+ * text — no additional clipping — plus its `hashEmbeddingInput` stamp.
+ */
+export function buildPromptEmbeddingInput(
+	userPrompt: string,
+	options: PromptNoiseOptions = DEFAULT_PROMPT_NOISE_CLEANUP,
+): { text: string; hash: string } {
+	const text = cleanPromptNoise(userPrompt, options);
+	return { text, hash: hashEmbeddingInput(text) };
 }
 
 /**

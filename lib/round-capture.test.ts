@@ -5,6 +5,7 @@ import {
 	buildAgentEndEmbeddingTexts,
 	buildAgentEndRoundData,
 	buildAgentEndToolSummary,
+	buildPromptEmbeddingInput,
 	cleanPromptNoise,
 	embeddingMaxTokensToResponseBytes,
 	extractAgentEndResponseText,
@@ -12,6 +13,7 @@ import {
 	extractAndStripFollowupMarker,
 	getAgentEndParentId,
 	getRelatedParentIdFromGroup,
+	hashEmbeddingInput,
 	type MessageEndProcessingState,
 	readAndClearFollowupFlag,
 } from "./round-capture.ts";
@@ -247,6 +249,28 @@ describe("buildAgentEndEmbeddingTexts", () => {
 		const longResponse = "x".repeat(50000);
 		const result = buildAgentEndEmbeddingTexts("prompt", longResponse, 100);
 		expect(Buffer.byteLength(result.clippedResponse, "utf-8")).toBeLessThanOrEqual(120);
+	});
+});
+
+describe("hashEmbeddingInput / buildPromptEmbeddingInput (issue #106 migration stamp)", () => {
+	it("hashes text deterministically and distinctly (sha256 base64url)", () => {
+		expect(hashEmbeddingInput("abc")).toBe(hashEmbeddingInput("abc"));
+		expect(hashEmbeddingInput("abc")).not.toBe(hashEmbeddingInput("abd"));
+		expect(hashEmbeddingInput("abc")).toMatch(/^[A-Za-z0-9_-]+$/);
+	});
+
+	it("buildPromptEmbeddingInput returns cleaned full text and its hash", () => {
+		const noisy = `explain\n${"-".repeat(500)}\nend`;
+		const { text, hash } = buildPromptEmbeddingInput(noisy);
+		expect(text).toContain("[REPEAT: '-'");
+		expect(hash).toBe(hashEmbeddingInput(text));
+	});
+
+	it("respects custom noise options", () => {
+		const noisy = `explain\n${"-".repeat(500)}\nend`;
+		const noCollapse = buildPromptEmbeddingInput(noisy, { fenceMaxChars: 600, jsonMaxChars: 600, repeatMaxChars: 0 });
+		expect(noCollapse.text).toBe(noisy);
+		expect(noCollapse.hash).toBe(hashEmbeddingInput(noisy));
 	});
 });
 

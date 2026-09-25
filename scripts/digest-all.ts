@@ -34,6 +34,7 @@ import {
 	type VectorIndexEntry,
 } from "../lib/index-io.ts";
 import { type ParsedPiRound, parsePiSessionJsonl } from "../lib/pi-session.ts";
+import { buildPromptEmbeddingInput } from "../lib/round-capture.ts";
 import {
 	resolveScriptApiKey,
 	resolveScriptConfig,
@@ -254,7 +255,14 @@ export async function runDigestAll(options: DigestAllOptions = {}): Promise<numb
 
 		try {
 			const entries: VectorIndexEntry[] = [];
-			const promptVector = await embedText(round.userPrompt.slice(0, config.embeddingMaxTokens), apiKey, {
+			// Prompt input: noise-cleaned full text + embedding-input hash stamp (issue #106),
+			// matching the extension capture path so `just migrate` stays churn-free.
+			const { text: promptInput, hash: promptInputHash } = buildPromptEmbeddingInput(round.userPrompt, {
+				fenceMaxChars: config.promptNoiseFenceMaxChars,
+				jsonMaxChars: config.promptNoiseJsonMaxChars,
+				repeatMaxChars: config.promptNoiseRepeatMaxChars,
+			});
+			const promptVector = await embedText(promptInput, apiKey, {
 				fetchImpl: options.fetchImpl,
 				config: embeddingConfig,
 				modelRegistry,
@@ -263,6 +271,7 @@ export async function runDigestAll(options: DigestAllOptions = {}): Promise<numb
 				vector: normalize(promptVector),
 				filePath: `${roundFile}:prompt`,
 				model: config.embeddingModel,
+				embeddingInputHash: promptInputHash,
 			});
 
 			const respText = round.responseSequence.slice(0, config.embeddingMaxTokens);
@@ -283,7 +292,7 @@ export async function runDigestAll(options: DigestAllOptions = {}): Promise<numb
 				replaceIndexEntriesForRoundFile(indexPath, roundFile, entries);
 			} else {
 				for (const entry of entries) {
-					appendVectorIndexEntry(indexPath, entry.vector, entry.filePath, entry.model);
+					appendVectorIndexEntry(indexPath, entry.vector, entry.filePath, entry.model, entry.embeddingInputHash);
 				}
 			}
 

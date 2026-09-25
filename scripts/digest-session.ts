@@ -30,6 +30,7 @@ import {
 	migrateIndexEntries as migrateIndexEntriesFile,
 } from "../lib/index-io.ts";
 import { parsePiSessionJsonl, reconstructPiSessionRounds } from "../lib/pi-session.ts";
+import { buildPromptEmbeddingInput } from "../lib/round-capture.ts";
 import {
 	resolveScriptApiKey,
 	resolveScriptConfig,
@@ -146,18 +147,31 @@ export async function runDigestSession(options: DigestSessionOptions = {}): Prom
 			continue;
 		}
 
-		// Embed prompt
+		// Embed prompt — noise-cleaned under the current #106 cleanup heuristics, and
+		// stamped with the embedding-input hash so `just migrate` can detect later
+		// heuristic changes. Full cleaned text (no slice), matching the extension capture path.
 		out.log(`  🔄 Embedding round ${round.turnIndex + 1}/${rounds.length}...`);
 		const apiKey = await resolveScriptApiKey(config, options);
 		if (!apiKey) {
 			throw new Error("OPENROUTER_API_KEY environment variable required");
 		}
-		const promptVector = await embedText(round.userPrompt.slice(0, config.embeddingMaxTokens), apiKey, {
+		const { text: promptInput, hash: promptInputHash } = buildPromptEmbeddingInput(round.userPrompt, {
+			fenceMaxChars: config.promptNoiseFenceMaxChars,
+			jsonMaxChars: config.promptNoiseJsonMaxChars,
+			repeatMaxChars: config.promptNoiseRepeatMaxChars,
+		});
+		const promptVector = await embedText(promptInput, apiKey, {
 			fetchImpl: options.fetchImpl,
 			config: embeddingConfig,
 			modelRegistry,
 		});
-		appendVectorIndexEntry(indexPath, normalize(promptVector), `${roundFile}:prompt`, config.embeddingModel);
+		appendVectorIndexEntry(
+			indexPath,
+			normalize(promptVector),
+			`${roundFile}:prompt`,
+			config.embeddingModel,
+			promptInputHash,
+		);
 
 		// Embed response
 		const respVector = await embedText(round.responseSequence.slice(0, config.embeddingMaxTokens), apiKey, {
