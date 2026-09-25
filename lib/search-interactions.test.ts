@@ -484,7 +484,7 @@ describe("selectContextRounds", () => {
 
 	it("selects rounds within budget", () => {
 		const rounds = [makeRound("a.json", "hi"), makeRound("b.json", "yo")];
-		const result = selectContextRounds(rounds, null, () => null as unknown as RoundData, {
+		const result = selectContextRounds(rounds, {
 			budgetTokens: 10000,
 			estimateTokensFn: lenCost,
 			minSimilarity: 0.3,
@@ -495,7 +495,7 @@ describe("selectContextRounds", () => {
 	it("charges the truncated entry size, not the full round content", () => {
 		// A 20K-char prompt renders as a ~470-char entry after the unit-001 clamp.
 		const rounds = [makeRound("a.json", "x".repeat(20_000)), makeRound("b.json", "y".repeat(20_000))];
-		const result = selectContextRounds(rounds, null, () => null as unknown as RoundData, {
+		const result = selectContextRounds(rounds, {
 			budgetTokens: 1000,
 			estimateTokensFn: lenCost,
 			minSimilarity: 0.3,
@@ -505,7 +505,7 @@ describe("selectContextRounds", () => {
 
 	it("selects nothing for oversized prompts when truncation is disabled", () => {
 		const rounds = [makeRound("a.json", "x".repeat(20_000))];
-		const result = selectContextRounds(rounds, null, () => null as unknown as RoundData, {
+		const result = selectContextRounds(rounds, {
 			budgetTokens: 1000,
 			estimateTokensFn: lenCost,
 			minSimilarity: 0.3,
@@ -517,7 +517,7 @@ describe("selectContextRounds", () => {
 	it("stops when budget is exhausted", () => {
 		const rounds = [makeRound("a.json", "x".repeat(2000)), makeRound("b.json", "y".repeat(2000))];
 		// Each truncated entry costs ~470 chars; a 700-char budget admits one.
-		const result = selectContextRounds(rounds, null, () => null as unknown as RoundData, {
+		const result = selectContextRounds(rounds, {
 			budgetTokens: 700,
 			estimateTokensFn: lenCost,
 			minSimilarity: 0.3,
@@ -528,7 +528,7 @@ describe("selectContextRounds", () => {
 
 	it("hard-caps entries regardless of budget", () => {
 		const rounds = Array.from({ length: 25 }, (_, i) => makeRound(`${i}.json`, "hi"));
-		const result = selectContextRounds(rounds, null, () => null as unknown as RoundData, {
+		const result = selectContextRounds(rounds, {
 			budgetTokens: 1_000_000,
 			estimateTokensFn: lenCost,
 			minSimilarity: 0.3,
@@ -538,7 +538,7 @@ describe("selectContextRounds", () => {
 
 	it("honors a smaller maxEntries override", () => {
 		const rounds = Array.from({ length: 25 }, (_, i) => makeRound(`${i}.json`, "hi"));
-		const result = selectContextRounds(rounds, null, () => null as unknown as RoundData, {
+		const result = selectContextRounds(rounds, {
 			budgetTokens: 1_000_000,
 			estimateTokensFn: lenCost,
 			minSimilarity: 0.3,
@@ -547,27 +547,14 @@ describe("selectContextRounds", () => {
 		expect(result).toHaveLength(5);
 	});
 
-	it("appends the last round on top of a full cap", () => {
-		const rounds = Array.from({ length: 25 }, (_, i) => makeRound(`${i}.json`, "hi"));
-		const lastData: RoundData = {
-			userPrompt: "last",
-			responseSequence: "last response",
-			turnIndex: 0,
-		};
-		const readRound = (fp: string) => (fp === "last.json" ? lastData : null);
-		const result = selectContextRounds(rounds, "last.json", readRound, {
-			budgetTokens: 1_000_000,
-			estimateTokensFn: lenCost,
-			minSimilarity: 0.3,
-		});
-		expect(result).toHaveLength(21);
-		expect(result[result.length - 1].fileName).toBe("last.json");
-	});
+	// issue #107 F1: the lastRoundFileName append was removed — selection contains
+	// only scored rounds and never exceeds the cap/budget. The previous round is
+	// carried by the recency list, which is built independently of this selection.
 
 	it("charges reserved header/boilerplate tokens against the budget", () => {
 		const rounds = [makeRound("a.json", "h".repeat(300)), makeRound("b.json", "h".repeat(300))];
 		const select = (reservedTokens: number) =>
-			selectContextRounds(rounds, null, () => null as unknown as RoundData, {
+			selectContextRounds(rounds, {
 				budgetTokens: 700,
 				estimateTokensFn: lenCost,
 				minSimilarity: 0.3,
@@ -581,51 +568,7 @@ describe("selectContextRounds", () => {
 
 	it("skips rounds below minSimilarity", () => {
 		const rounds = [makeRound("a.json", "hi", 0.5), makeRound("b.json", "yo", 0.2)];
-		const result = selectContextRounds(rounds, null, () => null as unknown as RoundData, {
-			budgetTokens: 10000,
-			estimateTokensFn: lenCost,
-			minSimilarity: 0.3,
-		});
-		expect(result).toHaveLength(1);
-	});
-
-	it("does not duplicate the last round when the search already selected it", () => {
-		const rounds = [makeRound("last.json", "hi")];
-		const lastData: RoundData = {
-			userPrompt: "last",
-			responseSequence: "last response",
-			turnIndex: 0,
-		};
-		const readRound = (fp: string) => (fp === "last.json" ? lastData : null);
-		const result = selectContextRounds(rounds, "last.json", readRound, {
-			budgetTokens: 10000,
-			estimateTokensFn: lenCost,
-			minSimilarity: 0.3,
-		});
-		expect(result).toHaveLength(1);
-		expect(result[0].bestScore).toBe(0.9);
-	});
-
-	it("includes lastRoundFileName at the end with score 0", () => {
-		const rounds = [makeRound("a.json", "hi")];
-		const lastData: RoundData = {
-			userPrompt: "last",
-			responseSequence: "last response",
-			turnIndex: 0,
-		};
-		const readRound = (fp: string) => (fp === "last.json" ? lastData : null);
-		const result = selectContextRounds(rounds, "last.json", readRound, {
-			budgetTokens: 10000,
-			estimateTokensFn: lenCost,
-			minSimilarity: 0.3,
-		});
-		expect(result[result.length - 1].fileName).toBe("last.json");
-		expect(result[result.length - 1].bestScore).toBe(0);
-	});
-
-	it("handles null lastRoundFileName", () => {
-		const rounds = [makeRound("a.json", "hi")];
-		const result = selectContextRounds(rounds, null, () => null as unknown as RoundData, {
+		const result = selectContextRounds(rounds, {
 			budgetTokens: 10000,
 			estimateTokensFn: lenCost,
 			minSimilarity: 0.3,
@@ -634,7 +577,7 @@ describe("selectContextRounds", () => {
 	});
 
 	it("handles empty scored rounds", () => {
-		const result = selectContextRounds([], null, () => null as unknown as RoundData, {
+		const result = selectContextRounds([], {
 			budgetTokens: 10000,
 			estimateTokensFn: lenCost,
 			minSimilarity: 0.3,

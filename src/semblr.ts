@@ -95,13 +95,7 @@ import {
 } from "../lib/search-tools.ts";
 import { loadSemblrConfig, type SemblrConfig } from "../lib/semblr-config.ts";
 import type { CheckpointSummary, ToolCallDetail } from "../lib/state.ts";
-import {
-	contextCacheSnapshot,
-	contextCacheStore,
-	contextCacheValid,
-	createRound,
-	createSession,
-} from "../lib/state.ts";
+import { contextCacheStore, contextCacheValid, createRound, createSession } from "../lib/state.ts";
 import {
 	flushStatsFile,
 	formatChainReadStatsReport,
@@ -684,6 +678,52 @@ export default function (pi: ExtensionAPI) {
 			return { messages: finalMessages } as any;
 		}
 
+		// --- Recency list: built once, independent of the relevance/search outcome ───
+		//     Recency is the always-on causal context (issue #107 F1): the previous
+		//     round is the newest causal-chain entry and always leads the list, so
+		//     relevance selection needs no last-round exception, and the no-match /
+		//     unavailable-search paths below still ship recency.
+		const recencyList = buildGroupedRecencyList(
+			session.roundGroups,
+			session.causalChain,
+			getRoundSize,
+			PROMPT_TRUNCATION,
+			{
+				maxEntries: SEMBLR_CONFIG.contextRecencyMaxEntries,
+				budgetTokens: computeRecencyBudget(ctx.model?.contextWindow ?? 128_000, SEMBLR_CONFIG.contextBudgetRatio),
+			},
+		);
+
+		// Degraded-path assembly shared by the short-prompt, no-API-key, empty-index,
+		// no-relevance, and error paths (issue #107 F1): recency still travels with
+		// the prompt — only the relevance list is absent. Cached for the agent cycle
+		// like the full path.
+		const assembleDegradedContext = (): { messages: unknown[] } => {
+			const { followUpMsg, checkpointMsg } = resolveCompoundInjections();
+			const preamble = buildContextPreamble(!!recencyList, false);
+			const prefixMsgs = assembleContextPrefix({
+				systemMsg,
+				sessionArchitecture: buildSessionArchitecture(),
+				workingMemory: buildWorkingMemorySection(session.miniMemStore),
+				preamble,
+				recencyList,
+				relevanceList: null,
+				followUpMsg,
+				checkpointMsg,
+				contractMsg: {
+					role: "user" as const,
+					content: [{ type: "text" as const, text: buildFinalResponseContract() }],
+				},
+			});
+			contextCacheStore(round.contextCache, envPreamble, [...prefixMsgs], userPrompt);
+			const finalMessages: unknown[] = applyContextSizeWarning(
+				round.contextCache.messages!,
+				currentMessages,
+				systemMsg,
+			);
+			return { messages: finalMessages };
+		};
+
 		// --- Short-prompt fast path: skip embedding and retrieval but keep ───
 		//     recency list, follow-up injection, and preamble (all zero API cost).
 		// Short prompts ("yes", "do it", "continue") produce noisy embeddings.
@@ -692,49 +732,6 @@ export default function (pi: ExtensionAPI) {
 			// Per https://github.com/vhallac/semblr/issues/38#issuecomment-4629826478
 			round.skipPromptEmbedding = true;
 			round.promptVec = null;
-			round.contextCache.envPreamble = envPreamble;
-			round.contextCache.userPrompt = userPrompt;
-
-			// Build non-embedding context sections (all in-memory / disk, zero API cost)
-			const recencyList = buildGroupedRecencyList(
-				session.roundGroups,
-				session.causalChain,
-				getRoundSize,
-				PROMPT_TRUNCATION,
-				{
-					maxEntries: SEMBLR_CONFIG.contextRecencyMaxEntries,
-					budgetTokens: computeRecencyBudget(
-						ctx.model?.contextWindow ?? 128_000,
-						SEMBLR_CONFIG.contextBudgetRatio,
-					),
-				},
-			);
-			const preamble = buildContextPreamble(!!recencyList, false);
-
-			const { followUpMsg, checkpointMsg } = resolveCompoundInjections();
-
-			const workingMem = buildWorkingMemorySection(session.miniMemStore);
-
-			const sessionArchitecture = buildSessionArchitecture();
-
-			const contractMsg = {
-				role: "user" as const,
-				content: [{ type: "text" as const, text: buildFinalResponseContract() }],
-			};
-
-			// Assemble context prefix via assembleContextPrefix — single call, consistent order
-			const prefixMsgs = assembleContextPrefix({
-				systemMsg,
-				sessionArchitecture,
-				workingMemory: workingMem,
-				preamble,
-				recencyList,
-				relevanceList: null,
-				followUpMsg,
-				checkpointMsg,
-				contractMsg,
-			});
-			contextCacheSnapshot(round.contextCache, [...prefixMsgs]);
 
 			// ══ Stats: record all 5 positions presented ══
 			if (!round.presentedRecorded) {
@@ -742,12 +739,7 @@ export default function (pi: ExtensionAPI) {
 				round.presentedRecorded = true;
 			}
 
-			const finalMessages: unknown[] = applyContextSizeWarning(
-				round.contextCache.messages!,
-				currentMessages,
-				systemMsg,
-			);
-			return { messages: finalMessages } as any;
+			return assembleDegradedContext();
 		}
 
 		// round.promptVec is stashed after embedding below for agent_end to reuse
@@ -755,22 +747,8 @@ export default function (pi: ExtensionAPI) {
 		try {
 			const apiKey = await getApiKey(ctx, { config: SEMBLR_CONFIG });
 			if (!apiKey) {
-				const prefixMsgs = assembleContextPrefix({
-					systemMsg,
-					sessionArchitecture: buildSessionArchitecture(),
-					workingMemory: buildWorkingMemorySection(session.miniMemStore),
-					preamble: null,
-					recencyList: null,
-					relevanceList: null,
-					followUpMsg: null,
-					checkpointMsg: null,
-					contractMsg: {
-						role: "user" as const,
-						content: [{ type: "text" as const, text: buildFinalResponseContract() }],
-					},
-				});
-				const finalMessages: unknown[] = applyContextSizeWarning(prefixMsgs, currentMessages, systemMsg);
-				return { messages: finalMessages } as any;
+				// Embedding unavailable — recency still ships (issue #107 F1).
+				return assembleDegradedContext();
 			}
 
 			// Embed the user prompt — cached per agent cycle to avoid redundant API calls
@@ -789,30 +767,8 @@ export default function (pi: ExtensionAPI) {
 			// Load and score the index
 			const index = loadIndex();
 			if (index.length === 0) {
-				// Final response contract + current messages (no context lists)
-				round.contextCache.envPreamble = envPreamble;
-				round.contextCache.userPrompt = userPrompt;
-				const emptyIdxMsgs = assembleContextPrefix({
-					systemMsg,
-					sessionArchitecture: buildSessionArchitecture(),
-					workingMemory: buildWorkingMemorySection(session.miniMemStore),
-					preamble: null,
-					recencyList: null,
-					relevanceList: null,
-					followUpMsg: null,
-					checkpointMsg: null,
-					contractMsg: {
-						role: "user" as const,
-						content: [{ type: "text" as const, text: buildFinalResponseContract() }],
-					},
-				});
-				contextCacheSnapshot(round.contextCache, emptyIdxMsgs);
-				const finalMessages: unknown[] = applyContextSizeWarning(
-					round.contextCache.messages!,
-					currentMessages,
-					systemMsg,
-				);
-				return { messages: finalMessages } as any;
+				// Empty index — recency still ships (issue #107 F1).
+				return assembleDegradedContext();
 			}
 
 			const bm25Scores = normalizeBm25Scores(scoreBm25Query(loadSearchBm25Index(), userPrompt));
@@ -835,7 +791,7 @@ export default function (pi: ExtensionAPI) {
 			// the budget bounds the full injected section, not just round entries.
 			const reservedTokens =
 				estimateTokens(RELEVANCE_LIST_HEADER) + estimateTokens(buildContextPreamble(true, true) ?? "");
-			const selectedRounds = selectContextRounds(scoredRounds, lastRoundFileName, readRoundFile, {
+			const selectedRounds = selectContextRounds(scoredRounds, {
 				minSimilarity: SEMBLR_CONFIG.minSimilarity,
 				budgetTokens,
 				maxEntries: SEMBLR_CONFIG.contextRelevanceMaxEntries,
@@ -845,30 +801,9 @@ export default function (pi: ExtensionAPI) {
 
 			if (selectedRounds.length === 0) {
 				ctx.ui.setStatus("semblr", `🧠 no relevant context (best: ${bestScore.toFixed(3)})`);
-				// Cache the empty-context result so subsequent turns reuse it
-				round.contextCache.envPreamble = envPreamble;
-				round.contextCache.userPrompt = userPrompt;
-				const zeroResultMsgs = assembleContextPrefix({
-					systemMsg,
-					sessionArchitecture: buildSessionArchitecture(),
-					workingMemory: buildWorkingMemorySection(session.miniMemStore),
-					preamble: null,
-					recencyList: null,
-					relevanceList: null,
-					followUpMsg: null,
-					checkpointMsg: null,
-					contractMsg: {
-						role: "user" as const,
-						content: [{ type: "text" as const, text: buildFinalResponseContract() }],
-					},
-				});
-				contextCacheSnapshot(round.contextCache, zeroResultMsgs);
-				const finalMessages: unknown[] = applyContextSizeWarning(
-					round.contextCache.messages!,
-					currentMessages,
-					systemMsg,
-				);
-				return { messages: finalMessages } as any;
+				// No semantic matches → relevanceList is null, recency still ships
+				// (issue #107 F1).
+				return assembleDegradedContext();
 			}
 
 			// ── Build the three-section context block ──
@@ -880,19 +815,6 @@ export default function (pi: ExtensionAPI) {
 						getRoundSize,
 						PROMPT_TRUNCATION,
 					);
-			const recencyList = buildGroupedRecencyList(
-				session.roundGroups,
-				session.causalChain,
-				getRoundSize,
-				PROMPT_TRUNCATION,
-				{
-					maxEntries: SEMBLR_CONFIG.contextRecencyMaxEntries,
-					budgetTokens: computeRecencyBudget(
-						ctx.model?.contextWindow ?? 128_000,
-						SEMBLR_CONFIG.contextBudgetRatio,
-					),
-				},
-			);
 			const preamble = buildContextPreamble(!!recencyList, !!relevanceList);
 
 			// ══ Stats: record all 5 positions presented ══
@@ -942,6 +864,13 @@ export default function (pi: ExtensionAPI) {
 			return { messages: resultMessages } as any;
 		} catch (err) {
 			ctx.ui.setStatus("semblr", `🧠 error: ${(err as Error).message}`);
+			try {
+				// Degraded but always-on: when the embedding/search pipeline throws,
+				// recency still travels with the prompt (issue #107 F1).
+				return assembleDegradedContext();
+			} catch {
+				// Fall back to the unmodified messages rather than throw from the hook.
+			}
 		}
 	});
 

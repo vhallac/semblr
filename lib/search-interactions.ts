@@ -213,10 +213,14 @@ export function computeRecencyBudget(
 	return Math.max(minBudget, Math.floor(budgetRatio * contextWindow));
 }
 
+/**
+ * Select relevance rounds under a hard entry cap and token budget (issue #107 F1).
+ * The previous round is deliberately NOT special-cased here — it belongs to the
+ * recency list, which is built independently of the search outcome; appending it
+ * here used to let the list exceed `maxEntries` and dodge `budgetTokens`.
+ */
 export function selectContextRounds(
 	scoredRounds: readonly SearchRoundScore[],
-	lastRoundFileName: string | null,
-	readRound: (filePath: string) => RoundData | null,
 	options: {
 		minSimilarity?: number;
 		budgetTokens: number;
@@ -251,13 +255,6 @@ export function selectContextRounds(
 		if (usedTokens + roundTokens > options.budgetTokens) break;
 		selectedRounds.push(round);
 		usedTokens += roundTokens;
-	}
-
-	// The last round is appended so it is always available for follow-up — but
-	// never duplicated if the search already selected it.
-	if (lastRoundFileName && !selectedRounds.some((r) => r.fileName === lastRoundFileName)) {
-		const lastData = readRound(lastRoundFileName);
-		if (lastData) selectedRounds.push({ data: lastData, fileName: lastRoundFileName, bestScore: 0 });
 	}
 
 	return selectedRounds;
