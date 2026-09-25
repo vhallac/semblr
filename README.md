@@ -112,7 +112,7 @@ Each list entry is clamped to a head+tail window (default ~400 chars: 260 head +
 
 The relevance list is bounded on top of the per-entry clamp (#106): at most `contextRelevanceMaxEntries` (default 20) entries fit, within a token budget of `contextBudgetRatio` (default 8%) of the model's context window at best match. The budget is charged for what is actually injected — section header, preamble, and each rendered entry — not for the full round content stored on disk.
 
-The recency list carries the same per-entry clamp plus its own bounds (#106): at most `contextRecencyMaxEntries` (default 20) rounds across all topic groups, within a flat token budget of `contextBudgetRatio` of the context window. When the bounds bite, the oldest rounds drop first; the most recent round of the session is always kept — the recency list is the always-on causal context. Group headers are charged against the budget too, and a group emptied by the bounds renders no header.
+The recency list carries the same per-entry clamp plus its own bounds (#106): at most `contextRecencyMaxEntries` (default 20) rounds across all topic groups, within a flat token budget of `contextBudgetRatio` of the context window. When the bounds bite, the oldest rounds drop first; the most recent round of the session is always kept — the recency list is the always-on causal context. Group headers are charged against the budget too, and a group emptied by the bounds renders no header. Set `contextRecencyMaxEntries` to `0` to disable the list entirely — including the always-on recency context, so no recent-round context is injected automatically (older rounds remain reachable via `search_interactions`).
 
 ### Recency List
 
@@ -325,7 +325,7 @@ Relative `roundsDir` values in project settings resolve under the project cwd. R
 | `contextPromptTailChars` | `SEMBLR_CONTEXT_PROMPT_TAIL_CHARS` | `140` | Chars kept from the end of each recency/relevance list prompt |
 | `contextBudgetRatio` | `SEMBLR_CONTEXT_BUDGET_RATIO` | `0.08` | Fraction of the context window each list (relevance at best match, recency flat) may occupy |
 | `contextRelevanceMaxEntries` | `SEMBLR_CONTEXT_RELEVANCE_MAX_ENTRIES` | `20` | Hard cap on relevance-list entries |
-| `contextRecencyMaxEntries` | `SEMBLR_CONTEXT_RECENCY_MAX_ENTRIES` | `20` | Hard cap on recency-list entries across all groups |
+| `contextRecencyMaxEntries` | `SEMBLR_CONTEXT_RECENCY_MAX_ENTRIES` | `20` | Hard cap on recency-list entries across all groups; `0` disables the list entirely (including the always-on recency context) |
 | `promptNoiseFenceMaxChars` | `SEMBLR_PROMPT_NOISE_FENCE_MAX_CHARS` | `600` | Code fences longer than this collapse to a placeholder in embedding inputs; `0` disables |
 | `promptNoiseJsonMaxChars` | `SEMBLR_PROMPT_NOISE_JSON_MAX_CHARS` | `600` | JSON dumps longer than this collapse to a placeholder in embedding inputs; `0` disables |
 | `promptNoiseRepeatMaxChars` | `SEMBLR_PROMPT_NOISE_REPEAT_MAX_CHARS` | `200` | Repetition runs (same char hammered, solid no-space tokens) longer than this collapse to a placeholder in embedding inputs; `0` disables |
