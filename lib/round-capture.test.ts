@@ -473,6 +473,48 @@ describe("cleanPromptNoise", () => {
 	});
 });
 
+describe("cleanPromptNoise JSON-scan depth cap (issue #107 r4 F3)", () => {
+	/** A `depth`-deep nested JSON array wrapping `leaf`. */
+	function nestedArrayDump(depth: number, leaf: unknown): string {
+		let value: unknown = leaf;
+		for (let i = 0; i < depth; i++) value = [value];
+		return JSON.stringify(value);
+	}
+
+	it("still collapses sane-depth nested JSON", () => {
+		const dump = nestedArrayDump(40, `leaf ${"x".repeat(700)}`);
+		const cleaned = cleanPromptNoise(`data: ${dump}`, {
+			fenceMaxChars: 0,
+			jsonMaxChars: 600,
+			repeatMaxChars: 0,
+		});
+		expect(cleaned).toContain("data: ");
+		expect(cleaned).toMatch(/\[JSON_DUMP: ~\d+ chars\]/);
+	});
+
+	it("does not collapse JSON nested beyond the scan-depth cap", () => {
+		// 400 levels ≈ 802 chars: the whole dump exceeds jsonMaxChars (and parses), but every
+		// inner sub-candidate is ~130 chars — so pre-fix it collapsed wholesale, post-fix the
+		// depth bail leaves it verbatim (the pathological outer scans abort).
+		const dump = nestedArrayDump(400, 1);
+		const cleaned = cleanPromptNoise(`data: ${dump}`, {
+			fenceMaxChars: 0,
+			jsonMaxChars: 600,
+			repeatMaxChars: 0,
+		});
+		expect(cleaned).toBe(`data: ${dump}`);
+	});
+
+	it("aborts the per-opener scan on unbalanced opener runs (perf smoke, generous bound)", () => {
+		const input = "[".repeat(50_000); // pre-fix this run cost ~2.2s of quadratic per-opener scans
+		const t0 = Date.now();
+		const cleaned = cleanPromptNoise(input);
+		const elapsed = Date.now() - t0;
+		expect(cleaned).toBe("[REPEAT: '[' × 50000]");
+		expect(elapsed).toBeLessThan(500);
+	});
+});
+
 describe("buildAgentEndRoundData", () => {
 	it("builds round data with all fields", () => {
 		const result = buildAgentEndRoundData({

@@ -115,6 +115,12 @@ export const DEFAULT_PROMPT_NOISE_CLEANUP: PromptNoiseOptions = {
 
 const PLACEHOLDER_LINE_CLIP = 80;
 const JSON_PARSE_LENGTH_CAP = 1_000_000;
+// Nesting-depth guard for the bracket scan (issue #107 round-4 F3): a run of unbalanced openers
+// would otherwise drive each per-opener scan to end-of-text — O(n²) across the run (measured:
+// a 50k-char `[`-run took ~2.4s in the agent_end hot path). Real-world JSON nesting stays well
+// under this cap, so sane dumps scan identically; deeper candidates are simply not collapsed
+// (same outcome as unbalanced). Precedent: JSON_PARSE_LENGTH_CAP bounds parse size.
+const JSON_SCAN_DEPTH_CAP = 64;
 
 function clipPlaceholderLine(line: string): string {
 	const trimmed = line.trim();
@@ -161,7 +167,11 @@ function looksLikeJsonStart(text: string, open: number): boolean {
 	);
 }
 
-/** Find the bracket matching the opener at `open`, honoring JSON string escapes; -1 if unbalanced. */
+/**
+ * Find the bracket matching the opener at `open`, honoring JSON string escapes; -1 if unbalanced
+ * or if nesting exceeds JSON_SCAN_DEPTH_CAP (latency guard — the caller treats the bail exactly
+ * like unbalanced: the bracket run stays verbatim for the repetition phase to claim).
+ */
 function findMatchingBracket(text: string, open: number): number {
 	const openCh = text[open];
 	const closeCh = openCh === "{" ? "}" : "]";
@@ -180,6 +190,7 @@ function findMatchingBracket(text: string, open: number): number {
 			inString = true;
 		} else if (ch === openCh) {
 			depth++;
+			if (depth > JSON_SCAN_DEPTH_CAP) return -1;
 		} else if (ch === closeCh) {
 			depth--;
 			if (depth === 0) return i;
