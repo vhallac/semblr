@@ -3,8 +3,9 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { encodeVectorIndexLine, loadVectorIndex, makeAssumedStamp, readIndexLines } from "../lib/index-io.ts";
+import { appendToIndexPath } from "../lib/index-storage.ts";
 import { hashEmbeddingInput } from "../lib/round-capture.ts";
-import { isMainModule, runPromptEmbeddingsMigration } from "./migrate-prompt-embeddings.ts";
+import { isMainModule, mergeAppendedLines, runPromptEmbeddingsMigration } from "./migrate-prompt-embeddings.ts";
 
 let tempDir = "";
 
@@ -451,6 +452,113 @@ describe("migrate-prompt-embeddings script", () => {
 
 		expect(secondFetch).not.toHaveBeenCalled();
 		expect(logs.stdout.join("\n")).toContain("All :prompt rows are current. Nothing to migrate.");
+	});
+});
+
+describe("final write: short-lock merge (#107 F2)", () => {
+	it("merges rows appended by live sessions during the re-embed window", async () => {
+		const roundFile = "legacy-a.json";
+		writeRound(roundFile, { userPrompt: NOISY_PROMPT, responseSequence: RESPONSE, promptEmbedding: [0.5] });
+		// A second round captured by a "live session" — absent from the initial index.
+		writeRound("live-b.json", { userPrompt: PLAIN_PROMPT, responseSequence: RESPONSE });
+		const responseLine = encodeVectorIndexLine([8, 8], `${roundFile}:response`, "old-model");
+		writeIndex([encodeVectorIndexLine([9, 9], `${roundFile}:prompt`, "old-model"), responseLine]);
+		const indexPath = path.join(tempDir, "index.csv");
+
+		const requests: unknown[] = [];
+		const vectors = [
+			[3, 4], // prompt
+			[0, 5], // combined
+		];
+		const fetchImpl = vi.fn(async (input, init) => {
+			if (requests.length === 0) {
+				// Simulate a live session appending round-b while the migration
+				// re-embeds outside the lock — via the real runtime write path.
+				appendToIndexPath(indexPath, tempDir, "live-b.json:prompt", [7, 7], {}, "live-model", "live-hash");
+			}
+			requests.push({ body: JSON.parse(String(init?.body)) });
+			return new Response(JSON.stringify({ data: [{ embedding: vectors.shift() ?? [1] }] }), { status: 200 });
+		}) as typeof fetch;
+
+		const logs = logger();
+		await expect(
+			runPromptEmbeddingsMigration({ ...baseOptions(logs.out), fetchImpl, stderr: logs.err }),
+		).resolves.toBe(0);
+
+		// Rewritten row in place, untouched :response row, appended live row at the end.
+		expect(readIndexLines(indexPath)).toEqual([
+			encodeVectorIndexLine(
+				[0.6, 0.8],
+				`${roundFile}:prompt`,
+				"openai/text-embedding-3-small",
+				makeAssumedStamp(hashEmbeddingInput(CLEANED_NOISY_PROMPT)),
+			),
+			responseLine,
+			encodeVectorIndexLine([7, 7], "live-b.json:prompt", "live-model", "live-hash"),
+		]);
+		expect(logs.stdout.join("\n")).toContain("(3 rows)");
+
+		// No lockfile or tmp-file residue after the atomic publish.
+		expect(fs.readdirSync(tempDir).filter((f) => f.includes(".lock") || f.includes(".tmp."))).toEqual([]);
+	});
+
+	it("fails fast without writing when the index lock cannot be acquired", async () => {
+		const roundFile = "legacy-lock.json";
+		writeRound(roundFile, { userPrompt: NOISY_PROMPT, responseSequence: RESPONSE, promptEmbedding: [0.5] });
+		const originalLine = encodeVectorIndexLine([9, 9], `${roundFile}:prompt`, "old-model");
+		writeIndex([originalLine]);
+		const indexPath = path.join(tempDir, "index.csv");
+		// A live session holds the lock (fresh mtime — no stale takeover).
+		fs.writeFileSync(`${indexPath}.lock`, "held");
+
+		const requests: unknown[] = [];
+		const fetchImpl = embeddingFetch(
+			[
+				[3, 4],
+				[0, 5],
+			],
+			requests,
+		);
+		const logs = logger();
+		await expect(
+			runPromptEmbeddingsMigration({
+				...baseOptions(logs.out),
+				fetchImpl,
+				stderr: logs.err,
+				lockDeps: { lockRetries: 2, lockBackoffMs: 1, wait: () => {} },
+			}),
+		).resolves.toBe(1);
+
+		// The wholesale rewrite never happened — the index is unchanged.
+		expect(readIndexLines(indexPath)).toEqual([originalLine]);
+		// The holder's lockfile was not removed by our failed acquisition.
+		expect(fs.existsSync(`${indexPath}.lock`)).toBe(true);
+		// The re-embed ran before the lock attempt (documented cost: results discarded).
+		expect(requests.length).toBeGreaterThan(0);
+		expect(logs.stderr.join("\n")).toContain("NOT written");
+	});
+
+	describe("mergeAppendedLines", () => {
+		it("returns the rewritten lines unchanged when nothing was appended", () => {
+			expect(mergeAppendedLines(["a", "b"], ["a", "b"], ["a'", "b"])).toEqual(["a'", "b"]);
+		});
+
+		it("appends lines that appeared after the detection read, in file order", () => {
+			expect(mergeAppendedLines(["a"], ["a", "c", "d"], ["a'"])).toEqual(["a'", "c", "d"]);
+		});
+
+		it("counts duplicate lines as a multiset (pre-existing duplicates are not appends)", () => {
+			expect(mergeAppendedLines(["a", "a", "b"], ["a", "a", "b", "c"], ["a'", "a'", "b'"])).toEqual([
+				"a'",
+				"a'",
+				"b'",
+				"c",
+			]);
+		});
+
+		it("preserves a genuine re-append of an existing line", () => {
+			expect(mergeAppendedLines(["a"], ["a", "a"], ["a'"])).toEqual(["a'", "a"]);
+		});
 	});
 });
 

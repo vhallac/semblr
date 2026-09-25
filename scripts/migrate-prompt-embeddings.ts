@@ -31,6 +31,11 @@
  * marker, so the row re-enters this sweep once (one redundant re-embed; accepted).
  * Response-clipping budget changes are also not detected (out of #106 scope).
  *
+ * The re-embed loop runs outside the index lock (live sessions must not stall
+ * behind thousands of API calls); the final write takes the shared index lock
+ * and merges rows appended by live sessions during the loop (#107 F2). Lock
+ * exhaustion fails fast: the index is left untouched — re-run the sweep.
+ *
  * Usage:
  *   npx tsx scripts/migrate-prompt-embeddings.ts           # perform migration
  *   npx tsx scripts/migrate-prompt-embeddings.ts --dry-run # preview only
@@ -67,6 +72,7 @@ import {
 	type ScriptConfigOptions,
 	scriptEmbeddingConfig,
 } from "../lib/script-config.ts";
+import { type AcquireIndexLockDeps, acquireIndexLock } from "../lib/index-storage.ts";
 
 // ─────────────────────────────────────────────
 // Types
@@ -82,6 +88,8 @@ export interface MigratePromptEmbeddingsOptions extends ScriptConfigOptions {
 	/** Pre-resolved API key (tests); skips keyring/env resolution. */
 	apiKey?: string;
 	modelRegistry?: import("../lib/embed.ts").EmbeddingModelRegistry;
+	/** Overrides for the final short-lock write's lock protocol (tests). */
+	lockDeps?: AcquireIndexLockDeps;
 	stdout?: Pick<typeof console, "log">;
 	stderr?: Pick<typeof console, "error" | "warn">;
 }
@@ -122,6 +130,38 @@ function noiseOptionsFromConfig(config: ReturnType<typeof resolveScriptConfig>) 
 	};
 }
 
+/**
+ * Merge rows appended to the index since the detection read (#107 F2): the
+ * rewritten snapshot lines stay in position, and every fresh line the
+ * detection snapshot does not account for (exact-string multiset difference)
+ * is appended in file order. Runtime appends are add-only, so nothing needs
+ * removing; a line appended twice by a live session stays twice (faithful).
+ */
+export function mergeAppendedLines(
+	original: readonly string[],
+	fresh: readonly string[],
+	rewritten: readonly string[],
+): string[] {
+	const counts = new Map<string, number>();
+	for (const line of original) counts.set(line, (counts.get(line) ?? 0) + 1);
+	const appended = fresh.filter((line) => {
+		const remaining = counts.get(line) ?? 0;
+		if (remaining > 0) {
+			counts.set(line, remaining - 1);
+			return false;
+		}
+		return true;
+	});
+	return [...rewritten, ...appended];
+}
+
+/** Publish a wholesale index rewrite via tmp + atomic rename (readers never see a partial index). */
+function writeIndexLinesAtomic(indexPath: string, entries: string[]): void {
+	const tmp = `${indexPath}.tmp.${process.pid}`;
+	writeIndexLines(tmp, entries);
+	fs.renameSync(tmp, indexPath);
+}
+
 /** Atomic round.json update preserving all other fields. */
 function updateRoundFile(roundPath: string, mutate: (round: Record<string, unknown>) => void): void {
 	const existing = JSON.parse(fs.readFileSync(roundPath, "utf-8")) as Record<string, unknown>;
@@ -153,6 +193,9 @@ export async function runPromptEmbeddingsMigration(options: MigratePromptEmbeddi
 		out.log("ℹ Index file is empty. Nothing to migrate.");
 		return 0;
 	}
+	// Detection-time snapshot for the final short-lock merge (#107 F2): rows
+	// appended between this read and the final write are reconciled there.
+	const detectionLines = [...lines];
 
 	// ── Pass 1: detect, per :prompt row, whether the embedding input changed ──
 	const promptRows = new Map<string, PromptRowGroup>();
@@ -338,12 +381,39 @@ export async function runPromptEmbeddingsMigration(options: MigratePromptEmbeddi
 		out.log(`  ✅ [${reembedded}/${staleRounds.length}] ${decision.roundFile} (${decision.reason})`);
 	}
 
-	writeIndexLines(indexPath, lines);
+	// ── Final write: short-lock merge (#107 F2) ──
+	// The re-embed loop above ran OUTSIDE the lock (thousands of API calls; live
+	// sessions must not stall behind it). Only this phase takes the shared
+	// index lock: re-read the index, merge the lines live sessions appended
+	// during the re-embed window, and publish once via tmp + atomic rename. A
+	// session appending mid-merge blocks on the same lock and lands after the
+	// rename. On lock exhaustion this fails fast — a wholesale rewrite must
+	// never fall back to an unsynchronized write (replacing the whole file
+	// could drop concurrent rows; the runtime's single-line append fallback is
+	// the pre-existing accepted behavior, and this narrows its exposure window
+	// from minutes of re-embedding to the seconds-long merge phase).
+	const lock = acquireIndexLock(indexPath, options.lockDeps);
+	if (lock === null) {
+		err.error(`❌ Could not acquire the index lock (${indexPath}.lock) after all retries — the index was NOT written.`);
+		err.error(
+			"   A live session is likely holding it. This run's re-embed results were discarded; re-run the migration (already-restamped rows cost zero API calls).",
+		);
+		return 1;
+	}
+	let mergedRowCount = lines.length;
+	try {
+		const freshLines = readIndexLines(indexPath);
+		const mergedLines = mergeAppendedLines(detectionLines, freshLines, lines);
+		writeIndexLinesAtomic(indexPath, mergedLines);
+		mergedRowCount = mergedLines.length;
+	} finally {
+		lock.release();
+	}
 
 	out.log(
 		`\n✅ Done. ${reembedded} rounds re-embedded (${combinedReembedded} combined vectors), ${assumedStamped} legacy rows re-stamped with assumed- provenance.`,
 	);
-	out.log(`   Index: ${indexPath} (${lines.length} rows)`);
+	out.log(`   Index: ${indexPath} (${mergedRowCount} rows)`);
 	return 0;
 }
 

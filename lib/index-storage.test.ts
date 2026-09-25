@@ -1,5 +1,9 @@
-import { describe, expect, it } from "vitest";
+import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
+	acquireIndexLock,
 	appendToIndexPath,
 	buildSessionStartStatus,
 	countUniqueIndexedRounds,
@@ -275,5 +279,54 @@ describe("appendToIndexPath", () => {
 
 		// Should successfully acquire on retry after statSync throws
 		expect(openAttempts).toBeGreaterThan(1);
+	});
+});
+
+describe("acquireIndexLock", () => {
+	let tempDir = "";
+
+	beforeEach(() => {
+		tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "semblr-acquire-index-lock-"));
+	});
+
+	afterEach(() => {
+		fs.rmSync(tempDir, { recursive: true, force: true });
+	});
+
+	it("creates the lockfile on acquire and removes it on release", () => {
+		const target = path.join(tempDir, "index.csv");
+		const lock = acquireIndexLock(target);
+
+		expect(lock).not.toBeNull();
+		expect(lock?.lockPath).toBe(`${target}.lock`);
+		expect(fs.existsSync(`${target}.lock`)).toBe(true);
+
+		lock?.release();
+		expect(fs.existsSync(`${target}.lock`)).toBe(false);
+	});
+
+	it("returns null on exhaustion without touching the holder's lockfile", () => {
+		const target = path.join(tempDir, "index.csv");
+		fs.writeFileSync(`${target}.lock`, "held");
+
+		const lock = acquireIndexLock(target, { lockRetries: 2, lockBackoffMs: 1, wait: () => {} });
+
+		expect(lock).toBeNull();
+		// The existing holder's lock must survive our failed acquisition.
+		expect(fs.existsSync(`${target}.lock`)).toBe(true);
+	});
+
+	it("takes over a stale lockfile", () => {
+		const target = path.join(tempDir, "index.csv");
+		const staleTime = Date.now() - 20_000;
+		fs.writeFileSync(`${target}.lock`, "stale");
+		fs.utimesSync(`${target}.lock`, staleTime / 1000, staleTime / 1000);
+
+		const lock = acquireIndexLock(target, { lockRetries: 2, lockBackoffMs: 1, wait: () => {} });
+
+		expect(lock).not.toBeNull();
+		expect(fs.existsSync(`${target}.lock`)).toBe(true); // re-created by us
+		lock?.release();
+		expect(fs.existsSync(`${target}.lock`)).toBe(false);
 	});
 });
