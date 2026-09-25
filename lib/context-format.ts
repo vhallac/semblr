@@ -141,6 +141,30 @@ When NOT to expand:
 Rule: When in doubt, expand. A verification tool call is cheaper than a wrong
 answer.`;
 
+/**
+ * Build the recency list in two phases (issue #107 F2):
+ *
+ * Phase 1 — selection walks the causal chain newest-first and retains rounds
+ * under the entry cap and token budget by GLOBAL chronology, never by topic
+ * group: with topics interleaved in the chain (A1,B1,A2,B2), a 2-entry cap
+ * keeps B2 and A2 — a group-major walk would keep B2 and B1, discarding A2
+ * although it is newer than B1. Rounds that never reached a topic group
+ * (agent_end embedding failed, so assignToGroup never ran) stay visible: they
+ * render as singleton groups keyed by file name.
+ *
+ * Phase 2 — renders the retained subset grouped by topic. Groups emit in the
+ * order their newest retained round was selected (i.e. global recency order),
+ * rounds within a group render newest-first, and a group header renders — and
+ * is charged to the budget — exactly when the group keeps at least one
+ * retained round. A group's first-selected round is the round that leads it in
+ * the render, so the header charge is known during selection and the
+ * accounting matches the emitted output exactly (issue #106: what is charged
+ * is what is injected).
+ *
+ * The most recent round (kept === 0) is always kept: the recency list is the
+ * always-on causal context and must never be emptied by a tight budget — the
+ * budget bounds growth, not existence.
+ */
 export function buildGroupedRecencyList<T extends ContextChainEntry>(
 	groups: Array<ContextRoundGroup<T>>,
 	causalChain: T[],
@@ -155,72 +179,84 @@ export function buildGroupedRecencyList<T extends ContextChainEntry>(
 	} = {},
 ): string | null {
 	const maxEntries = options.maxEntries ?? DEFAULT_MAX_RECENCY_ENTRIES;
-	if (groups.length === 0 || maxEntries <= 0) return null;
+	if (causalChain.length === 0 || maxEntries <= 0) return null;
 	const budgetTokens = options.budgetTokens ?? 0;
 	const bounded = budgetTokens > 0;
 	const estimateTokensFn = options.estimateTokensFn ?? estimateTokens;
+
+	// Map each causal-chain entry to its topic group by object identity (the
+	// same entry object is pushed into a group by assignToGroup at agent_end).
+	// Chain entries found in no group have no topic — they render as singleton
+	// groups keyed by file name.
+	const entryToGroup = new Map<T, number>();
+	for (let gi = 0; gi < groups.length; gi++) {
+		for (const round of groups[gi].rounds) {
+			if (!entryToGroup.has(round)) entryToGroup.set(round, gi);
+		}
+	}
+
+	// Groups in render order: a group is created the first time one of its
+	// rounds is retained, led by that round (its newest retained member), and
+	// holds its retained entry lines. Groups whose rounds are all dropped by
+	// the cap or budget are never created — no stray headers.
+	const orderedGroups: Array<{ headerLines: string[]; items: string[][] }> = [];
+	const groupByKey = new Map<string, { headerLines: string[]; items: string[][] }>();
+
+	let usedTokens = bounded ? estimateTokensFn(RECENCY_LIST_HEADER) : 0;
+	let kept = 0;
+	for (let i = causalChain.length - 1; i >= 0 && kept < maxEntries; i--) {
+		const entry = causalChain[i];
+		const sizeStr = getRoundSize(entry.fileName) ?? undefined;
+		const entryLines = formatGroupedRoundEntry(
+			kept + 1,
+			entry.fileName,
+			entry.toolSummary,
+			entry.userPrompt,
+			sizeStr,
+			truncation,
+		);
+		const topicGroupIdx = entryToGroup.get(entry);
+		const groupKey = topicGroupIdx === undefined ? `u:${entry.fileName}` : `t:${topicGroupIdx}`;
+
+		// A group first encountered in this walk renders as the next group; its
+		// header block (separator + heading) is charged together with its leading
+		// entry, so cost and output cannot drift (issue #106). The block is only
+		// committed when the leading entry is retained, so a group emptied by the
+		// cap or budget never leaves a stray header.
+		const headerLines: string[] = [];
+		if (!groupByKey.has(groupKey)) {
+			if (orderedGroups.length > 0) headerLines.push("", "---", "");
+			headerLines.push(`**Group ${orderedGroups.length + 1}**`, "");
+		}
+
+		let entryTokens = 0;
+		if (bounded) {
+			entryTokens = estimateTokensFn(entryLines.join("\n"));
+			if (headerLines.length > 0) entryTokens += estimateTokensFn(headerLines.join("\n"));
+			// kept === 0 is always kept (see doc comment); later rounds must fit,
+			// and the walk stops at the first entry that does not — what remains
+			// is strictly the most recent context.
+			if (kept > 0 && usedTokens + entryTokens > budgetTokens) break;
+		}
+
+		usedTokens += entryTokens;
+		let group = groupByKey.get(groupKey);
+		if (!group) {
+			group = { headerLines, items: [] };
+			orderedGroups.push(group);
+			groupByKey.set(groupKey, group);
+		}
+		group.items.push(entryLines);
+		kept++;
+	}
+
 	const lines: string[] = [];
 	lines.push(RECENCY_LIST_HEADER);
 	lines.push("");
-
-	const sortedGroups = [...groups].sort((a, b) => {
-		const aLast = a.rounds[a.rounds.length - 1];
-		const bLast = b.rounds[b.rounds.length - 1];
-		return causalChain.indexOf(bLast) - causalChain.indexOf(aLast);
-	});
-
-	// Selection is fused with rendering: each round is charged the lines it
-	// actually injects (entry + its group header), so cost and output cannot
-	// drift (issue #106). Rounds render newest-first and the walk stops at the
-	// first entry that does not fit — what remains is strictly the most recent
-	// context.
-	let usedTokens = bounded ? estimateTokensFn(RECENCY_LIST_HEADER) : 0;
-	let kept = 0;
-	let groupNumber = 0;
-	for (const group of sortedGroups) {
-		if (kept >= maxEntries) break;
-		groupNumber++;
-		// Separator + group header flush only when the group keeps at least one
-		// entry — a group emptied by the cap must not leave a stray header.
-		const pending: string[] = [];
-		if (groupNumber > 1) pending.push("", "---", "");
-		pending.push(`**Group ${groupNumber}**`, "");
-		let keptInGroup = 0;
-		let stopped = false;
-
-		const reversed = [...group.rounds].reverse();
-		for (const entry of reversed) {
-			if (kept >= maxEntries) break;
-			const sizeStr = getRoundSize(entry.fileName) ?? undefined;
-			const entryLines = formatGroupedRoundEntry(
-				kept + 1,
-				entry.fileName,
-				entry.toolSummary,
-				entry.userPrompt,
-				sizeStr,
-				truncation,
-			);
-			let entryTokens = 0;
-			if (bounded) {
-				entryTokens = estimateTokensFn(entryLines.join("\n"));
-				if (keptInGroup === 0) entryTokens += estimateTokensFn(pending.join("\n"));
-				// The most recent round (kept === 0) is always kept: the recency
-				// list is the always-on causal context and must never be emptied by
-				// a tight budget — the budget bounds growth, not existence.
-				if (kept > 0 && usedTokens + entryTokens > budgetTokens) {
-					stopped = true;
-					break;
-				}
-			}
-			if (keptInGroup === 0) lines.push(...pending);
-			lines.push(...entryLines);
-			usedTokens += entryTokens;
-			kept++;
-			keptInGroup++;
-		}
-		if (stopped) break;
+	for (const group of orderedGroups) {
+		lines.push(...group.headerLines);
+		for (const entryLines of group.items) lines.push(...entryLines);
 	}
-
 	return lines.join("\n");
 }
 

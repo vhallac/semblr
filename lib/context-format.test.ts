@@ -213,6 +213,62 @@ describe("context formatting", () => {
 		expect(buildGroupedRecencyList([], [])).toBeNull();
 	});
 
+	it("selects retained rounds by global chronology across interleaved topics, then renders grouped (issue #107 F2)", () => {
+		// Causal order A1, B1, A2, B2 — topics A and B interleave. Under a
+		// 2-entry cap the globally newest two rounds are B2 and A2; a group-major
+		// walk would keep B2 and B1 instead, discarding A2 although it is newer
+		// than B1. Rendering stays grouped by topic, groups ordered by their
+		// newest retained round.
+		const a1 = { fileName: "a1.json", userPrompt: "A1", responseSequence: "", toolSummary: "0 tools" };
+		const b1 = { fileName: "b1.json", userPrompt: "B1", responseSequence: "", toolSummary: "0 tools" };
+		const a2 = { fileName: "a2.json", userPrompt: "A2", responseSequence: "", toolSummary: "0 tools" };
+		const b2 = { fileName: "b2.json", userPrompt: "B2", responseSequence: "", toolSummary: "0 tools" };
+		const causalChain = [a1, b1, a2, b2];
+		const groups = [{ rounds: [a1, a2] }, { rounds: [b1, b2] }];
+		const list = buildGroupedRecencyList(groups, causalChain, () => null, DEFAULT_PROMPT_TRUNCATION, {
+			maxEntries: 2,
+			budgetTokens: 1_000_000,
+			estimateTokensFn: (text) => text.length,
+		});
+		expect(list).toContain("**Group 1**\n\n- [index: 1] b2.json [n/a | 0 tools]:");
+		expect(list).toContain("**Group 2**\n\n- [index: 2] a2.json [n/a | 0 tools]:");
+		expect(list).not.toContain("a1.json");
+		expect(list).not.toContain("b1.json");
+	});
+
+	it("renders rounds that belong to no topic group as singleton groups (failed agent_end embedding)", () => {
+		// u1.json never reached assignToGroup (embedding unavailable at agent_end):
+		// it stays in the causal chain but in no topic group. It must still lead
+		// the recency list — group-based selection would have dropped it entirely.
+		const groupedOld = { fileName: "g.json", userPrompt: "grouped", responseSequence: "", toolSummary: "0 tools" };
+		const ungroupedNew = {
+			fileName: "u1.json",
+			userPrompt: "ungrouped",
+			responseSequence: "",
+			toolSummary: "0 tools",
+		};
+		const list = buildGroupedRecencyList([{ rounds: [groupedOld] }], [groupedOld, ungroupedNew]);
+		expect(list).toContain("**Group 1**\n\n- [index: 1] u1.json [n/a | 0 tools]:");
+		expect(list).toContain("**Group 2**\n\n- [index: 2] g.json [n/a | 0 tools]:");
+	});
+
+	it("places singleton groups at their global recency position with globally ordered indices", () => {
+		// Chain: gOld (topic G), uMid (ungrouped), gNew (topic G). Rendering is
+		// group-major, but indices follow the global recency walk — Group 1 holds
+		// gNew (1) and gOld (3), while the singleton holds uMid (2).
+		const gOld = { fileName: "g-old.json", userPrompt: "g old", responseSequence: "", toolSummary: "0 tools" };
+		const uMid = { fileName: "u-mid.json", userPrompt: "u mid", responseSequence: "", toolSummary: "0 tools" };
+		const gNew = { fileName: "g-new.json", userPrompt: "g new", responseSequence: "", toolSummary: "0 tools" };
+		const list = buildGroupedRecencyList([{ rounds: [gOld, gNew] }], [gOld, uMid, gNew]);
+		expect(list).toContain("**Group 1**\n\n- [index: 1] g-new.json");
+		expect(list).toContain("- [index: 3] g-old.json");
+		expect(list).toContain("**Group 2**\n\n- [index: 2] u-mid.json");
+		// group-major rendering: Group 1's rounds both come before Group 2
+		const text = list ?? "";
+		expect(text.indexOf("[index: 1] g-new.json")).toBeLessThan(text.indexOf("**Group 2**"));
+		expect(text.indexOf("[index: 3] g-old.json")).toBeLessThan(text.indexOf("**Group 2**"));
+	});
+
 	it("truncates long prompts in grouped recency entries", () => {
 		const entry = {
 			fileName: "long.json",
@@ -313,6 +369,22 @@ describe("context formatting", () => {
 			const list = buildGroupedRecencyList(groups, rounds, () => null, DEFAULT_PROMPT_TRUNCATION, {
 				budgetTokens: RECENCY_LIST_HEADER.length + 60,
 				estimateTokensFn: lenCost,
+			});
+			expect(list).toContain("[index: 1] a.json");
+			expect(list).not.toContain("b.json");
+			expect(list).not.toContain("**Group 2**");
+		});
+
+		it("charges singleton-group headers for ungrouped rounds against the budget", () => {
+			// a.json is the newest round (grouped); b.json is older and belongs to no
+			// group. An entry costs ~53 chars; a new group adds ~18 chars of
+			// separator + header, so 60 chars of slack fits a's entry + header but
+			// not b's singleton — b and its header are both dropped.
+			const a = entry("a.json", "hi");
+			const b = entry("b.json", "hi");
+			const list = buildGroupedRecencyList([{ rounds: [a] }], [b, a], () => null, DEFAULT_PROMPT_TRUNCATION, {
+				...bounds,
+				budgetTokens: RECENCY_LIST_HEADER.length + 60,
 			});
 			expect(list).toContain("[index: 1] a.json");
 			expect(list).not.toContain("b.json");

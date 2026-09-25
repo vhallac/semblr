@@ -683,6 +683,9 @@ export default function (pi: ExtensionAPI) {
 		//     round is the newest causal-chain entry and always leads the list, so
 		//     relevance selection needs no last-round exception, and the no-match /
 		//     unavailable-search paths below still ship recency.
+		//     Selection sources the causal chain itself (issue #107 F2), so a round
+		//     whose agent_end embedding failed — assigned to no topic group — still
+		//     renders (as a singleton group) instead of vanishing from recency.
 		const recencyList = buildGroupedRecencyList(
 			session.roundGroups,
 			session.causalChain,
