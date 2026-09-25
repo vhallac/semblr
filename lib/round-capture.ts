@@ -95,6 +95,149 @@ export function embeddingMaxTokensToResponseBytes(embeddingMaxTokens: number): n
 	return Math.max(0, Math.floor(embeddingMaxTokens * 3));
 }
 
+/** Thresholds for embedding-input prompt cleanup; non-positive values disable the collapse. */
+export interface PromptNoiseOptions {
+	/** Code fences whose body exceeds this many chars collapse to a placeholder; non-positive disables. */
+	fenceMaxChars: number;
+	/** JSON dumps whose text exceeds this many chars collapse to a placeholder; non-positive disables. */
+	jsonMaxChars: number;
+}
+
+/** Default cleanup thresholds (issue #106 Stage 1): collapse fences/JSON dumps past ~600 chars. */
+export const DEFAULT_PROMPT_NOISE_CLEANUP: PromptNoiseOptions = { fenceMaxChars: 600, jsonMaxChars: 600 };
+
+const PLACEHOLDER_LINE_CLIP = 80;
+const JSON_PARSE_LENGTH_CAP = 1_000_000;
+
+function clipPlaceholderLine(line: string): string {
+	const trimmed = line.trim();
+	return trimmed.length > PLACEHOLDER_LINE_CLIP ? `${trimmed.slice(0, PLACEHOLDER_LINE_CLIP)}…` : trimmed;
+}
+
+function collapseCodeFences(prompt: string, fenceMaxChars: number): string {
+	if (fenceMaxChars <= 0) return prompt;
+	// A fence opens with 3+ backticks/tildes at line start (optional indent) and closes with the
+	// same marker at line start; the lazy body ends the block at the first closing line.
+	const fenceRe = /^([ \t]*)(`{3,}|~{3})[^\n]*\n([\s\S]*?)^\1\2[^\n]*$/gm;
+	return prompt.replace(fenceRe, (match, indent: string, marker: string, body: string) => {
+		if (body.length <= fenceMaxChars) return match;
+		const infoLine = match.slice(indent.length + marker.length);
+		const langToken = infoLine.trim().split(/\s+/)[0]?.slice(0, 24) ?? "";
+		const lang = /^[A-Za-z0-9_+#.-]{1,24}$/.test(langToken) ? langToken : "plain";
+		const bodyText = body.endsWith("\n") ? body.slice(0, -1) : body;
+		const bodyLines = bodyText.split("\n");
+		const first = clipPlaceholderLine(bodyLines[0] ?? "");
+		const last = clipPlaceholderLine(bodyLines[bodyLines.length - 1] ?? "");
+		return `[CODE_BLOCK: ~${body.length} chars, ${lang}, first line: "${first}", last line: "${last}"]`;
+	});
+}
+
+/** Cheap prefilter: is the bracket run at `open` plausibly the start of a JSON value? */
+function looksLikeJsonStart(text: string, open: number): boolean {
+	let i = open + 1;
+	while (i < text.length && /\s/.test(text[i])) i++;
+	if (i >= text.length) return false;
+	const ch = text[i];
+	if (text[open] === "{") {
+		return ch === '"' || ch === "}";
+	}
+	return (
+		ch === '"' ||
+		ch === "{" ||
+		ch === "[" ||
+		ch === "]" ||
+		ch === "-" ||
+		ch === "t" ||
+		ch === "f" ||
+		ch === "n" ||
+		/\d/.test(ch)
+	);
+}
+
+/** Find the bracket matching the opener at `open`, honoring JSON string escapes; -1 if unbalanced. */
+function findMatchingBracket(text: string, open: number): number {
+	const openCh = text[open];
+	const closeCh = openCh === "{" ? "}" : "]";
+	let depth = 0;
+	let inString = false;
+	let escaped = false;
+	for (let i = open; i < text.length; i++) {
+		const ch = text[i];
+		if (inString) {
+			if (escaped) escaped = false;
+			else if (ch === "\\") escaped = true;
+			else if (ch === '"') inString = false;
+			continue;
+		}
+		if (ch === '"') {
+			inString = true;
+		} else if (ch === openCh) {
+			depth++;
+		} else if (ch === closeCh) {
+			depth--;
+			if (depth === 0) return i;
+		}
+	}
+	return -1;
+}
+
+function isJsonObjectOrArray(candidate: string): boolean {
+	if (candidate.length > JSON_PARSE_LENGTH_CAP) return false;
+	try {
+		const parsed: unknown = JSON.parse(candidate);
+		return typeof parsed === "object" && parsed !== null;
+	} catch {
+		return false;
+	}
+}
+
+function collapseJsonDumps(text: string, jsonMaxChars: number): string {
+	if (jsonMaxChars <= 0) return text;
+	let result = "";
+	let i = 0;
+	while (i < text.length) {
+		const ch = text[i];
+		if (ch !== "{" && ch !== "[") {
+			result += ch;
+			i++;
+			continue;
+		}
+		const close = looksLikeJsonStart(text, i) ? findMatchingBracket(text, i) : -1;
+		if (close === -1) {
+			result += ch;
+			i++;
+			continue;
+		}
+		const candidate = text.slice(i, close + 1);
+		if (candidate.length > jsonMaxChars && isJsonObjectOrArray(candidate)) {
+			result += `[JSON_DUMP: ~${candidate.length} chars]`;
+			i = close + 1;
+			continue;
+		}
+		result += ch;
+		i++;
+	}
+	return result;
+}
+
+/**
+ * Collapse embedding noise in a user prompt (issue #106 Stage 1, derived-not-stored):
+ * large code fences become `[CODE_BLOCK: ~M chars, lang, first/last line]` placeholders and
+ * parse-validated JSON dumps become `[JSON_DUMP: ~M chars]` placeholders. The raw prompt stays
+ * verbatim in the round file; the cleaned view is only an embedding-input transform.
+ */
+export function cleanPromptNoise(prompt: string, options: PromptNoiseOptions = DEFAULT_PROMPT_NOISE_CLEANUP): string {
+	// Fences first: fenced JSON would otherwise be matched (and mis-labeled) by the JSON scan.
+	let cleaned = collapseCodeFences(prompt, options.fenceMaxChars);
+	cleaned = collapseJsonDumps(cleaned, options.jsonMaxChars);
+	return cleaned;
+}
+
+/**
+ * Assemble the combined embedding text for a saved round.
+ * The prompt is expected pre-cleaned via `cleanPromptNoise` (embedding-input transform);
+ * the response is clipped to the configured embedding budget with REDACTED markers stripped.
+ */
 export function buildAgentEndEmbeddingTexts(
 	userPrompt: string,
 	responseText: string,

@@ -31,6 +31,8 @@ function testConfig(root: string): SemblrConfig {
 		contextBudgetRatio: 0.08,
 		contextRelevanceMaxEntries: 20,
 		contextRecencyMaxEntries: 20,
+		promptNoiseFenceMaxChars: 600,
+		promptNoiseJsonMaxChars: 600,
 	};
 }
 

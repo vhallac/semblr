@@ -81,7 +81,7 @@ When the extension is loaded, pi exposes:
 Current AI agent sessions degrade as they accumulate context. Pi's compaction mechanism summarises past rounds to free memory, but the summaries lose detail. Semblr replaces this with a different approach:
 
 1. **Save every round permanently.** Each user prompt + full assistant response sequence (tool calls, thinking, final answer) is saved as an individual JSON file.
-2. **Embed prompt, response, and combined text.** Three texts are sent to the configured embedding API: the user prompt, the clipped response (by default truncated to ~24KB, context-injection artifacts stripped), and the concatenation of both (`prompt + "\n\n" + clippedResponse`). The prompt and response vectors are stored in an append-only CSV index. The combined vector is stored in the round file for semantic grouping.
+2. **Embed prompt, response, and combined text.** Three texts are sent to the configured embedding API: the user prompt (noise-collapsed first: large code fences and JSON dumps are replaced by short placeholders; the raw prompt stays verbatim in the round file), the clipped response (by default truncated to ~24KB, context-injection artifacts stripped), and the concatenation of both (`cleanedPrompt + "\n\n" + clippedResponse`). The prompt and response vectors are stored in an append-only CSV index. The combined vector is stored in the round file for semantic grouping.
 3. **Retrieve by relevance.** On every user prompt, the prompt is embedded and compared against stored vectors via cosine similarity. Separately, `search_interactions` embeds its query once with each distinct model represented in the searched index; within that tool search, every stored vector is compared only with a query vector from the same model. The closest rounds are injected into context — up to a dynamic token budget (at most `contextBudgetRatio` of the context window and `contextRelevanceMaxEntries` entries; the recency list is capped analogously).
 4. **Drill-down via tools.** By default, rounds are shown as a compact numbered index. The LLM uses `get_round_details()` to expand a round and `get_tool_details()` to inspect individual tool calls within it.
 
@@ -326,6 +326,8 @@ Relative `roundsDir` values in project settings resolve under the project cwd. R
 | `contextBudgetRatio` | `SEMBLR_CONTEXT_BUDGET_RATIO` | `0.08` | Fraction of the context window each list (relevance at best match, recency flat) may occupy |
 | `contextRelevanceMaxEntries` | `SEMBLR_CONTEXT_RELEVANCE_MAX_ENTRIES` | `20` | Hard cap on relevance-list entries |
 | `contextRecencyMaxEntries` | `SEMBLR_CONTEXT_RECENCY_MAX_ENTRIES` | `20` | Hard cap on recency-list entries across all groups |
+| `promptNoiseFenceMaxChars` | `SEMBLR_PROMPT_NOISE_FENCE_MAX_CHARS` | `600` | Code fences longer than this collapse to a placeholder in embedding inputs; `0` disables |
+| `promptNoiseJsonMaxChars` | `SEMBLR_PROMPT_NOISE_JSON_MAX_CHARS` | `600` | JSON dumps longer than this collapse to a placeholder in embedding inputs; `0` disables |
 
 Additional runtime-only switches:
 

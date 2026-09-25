@@ -57,6 +57,7 @@ import {
 	buildAgentEndChainEntry,
 	buildAgentEndEmbeddingTexts,
 	buildAgentEndRoundData,
+	cleanPromptNoise,
 	embeddingMaxTokensToResponseBytes,
 	extractAgentEndResponseText,
 	extractAgentEndUserPrompt,
@@ -137,6 +138,7 @@ export {
 	buildAgentEndEmbeddingTexts,
 	buildAgentEndRoundData,
 	buildAgentEndToolSummary,
+	cleanPromptNoise,
 	extractAgentEndResponseText,
 	extractAgentEndUserPrompt,
 	getAgentEndParentId,
@@ -203,6 +205,12 @@ const SEMBLR_GROUP_THRESHOLD = SEMBLR_CONFIG.groupThreshold;
 const PROMPT_TRUNCATION = {
 	headChars: SEMBLR_CONFIG.contextPromptHeadChars,
 	tailChars: SEMBLR_CONFIG.contextPromptTailChars,
+};
+
+/** Embedding-input noise cleanup (issue #106 Stage 1): collapse large code fences / JSON dumps. */
+const PROMPT_NOISE_CLEANUP = {
+	fenceMaxChars: SEMBLR_CONFIG.promptNoiseFenceMaxChars,
+	jsonMaxChars: SEMBLR_CONFIG.promptNoiseJsonMaxChars,
 };
 
 /** Build a flat text representation of a checkpoint summary for embedding. */
@@ -1108,16 +1116,20 @@ export default function (pi: ExtensionAPI) {
 			}
 		} else {
 			try {
-				// Strip context-injection REDACTED markers and clip to the configured embedding budget.
+				// Embedding-input noise cleanup (issue #106 Stage 1, derived-not-stored): collapse large
+				// code fences and JSON dumps before embedding. The round file keeps the raw prompt.
+				const cleanedPrompt = cleanPromptNoise(userPrompt, PROMPT_NOISE_CLEANUP);
 				const { clippedResponse, combinedText } = buildAgentEndEmbeddingTexts(
-					userPrompt,
+					cleanedPrompt,
 					responseText,
 					EMBEDDING_RESPONSE_MAX_BYTES,
 				);
 
-				// Embedding #1: prompt (reuse cached round.promptVec if available)
+				// Embedding #1: prompt (reuse cached round.promptVec if available — only when the
+				// cleanup was a no-op, since the stashed vector was computed over the raw prompt)
+				const cachedPromptVec = cleanedPrompt === userPrompt ? round.promptVec : null;
 				const promptVec =
-					round.promptVec ?? normalize(await embedText(userPrompt, apiKey, embeddingClientDeps(ctx)));
+					cachedPromptVec ?? normalize(await embedText(cleanedPrompt, apiKey, embeddingClientDeps(ctx)));
 
 				// Embedding #2 + #3 in parallel
 				const [responseVec, combinedVec] = await Promise.all([

@@ -2,6 +2,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { DEFAULT_MAX_RECENCY_ENTRIES, DEFAULT_PROMPT_TRUNCATION } from "./context-format.ts";
+import { DEFAULT_PROMPT_NOISE_CLEANUP } from "./round-capture.ts";
 import { DEFAULT_CONTEXT_BUDGET_RATIO, DEFAULT_MAX_RELEVANCE_ENTRIES } from "./search-interactions.ts";
 
 export interface SemblrConfig {
@@ -30,6 +31,10 @@ export interface SemblrConfig {
 	contextRelevanceMaxEntries: number;
 	/** Hard cap on recency-list entries across all groups. */
 	contextRecencyMaxEntries: number;
+	/** Code fences longer than this many chars collapse to a placeholder in embedding inputs; 0 disables. */
+	promptNoiseFenceMaxChars: number;
+	/** JSON dumps longer than this many chars collapse to a placeholder in embedding inputs; 0 disables. */
+	promptNoiseJsonMaxChars: number;
 }
 
 export interface SemblrConfigEnv {
@@ -51,6 +56,8 @@ export interface SemblrConfigEnv {
 	SEMBLR_CONTEXT_BUDGET_RATIO?: string;
 	SEMBLR_CONTEXT_RELEVANCE_MAX_ENTRIES?: string;
 	SEMBLR_CONTEXT_RECENCY_MAX_ENTRIES?: string;
+	SEMBLR_PROMPT_NOISE_FENCE_MAX_CHARS?: string;
+	SEMBLR_PROMPT_NOISE_JSON_MAX_CHARS?: string;
 }
 
 export interface SemblrConfigDeps {
@@ -82,6 +89,8 @@ const DEFAULTS = {
 	contextBudgetRatio: DEFAULT_CONTEXT_BUDGET_RATIO,
 	contextRelevanceMaxEntries: DEFAULT_MAX_RELEVANCE_ENTRIES,
 	contextRecencyMaxEntries: DEFAULT_MAX_RECENCY_ENTRIES,
+	promptNoiseFenceMaxChars: DEFAULT_PROMPT_NOISE_CLEANUP.fenceMaxChars,
+	promptNoiseJsonMaxChars: DEFAULT_PROMPT_NOISE_CLEANUP.jsonMaxChars,
 };
 
 const ENV_KEYS = {
@@ -102,6 +111,8 @@ const ENV_KEYS = {
 	contextBudgetRatio: "SEMBLR_CONTEXT_BUDGET_RATIO",
 	contextRelevanceMaxEntries: "SEMBLR_CONTEXT_RELEVANCE_MAX_ENTRIES",
 	contextRecencyMaxEntries: "SEMBLR_CONTEXT_RECENCY_MAX_ENTRIES",
+	promptNoiseFenceMaxChars: "SEMBLR_PROMPT_NOISE_FENCE_MAX_CHARS",
+	promptNoiseJsonMaxChars: "SEMBLR_PROMPT_NOISE_JSON_MAX_CHARS",
 } satisfies Record<ConfigKey, keyof SemblrConfigEnv>;
 
 function defaultAgentDir(env: SemblrConfigEnv): string {
@@ -304,6 +315,18 @@ export function loadSemblrConfig(deps: SemblrConfigDeps = {}): SemblrConfig {
 			0,
 			Math.floor(
 				resolveNumber("contextRecencyMaxEntries", DEFAULTS.contextRecencyMaxEntries, env, mergedSettings, {}, warn),
+			),
+		),
+		promptNoiseFenceMaxChars: Math.max(
+			0,
+			Math.floor(
+				resolveNumber("promptNoiseFenceMaxChars", DEFAULTS.promptNoiseFenceMaxChars, env, mergedSettings, {}, warn),
+			),
+		),
+		promptNoiseJsonMaxChars: Math.max(
+			0,
+			Math.floor(
+				resolveNumber("promptNoiseJsonMaxChars", DEFAULTS.promptNoiseJsonMaxChars, env, mergedSettings, {}, warn),
 			),
 		),
 	};

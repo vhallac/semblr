@@ -38,6 +38,8 @@ describe("loadSemblrConfig", () => {
 			contextBudgetRatio: 0.08,
 			contextRelevanceMaxEntries: 20,
 			contextRecencyMaxEntries: 20,
+			promptNoiseFenceMaxChars: 600,
+			promptNoiseJsonMaxChars: 600,
 		});
 	});
 
@@ -60,6 +62,8 @@ describe("loadSemblrConfig", () => {
 				SEMBLR_CONTEXT_BUDGET_RATIO: "0.12",
 				SEMBLR_CONTEXT_RELEVANCE_MAX_ENTRIES: "5",
 				SEMBLR_CONTEXT_RECENCY_MAX_ENTRIES: "7",
+				SEMBLR_PROMPT_NOISE_FENCE_MAX_CHARS: "1200",
+				SEMBLR_PROMPT_NOISE_JSON_MAX_CHARS: "800",
 			},
 			fsImpl,
 		});
@@ -73,6 +77,8 @@ describe("loadSemblrConfig", () => {
 		expect(config.contextBudgetRatio).toBe(0.12);
 		expect(config.contextRelevanceMaxEntries).toBe(5);
 		expect(config.contextRecencyMaxEntries).toBe(7);
+		expect(config.promptNoiseFenceMaxChars).toBe(1200);
+		expect(config.promptNoiseJsonMaxChars).toBe(800);
 	});
 
 	it("lets project settings override global settings per key", () => {
@@ -98,6 +104,8 @@ describe("loadSemblrConfig", () => {
 				SEMBLR_CONTEXT_BUDGET_RATIO: "7",
 				SEMBLR_CONTEXT_RELEVANCE_MAX_ENTRIES: "-3",
 				SEMBLR_CONTEXT_RECENCY_MAX_ENTRIES: "-1",
+				SEMBLR_PROMPT_NOISE_FENCE_MAX_CHARS: "-9",
+				SEMBLR_PROMPT_NOISE_JSON_MAX_CHARS: "-4",
 			},
 			fsImpl: fsFromFiles({}),
 		});
@@ -105,6 +113,8 @@ describe("loadSemblrConfig", () => {
 		expect(config.contextBudgetRatio).toBe(1);
 		expect(config.contextRelevanceMaxEntries).toBe(0);
 		expect(config.contextRecencyMaxEntries).toBe(0);
+		expect(config.promptNoiseFenceMaxChars).toBe(0);
+		expect(config.promptNoiseJsonMaxChars).toBe(0);
 	});
 
 	it("merges global and project semblr sections without reading unrelated settings", () => {
