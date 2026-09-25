@@ -822,6 +822,9 @@ export default function (pi: ExtensionAPI) {
 				maxEntries: SEMBLR_CONFIG.contextRelevanceMaxEntries,
 				reservedTokens,
 				truncation: PROMPT_TRUNCATION,
+				// Same size fn the relevance list renders with, so the charged
+				// entry includes the size tag (charged == injected, #107 F4).
+				getRoundSizeFn: getRoundSize,
 			});
 
 			if (selectedRounds.length === 0) {

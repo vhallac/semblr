@@ -231,6 +231,10 @@ export function selectContextRounds(
 		reservedTokens?: number;
 		/** Truncation applied to entry prompts — cost must match rendered entries. */
 		truncation?: PromptTruncationOptions;
+		/** Size-tag source — must be the same fn the renderer passes to
+		 * buildRelevanceList, so the rendered ` | 12.34KB` suffix is charged to
+		 * the budget, not just injected (issue #107 F4). Defaults to no tag. */
+		getRoundSizeFn?: (fileName: string) => string | null;
 	} = { budgetTokens: 2000 },
 ): SearchRoundScore[] {
 	const minSimilarity = options.minSimilarity ?? 0.3;
@@ -239,17 +243,19 @@ export function selectContextRounds(
 	const truncation = options.truncation ?? DEFAULT_PROMPT_TRUNCATION;
 	const selectedRounds: SearchRoundScore[] = [];
 	// Budget accounting covers what is actually injected: each round is charged
-	// the rendered entry (truncated prompt + entry header + tool summary), not
-	// its full on-disk content (issue #106).
+	// the rendered entry (truncated prompt + entry header + tool summary + size
+	// tag), not its full on-disk content (issue #106; size-tag charging: #107 F4).
 	let usedTokens = options.reservedTokens ?? 0;
 
 	for (const round of scoredRounds) {
 		if (selectedRounds.length >= maxEntries) break;
 		if (round.bestScore < minSimilarity) break;
+		const sizeStr = options.getRoundSizeFn?.(round.fileName) ?? undefined;
 		const renderedEntry = buildRelevanceEntry(
 			selectedRounds.length + 1,
 			{ fileName: round.fileName, bestScore: round.bestScore, data: round.data },
 			truncation,
+			sizeStr,
 		).join("\n");
 		const roundTokens = estimateTokensFn(renderedEntry);
 		if (usedTokens + roundTokens > options.budgetTokens) break;

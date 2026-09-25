@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { buildRelevanceEntry, DEFAULT_PROMPT_TRUNCATION } from "./context-format.ts";
 import { indexRoundFileFromPath } from "./index-io.ts";
 import type { IndexEntry } from "./index-storage.ts";
 import type { RoundData } from "./round-data.ts";
@@ -564,6 +565,47 @@ describe("selectContextRounds", () => {
 		expect(select(0)).toHaveLength(2);
 		expect(select(100)).toHaveLength(1);
 		expect(select(400)).toHaveLength(0);
+	});
+
+	// issue #107 F4: the relevance list renders ` | 12.34KB` size tags that
+	// selection previously never charged — the charged==injected invariant
+	// (issue #106) drifted by ~3 tokens/entry.
+
+	it("charges the size tag — drift vs the rendered list", () => {
+		const rounds = [makeRound("a.json", "x".repeat(300)), makeRound("b.json", "y".repeat(300))];
+		const getRoundSizeFn = () => "12.34KB";
+		// ~341/entry untagged (682 ≤ 700 both fit) vs ~351 tagged (702 > 700).
+		const opts = {
+			budgetTokens: 700,
+			estimateTokensFn: lenCost,
+			minSimilarity: 0.3,
+			getRoundSizeFn,
+		};
+		expect(selectContextRounds(rounds, opts)).toHaveLength(1);
+		// Without the tag source, selection is unchanged (no tag → no drift).
+		expect(selectContextRounds(rounds, { ...opts, getRoundSizeFn: undefined })).toHaveLength(2);
+	});
+
+	it("charged cost equals the rendered entry byte-for-byte (drift == 0)", () => {
+		const round = makeRound("a.json", "x".repeat(300));
+		const rendered = buildRelevanceEntry(
+			1,
+			{ fileName: round.fileName, bestScore: round.bestScore, data: round.data },
+			DEFAULT_PROMPT_TRUNCATION,
+			"12.34KB",
+		).join("\n");
+		const cost = rendered.length;
+		// The budget threshold sits exactly at the rendered-with-tag cost:
+		// admitted at cost, rejected one char earlier.
+		const select = (budgetTokens: number) =>
+			selectContextRounds([round], {
+				budgetTokens,
+				estimateTokensFn: lenCost,
+				minSimilarity: 0.3,
+				getRoundSizeFn: () => "12.34KB",
+			});
+		expect(select(cost)).toHaveLength(1);
+		expect(select(cost - 1)).toHaveLength(0);
 	});
 
 	it("skips rounds below minSimilarity", () => {
