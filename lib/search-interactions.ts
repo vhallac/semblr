@@ -1,11 +1,20 @@
-import { formatFileSize } from "./context-format.ts";
+import {
+	buildRelevanceEntry,
+	DEFAULT_PROMPT_TRUNCATION,
+	formatFileSize,
+	type PromptTruncationOptions,
+} from "./context-format.ts";
 import { indexRoundFileFromPath } from "./index-io.ts";
 import type { IndexEntry } from "./index-storage.ts";
 import type { RoundData, ToolCallDetail, ToolResult } from "./round-data.ts";
 import { estimateTokens } from "./tokens.ts";
 import { cosineSimilarity, normalize } from "./vector.ts";
 
-const DEFAULT_CONTEXT_BUDGET_RATIO = 0.5;
+/** Fraction of the context window the relevance-list injection may occupy at bestScore → 1.0 (issue #106: 0.5 → 0.08). */
+export const DEFAULT_CONTEXT_BUDGET_RATIO = 0.08;
+
+/** Hard cap on relevance-list entries regardless of budget (issue #106). */
+export const DEFAULT_MAX_RELEVANCE_ENTRIES = 20;
 
 export type SearchInteractionsMode = "similarity" | "text-match" | "hybrid" | "tool";
 
@@ -184,7 +193,9 @@ export function computeContextBudget(
 	minBudget = 2000,
 	budgetRatio = DEFAULT_CONTEXT_BUDGET_RATIO,
 ): number {
-	const maxBudget = Math.floor(budgetRatio * contextWindow);
+	// Guard small windows: ratio × window can fall below minBudget, which would
+	// invert the curve (higher relevance → smaller budget). Keep it monotonic.
+	const maxBudget = Math.max(minBudget, Math.floor(budgetRatio * contextWindow));
 	const t = Math.max(0, Math.min(1, (bestScore - minSimilarity) / (1 - minSimilarity)));
 	return Math.floor(minBudget + t * (maxBudget - minBudget));
 }
@@ -197,22 +208,41 @@ export function selectContextRounds(
 		minSimilarity?: number;
 		budgetTokens: number;
 		estimateTokensFn?: (text: string) => number;
+		/** Hard cap on selected entries (default 20, issue #106). */
+		maxEntries?: number;
+		/** Fixed overhead (section header, preamble) charged up-front. */
+		reservedTokens?: number;
+		/** Truncation applied to entry prompts — cost must match rendered entries. */
+		truncation?: PromptTruncationOptions;
 	} = { budgetTokens: 2000 },
 ): SearchRoundScore[] {
 	const minSimilarity = options.minSimilarity ?? 0.3;
 	const estimateTokensFn = options.estimateTokensFn ?? estimateTokens;
+	const maxEntries = options.maxEntries ?? DEFAULT_MAX_RELEVANCE_ENTRIES;
+	const truncation = options.truncation ?? DEFAULT_PROMPT_TRUNCATION;
 	const selectedRounds: SearchRoundScore[] = [];
-	let usedTokens = 0;
+	// Budget accounting covers what is actually injected: each round is charged
+	// the rendered entry (truncated prompt + entry header + tool summary), not
+	// its full on-disk content (issue #106).
+	let usedTokens = options.reservedTokens ?? 0;
 
 	for (const round of scoredRounds) {
+		if (selectedRounds.length >= maxEntries) break;
 		if (round.bestScore < minSimilarity) break;
-		const roundTokens = estimateTokensFn(round.data.userPrompt + round.data.responseSequence);
+		const renderedEntry = buildRelevanceEntry(
+			selectedRounds.length + 1,
+			{ fileName: round.fileName, bestScore: round.bestScore, data: round.data },
+			truncation,
+		).join("\n");
+		const roundTokens = estimateTokensFn(renderedEntry);
 		if (usedTokens + roundTokens > options.budgetTokens) break;
 		selectedRounds.push(round);
 		usedTokens += roundTokens;
 	}
 
-	if (lastRoundFileName) {
+	// The last round is appended so it is always available for follow-up — but
+	// never duplicated if the search already selected it.
+	if (lastRoundFileName && !selectedRounds.some((r) => r.fileName === lastRoundFileName)) {
 		const lastData = readRound(lastRoundFileName);
 		if (lastData) selectedRounds.push({ data: lastData, fileName: lastRoundFileName, bestScore: 0 });
 	}

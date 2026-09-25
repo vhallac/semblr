@@ -28,6 +28,8 @@ function testConfig(root: string): SemblrConfig {
 		summaryThresholdExtra: 40_000,
 		contextPromptHeadChars: 260,
 		contextPromptTailChars: 140,
+		contextBudgetRatio: 0.08,
+		contextRelevanceMaxEntries: 20,
 	};
 }
 

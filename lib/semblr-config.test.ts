@@ -35,6 +35,8 @@ describe("loadSemblrConfig", () => {
 			summaryThresholdExtra: 0,
 			contextPromptHeadChars: 260,
 			contextPromptTailChars: 140,
+			contextBudgetRatio: 0.08,
+			contextRelevanceMaxEntries: 20,
 		});
 	});
 
@@ -54,6 +56,8 @@ describe("loadSemblrConfig", () => {
 				SEMBLR_HYBRID_SEMANTIC_WEIGHT: "0.4",
 				SEMBLR_CONTEXT_PROMPT_HEAD_CHARS: "600",
 				SEMBLR_CONTEXT_PROMPT_TAIL_CHARS: "300",
+				SEMBLR_CONTEXT_BUDGET_RATIO: "0.12",
+				SEMBLR_CONTEXT_RELEVANCE_MAX_ENTRIES: "5",
 			},
 			fsImpl,
 		});
@@ -64,6 +68,8 @@ describe("loadSemblrConfig", () => {
 		expect(config.hybridSemanticWeight).toBe(0.4);
 		expect(config.contextPromptHeadChars).toBe(600);
 		expect(config.contextPromptTailChars).toBe(300);
+		expect(config.contextBudgetRatio).toBe(0.12);
+		expect(config.contextRelevanceMaxEntries).toBe(5);
 	});
 
 	it("lets project settings override global settings per key", () => {
@@ -79,6 +85,21 @@ describe("loadSemblrConfig", () => {
 		expect(config.embeddingProvider).toBe("global-provider");
 		expect(config.embeddingModel).toBe("project-model");
 		expect(config.minSimilarity).toBe(0.4);
+	});
+
+	it("clamps context budget ratio and relevance entry cap to sane ranges", () => {
+		const config = loadSemblrConfig({
+			cwd: "/repo",
+			agentDir: "/agent",
+			env: {
+				SEMBLR_CONTEXT_BUDGET_RATIO: "7",
+				SEMBLR_CONTEXT_RELEVANCE_MAX_ENTRIES: "-3",
+			},
+			fsImpl: fsFromFiles({}),
+		});
+
+		expect(config.contextBudgetRatio).toBe(1);
+		expect(config.contextRelevanceMaxEntries).toBe(0);
 	});
 
 	it("merges global and project semblr sections without reading unrelated settings", () => {

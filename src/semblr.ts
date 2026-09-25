@@ -32,6 +32,7 @@ import {
 	buildRelevanceList,
 	buildSessionArchitecture,
 	buildWorkingMemorySection,
+	RELEVANCE_LIST_HEADER,
 	splitCommandArgs,
 } from "../lib/context-format.ts";
 import {
@@ -106,7 +107,7 @@ import {
 	recordPresented,
 	recordRead,
 } from "../lib/stats.ts";
-import { estimateMessagesTokens } from "../lib/tokens.ts";
+import { estimateMessagesTokens, estimateTokens } from "../lib/tokens.ts";
 import { normalize } from "../lib/vector.ts";
 import {
 	addSlot,
@@ -809,11 +810,20 @@ export default function (pi: ExtensionAPI) {
 				bestScore,
 				ctx.model?.contextWindow ?? 128_000,
 				SEMBLR_CONFIG.minSimilarity,
+				undefined,
+				SEMBLR_CONFIG.contextBudgetRatio,
 			);
 
+			// Reserve the static section overhead (relevance header + preamble) so
+			// the budget bounds the full injected section, not just round entries.
+			const reservedTokens =
+				estimateTokens(RELEVANCE_LIST_HEADER) + estimateTokens(buildContextPreamble(true, true) ?? "");
 			const selectedRounds = selectContextRounds(scoredRounds, lastRoundFileName, readRoundFile, {
 				minSimilarity: SEMBLR_CONFIG.minSimilarity,
 				budgetTokens,
+				maxEntries: SEMBLR_CONFIG.contextRelevanceMaxEntries,
+				reservedTokens,
+				truncation: PROMPT_TRUNCATION,
 			});
 
 			if (selectedRounds.length === 0) {

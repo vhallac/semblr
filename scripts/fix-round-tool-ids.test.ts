@@ -67,6 +67,8 @@ function testConfig(overrides: Partial<SemblrConfig> = {}): SemblrConfig {
 		summaryThresholdExtra: 0,
 		contextPromptHeadChars: 260,
 		contextPromptTailChars: 140,
+		contextBudgetRatio: 0.08,
+		contextRelevanceMaxEntries: 20,
 		...overrides,
 	};
 }

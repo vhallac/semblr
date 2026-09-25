@@ -2,6 +2,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { DEFAULT_PROMPT_TRUNCATION } from "./context-format.ts";
+import { DEFAULT_CONTEXT_BUDGET_RATIO, DEFAULT_MAX_RELEVANCE_ENTRIES } from "./search-interactions.ts";
 
 export interface SemblrConfig {
 	agentDir: string;
@@ -23,6 +24,10 @@ export interface SemblrConfig {
 	contextPromptHeadChars: number;
 	/** Chars kept from the tail of each recency/relevance list prompt. */
 	contextPromptTailChars: number;
+	/** Fraction of the context window the relevance-list injection may occupy at best score (0–1). */
+	contextBudgetRatio: number;
+	/** Hard cap on relevance-list entries. */
+	contextRelevanceMaxEntries: number;
 }
 
 export interface SemblrConfigEnv {
@@ -41,6 +46,8 @@ export interface SemblrConfigEnv {
 	SEMBLR_SUMMARY_THRESHOLD_EXTRA?: string;
 	SEMBLR_CONTEXT_PROMPT_HEAD_CHARS?: string;
 	SEMBLR_CONTEXT_PROMPT_TAIL_CHARS?: string;
+	SEMBLR_CONTEXT_BUDGET_RATIO?: string;
+	SEMBLR_CONTEXT_RELEVANCE_MAX_ENTRIES?: string;
 }
 
 export interface SemblrConfigDeps {
@@ -69,6 +76,8 @@ const DEFAULTS = {
 	summaryThresholdExtra: 0,
 	contextPromptHeadChars: DEFAULT_PROMPT_TRUNCATION.headChars,
 	contextPromptTailChars: DEFAULT_PROMPT_TRUNCATION.tailChars,
+	contextBudgetRatio: DEFAULT_CONTEXT_BUDGET_RATIO,
+	contextRelevanceMaxEntries: DEFAULT_MAX_RELEVANCE_ENTRIES,
 };
 
 const ENV_KEYS = {
@@ -86,6 +95,8 @@ const ENV_KEYS = {
 	summaryThresholdExtra: "SEMBLR_SUMMARY_THRESHOLD_EXTRA",
 	contextPromptHeadChars: "SEMBLR_CONTEXT_PROMPT_HEAD_CHARS",
 	contextPromptTailChars: "SEMBLR_CONTEXT_PROMPT_TAIL_CHARS",
+	contextBudgetRatio: "SEMBLR_CONTEXT_BUDGET_RATIO",
+	contextRelevanceMaxEntries: "SEMBLR_CONTEXT_RELEVANCE_MAX_ENTRIES",
 } satisfies Record<ConfigKey, keyof SemblrConfigEnv>;
 
 function defaultAgentDir(env: SemblrConfigEnv): string {
@@ -266,6 +277,23 @@ export function loadSemblrConfig(deps: SemblrConfigDeps = {}): SemblrConfig {
 			mergedSettings,
 			{},
 			warn,
+		),
+		contextBudgetRatio: Math.max(
+			0,
+			Math.min(1, resolveNumber("contextBudgetRatio", DEFAULTS.contextBudgetRatio, env, mergedSettings, {}, warn)),
+		),
+		contextRelevanceMaxEntries: Math.max(
+			0,
+			Math.floor(
+				resolveNumber(
+					"contextRelevanceMaxEntries",
+					DEFAULTS.contextRelevanceMaxEntries,
+					env,
+					mergedSettings,
+					{},
+					warn,
+				),
+			),
 		),
 	};
 }

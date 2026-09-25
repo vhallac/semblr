@@ -208,14 +208,8 @@ export function buildToolSummary(toolCalls: ContextToolCallDetail[], totalCount:
 	return `${totalCount} tools (${parts.join(", ")})`;
 }
 
-export function buildRelevanceList(
-	rounds: RelevanceRound[],
-	getRoundSize: (fileName: string) => string | null = () => null,
-	truncation: PromptTruncationOptions = DEFAULT_PROMPT_TRUNCATION,
-): string | null {
-	if (rounds.length === 0) return null;
-	const lines: string[] = [];
-	const header = `--- RELEVANCE LIST (all sessions, by hybrid relevance) ---
+/** Static header for the relevance list section (issue #106: counted against the injection budget). */
+export const RELEVANCE_LIST_HEADER = `--- RELEVANCE LIST (all sessions, by hybrid relevance) ---
 These rounds have numeric similarity scores (0.0–1.0). Higher = stronger
 match. They combine semantic vector similarity with exact keyword matching.
 They come from ALL past sessions, not just the current one.
@@ -228,31 +222,49 @@ Use this list when the prompt asks about past work, decisions, or findings
 from prior sessions, or requires cross-session continuity (same project,
 recurring topic, long-running task). If nothing here matches but the query
 clearly needs past context, use search_interactions.`;
-	lines.push(header);
+
+/**
+ * Render one relevance-list entry. Shared by buildRelevanceList (rendering)
+ * and selectContextRounds (injection-cost accounting) so both stay in
+ * lockstep: what is charged to the budget is exactly what is injected.
+ */
+export function buildRelevanceEntry(
+	idx: number,
+	round: RelevanceRound,
+	truncation: PromptTruncationOptions = DEFAULT_PROMPT_TRUNCATION,
+	sizeStr?: string,
+): string[] {
+	const toolCount = round.data.toolCallCount ?? 0;
+	let toolSummary = `${toolCount} tools`;
+	if (round.data.toolCalls && round.data.toolCalls.length > 0) {
+		toolSummary = buildToolSummary(round.data.toolCalls, toolCount);
+	}
+	return formatRoundEntry(
+		idx,
+		round.fileName,
+		round.bestScore.toFixed(2),
+		toolSummary,
+		round.data.userPrompt,
+		sizeStr,
+		truncation,
+	);
+}
+
+export function buildRelevanceList(
+	rounds: RelevanceRound[],
+	getRoundSize: (fileName: string) => string | null = () => null,
+	truncation: PromptTruncationOptions = DEFAULT_PROMPT_TRUNCATION,
+): string | null {
+	if (rounds.length === 0) return null;
+	const lines: string[] = [];
+	lines.push(RELEVANCE_LIST_HEADER);
 	lines.push("");
 
 	let idx = 0;
 	for (const round of rounds) {
 		idx++;
-		const toolCount = round.data.toolCallCount ?? 0;
 		const sizeStr = getRoundSize(round.fileName) ?? undefined;
-
-		let toolSummary = `${toolCount} tools`;
-		if (round.data.toolCalls && round.data.toolCalls.length > 0) {
-			toolSummary = buildToolSummary(round.data.toolCalls, toolCount);
-		}
-
-		lines.push(
-			...formatRoundEntry(
-				idx,
-				round.fileName,
-				round.bestScore.toFixed(2),
-				toolSummary,
-				round.data.userPrompt,
-				sizeStr,
-				truncation,
-			),
-		);
+		lines.push(...buildRelevanceEntry(idx, round, truncation, sizeStr));
 	}
 	return lines.join("\n");
 }
