@@ -101,10 +101,16 @@ export interface PromptNoiseOptions {
 	fenceMaxChars: number;
 	/** JSON dumps whose text exceeds this many chars collapse to a placeholder; non-positive disables. */
 	jsonMaxChars: number;
+	/** Repeat runs (same char hammered, or a single no-space token) longer than this collapse; non-positive disables. */
+	repeatMaxChars: number;
 }
 
-/** Default cleanup thresholds (issue #106 Stage 1): collapse fences/JSON dumps past ~600 chars. */
-export const DEFAULT_PROMPT_NOISE_CLEANUP: PromptNoiseOptions = { fenceMaxChars: 600, jsonMaxChars: 600 };
+/** Default cleanup thresholds (issue #106 Stage 1): collapse fences/JSON dumps past ~600 chars, repetition past ~200. */
+export const DEFAULT_PROMPT_NOISE_CLEANUP: PromptNoiseOptions = {
+	fenceMaxChars: 600,
+	jsonMaxChars: 600,
+	repeatMaxChars: 200,
+};
 
 const PLACEHOLDER_LINE_CLIP = 80;
 const JSON_PARSE_LENGTH_CAP = 1_000_000;
@@ -220,16 +226,51 @@ function collapseJsonDumps(text: string, jsonMaxChars: number): string {
 	return result;
 }
 
+/** Escaped, single-line rendering of the repeated character for the REPEAT placeholder. */
+function describeRepeatChar(ch: string): string {
+	return JSON.stringify(ch).slice(1, -1);
+}
+
+/**
+ * Collapse zero-variety repetition runs: the same character hammered past `repeatMaxChars`
+ * (paste glitches like `pppp…`, oversized rules `----…`, huge whitespace) becomes
+ * `[REPEAT: 'c' × M]`. Runs at or below the threshold are left verbatim.
+ */
+function collapseRepeatRuns(prompt: string, repeatMaxChars: number): string {
+	if (repeatMaxChars <= 0) return prompt;
+	// Match from 11 chars up so the replacement callback only runs on plausible noise runs;
+	// dotAll so line-terminator runs (huge newline/whitespace gaps) are guarded too.
+	return prompt.replace(/(.)\1{10,}/gs, (run, ch: string) =>
+		run.length > repeatMaxChars ? `[REPEAT: '${describeRepeatChar(ch)}' × ${run.length}]` : run,
+	);
+}
+
+/**
+ * Collapse solid no-space tokens (base64 blobs, hex dumps, minified one-liners, periodic junk
+ * like `ababab…`) longer than `repeatMaxChars` to `[LONG_TOKEN: ~M chars]`. Runs after the
+ * single-char collapse, so it only claims mixed-content runs the char guard did not.
+ */
+function collapseLongTokens(prompt: string, repeatMaxChars: number): string {
+	if (repeatMaxChars <= 0) return prompt;
+	const longTokenRe = new RegExp(`[^\\s]{${repeatMaxChars + 1},}`, "g");
+	return prompt.replace(longTokenRe, (token) => `[LONG_TOKEN: ~${token.length} chars]`);
+}
+
 /**
  * Collapse embedding noise in a user prompt (issue #106 Stage 1, derived-not-stored):
- * large code fences become `[CODE_BLOCK: ~M chars, lang, first/last line]` placeholders and
- * parse-validated JSON dumps become `[JSON_DUMP: ~M chars]` placeholders. The raw prompt stays
- * verbatim in the round file; the cleaned view is only an embedding-input transform.
+ * large code fences become `[CODE_BLOCK: ~M chars, lang, first/last line]` placeholders,
+ * parse-validated JSON dumps become `[JSON_DUMP: ~M chars]` placeholders, and zero-variety
+ * repetition runs (hammered chars, solid long tokens) become `[REPEAT: …]` / `[LONG_TOKEN: …]`
+ * placeholders. The raw prompt stays verbatim in the round file; the cleaned view is only an
+ * embedding-input transform.
  */
 export function cleanPromptNoise(prompt: string, options: PromptNoiseOptions = DEFAULT_PROMPT_NOISE_CLEANUP): string {
 	// Fences first: fenced JSON would otherwise be matched (and mis-labeled) by the JSON scan.
 	let cleaned = collapseCodeFences(prompt, options.fenceMaxChars);
 	cleaned = collapseJsonDumps(cleaned, options.jsonMaxChars);
+	// Repetition last: it only claims residual runs the structural collapses did not absorb.
+	cleaned = collapseRepeatRuns(cleaned, options.repeatMaxChars);
+	cleaned = collapseLongTokens(cleaned, options.repeatMaxChars);
 	return cleaned;
 }
 

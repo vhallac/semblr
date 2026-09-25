@@ -72,6 +72,7 @@ function testConfig(overrides: Partial<SemblrConfig> = {}): SemblrConfig {
 		contextRecencyMaxEntries: 20,
 		promptNoiseFenceMaxChars: 600,
 		promptNoiseJsonMaxChars: 600,
+		promptNoiseRepeatMaxChars: 200,
 		...overrides,
 	};
 }

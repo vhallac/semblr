@@ -259,7 +259,7 @@ describe("cleanPromptNoise", () => {
 	it("collapses a large code fence to a placeholder with lang and first/last line", () => {
 		const body = Array.from({ length: 50 }, (_, i) => `line-${i} = ${i};`).join("\n");
 		const prompt = `Intro text here.\n\n\`\`\`python\n${body}\n\`\`\`\n\nOutro.`;
-		const cleaned = cleanPromptNoise(prompt, { fenceMaxChars: 100, jsonMaxChars: 0 });
+		const cleaned = cleanPromptNoise(prompt, { fenceMaxChars: 100, jsonMaxChars: 0, repeatMaxChars: 200 });
 		expect(cleaned).toContain("Intro text here.");
 		expect(cleaned).toContain("Outro.");
 		expect(cleaned).toContain("[CODE_BLOCK: ~");
@@ -271,13 +271,21 @@ describe("cleanPromptNoise", () => {
 
 	it("falls back to plain when the fence info is not a language token", () => {
 		const body = "x".repeat(400);
-		const cleaned = cleanPromptNoise(`\`\`\`[\n${body}\n\`\`\``, { fenceMaxChars: 100, jsonMaxChars: 0 });
+		const cleaned = cleanPromptNoise(`\`\`\`[\n${body}\n\`\`\``, {
+			fenceMaxChars: 100,
+			jsonMaxChars: 0,
+			repeatMaxChars: 200,
+		});
 		expect(cleaned).toContain("[CODE_BLOCK: ~401 chars, plain,");
 	});
 
 	it("collapses a tilde fence and clips long placeholder lines", () => {
 		const body = `start ${"y".repeat(200)}\n${"z".repeat(200)} end`;
-		const cleaned = cleanPromptNoise(`before\n~~~ruby\n${body}\n~~~\nafter`, { fenceMaxChars: 50, jsonMaxChars: 0 });
+		const cleaned = cleanPromptNoise(`before\n~~~ruby\n${body}\n~~~\nafter`, {
+			fenceMaxChars: 50,
+			jsonMaxChars: 0,
+			repeatMaxChars: 200,
+		});
 		expect(cleaned).toContain("ruby");
 		expect(cleaned).toContain('first line: "start');
 		expect(cleaned).toContain("last line: ");
@@ -285,8 +293,9 @@ describe("cleanPromptNoise", () => {
 	});
 
 	it("leaves an unterminated fence alone", () => {
-		const prompt = `prose\n\`\`\`ts\n${"x".repeat(2000)}`;
-		expect(cleanPromptNoise(prompt, { fenceMaxChars: 100, jsonMaxChars: 0 })).toBe(prompt);
+		const body = Array.from({ length: 40 }, (_, i) => `value-${i} = ${i * 7};`).join("\n");
+		const prompt = `prose\n\`\`\`ts\n${body}`;
+		expect(cleanPromptNoise(prompt, { fenceMaxChars: 100, jsonMaxChars: 0, repeatMaxChars: 200 })).toBe(prompt);
 	});
 
 	it("collapses a large pretty-printed JSON dump", () => {
@@ -296,7 +305,7 @@ describe("cleanPromptNoise", () => {
 			2,
 		);
 		const prompt = `Load this config:\n${dump}\nthanks`;
-		const cleaned = cleanPromptNoise(prompt, { fenceMaxChars: 0, jsonMaxChars: 200 });
+		const cleaned = cleanPromptNoise(prompt, { fenceMaxChars: 0, jsonMaxChars: 200, repeatMaxChars: 200 });
 		expect(cleaned).toContain("Load this config:");
 		expect(cleaned).toContain("thanks");
 		expect(cleaned).toMatch(/\[JSON_DUMP: ~\d+ chars\]/);
@@ -305,21 +314,21 @@ describe("cleanPromptNoise", () => {
 
 	it("collapses a large minified single-line JSON array", () => {
 		const dump = JSON.stringify(Array.from({ length: 60 }, (_, i) => `entry-${i}`));
-		const cleaned = cleanPromptNoise(`data: ${dump}`, { fenceMaxChars: 0, jsonMaxChars: 100 });
+		const cleaned = cleanPromptNoise(`data: ${dump}`, { fenceMaxChars: 0, jsonMaxChars: 100, repeatMaxChars: 200 });
 		expect(cleaned).toContain("data: ");
 		expect(cleaned).toMatch(/\[JSON_DUMP: ~/);
 	});
 
 	it("does not collapse parse-failing braces in prose or code", () => {
 		const prompt = `Use {"key": value} shapes. Also:\nif (a) {\n\tlog("${"x".repeat(300)}");\n}`;
-		const cleaned = cleanPromptNoise(prompt, { fenceMaxChars: 0, jsonMaxChars: 50 });
+		const cleaned = cleanPromptNoise(prompt, { fenceMaxChars: 0, jsonMaxChars: 50, repeatMaxChars: 0 });
 		expect(cleaned).toBe(prompt);
 	});
 
 	it("prefers the fence collapse for fenced JSON and does not double-process placeholders", () => {
 		const dump = JSON.stringify({ rows: Array.from({ length: 30 }, (_, i) => [i, `r-${i}`]) }, null, 2);
 		const prompt = `\`\`\`json\n${dump}\n\`\`\``;
-		const cleaned = cleanPromptNoise(prompt, { fenceMaxChars: 100, jsonMaxChars: 100 });
+		const cleaned = cleanPromptNoise(prompt, { fenceMaxChars: 100, jsonMaxChars: 100, repeatMaxChars: 200 });
 		expect(cleaned).toContain("[CODE_BLOCK:");
 		expect(cleaned).toContain("json");
 		expect(cleaned).not.toContain("[JSON_DUMP:");
@@ -328,7 +337,58 @@ describe("cleanPromptNoise", () => {
 	it("disables collapse with non-positive thresholds", () => {
 		const dump = JSON.stringify({ items: Array.from({ length: 40 }, (_, i) => `x-${i}`) }, null, 2);
 		const prompt = `\`\`\`ts\n${"c".repeat(300)}\n\`\`\`\n${dump}`;
-		expect(cleanPromptNoise(prompt, { fenceMaxChars: 0, jsonMaxChars: 0 })).toBe(prompt);
+		expect(cleanPromptNoise(prompt, { fenceMaxChars: 0, jsonMaxChars: 0, repeatMaxChars: 0 })).toBe(prompt);
+	});
+
+	it("collapses a long single-char repeat run to a REPEAT placeholder", () => {
+		const cleaned = cleanPromptNoise(`oops:${"p".repeat(8100)}end`, {
+			fenceMaxChars: 0,
+			jsonMaxChars: 0,
+			repeatMaxChars: 200,
+		});
+		expect(cleaned).toContain("oops:");
+		expect(cleaned).toContain("[REPEAT: 'p' × 8100]");
+		expect(cleaned).toContain("end");
+		expect(cleaned).not.toContain("ppppp");
+	});
+
+	it("leaves repeat runs at or below the threshold untouched", () => {
+		const prompt = `sep\n${"─".repeat(178)}\n${"━".repeat(44)}\nprose`;
+		expect(cleanPromptNoise(prompt, { fenceMaxChars: 0, jsonMaxChars: 0, repeatMaxChars: 200 })).toBe(prompt);
+	});
+
+	it("collapses a solid base64-like token to a LONG_TOKEN placeholder", () => {
+		const blob = Array.from({ length: 40 }, (_, i) => Buffer.from(`segment-${i}-`).toString("base64")).join("");
+		const cleaned = cleanPromptNoise(`key: ${blob}`, { fenceMaxChars: 0, jsonMaxChars: 0, repeatMaxChars: 200 });
+		expect(cleaned).toBe(`key: [LONG_TOKEN: ~${blob.length} chars]`);
+	});
+
+	it("collapses periodic junk runs via the long-token guard", () => {
+		const cleaned = cleanPromptNoise(`noise ${"ab".repeat(150)} done`, {
+			fenceMaxChars: 0,
+			jsonMaxChars: 0,
+			repeatMaxChars: 200,
+		});
+		expect(cleaned).toBe("noise [LONG_TOKEN: ~300 chars] done");
+	});
+
+	it("escapes whitespace characters in REPEAT placeholders", () => {
+		const cleaned = cleanPromptNoise(`a${"\n".repeat(250)}b`, {
+			fenceMaxChars: 0,
+			jsonMaxChars: 0,
+			repeatMaxChars: 200,
+		});
+		expect(cleaned).toBe("a[REPEAT: '\\n' × 250]b");
+	});
+
+	it("prefers the fence collapse for degenerate runs inside fences", () => {
+		const cleaned = cleanPromptNoise(`\`\`\`text\n${"p".repeat(500)}\n\`\`\``, {
+			fenceMaxChars: 100,
+			jsonMaxChars: 0,
+			repeatMaxChars: 200,
+		});
+		expect(cleaned).toContain("[CODE_BLOCK: ~501 chars, text,");
+		expect(cleaned).not.toContain("[REPEAT:");
 	});
 
 	it("handles empty prompt", () => {

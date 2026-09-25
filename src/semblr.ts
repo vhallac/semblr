@@ -207,10 +207,11 @@ const PROMPT_TRUNCATION = {
 	tailChars: SEMBLR_CONFIG.contextPromptTailChars,
 };
 
-/** Embedding-input noise cleanup (issue #106 Stage 1): collapse large code fences / JSON dumps. */
+/** Embedding-input noise cleanup (issue #106 Stage 1): collapse large code fences / JSON dumps / repetition runs. */
 const PROMPT_NOISE_CLEANUP = {
 	fenceMaxChars: SEMBLR_CONFIG.promptNoiseFenceMaxChars,
 	jsonMaxChars: SEMBLR_CONFIG.promptNoiseJsonMaxChars,
+	repeatMaxChars: SEMBLR_CONFIG.promptNoiseRepeatMaxChars,
 };
 
 /** Build a flat text representation of a checkpoint summary for embedding. */

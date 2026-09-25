@@ -35,6 +35,8 @@ export interface SemblrConfig {
 	promptNoiseFenceMaxChars: number;
 	/** JSON dumps longer than this many chars collapse to a placeholder in embedding inputs; 0 disables. */
 	promptNoiseJsonMaxChars: number;
+	/** Repetition runs (hammered chars, solid long tokens) longer than this collapse in embedding inputs; 0 disables. */
+	promptNoiseRepeatMaxChars: number;
 }
 
 export interface SemblrConfigEnv {
@@ -58,6 +60,7 @@ export interface SemblrConfigEnv {
 	SEMBLR_CONTEXT_RECENCY_MAX_ENTRIES?: string;
 	SEMBLR_PROMPT_NOISE_FENCE_MAX_CHARS?: string;
 	SEMBLR_PROMPT_NOISE_JSON_MAX_CHARS?: string;
+	SEMBLR_PROMPT_NOISE_REPEAT_MAX_CHARS?: string;
 }
 
 export interface SemblrConfigDeps {
@@ -91,6 +94,7 @@ const DEFAULTS = {
 	contextRecencyMaxEntries: DEFAULT_MAX_RECENCY_ENTRIES,
 	promptNoiseFenceMaxChars: DEFAULT_PROMPT_NOISE_CLEANUP.fenceMaxChars,
 	promptNoiseJsonMaxChars: DEFAULT_PROMPT_NOISE_CLEANUP.jsonMaxChars,
+	promptNoiseRepeatMaxChars: DEFAULT_PROMPT_NOISE_CLEANUP.repeatMaxChars,
 };
 
 const ENV_KEYS = {
@@ -113,6 +117,7 @@ const ENV_KEYS = {
 	contextRecencyMaxEntries: "SEMBLR_CONTEXT_RECENCY_MAX_ENTRIES",
 	promptNoiseFenceMaxChars: "SEMBLR_PROMPT_NOISE_FENCE_MAX_CHARS",
 	promptNoiseJsonMaxChars: "SEMBLR_PROMPT_NOISE_JSON_MAX_CHARS",
+	promptNoiseRepeatMaxChars: "SEMBLR_PROMPT_NOISE_REPEAT_MAX_CHARS",
 } satisfies Record<ConfigKey, keyof SemblrConfigEnv>;
 
 function defaultAgentDir(env: SemblrConfigEnv): string {
@@ -327,6 +332,19 @@ export function loadSemblrConfig(deps: SemblrConfigDeps = {}): SemblrConfig {
 			0,
 			Math.floor(
 				resolveNumber("promptNoiseJsonMaxChars", DEFAULTS.promptNoiseJsonMaxChars, env, mergedSettings, {}, warn),
+			),
+		),
+		promptNoiseRepeatMaxChars: Math.max(
+			0,
+			Math.floor(
+				resolveNumber(
+					"promptNoiseRepeatMaxChars",
+					DEFAULTS.promptNoiseRepeatMaxChars,
+					env,
+					mergedSettings,
+					{},
+					warn,
+				),
 			),
 		),
 	};

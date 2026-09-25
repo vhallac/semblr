@@ -33,6 +33,7 @@ function testConfig(root: string): SemblrConfig {
 		contextRecencyMaxEntries: 20,
 		promptNoiseFenceMaxChars: 600,
 		promptNoiseJsonMaxChars: 600,
+		promptNoiseRepeatMaxChars: 200,
 	};
 }
 
