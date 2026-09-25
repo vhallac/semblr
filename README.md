@@ -103,8 +103,12 @@ The lists below show past conversation rounds. Each entry contains only the user
 Use get_round_details("hash.json") to expand a round's full conversation.
 Use get_tool_details("hash.json", N) to inspect tool call N within a round.
 
-Format: [index: N] hash.json [score | N tools | size]: followed by the full user prompt (indented).
+Format: [index: N] hash.json [score | N tools | size]: followed by the user
+prompt (indented). Very long prompts are elided mid-section — use get_round_details
+for the full text.
 ```
+
+Each list entry is clamped to a head+tail window (default ~400 chars: 260 head + 140 tail) so long prompts cannot blow up the initial context (#106). The middle of an over-budget prompt is replaced with an `… [N chars elided] …` marker; the full prompt stays in the round file on disk and remains reachable via `get_round_details`. Set `contextPromptHeadChars` to `0` to disable the clamp.
 
 ### Recency List
 
@@ -312,6 +316,8 @@ Relative `roundsDir` values in project settings resolve under the project cwd. R
 | `embedBackoffMs` | `SEMBLR_EMBED_BACKOFF` | `1000` | Base retry backoff in milliseconds |
 | `hybridSemanticWeight` | `SEMBLR_HYBRID_SEMANTIC_WEIGHT` | `0.7` | Semantic-score weight (`alpha`) in hybrid retrieval; BM25 receives `1 - alpha` |
 | `summaryThresholdExtra` | `SEMBLR_SUMMARY_THRESHOLD_EXTRA` | `0` | Additional token threshold for the automatic context-size warning; `0` disables it |
+| `contextPromptHeadChars` | `SEMBLR_CONTEXT_PROMPT_HEAD_CHARS` | `260` | Chars kept from the start of each recency/relevance list prompt; `0` disables the injection clamp |
+| `contextPromptTailChars` | `SEMBLR_CONTEXT_PROMPT_TAIL_CHARS` | `140` | Chars kept from the end of each recency/relevance list prompt |
 
 Additional runtime-only switches:
 

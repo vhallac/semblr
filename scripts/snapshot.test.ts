@@ -26,6 +26,8 @@ function testConfig(root: string): SemblrConfig {
 		embedBackoffMs: 1000,
 		hybridSemanticWeight: 0.7,
 		summaryThresholdExtra: 40_000,
+		contextPromptHeadChars: 260,
+		contextPromptTailChars: 140,
 	};
 }
 

@@ -33,6 +33,8 @@ describe("loadSemblrConfig", () => {
 			embedBackoffMs: 1000,
 			hybridSemanticWeight: 0.7,
 			summaryThresholdExtra: 0,
+			contextPromptHeadChars: 260,
+			contextPromptTailChars: 140,
 		});
 	});
 
@@ -50,6 +52,8 @@ describe("loadSemblrConfig", () => {
 				SEMBLR_EMBEDDING_MAX_TOKENS: "3000",
 				SEMBLR_EMBEDDING_API_URL: "https://embeddings.example/v1",
 				SEMBLR_HYBRID_SEMANTIC_WEIGHT: "0.4",
+				SEMBLR_CONTEXT_PROMPT_HEAD_CHARS: "600",
+				SEMBLR_CONTEXT_PROMPT_TAIL_CHARS: "300",
 			},
 			fsImpl,
 		});
@@ -58,6 +62,8 @@ describe("loadSemblrConfig", () => {
 		expect(config.embeddingMaxTokens).toBe(3000);
 		expect(config.embeddingApiUrl).toBe("https://embeddings.example/v1");
 		expect(config.hybridSemanticWeight).toBe(0.4);
+		expect(config.contextPromptHeadChars).toBe(600);
+		expect(config.contextPromptTailChars).toBe(300);
 	});
 
 	it("lets project settings override global settings per key", () => {

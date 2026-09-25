@@ -65,6 +65,8 @@ function testConfig(overrides: Partial<SemblrConfig> = {}): SemblrConfig {
 		embedBackoffMs: 1000,
 		hybridSemanticWeight: 0.7,
 		summaryThresholdExtra: 0,
+		contextPromptHeadChars: 260,
+		contextPromptTailChars: 140,
 		...overrides,
 	};
 }

@@ -1,6 +1,7 @@
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { DEFAULT_PROMPT_TRUNCATION } from "./context-format.ts";
 
 export interface SemblrConfig {
 	agentDir: string;
@@ -18,6 +19,10 @@ export interface SemblrConfig {
 	hybridSemanticWeight: number;
 	/** 0 disables the automatic context-size warning; set a positive token count to enable it. */
 	summaryThresholdExtra: number;
+	/** Chars kept from the head of each recency/relevance list prompt; non-positive disables truncation. */
+	contextPromptHeadChars: number;
+	/** Chars kept from the tail of each recency/relevance list prompt. */
+	contextPromptTailChars: number;
 }
 
 export interface SemblrConfigEnv {
@@ -34,6 +39,8 @@ export interface SemblrConfigEnv {
 	SEMBLR_EMBED_BACKOFF?: string;
 	SEMBLR_HYBRID_SEMANTIC_WEIGHT?: string;
 	SEMBLR_SUMMARY_THRESHOLD_EXTRA?: string;
+	SEMBLR_CONTEXT_PROMPT_HEAD_CHARS?: string;
+	SEMBLR_CONTEXT_PROMPT_TAIL_CHARS?: string;
 }
 
 export interface SemblrConfigDeps {
@@ -60,6 +67,8 @@ const DEFAULTS = {
 	embedBackoffMs: 1000,
 	hybridSemanticWeight: 0.7,
 	summaryThresholdExtra: 0,
+	contextPromptHeadChars: DEFAULT_PROMPT_TRUNCATION.headChars,
+	contextPromptTailChars: DEFAULT_PROMPT_TRUNCATION.tailChars,
 };
 
 const ENV_KEYS = {
@@ -75,6 +84,8 @@ const ENV_KEYS = {
 	embedBackoffMs: "SEMBLR_EMBED_BACKOFF",
 	hybridSemanticWeight: "SEMBLR_HYBRID_SEMANTIC_WEIGHT",
 	summaryThresholdExtra: "SEMBLR_SUMMARY_THRESHOLD_EXTRA",
+	contextPromptHeadChars: "SEMBLR_CONTEXT_PROMPT_HEAD_CHARS",
+	contextPromptTailChars: "SEMBLR_CONTEXT_PROMPT_TAIL_CHARS",
 } satisfies Record<ConfigKey, keyof SemblrConfigEnv>;
 
 function defaultAgentDir(env: SemblrConfigEnv): string {
@@ -235,6 +246,22 @@ export function loadSemblrConfig(deps: SemblrConfigDeps = {}): SemblrConfig {
 		summaryThresholdExtra: resolveNumber(
 			"summaryThresholdExtra",
 			DEFAULTS.summaryThresholdExtra,
+			env,
+			mergedSettings,
+			{},
+			warn,
+		),
+		contextPromptHeadChars: resolveNumber(
+			"contextPromptHeadChars",
+			DEFAULTS.contextPromptHeadChars,
+			env,
+			mergedSettings,
+			{},
+			warn,
+		),
+		contextPromptTailChars: resolveNumber(
+			"contextPromptTailChars",
+			DEFAULTS.contextPromptTailChars,
 			env,
 			mergedSettings,
 			{},

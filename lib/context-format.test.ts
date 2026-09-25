@@ -6,12 +6,21 @@ import {
 	buildRelevanceList,
 	buildSessionArchitecture,
 	buildWorkingMemorySection,
+	DEFAULT_PROMPT_TRUNCATION,
 	formatFileSize,
 	formatGroupedRoundEntry,
 	formatRoundEntry,
 	splitCommandArgs,
+	truncateUserPrompt,
 } from "./context-format.ts";
 import { addSlot, createMiniMemStore } from "./working-memory.ts";
+
+const LONG_PROMPT = [
+	"Fix the auth flow in lib/auth.ts.",
+	"The spec below is the source of truth:",
+	...Array.from({ length: 80 }, (_, i) => `spec line ${i} with some content to pad`),
+	"Final instruction: keep the token budget small.",
+].join("\n");
 
 describe("follow-up section", () => {
 	it("builds the follow-up section with round content", () => {
@@ -107,6 +116,47 @@ describe("working memory section", () => {
 	});
 });
 
+describe("truncateUserPrompt", () => {
+	it("returns prompts at or below the head+tail budget unchanged", () => {
+		const budget = DEFAULT_PROMPT_TRUNCATION.headChars + DEFAULT_PROMPT_TRUNCATION.tailChars;
+		const shortPrompt = "a".repeat(budget);
+		expect(truncateUserPrompt(shortPrompt)).toBe(shortPrompt);
+	});
+
+	it("keeps head and tail of long prompts and elides the middle", () => {
+		const result = truncateUserPrompt(LONG_PROMPT);
+		expect(result).toContain("Fix the auth flow in lib/auth.ts.");
+		expect(result).toContain("Final instruction: keep the token budget small.");
+		const match = result.match(/… \[(\d+) chars elided\] …/);
+		expect(match).not.toBeNull();
+		const kept = result.replace(`\n${match?.[0]}\n`, "");
+		expect(LONG_PROMPT.length - Number(match?.[1])).toBe(kept.length);
+	});
+
+	it("clamps to complete lines when the head/tail windows allow it", () => {
+		const lines = Array.from({ length: 40 }, (_, i) => "x".repeat(28) + String(i).padStart(2, "0"));
+		const prompt = lines.join("\n"); // 40 lines × 30 chars + 39 newlines = 1239
+		const result = truncateUserPrompt(prompt, { headChars: 260, tailChars: 140 });
+		expect(result.split("\n")).toEqual([...lines.slice(0, 8), "… [869 chars elided] …", ...lines.slice(36)]);
+	});
+
+	it("truncates prompts one char over the budget without line snapping", () => {
+		const budget = DEFAULT_PROMPT_TRUNCATION.headChars + DEFAULT_PROMPT_TRUNCATION.tailChars;
+		const prompt = "a".repeat(budget + 1);
+		const result = truncateUserPrompt(prompt);
+		expect(result).toBe(
+			`${"a".repeat(DEFAULT_PROMPT_TRUNCATION.headChars)}\n… [1 chars elided] …\n${"a".repeat(
+				DEFAULT_PROMPT_TRUNCATION.tailChars,
+			)}`,
+		);
+	});
+
+	it("is disabled when head or tail chars are not positive", () => {
+		expect(truncateUserPrompt(LONG_PROMPT, { headChars: 0, tailChars: 140 })).toBe(LONG_PROMPT);
+		expect(truncateUserPrompt(LONG_PROMPT, { headChars: 260, tailChars: 0 })).toBe(LONG_PROMPT);
+	});
+});
+
 describe("context formatting", () => {
 	it("formats relevance and grouped entries with multiline prompts and optional size", () => {
 		expect(formatRoundEntry(2, "abc.json", "0.91", "1 tools", "first\nsecond", "2KB")).toEqual([
@@ -120,6 +170,25 @@ describe("context formatting", () => {
 			"  user: prompt",
 			"  ---",
 		]);
+	});
+
+	it("truncates long prompts in relevance entries with an elision marker", () => {
+		const entry = formatRoundEntry(1, "round.json", "0.90", "0 tools", LONG_PROMPT, "2KB");
+		expect(entry).toContain("  user: Fix the auth flow in lib/auth.ts.");
+		expect(entry).toContain("  Final instruction: keep the token budget small.");
+		expect(entry.some((line) => /… \[\d+ chars elided\] …/.test(line))).toBe(true);
+		expect(entry.some((line) => line.includes("spec line 40 with some content to pad"))).toBe(false);
+	});
+
+	it("honors custom truncation options in grouped entries", () => {
+		const entry = formatGroupedRoundEntry(1, "round.json", "0 tools", LONG_PROMPT, undefined, {
+			headChars: 30,
+			tailChars: 20,
+		});
+		expect(entry.join("\n")).toContain("… [");
+		expect(entry.join("\n")).toContain("chars elided] …");
+		expect(entry.some((line) => line.includes("Final instruction"))).toBe(false);
+		expect(entry[1]).toBe("  user: Fix the auth flow in lib/auth.");
 	});
 
 	it("builds grouped recency lists newest topic first with stable global indices", () => {
@@ -141,6 +210,20 @@ describe("context formatting", () => {
 		expect(list).toContain("- [index: 2] new-a.json [n/a | 1 tools]:");
 		expect(list).toContain("**Group 2**\n\n- [index: 3] older.json [n/a | 0 tools]:");
 		expect(buildGroupedRecencyList([], [])).toBeNull();
+	});
+
+	it("truncates long prompts in grouped recency entries", () => {
+		const entry = {
+			fileName: "long.json",
+			userPrompt: LONG_PROMPT,
+			responseSequence: "",
+			toolSummary: "0 tools",
+		};
+		const list = buildGroupedRecencyList([{ rounds: [entry] }], [entry], () => null);
+		expect(list).toContain("- [index: 1] long.json [n/a | 0 tools]:");
+		expect(list).toContain("  user: Fix the auth flow in lib/auth.ts.");
+		expect(list).toContain("chars elided] …");
+		expect(list).not.toContain("spec line 40 with some content to pad");
 	});
 
 	it("builds relevance lists with score, size, and per-tool result sizes", () => {
@@ -174,6 +257,22 @@ describe("context formatting", () => {
 		expect(buildRelevanceList([])).toBeNull();
 	});
 
+	it("truncates long prompts in relevance list entries", () => {
+		const list = buildRelevanceList(
+			[
+				{
+					fileName: "round.json",
+					bestScore: 0.9,
+					data: { userPrompt: LONG_PROMPT },
+				},
+			],
+			() => null,
+		);
+		expect(list).toContain("  user: Fix the auth flow in lib/auth.ts.");
+		expect(list).toContain("chars elided] …");
+		expect(list).not.toContain("spec line 40 with some content to pad");
+	});
+
 	it("builds context preamble only when at least one list exists", () => {
 		expect(buildContextPreamble(false, false)).toBeNull();
 		expect(buildContextPreamble(true, false)).toContain("[CONTEXT BUILDING REFERENCES]");
@@ -184,6 +283,12 @@ describe("context formatting", () => {
 		const result = buildContextPreamble(true, false);
 		expect(result).toContain("These tools fill in what the context summaries leave out");
 		expect(result).toContain("See the SESSION ARCHITECTURE section for details.");
+	});
+
+	it("context preamble notes mid-section elision of long prompts", () => {
+		const result = buildContextPreamble(true, false);
+		expect(result).toContain("Very long prompts are elided mid-section");
+		expect(result).not.toContain("the full user prompt");
 	});
 
 	it("formats byte counts", () => {

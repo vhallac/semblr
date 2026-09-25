@@ -30,6 +30,45 @@ export interface RelevanceRound {
 	data: ContextRoundData;
 }
 
+export interface PromptTruncationOptions {
+	/** Characters kept from the start of the prompt. Non-positive disables truncation. */
+	headChars: number;
+	/** Characters kept from the end of the prompt. Non-positive disables truncation. */
+	tailChars: number;
+}
+
+/** Default injection clamp: keep ~400 chars of head+tail per list entry (issue #106). */
+export const DEFAULT_PROMPT_TRUNCATION: PromptTruncationOptions = {
+	headChars: 260,
+	tailChars: 140,
+};
+
+/**
+ * Clamp a user prompt for list injection: keep head and tail (first/last
+ * lines carry intent), elide the middle with a marker. Prompts at or below
+ * the head+tail budget pass through unchanged. When a window can snap to a
+ * line boundary inside it, complete lines are preferred over partial ones.
+ */
+export function truncateUserPrompt(
+	prompt: string,
+	options: PromptTruncationOptions = DEFAULT_PROMPT_TRUNCATION,
+): string {
+	const { headChars, tailChars } = options;
+	if (headChars <= 0 || tailChars <= 0) return prompt;
+	if (prompt.length <= headChars + tailChars) return prompt;
+
+	let head = prompt.slice(0, headChars);
+	let tail = prompt.slice(prompt.length - tailChars);
+
+	const headBreak = head.lastIndexOf("\n");
+	if (headBreak > 0) head = head.slice(0, headBreak);
+	const tailBreak = tail.indexOf("\n");
+	if (tailBreak !== -1 && tailBreak < tail.length - 1) tail = tail.slice(tailBreak + 1);
+
+	const elided = prompt.length - head.length - tail.length;
+	return `${head}\n… [${elided} chars elided] …\n${tail}`;
+}
+
 export function formatRoundEntry(
 	idx: number,
 	fileName: string,
@@ -37,8 +76,11 @@ export function formatRoundEntry(
 	toolSummary: string,
 	userPrompt: string,
 	sizeStr?: string,
+	truncation: PromptTruncationOptions = DEFAULT_PROMPT_TRUNCATION,
 ): string[] {
-	const promptLines = userPrompt.split("\n").map((line, i) => (i === 0 ? `  user: ${line}` : `  ${line}`));
+	const promptLines = truncateUserPrompt(userPrompt, truncation)
+		.split("\n")
+		.map((line, i) => (i === 0 ? `  user: ${line}` : `  ${line}`));
 	const sizePart = sizeStr ? ` | ${sizeStr}` : "";
 	return [`${idx}. ${fileName} [${score} | ${toolSummary}${sizePart}]:`, ...promptLines, "  ---"];
 }
@@ -49,8 +91,11 @@ export function formatGroupedRoundEntry(
 	toolSummary: string,
 	userPrompt: string,
 	sizeStr?: string,
+	truncation: PromptTruncationOptions = DEFAULT_PROMPT_TRUNCATION,
 ): string[] {
-	const promptLines = userPrompt.split("\n").map((line, i) => (i === 0 ? `  user: ${line}` : `  ${line}`));
+	const promptLines = truncateUserPrompt(userPrompt, truncation)
+		.split("\n")
+		.map((line, i) => (i === 0 ? `  user: ${line}` : `  ${line}`));
 	const sizePart = sizeStr ? ` | ${sizeStr}` : "";
 	return [`- [index: ${index}] ${fileName} [n/a | ${toolSummary}${sizePart}]:`, ...promptLines, "  ---"];
 }
@@ -59,6 +104,7 @@ export function buildGroupedRecencyList<T extends ContextChainEntry>(
 	groups: Array<ContextRoundGroup<T>>,
 	causalChain: T[],
 	getRoundSize: (fileName: string) => string | null = () => null,
+	truncation: PromptTruncationOptions = DEFAULT_PROMPT_TRUNCATION,
 ): string | null {
 	if (groups.length === 0) return null;
 	const lines: string[] = [];
@@ -131,7 +177,9 @@ answer.`;
 		for (const entry of reversed) {
 			const idx = globalIndices.get(entry) ?? 0;
 			const sizeStr = getRoundSize(entry.fileName) ?? undefined;
-			lines.push(...formatGroupedRoundEntry(idx, entry.fileName, entry.toolSummary, entry.userPrompt, sizeStr));
+			lines.push(
+				...formatGroupedRoundEntry(idx, entry.fileName, entry.toolSummary, entry.userPrompt, sizeStr, truncation),
+			);
 		}
 	}
 
@@ -163,6 +211,7 @@ export function buildToolSummary(toolCalls: ContextToolCallDetail[], totalCount:
 export function buildRelevanceList(
 	rounds: RelevanceRound[],
 	getRoundSize: (fileName: string) => string | null = () => null,
+	truncation: PromptTruncationOptions = DEFAULT_PROMPT_TRUNCATION,
 ): string | null {
 	if (rounds.length === 0) return null;
 	const lines: string[] = [];
@@ -201,6 +250,7 @@ clearly needs past context, use search_interactions.`;
 				toolSummary,
 				round.data.userPrompt,
 				sizeStr,
+				truncation,
 			),
 		);
 	}
@@ -214,7 +264,9 @@ The lists below show past conversation rounds. Each entry contains only the user
 Use get_round_details("hash.json") to expand a round's full conversation.
 Use get_tool_details("hash.json", N) to inspect tool call N within a round.
 
-Format: [index: N] hash.json [score | N tools | size]: followed by the full user prompt (indented).
+Format: [index: N] hash.json [score | N tools | size]: followed by the user
+prompt (indented). Very long prompts are elided mid-section — use get_round_details
+for the full text.
 
 These tools fill in what the context summaries leave out — use them to expand hidden parts of past rounds and build up the full picture. See the SESSION ARCHITECTURE section for details.`;
 }

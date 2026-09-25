@@ -197,6 +197,12 @@ let round = createRound();
 
 const SEMBLR_GROUP_THRESHOLD = SEMBLR_CONFIG.groupThreshold;
 
+/** Injection clamp for recency/relevance list prompts (issue #106): keep head+tail, elide the middle. */
+const PROMPT_TRUNCATION = {
+	headChars: SEMBLR_CONFIG.contextPromptHeadChars,
+	tailChars: SEMBLR_CONFIG.contextPromptTailChars,
+};
+
 /** Build a flat text representation of a checkpoint summary for embedding. */
 function buildCheckpointSummaryText(summary: CheckpointSummary): string {
 	const lines: string[] = [];
@@ -679,7 +685,12 @@ export default function (pi: ExtensionAPI) {
 			round.contextCache.userPrompt = userPrompt;
 
 			// Build non-embedding context sections (all in-memory / disk, zero API cost)
-			const recencyList = buildGroupedRecencyList(session.roundGroups, session.causalChain, getRoundSize);
+			const recencyList = buildGroupedRecencyList(
+				session.roundGroups,
+				session.causalChain,
+				getRoundSize,
+				PROMPT_TRUNCATION,
+			);
 			const preamble = buildContextPreamble(!!recencyList, false);
 
 			const { followUpMsg, checkpointMsg } = resolveCompoundInjections();
@@ -840,8 +851,14 @@ export default function (pi: ExtensionAPI) {
 				: buildRelevanceList(
 						selectedRounds.map((r) => ({ fileName: r.fileName, bestScore: r.bestScore, data: r.data })),
 						getRoundSize,
+						PROMPT_TRUNCATION,
 					);
-			const recencyList = buildGroupedRecencyList(session.roundGroups, session.causalChain, getRoundSize);
+			const recencyList = buildGroupedRecencyList(
+				session.roundGroups,
+				session.causalChain,
+				getRoundSize,
+				PROMPT_TRUNCATION,
+			);
 			const preamble = buildContextPreamble(!!recencyList, !!relevanceList);
 
 			// ══ Stats: record all 5 positions presented ══
