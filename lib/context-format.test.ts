@@ -10,6 +10,7 @@ import {
 	formatFileSize,
 	formatGroupedRoundEntry,
 	formatRoundEntry,
+	RECENCY_LIST_HEADER,
 	splitCommandArgs,
 	truncateUserPrompt,
 } from "./context-format.ts";
@@ -224,6 +225,116 @@ describe("context formatting", () => {
 		expect(list).toContain("  user: Fix the auth flow in lib/auth.ts.");
 		expect(list).toContain("chars elided] …");
 		expect(list).not.toContain("spec line 40 with some content to pad");
+	});
+
+	describe("recency list bounds (issue #106)", () => {
+		const entry = (name: string, prompt = "short") => ({
+			fileName: name,
+			userPrompt: prompt,
+			responseSequence: "",
+			toolSummary: "0 tools",
+		});
+		// Entry cost is the rendered injection (entry + group header), measured
+		// with a char-counting estimator like the relevance-list tests.
+		const lenCost = (text: string) => text.length;
+		const bounds = { budgetTokens: 1_000_000, estimateTokensFn: lenCost } as const;
+
+		it("hard-caps entries across groups, keeping the most recent rounds", () => {
+			const rounds = Array.from({ length: 9 }, (_, i) => entry(`r${i}.json`, `round ${i}`));
+			const groups = [
+				{ rounds: [rounds[0]] },
+				{ rounds: [rounds[1], rounds[2], rounds[3]] },
+				{ rounds: [rounds[4], rounds[5], rounds[6], rounds[7], rounds[8]] },
+			];
+			const list = buildGroupedRecencyList(groups, rounds, () => null, DEFAULT_PROMPT_TRUNCATION, {
+				...bounds,
+				maxEntries: 4,
+			});
+			// The newest group renders first: r8..r5 kept, everything older dropped.
+			expect(list).toContain("[index: 1] r8.json");
+			expect(list).toContain("[index: 4] r5.json");
+			expect(list).not.toContain("r4.json");
+			expect(list).not.toContain("r0.json");
+		});
+
+		it("drops emptied groups without leaving a stray header", () => {
+			const rounds = Array.from({ length: 6 }, (_, i) => entry(`r${i}.json`, `round ${i}`));
+			const groups = [{ rounds: [rounds[0], rounds[1], rounds[2]] }, { rounds: [rounds[3], rounds[4], rounds[5]] }];
+			const list = buildGroupedRecencyList(groups, rounds, () => null, DEFAULT_PROMPT_TRUNCATION, {
+				...bounds,
+				maxEntries: 4,
+			});
+			// Newest group keeps r5, r4, r3; the older group keeps only r2 — r1
+			// and r0 are dropped, and no group header renders without entries.
+			expect(list).toContain("**Group 1**");
+			expect(list).toContain("**Group 2**");
+			expect(list).toContain("[index: 4] r2.json");
+			expect(list).not.toContain("r1.json");
+			expect(list).not.toContain("r0.json");
+		});
+
+		it("defaults to a 20-entry cap when no options are passed", () => {
+			const rounds = Array.from({ length: 30 }, (_, i) => entry(`r${i}.json`, "hi"));
+			const list = buildGroupedRecencyList([{ rounds }], rounds);
+			expect(list).toContain("[index: 20] r10.json");
+			expect(list).not.toContain("r9.json");
+		});
+
+		it("stops at the token budget after the header charge", () => {
+			const rounds = [entry("old.json", "x".repeat(2000)), entry("new.json", "x".repeat(2000))];
+			// The header is charged up-front; a truncated entry costs ~490 chars,
+			// so 100 chars of slack admits exactly one (the newest, kept
+			// unconditionally as the always-on causal context).
+			const list = buildGroupedRecencyList([{ rounds }], rounds, () => null, DEFAULT_PROMPT_TRUNCATION, {
+				budgetTokens: RECENCY_LIST_HEADER.length + 100,
+				estimateTokensFn: lenCost,
+			});
+			expect(list).toContain("[index: 1] new.json");
+			expect(list).not.toContain("old.json");
+		});
+
+		it("always keeps the most recent round even when the budget cannot fit it", () => {
+			const rounds = [entry("old.json", "hi"), entry("new.json", "hi")];
+			const list = buildGroupedRecencyList([{ rounds }], rounds, () => null, DEFAULT_PROMPT_TRUNCATION, {
+				budgetTokens: 10,
+				estimateTokensFn: lenCost,
+			});
+			expect(list).toContain("[index: 1] new.json");
+			expect(list).not.toContain("old.json");
+		});
+
+		it("charges group headers against the budget", () => {
+			// a.json is the newest round (renders as index 1); b.json sits in an older
+			// group. An entry costs ~52 chars; a new group adds ~18 chars of
+			// separator + header, so 60 chars of slack fits one more entry but not a
+			// new group — b.json and its header are both dropped.
+			const groups = [{ rounds: [entry("b.json", "hi")] }, { rounds: [entry("a.json", "hi")] }];
+			const rounds = [...groups[0].rounds, ...groups[1].rounds];
+			const list = buildGroupedRecencyList(groups, rounds, () => null, DEFAULT_PROMPT_TRUNCATION, {
+				budgetTokens: RECENCY_LIST_HEADER.length + 60,
+				estimateTokensFn: lenCost,
+			});
+			expect(list).toContain("[index: 1] a.json");
+			expect(list).not.toContain("b.json");
+			expect(list).not.toContain("**Group 2**");
+		});
+
+		it("treats a non-positive budget as unbounded", () => {
+			const rounds = Array.from({ length: 25 }, (_, i) => entry(`r${i}.json`, "hi"));
+			const list = buildGroupedRecencyList([{ rounds }], rounds, () => null, DEFAULT_PROMPT_TRUNCATION, {
+				maxEntries: 30,
+				budgetTokens: 0,
+			});
+			expect(list).toContain("[index: 25] r0.json");
+			expect(list).toContain("[index: 1] r24.json");
+		});
+
+		it("returns null when the entry cap is zero", () => {
+			const rounds = [entry("a.json", "hi")];
+			expect(
+				buildGroupedRecencyList([{ rounds }], rounds, () => null, DEFAULT_PROMPT_TRUNCATION, { maxEntries: 0 }),
+			).toBeNull();
+		});
 	});
 
 	it("builds relevance lists with score, size, and per-tool result sizes", () => {

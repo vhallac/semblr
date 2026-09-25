@@ -1,7 +1,7 @@
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { DEFAULT_PROMPT_TRUNCATION } from "./context-format.ts";
+import { DEFAULT_MAX_RECENCY_ENTRIES, DEFAULT_PROMPT_TRUNCATION } from "./context-format.ts";
 import { DEFAULT_CONTEXT_BUDGET_RATIO, DEFAULT_MAX_RELEVANCE_ENTRIES } from "./search-interactions.ts";
 
 export interface SemblrConfig {
@@ -28,6 +28,8 @@ export interface SemblrConfig {
 	contextBudgetRatio: number;
 	/** Hard cap on relevance-list entries. */
 	contextRelevanceMaxEntries: number;
+	/** Hard cap on recency-list entries across all groups. */
+	contextRecencyMaxEntries: number;
 }
 
 export interface SemblrConfigEnv {
@@ -48,6 +50,7 @@ export interface SemblrConfigEnv {
 	SEMBLR_CONTEXT_PROMPT_TAIL_CHARS?: string;
 	SEMBLR_CONTEXT_BUDGET_RATIO?: string;
 	SEMBLR_CONTEXT_RELEVANCE_MAX_ENTRIES?: string;
+	SEMBLR_CONTEXT_RECENCY_MAX_ENTRIES?: string;
 }
 
 export interface SemblrConfigDeps {
@@ -78,6 +81,7 @@ const DEFAULTS = {
 	contextPromptTailChars: DEFAULT_PROMPT_TRUNCATION.tailChars,
 	contextBudgetRatio: DEFAULT_CONTEXT_BUDGET_RATIO,
 	contextRelevanceMaxEntries: DEFAULT_MAX_RELEVANCE_ENTRIES,
+	contextRecencyMaxEntries: DEFAULT_MAX_RECENCY_ENTRIES,
 };
 
 const ENV_KEYS = {
@@ -97,6 +101,7 @@ const ENV_KEYS = {
 	contextPromptTailChars: "SEMBLR_CONTEXT_PROMPT_TAIL_CHARS",
 	contextBudgetRatio: "SEMBLR_CONTEXT_BUDGET_RATIO",
 	contextRelevanceMaxEntries: "SEMBLR_CONTEXT_RELEVANCE_MAX_ENTRIES",
+	contextRecencyMaxEntries: "SEMBLR_CONTEXT_RECENCY_MAX_ENTRIES",
 } satisfies Record<ConfigKey, keyof SemblrConfigEnv>;
 
 function defaultAgentDir(env: SemblrConfigEnv): string {
@@ -293,6 +298,12 @@ export function loadSemblrConfig(deps: SemblrConfigDeps = {}): SemblrConfig {
 					{},
 					warn,
 				),
+			),
+		),
+		contextRecencyMaxEntries: Math.max(
+			0,
+			Math.floor(
+				resolveNumber("contextRecencyMaxEntries", DEFAULTS.contextRecencyMaxEntries, env, mergedSettings, {}, warn),
 			),
 		),
 	};

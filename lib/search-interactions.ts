@@ -200,6 +200,19 @@ export function computeContextBudget(
 	return Math.floor(minBudget + t * (maxBudget - minBudget));
 }
 
+/**
+ * Recency list budget: flat ratio × window (no score scaling — the list is
+ * always injected, unlike the score-scaled relevance budget). Same small-window
+ * floor as the relevance min budget (issue #106).
+ */
+export function computeRecencyBudget(
+	contextWindow = 128_000,
+	budgetRatio = DEFAULT_CONTEXT_BUDGET_RATIO,
+	minBudget = 2000,
+): number {
+	return Math.max(minBudget, Math.floor(budgetRatio * contextWindow));
+}
+
 export function selectContextRounds(
 	scoredRounds: readonly SearchRoundScore[],
 	lastRoundFileName: string | null,

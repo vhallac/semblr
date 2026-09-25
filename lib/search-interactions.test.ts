@@ -6,6 +6,7 @@ import {
 	collectMultiModelSearchRoundScores,
 	collectSearchRoundScores,
 	computeContextBudget,
+	computeRecencyBudget,
 	filterSearchIndexByRounds,
 	getIndexEmbeddingModels,
 	normalizeSearchInteractionsParams,
@@ -444,6 +445,26 @@ describe("computeContextBudget", () => {
 	it("uses default parameters when not specified", () => {
 		const budget = computeContextBudget(0.9);
 		expect(budget).toBeGreaterThan(0);
+	});
+});
+
+describe("computeRecencyBudget", () => {
+	it("returns a flat ratio × window budget", () => {
+		// No score scaling: the recency list is always injected at full width.
+		expect(computeRecencyBudget(128_000, 0.08)).toBe(10_240);
+		expect(computeRecencyBudget()).toBe(10_240);
+	});
+
+	it("floors small windows at the minimum budget", () => {
+		expect(computeRecencyBudget(16_000, 0.08)).toBe(2000);
+	});
+
+	it("keeps the minimum budget at ratio zero", () => {
+		expect(computeRecencyBudget(128_000, 0)).toBe(2000);
+	});
+
+	it("honors a custom budget ratio", () => {
+		expect(computeRecencyBudget(128_000, 0.25)).toBe(32_000);
 	});
 });
 

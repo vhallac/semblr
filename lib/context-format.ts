@@ -1,3 +1,4 @@
+import { estimateTokens } from "./tokens.ts";
 import type { MiniMemStore } from "./working-memory.ts";
 
 export interface ContextChainEntry {
@@ -100,15 +101,11 @@ export function formatGroupedRoundEntry(
 	return [`- [index: ${index}] ${fileName} [n/a | ${toolSummary}${sizePart}]:`, ...promptLines, "  ---"];
 }
 
-export function buildGroupedRecencyList<T extends ContextChainEntry>(
-	groups: Array<ContextRoundGroup<T>>,
-	causalChain: T[],
-	getRoundSize: (fileName: string) => string | null = () => null,
-	truncation: PromptTruncationOptions = DEFAULT_PROMPT_TRUNCATION,
-): string | null {
-	if (groups.length === 0) return null;
-	const lines: string[] = [];
-	const header = `--- RECENCY LIST (current session, by topic) ---
+/** Default recency list entry cap (issue #106): hard bound across all groups. */
+export const DEFAULT_MAX_RECENCY_ENTRIES = 20;
+
+/** Static header for the recency list section (issue #106: counted against the injection budget). */
+export const RECENCY_LIST_HEADER = `--- RECENCY LIST (current session, by topic) ---
 These rounds have n/a scores because they are presented by recency — they form
 the immediate conversational context from this session.
 
@@ -143,7 +140,27 @@ When NOT to expand:
 
 Rule: When in doubt, expand. A verification tool call is cheaper than a wrong
 answer.`;
-	lines.push(header);
+
+export function buildGroupedRecencyList<T extends ContextChainEntry>(
+	groups: Array<ContextRoundGroup<T>>,
+	causalChain: T[],
+	getRoundSize: (fileName: string) => string | null = () => null,
+	truncation: PromptTruncationOptions = DEFAULT_PROMPT_TRUNCATION,
+	options: {
+		/** Hard cap on entries across all groups (default 20, issue #106). `0` disables the list. */
+		maxEntries?: number;
+		/** Total token budget for the whole list (header + group headers + entries). Non-positive disables the bound. */
+		budgetTokens?: number;
+		estimateTokensFn?: (text: string) => number;
+	} = {},
+): string | null {
+	const maxEntries = options.maxEntries ?? DEFAULT_MAX_RECENCY_ENTRIES;
+	if (groups.length === 0 || maxEntries <= 0) return null;
+	const budgetTokens = options.budgetTokens ?? 0;
+	const bounded = budgetTokens > 0;
+	const estimateTokensFn = options.estimateTokensFn ?? estimateTokens;
+	const lines: string[] = [];
+	lines.push(RECENCY_LIST_HEADER);
 	lines.push("");
 
 	const sortedGroups = [...groups].sort((a, b) => {
@@ -152,35 +169,56 @@ answer.`;
 		return causalChain.indexOf(bLast) - causalChain.indexOf(aLast);
 	});
 
-	const globalIndices = new Map<T, number>();
-	let globalIdx = 0;
-	for (const group of sortedGroups) {
-		const reversed = [...group.rounds].reverse();
-		for (const entry of reversed) {
-			globalIdx++;
-			globalIndices.set(entry, globalIdx);
-		}
-	}
-
+	// Selection is fused with rendering: each round is charged the lines it
+	// actually injects (entry + its group header), so cost and output cannot
+	// drift (issue #106). Rounds render newest-first and the walk stops at the
+	// first entry that does not fit — what remains is strictly the most recent
+	// context.
+	let usedTokens = bounded ? estimateTokensFn(RECENCY_LIST_HEADER) : 0;
+	let kept = 0;
 	let groupNumber = 0;
 	for (const group of sortedGroups) {
+		if (kept >= maxEntries) break;
 		groupNumber++;
-		if (groupNumber > 1) {
-			lines.push("");
-			lines.push("---");
-			lines.push("");
-		}
-		lines.push(`**Group ${groupNumber}**`);
-		lines.push("");
+		// Separator + group header flush only when the group keeps at least one
+		// entry — a group emptied by the cap must not leave a stray header.
+		const pending: string[] = [];
+		if (groupNumber > 1) pending.push("", "---", "");
+		pending.push(`**Group ${groupNumber}**`, "");
+		let keptInGroup = 0;
+		let stopped = false;
 
 		const reversed = [...group.rounds].reverse();
 		for (const entry of reversed) {
-			const idx = globalIndices.get(entry) ?? 0;
+			if (kept >= maxEntries) break;
 			const sizeStr = getRoundSize(entry.fileName) ?? undefined;
-			lines.push(
-				...formatGroupedRoundEntry(idx, entry.fileName, entry.toolSummary, entry.userPrompt, sizeStr, truncation),
+			const entryLines = formatGroupedRoundEntry(
+				kept + 1,
+				entry.fileName,
+				entry.toolSummary,
+				entry.userPrompt,
+				sizeStr,
+				truncation,
 			);
+			let entryTokens = 0;
+			if (bounded) {
+				entryTokens = estimateTokensFn(entryLines.join("\n"));
+				if (keptInGroup === 0) entryTokens += estimateTokensFn(pending.join("\n"));
+				// The most recent round (kept === 0) is always kept: the recency
+				// list is the always-on causal context and must never be emptied by
+				// a tight budget — the budget bounds growth, not existence.
+				if (kept > 0 && usedTokens + entryTokens > budgetTokens) {
+					stopped = true;
+					break;
+				}
+			}
+			if (keptInGroup === 0) lines.push(...pending);
+			lines.push(...entryLines);
+			usedTokens += entryTokens;
+			kept++;
+			keptInGroup++;
 		}
+		if (stopped) break;
 	}
 
 	return lines.join("\n");

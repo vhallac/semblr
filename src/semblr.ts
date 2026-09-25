@@ -77,6 +77,7 @@ import {
 	collectMultiModelSearchRoundScores,
 	collectSearchRoundScores,
 	computeContextBudget,
+	computeRecencyBudget,
 	normalizeSearchInteractionsParams,
 	prepareMultiModelQueryVectors,
 	renderSearchInteractionsToolResult,
@@ -691,6 +692,13 @@ export default function (pi: ExtensionAPI) {
 				session.causalChain,
 				getRoundSize,
 				PROMPT_TRUNCATION,
+				{
+					maxEntries: SEMBLR_CONFIG.contextRecencyMaxEntries,
+					budgetTokens: computeRecencyBudget(
+						ctx.model?.contextWindow ?? 128_000,
+						SEMBLR_CONFIG.contextBudgetRatio,
+					),
+				},
 			);
 			const preamble = buildContextPreamble(!!recencyList, false);
 
@@ -868,6 +876,13 @@ export default function (pi: ExtensionAPI) {
 				session.causalChain,
 				getRoundSize,
 				PROMPT_TRUNCATION,
+				{
+					maxEntries: SEMBLR_CONFIG.contextRecencyMaxEntries,
+					budgetTokens: computeRecencyBudget(
+						ctx.model?.contextWindow ?? 128_000,
+						SEMBLR_CONFIG.contextBudgetRatio,
+					),
+				},
 			);
 			const preamble = buildContextPreamble(!!recencyList, !!relevanceList);
 

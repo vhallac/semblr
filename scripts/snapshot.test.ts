@@ -30,6 +30,7 @@ function testConfig(root: string): SemblrConfig {
 		contextPromptTailChars: 140,
 		contextBudgetRatio: 0.08,
 		contextRelevanceMaxEntries: 20,
+		contextRecencyMaxEntries: 20,
 	};
 }
 

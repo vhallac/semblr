@@ -82,7 +82,7 @@ Current AI agent sessions degrade as they accumulate context. Pi's compaction me
 
 1. **Save every round permanently.** Each user prompt + full assistant response sequence (tool calls, thinking, final answer) is saved as an individual JSON file.
 2. **Embed prompt, response, and combined text.** Three texts are sent to the configured embedding API: the user prompt, the clipped response (by default truncated to ~24KB, context-injection artifacts stripped), and the concatenation of both (`prompt + "\n\n" + clippedResponse`). The prompt and response vectors are stored in an append-only CSV index. The combined vector is stored in the round file for semantic grouping.
-3. **Retrieve by relevance.** On every user prompt, the prompt is embedded and compared against stored vectors via cosine similarity. Separately, `search_interactions` embeds its query once with each distinct model represented in the searched index; within that tool search, every stored vector is compared only with a query vector from the same model. The closest rounds are injected into context — up to a dynamic token budget (at most `contextBudgetRatio` of the context window and `contextRelevanceMaxEntries` entries).
+3. **Retrieve by relevance.** On every user prompt, the prompt is embedded and compared against stored vectors via cosine similarity. Separately, `search_interactions` embeds its query once with each distinct model represented in the searched index; within that tool search, every stored vector is compared only with a query vector from the same model. The closest rounds are injected into context — up to a dynamic token budget (at most `contextBudgetRatio` of the context window and `contextRelevanceMaxEntries` entries; the recency list is capped analogously).
 4. **Drill-down via tools.** By default, rounds are shown as a compact numbered index. The LLM uses `get_round_details()` to expand a round and `get_tool_details()` to inspect individual tool calls within it.
 
 The result: context that is **always roughly the same size, always the most relevant, and never lossy** — even across sessions.
@@ -111,6 +111,8 @@ for the full text.
 Each list entry is clamped to a head+tail window (default ~400 chars: 260 head + 140 tail) so long prompts cannot blow up the initial context (#106). The middle of an over-budget prompt is replaced with an `… [N chars elided] …` marker; the full prompt stays in the round file on disk and remains reachable via `get_round_details`. Set `contextPromptHeadChars` to `0` to disable the clamp.
 
 The relevance list is bounded on top of the per-entry clamp (#106): at most `contextRelevanceMaxEntries` (default 20) entries fit, within a token budget of `contextBudgetRatio` (default 8%) of the model's context window at best match. The budget is charged for what is actually injected — section header, preamble, and each rendered entry — not for the full round content stored on disk.
+
+The recency list carries the same per-entry clamp plus its own bounds (#106): at most `contextRecencyMaxEntries` (default 20) rounds across all topic groups, within a flat token budget of `contextBudgetRatio` of the context window. When the bounds bite, the oldest rounds drop first; the most recent round of the session is always kept — the recency list is the always-on causal context. Group headers are charged against the budget too, and a group emptied by the bounds renders no header.
 
 ### Recency List
 
@@ -321,8 +323,9 @@ Relative `roundsDir` values in project settings resolve under the project cwd. R
 | `summaryThresholdExtra` | `SEMBLR_SUMMARY_THRESHOLD_EXTRA` | `0` | Additional token threshold for the automatic context-size warning; `0` disables it |
 | `contextPromptHeadChars` | `SEMBLR_CONTEXT_PROMPT_HEAD_CHARS` | `260` | Chars kept from the start of each recency/relevance list prompt; `0` disables the injection clamp |
 | `contextPromptTailChars` | `SEMBLR_CONTEXT_PROMPT_TAIL_CHARS` | `140` | Chars kept from the end of each recency/relevance list prompt |
-| `contextBudgetRatio` | `SEMBLR_CONTEXT_BUDGET_RATIO` | `0.08` | Fraction of the context window the relevance-list injection may occupy at best match |
+| `contextBudgetRatio` | `SEMBLR_CONTEXT_BUDGET_RATIO` | `0.08` | Fraction of the context window each list (relevance at best match, recency flat) may occupy |
 | `contextRelevanceMaxEntries` | `SEMBLR_CONTEXT_RELEVANCE_MAX_ENTRIES` | `20` | Hard cap on relevance-list entries |
+| `contextRecencyMaxEntries` | `SEMBLR_CONTEXT_RECENCY_MAX_ENTRIES` | `20` | Hard cap on recency-list entries across all groups |
 
 Additional runtime-only switches:
 
@@ -405,7 +408,7 @@ Semblr also maintains `index.bm25.json` beside `index.csv`. It stores a local BM
 ## Known Problems
 
 ### Most-recent-round context loss (addressed by Recency List)
-The Recency List (see [Injected Context Structure](#injected-context-structure)) shows the most recent rounds from the current session with instructions for the model to expand them when resolving references like "those changes" or "it". The list covers all prior rounds in the session, so the special-case last-round injection is no longer needed.
+The Recency List (see [Injected Context Structure](#injected-context-structure)) shows the most recent rounds from the current session with instructions for the model to expand them when resolving references like "those changes" or "it". The list covers the most recent rounds in the session (bounded by `contextRecencyMaxEntries`; older rounds remain reachable via `search_interactions`), so the special-case last-round injection is no longer needed.
 
 ### Embedding API dependency
 Semblr requires a working embedding provider/API key to function. By default it uses pi's `openrouter` provider with `openai/text-embedding-3-small`, but you can configure another pi provider/model or set `embeddingApiUrl` as a full endpoint override. If the API is unreachable, context assembly falls back to a no-op (no historical context injected). The extension degrades gracefully but silently.
