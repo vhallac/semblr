@@ -11,7 +11,7 @@ import {
 	stripEnvPreamble,
 } from "./context-messages.ts";
 import { extractText } from "./message-content.ts";
-import { buildPromptEmbeddingInput } from "./round-capture.ts";
+import { buildPromptEmbeddingInput, DEFAULT_PROMPT_NOISE_CLEANUP } from "./round-capture.ts";
 
 describe("startsWithEnvironmentPreamble", () => {
 	it("returns true when content starts with [ENVIRONMENT]", () => {
@@ -308,6 +308,25 @@ describe("stripEnvPreamble (issue #107 F3 query-domain parity)", () => {
 		}
 		// Sanity: the noisy case is load-bearing — cleanup actually changed the text.
 		expect(buildPromptEmbeddingInput(noisy).text).not.toBe(noisy);
+	});
+
+	it("keeps the query == stored hash parity when the F4 clip fires (both sides share the budget)", () => {
+		// 100 words survives the hook's 200-word derivation clip (so the strip recovers
+		// the full raw prompt) but exceeds a small configured budget — the #107 F4 clip
+		// fires on BOTH sides and must not break the F3 query-domain parity: identical
+		// hashes keep the agent_end stash-reuse gate matching.
+		const raw = Array.from({ length: 100 }, (_, i) => `word${i}`).join(" ");
+		const budget = 50;
+		const { userPrompt } = prepareContextMessages([{ role: "user", content: raw }], envPreamble);
+		const queryInput = buildPromptEmbeddingInput(
+			stripEnvPreamble(userPrompt!, envPreamble),
+			DEFAULT_PROMPT_NOISE_CLEANUP,
+			budget,
+		);
+		const storedInput = buildPromptEmbeddingInput(raw, DEFAULT_PROMPT_NOISE_CLEANUP, budget);
+		expect(storedInput.text).toHaveLength(budget); // the clip actually fired
+		expect(queryInput.hash).toBe(storedInput.hash);
+		expect(queryInput.text).toBe(storedInput.text);
 	});
 
 	it("leaves a divergent derivation for non-text-first array content (hash gate catches it)", () => {

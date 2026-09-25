@@ -147,19 +147,23 @@ export async function runDigestSession(options: DigestSessionOptions = {}): Prom
 			continue;
 		}
 
-		// Embed prompt — noise-cleaned under the current #106 cleanup heuristics, and
-		// stamped with the embedding-input hash so `just migrate` can detect later
-		// heuristic changes. Full cleaned text (no slice), matching the extension capture path.
+		// Embed prompt — noise-cleaned under the current #106 cleanup heuristics, clipped to
+		// the configured embeddingMaxTokens (issue #107 F4), and stamped with the embedding-input
+		// hash so `just migrate` can detect later convention changes. Matches the extension capture path.
 		out.log(`  🔄 Embedding round ${round.turnIndex + 1}/${rounds.length}...`);
 		const apiKey = await resolveScriptApiKey(config, options);
 		if (!apiKey) {
 			throw new Error("OPENROUTER_API_KEY environment variable required");
 		}
-		const { text: promptInput, hash: promptInputHash } = buildPromptEmbeddingInput(round.userPrompt, {
-			fenceMaxChars: config.promptNoiseFenceMaxChars,
-			jsonMaxChars: config.promptNoiseJsonMaxChars,
-			repeatMaxChars: config.promptNoiseRepeatMaxChars,
-		});
+		const { text: promptInput, hash: promptInputHash } = buildPromptEmbeddingInput(
+			round.userPrompt,
+			{
+				fenceMaxChars: config.promptNoiseFenceMaxChars,
+				jsonMaxChars: config.promptNoiseJsonMaxChars,
+				repeatMaxChars: config.promptNoiseRepeatMaxChars,
+			},
+			config.embeddingMaxTokens,
+		);
 		const promptVector = await embedText(promptInput, apiKey, {
 			fetchImpl: options.fetchImpl,
 			config: embeddingConfig,

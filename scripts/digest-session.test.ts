@@ -162,12 +162,14 @@ describe("digest-session script", () => {
 
 		const roundFile = `${computeContentHash("123456", "abcdef", [])}.json`;
 		expect(fs.existsSync(path.join(configuredRoundsDir, roundFile))).toBe(true);
+		// The prompt is clipped to the configured budget too (issue #107 F4): 6-char
+		// prompt at embeddingMaxTokens 4 → "1234". The response clip is unchanged.
 		expect(loadVectorIndex(path.join(configuredRoundsDir, "index.csv"))).toEqual([
 			{
 				vector: [1],
 				filePath: `${roundFile}:prompt`,
 				model: "configured-embedding-model",
-				embeddingInputHash: hashEmbeddingInput("123456"),
+				embeddingInputHash: hashEmbeddingInput("1234"),
 			},
 			{ vector: [1], filePath: `${roundFile}:response`, model: "configured-embedding-model" },
 		]);
@@ -176,7 +178,7 @@ describe("digest-session script", () => {
 				input: "https://embeddings.example/custom",
 				method: "POST",
 				headers: { Authorization: "Bearer key", "Content-Type": "application/json" },
-				body: { model: "configured-embedding-model", input: "123456" },
+				body: { model: "configured-embedding-model", input: "1234" },
 			},
 			{
 				input: "https://embeddings.example/custom",

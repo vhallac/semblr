@@ -3,15 +3,18 @@
  * (issue #106 re-embed migration).
  *
  * Before the #106 embedding-input cleanup, :prompt index rows were embedded over
- * the raw user prompt. The extension now embeds `cleanPromptNoise(prompt)` and
- * stamps the row with `hashEmbeddingInput(cleaned)` (4th CSV column). This sweep:
+ * the raw user prompt. The extension now embeds the noise-cleaned prompt, clipped
+ * to the configured `embeddingMaxTokens` budget (clip restored post-cleanup in
+ * #107 F4), and stamps the row with `hashEmbeddingInput(final input)` (4th CSV
+ * column). This sweep:
  *
  *   1. Stamped rows: recompute the current embedding input; stamp mismatch means
- *      cleanup heuristics/thresholds changed since capture → re-embed.
- *   2. Legacy rows (no stamp): if the current cleanup transforms the stored raw
- *      prompt, the old raw-based vector is stale → re-embed. If cleanup is a
- *      no-op for that prompt, the old vector is still valid → stamp the row
- *      without an embedding API call.
+ *      the convention (cleanup heuristics, thresholds, clip budget) changed since
+ *      capture → re-embed.
+ *   2. Legacy rows (no stamp): if the current convention (cleanup + clip)
+ *      transforms the stored raw prompt, the old raw-based vector is stale →
+ *      re-embed. If the convention is a no-op for that prompt, the old vector is
+ *      still valid → stamp the row without an embedding API call.
  *
  * Re-embeds the round.json combined vector (`promptEmbedding`) alongside the
  * :prompt row whenever it exists — combined = cleanedPrompt + "\n\n" + response
@@ -19,8 +22,11 @@
  * :summary rows are not prompt-derived and are left untouched.
  *
  * Known limitation: legacy digest rows embedded over `raw.slice(0, embeddingMaxTokens)`
- * look identical to extension rows without a stamp; long no-op prompts keep their
- * (valid prefix) vector until they are re-captured or re-embedded by other means.
+ * carry no stamp. When cleanup is a no-op and the prompt fits the budget, the old
+ * vector matches the current convention input → stamp-only. When cleanup is a no-op
+ * and the prompt exceeds the budget, the current clipped input differs from the
+ * stored raw prompt → the row is detected stale and re-embedded (over the same
+ * prefix bytes when the budget is unchanged), gaining a correct stamp.
  * Response-clipping budget changes are also not detected (out of #106 scope).
  *
  * Usage:
@@ -171,7 +177,7 @@ export async function runPromptEmbeddingsMigration(options: MigratePromptEmbeddi
 		}
 
 		const userPrompt = typeof round.userPrompt === "string" ? round.userPrompt : "";
-		const current = buildPromptEmbeddingInput(userPrompt, noiseOptions);
+		const current = buildPromptEmbeddingInput(userPrompt, noiseOptions, config.embeddingMaxTokens);
 		const existingHash = splitVectorIndexMetadata(line.slice(firstComma + 1)).embeddingInputHash;
 
 		let reason: PromptRowDecision["reason"];
@@ -288,7 +294,7 @@ export async function runPromptEmbeddingsMigration(options: MigratePromptEmbeddi
 		const roundPath = path.resolve(roundsDir, decision.roundFile);
 		const round = JSON.parse(fs.readFileSync(roundPath, "utf-8")) as RoundJsonLike;
 		const userPrompt = typeof round.userPrompt === "string" ? round.userPrompt : "";
-		const current = buildPromptEmbeddingInput(userPrompt, noiseOptions);
+		const current = buildPromptEmbeddingInput(userPrompt, noiseOptions, config.embeddingMaxTokens);
 		// Guard against the round file mutating between detection and apply: if the
 		// recomputed hash no longer matches the detection stamp, the row is re-detected
 		// on the next run — skip it here rather than write a wrong stamp.

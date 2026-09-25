@@ -7,6 +7,7 @@ import {
 	buildAgentEndToolSummary,
 	buildPromptEmbeddingInput,
 	cleanPromptNoise,
+	DEFAULT_PROMPT_NOISE_CLEANUP,
 	embeddingMaxTokensToResponseBytes,
 	extractAgentEndResponseText,
 	extractAgentEndUserPrompt,
@@ -271,6 +272,58 @@ describe("hashEmbeddingInput / buildPromptEmbeddingInput (issue #106 migration s
 		const noCollapse = buildPromptEmbeddingInput(noisy, { fenceMaxChars: 600, jsonMaxChars: 600, repeatMaxChars: 0 });
 		expect(noCollapse.text).toBe(noisy);
 		expect(noCollapse.hash).toBe(hashEmbeddingInput(noisy));
+	});
+});
+
+describe("buildPromptEmbeddingInput prompt clip (issue #107 F4)", () => {
+	it("clips the cleaned prompt to the budget and hashes the exact final input", () => {
+		// Varied prose: cleanup is a no-op here (no fences, JSON, or repeat runs), so
+		// the clip is the only transform — and the hash stamps the exact clipped input.
+		const raw = Array.from({ length: 400 }, (_, i) => `word${i}`).join(" ");
+		const { text, hash } = buildPromptEmbeddingInput(raw, DEFAULT_PROMPT_NOISE_CLEANUP, 100);
+		expect(text).toBe(raw.slice(0, 100));
+		expect(hash).toBe(hashEmbeddingInput(text));
+	});
+
+	it("runs cleanup BEFORE the clip: collapsed noise keeps the prompt under budget (tail survives)", () => {
+		// The legacy convention clipped the RAW prompt; the restored convention cleans
+		// first, so a prompt whose noise collapses under the budget keeps its whole
+		// cleaned text — the budget never cuts the meaningful tail.
+		const fenceBody = Array.from({ length: 100 }, (_, i) => `line-${i} = ${i};`).join("\n");
+		const raw = `Analyze this:\n\`\`\`ts\n${fenceBody}\n\`\`\`\nConcluding sentence.`;
+		const budget = 400;
+		expect(raw.length).toBeGreaterThan(budget);
+		const cleaned = cleanPromptNoise(raw);
+		expect(cleaned.length).toBeLessThanOrEqual(budget);
+		const { text, hash } = buildPromptEmbeddingInput(raw, DEFAULT_PROMPT_NOISE_CLEANUP, budget);
+		expect(text).toBe(cleaned);
+		expect(text.endsWith("Concluding sentence.")).toBe(true);
+		expect(hash).toBe(hashEmbeddingInput(text));
+	});
+
+	it("clips AFTER cleanup when the cleaned text still exceeds the budget", () => {
+		// High-entropy prose is not collapsible noise: the clip is what bounds it
+		// (the F4 concern — unbounded embedding inputs for cleanup-proof prompts).
+		const raw = Array.from({ length: 2000 }, (_, i) => `word${i}`).join(" ");
+		const budget = 500;
+		const { text, hash } = buildPromptEmbeddingInput(raw, DEFAULT_PROMPT_NOISE_CLEANUP, budget);
+		expect(text).toBe(cleanPromptNoise(raw).slice(0, budget));
+		expect(text.length).toBe(budget);
+		expect(hash).toBe(hashEmbeddingInput(text));
+	});
+
+	it("leaves under-budget prompts untouched and hashes them verbatim", () => {
+		const raw = "a short prompt";
+		const { text, hash } = buildPromptEmbeddingInput(raw, DEFAULT_PROMPT_NOISE_CLEANUP, 8000);
+		expect(text).toBe(raw);
+		expect(hash).toBe(hashEmbeddingInput(raw));
+	});
+
+	it("treats a non-positive budget as clip disabled (noise-option convention)", () => {
+		const raw = Array.from({ length: 400 }, (_, i) => `word${i}`).join(" ");
+		const { text, hash } = buildPromptEmbeddingInput(raw, DEFAULT_PROMPT_NOISE_CLEANUP, 0);
+		expect(text).toBe(raw);
+		expect(hash).toBe(hashEmbeddingInput(raw));
 	});
 });
 

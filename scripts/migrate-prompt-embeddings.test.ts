@@ -213,6 +213,41 @@ describe("migrate-prompt-embeddings script", () => {
 		]);
 	});
 
+	it("re-embeds over-budget prompts when the clip changes the embedding input (#107 F4)", async () => {
+		// A row stamped under the pre-F4 convention (hash over the full cleaned text,
+		// no clip) no longer matches once the clip fires on a prompt cleanup cannot
+		// shrink (varied prose — no fences, JSON, or repeat runs): the sweep must
+		// re-embed over the exact clipped input and restamp.
+		const longPrompt = Array.from({ length: 1500 }, (_, i) => `word${i}`).join(" "); // ~10.5K chars
+		const roundFile = "over-budget.json";
+		writeRound(roundFile, { userPrompt: longPrompt, responseSequence: RESPONSE, promptEmbedding: [0.5] });
+		writeIndex([encodeVectorIndexLine([9, 9], `${roundFile}:prompt`, "old-model", hashEmbeddingInput(longPrompt))]);
+		const requests: unknown[] = [];
+		const fetchImpl = embeddingFetch(
+			[
+				[3, 4],
+				[0, 5],
+			],
+			requests,
+		);
+
+		await expect(
+			runPromptEmbeddingsMigration({ ...baseOptions(logger().out), fetchImpl, stderr: logger().err }),
+		).resolves.toBe(0);
+
+		const clipped = longPrompt.slice(0, 8000); // default embeddingMaxTokens
+		expect((requests[0] as any).body.input).toBe(clipped);
+		expect((requests[1] as any).body.input).toBe(`${clipped}\n\n${RESPONSE}`);
+		expect(loadVectorIndex(path.join(tempDir, "index.csv"))).toEqual([
+			{
+				vector: [0.6, 0.8],
+				filePath: `${roundFile}:prompt`,
+				model: "openai/text-embedding-3-small",
+				embeddingInputHash: hashEmbeddingInput(clipped),
+			},
+		]);
+	});
+
 	it("re-embeds only the prompt row for digest-shaped rounds without a combined vector", async () => {
 		const roundFile = "digest-shaped.json";
 		writeRound(roundFile, { userPrompt: NOISY_PROMPT, responseSequence: RESPONSE });

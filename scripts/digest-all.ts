@@ -255,13 +255,18 @@ export async function runDigestAll(options: DigestAllOptions = {}): Promise<numb
 
 		try {
 			const entries: VectorIndexEntry[] = [];
-			// Prompt input: noise-cleaned full text + embedding-input hash stamp (issue #106),
-			// matching the extension capture path so `just migrate` stays churn-free.
-			const { text: promptInput, hash: promptInputHash } = buildPromptEmbeddingInput(round.userPrompt, {
-				fenceMaxChars: config.promptNoiseFenceMaxChars,
-				jsonMaxChars: config.promptNoiseJsonMaxChars,
-				repeatMaxChars: config.promptNoiseRepeatMaxChars,
-			});
+			// Prompt input: noise-cleaned, budget-clipped prompt text + embedding-input hash
+			// stamp (issue #106; clip restored post-cleanup in #107 F4), matching the
+			// extension capture path so `just migrate` stays churn-free.
+			const { text: promptInput, hash: promptInputHash } = buildPromptEmbeddingInput(
+				round.userPrompt,
+				{
+					fenceMaxChars: config.promptNoiseFenceMaxChars,
+					jsonMaxChars: config.promptNoiseJsonMaxChars,
+					repeatMaxChars: config.promptNoiseRepeatMaxChars,
+				},
+				config.embeddingMaxTokens,
+			);
 			const promptVector = await embedText(promptInput, apiKey, {
 				fetchImpl: options.fetchImpl,
 				config: embeddingConfig,

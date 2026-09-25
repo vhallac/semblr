@@ -776,6 +776,7 @@ export default function (pi: ExtensionAPI) {
 				const { text: queryEmbeddingInput, hash: queryInputHash } = buildPromptEmbeddingInput(
 					stripEnvPreamble(userPrompt, envPreamble),
 					PROMPT_NOISE_CLEANUP,
+					SEMBLR_CONFIG.embeddingMaxTokens,
 				);
 				queryVec = normalize(await embedText(queryEmbeddingInput, apiKey, embeddingClientDeps(ctx)));
 				round.lastContextUserPrompt = userPrompt;
@@ -1075,6 +1076,7 @@ export default function (pi: ExtensionAPI) {
 				const { text: cleanedPrompt, hash: promptInputHash } = buildPromptEmbeddingInput(
 					userPrompt,
 					PROMPT_NOISE_CLEANUP,
+					SEMBLR_CONFIG.embeddingMaxTokens,
 				);
 				const { clippedResponse, combinedText } = buildAgentEndEmbeddingTexts(
 					cleanedPrompt,

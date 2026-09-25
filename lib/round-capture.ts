@@ -308,14 +308,26 @@ export function hashEmbeddingInput(text: string): string {
 
 /**
  * The current prompt-side embedding-input convention (issue #106, single source
- * of truth for capture and the re-embed migration): the full noise-cleaned prompt
- * text — no additional clipping — plus its `hashEmbeddingInput` stamp.
+ * of truth for capture, the digest scripts, and the re-embed migration): the
+ * noise-cleaned prompt, clipped to `maxTokens` characters AFTER cleanup, plus
+ * its `hashEmbeddingInput` stamp over the exact final input.
+ *
+ * Cleanup runs first so placeholders shrink high-entropy spans before the budget
+ * is applied; the clip then still bounds the input actually sent to the embedding
+ * API for prompts cleanup cannot shrink (issue #107 F4 — the unbounded full-text
+ * embedding that replaced the legacy raw `slice(0, embeddingMaxTokens)` clip is
+ * not restored verbatim, but bounded post-cleanup). The clip budget comes from
+ * the configured `embeddingMaxTokens`; the default mirrors the config default
+ * (same precedent as `buildAgentEndEmbeddingTexts`). Non-positive `maxTokens`
+ * disables the clip (same convention as the noise options).
  */
 export function buildPromptEmbeddingInput(
 	userPrompt: string,
 	options: PromptNoiseOptions = DEFAULT_PROMPT_NOISE_CLEANUP,
+	maxTokens = 8000,
 ): { text: string; hash: string } {
-	const text = cleanPromptNoise(userPrompt, options);
+	const cleaned = cleanPromptNoise(userPrompt, options);
+	const text = maxTokens > 0 && cleaned.length > maxTokens ? cleaned.slice(0, maxTokens) : cleaned;
 	return { text, hash: hashEmbeddingInput(text) };
 }
 
