@@ -1,11 +1,20 @@
-import { formatFileSize } from "./context-format.ts";
+import {
+	buildRelevanceEntry,
+	DEFAULT_PROMPT_TRUNCATION,
+	formatFileSize,
+	type PromptTruncationOptions,
+} from "./context-format.ts";
 import { indexRoundFileFromPath } from "./index-io.ts";
 import type { IndexEntry } from "./index-storage.ts";
 import type { RoundData, ToolCallDetail, ToolResult } from "./round-data.ts";
 import { estimateTokens } from "./tokens.ts";
 import { cosineSimilarity, normalize } from "./vector.ts";
 
-const DEFAULT_CONTEXT_BUDGET_RATIO = 0.5;
+/** Fraction of the context window the relevance-list injection may occupy at bestScore → 1.0 (issue #106: 0.5 → 0.08). */
+export const DEFAULT_CONTEXT_BUDGET_RATIO = 0.08;
+
+/** Hard cap on relevance-list entries regardless of budget (issue #106). */
+export const DEFAULT_MAX_RELEVANCE_ENTRIES = 20;
 
 export type SearchInteractionsMode = "similarity" | "text-match" | "hybrid" | "tool";
 
@@ -184,37 +193,74 @@ export function computeContextBudget(
 	minBudget = 2000,
 	budgetRatio = DEFAULT_CONTEXT_BUDGET_RATIO,
 ): number {
-	const maxBudget = Math.floor(budgetRatio * contextWindow);
+	// Guard small windows: ratio × window can fall below minBudget, which would
+	// invert the curve (higher relevance → smaller budget). Keep it monotonic.
+	const maxBudget = Math.max(minBudget, Math.floor(budgetRatio * contextWindow));
 	const t = Math.max(0, Math.min(1, (bestScore - minSimilarity) / (1 - minSimilarity)));
 	return Math.floor(minBudget + t * (maxBudget - minBudget));
 }
 
+/**
+ * Recency list budget: flat ratio × window (no score scaling — the list is
+ * always injected, unlike the score-scaled relevance budget). Same small-window
+ * floor as the relevance min budget (issue #106).
+ */
+export function computeRecencyBudget(
+	contextWindow = 128_000,
+	budgetRatio = DEFAULT_CONTEXT_BUDGET_RATIO,
+	minBudget = 2000,
+): number {
+	return Math.max(minBudget, Math.floor(budgetRatio * contextWindow));
+}
+
+/**
+ * Select relevance rounds under a hard entry cap and token budget (issue #107 F1).
+ * The previous round is deliberately NOT special-cased here — it belongs to the
+ * recency list, which is built independently of the search outcome; appending it
+ * here used to let the list exceed `maxEntries` and dodge `budgetTokens`.
+ */
 export function selectContextRounds(
 	scoredRounds: readonly SearchRoundScore[],
-	lastRoundFileName: string | null,
-	readRound: (filePath: string) => RoundData | null,
 	options: {
 		minSimilarity?: number;
 		budgetTokens: number;
 		estimateTokensFn?: (text: string) => number;
+		/** Hard cap on selected entries (default 20, issue #106). */
+		maxEntries?: number;
+		/** Fixed overhead (section header, preamble) charged up-front. */
+		reservedTokens?: number;
+		/** Truncation applied to entry prompts — cost must match rendered entries. */
+		truncation?: PromptTruncationOptions;
+		/** Size-tag source — must be the same fn the renderer passes to
+		 * buildRelevanceList, so the rendered ` | 12.34KB` suffix is charged to
+		 * the budget, not just injected (issue #107 F4). Defaults to no tag. */
+		getRoundSizeFn?: (fileName: string) => string | null;
 	} = { budgetTokens: 2000 },
 ): SearchRoundScore[] {
 	const minSimilarity = options.minSimilarity ?? 0.3;
 	const estimateTokensFn = options.estimateTokensFn ?? estimateTokens;
+	const maxEntries = options.maxEntries ?? DEFAULT_MAX_RELEVANCE_ENTRIES;
+	const truncation = options.truncation ?? DEFAULT_PROMPT_TRUNCATION;
 	const selectedRounds: SearchRoundScore[] = [];
-	let usedTokens = 0;
+	// Budget accounting covers what is actually injected: each round is charged
+	// the rendered entry (truncated prompt + entry header + tool summary + size
+	// tag), not its full on-disk content (issue #106; size-tag charging: #107 F4).
+	let usedTokens = options.reservedTokens ?? 0;
 
 	for (const round of scoredRounds) {
+		if (selectedRounds.length >= maxEntries) break;
 		if (round.bestScore < minSimilarity) break;
-		const roundTokens = estimateTokensFn(round.data.userPrompt + round.data.responseSequence);
+		const sizeStr = options.getRoundSizeFn?.(round.fileName) ?? undefined;
+		const renderedEntry = buildRelevanceEntry(
+			selectedRounds.length + 1,
+			{ fileName: round.fileName, bestScore: round.bestScore, data: round.data },
+			truncation,
+			sizeStr,
+		).join("\n");
+		const roundTokens = estimateTokensFn(renderedEntry);
 		if (usedTokens + roundTokens > options.budgetTokens) break;
 		selectedRounds.push(round);
 		usedTokens += roundTokens;
-	}
-
-	if (lastRoundFileName) {
-		const lastData = readRound(lastRoundFileName);
-		if (lastData) selectedRounds.push({ data: lastData, fileName: lastRoundFileName, bestScore: 0 });
 	}
 
 	return selectedRounds;

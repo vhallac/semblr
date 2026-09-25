@@ -13,6 +13,29 @@ export function startsWithEnvironmentPreamble(content: string): boolean {
 	return content.trimStart().startsWith("[ENVIRONMENT]");
 }
 
+/**
+ * Marker appended after the env preamble when this module augments the current
+ * user prompt (see prepareContextMessages). The hook's derived `userPrompt`
+ * carries `envPreamble + MARKER + rawPrompt`; this is the seam between them.
+ */
+export const ACTIONABLE_PROMPT_MARKER = "\n\n[ACTIONABLE PROMPT]\n";
+
+/**
+ * Recover the raw user prompt from the hook's derived `userPrompt`
+ * (issue #107 F3): prepareContextMessages derives the prompt from the AUGMENTED
+ * message, so it carries the env preamble prefix this module added. Slicing the
+ * exact `envPreamble + marker` prefix (not a heuristic "starts with
+ * [ENVIRONMENT]" check) makes false strips practically impossible — a foreign
+ * env-style block would have to match the pinned preamble byte-for-byte,
+ * including the timestamp. Text without the exact prefix passes through
+ * untouched (e.g. prompts that were never augmented, or host-injected blocks
+ * with a different preamble).
+ */
+export function stripEnvPreamble(userPrompt: string, envPreamble: string): string {
+	const prefix = `${envPreamble}${ACTIONABLE_PROMPT_MARKER}`;
+	return userPrompt.startsWith(prefix) ? userPrompt.slice(prefix.length) : userPrompt;
+}
+
 export function countWordsInMessageContent(content: unknown): number {
 	const text = typeof content === "string" ? content : Array.isArray(content) ? extractText(content) : "";
 	return text.split(/\s+/).filter((word) => word.length > 0).length;
@@ -46,7 +69,7 @@ export function prepareContextMessages(messages: readonly unknown[], envPreamble
 			if (!startsWithEnvironmentPreamble(userContent)) {
 				augmentedMessages[lastUserIdx] = {
 					...userMsgAny,
-					content: `${envPreamble}\n\n[ACTIONABLE PROMPT]\n${userContent}`,
+					content: `${envPreamble}${ACTIONABLE_PROMPT_MARKER}${userContent}`,
 				};
 			}
 		} else if (
@@ -57,13 +80,13 @@ export function prepareContextMessages(messages: readonly unknown[], envPreamble
 			const firstBlock = userContent[0] as { type: string; text: string };
 			if (!startsWithEnvironmentPreamble(firstBlock.text)) {
 				const newContent = [...userContent];
-				newContent[0] = { ...firstBlock, text: `${envPreamble}\n\n[ACTIONABLE PROMPT]\n${firstBlock.text}` };
+				newContent[0] = { ...firstBlock, text: `${envPreamble}${ACTIONABLE_PROMPT_MARKER}${firstBlock.text}` };
 				augmentedMessages[lastUserIdx] = { ...userMsgAny, content: newContent };
 			}
 		} else if (Array.isArray(userContent)) {
 			augmentedMessages[lastUserIdx] = {
 				...userMsgAny,
-				content: [{ type: "text", text: `${envPreamble}\n\n[ACTIONABLE PROMPT]\n` }, ...userContent],
+				content: [{ type: "text", text: `${envPreamble}${ACTIONABLE_PROMPT_MARKER}` }, ...userContent],
 			};
 		}
 	}

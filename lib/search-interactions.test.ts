@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { buildRelevanceEntry, DEFAULT_PROMPT_TRUNCATION } from "./context-format.ts";
 import { indexRoundFileFromPath } from "./index-io.ts";
 import type { IndexEntry } from "./index-storage.ts";
 import type { RoundData } from "./round-data.ts";
@@ -6,6 +7,7 @@ import {
 	collectMultiModelSearchRoundScores,
 	collectSearchRoundScores,
 	computeContextBudget,
+	computeRecencyBudget,
 	filterSearchIndexByRounds,
 	getIndexEmbeddingModels,
 	normalizeSearchInteractionsParams,
@@ -417,16 +419,28 @@ describe("computeContextBudget", () => {
 		expect(budget).toBe(2000);
 	});
 
-	it("returns maximum budget for perfect similarity", () => {
+	it("caps the budget at the tightened ratio of the context window", () => {
+		// Issue #106: 50% of the window was effectively unbounded; now 8%.
 		const budget = computeContextBudget(1.0, 128000, 0.3, 2000);
-		expect(budget).toBe(64000);
+		expect(budget).toBe(10240);
 	});
 
 	it("scales budget between min and max proportionally", () => {
 		const budget = computeContextBudget(0.65, 128000, 0.3, 2000);
 		// t = (0.65 - 0.3) / (1 - 0.3) = 0.5
-		// budget = 2000 + 0.5 * (64000 - 2000) = 2000 + 31000 = 33000
-		expect(budget).toBe(33000);
+		// budget = 2000 + 0.5 * (10240 - 2000) = 2000 + 4120 = 6120
+		expect(budget).toBe(6120);
+	});
+
+	it("never shrinks the budget below minBudget on small context windows", () => {
+		// 0.08 * 16000 = 1280 < minBudget — the score→budget curve must not invert.
+		const budget = computeContextBudget(1.0, 16000, 0.3, 2000);
+		expect(budget).toBe(2000);
+	});
+
+	it("honors a custom budget ratio", () => {
+		const budget = computeContextBudget(1.0, 128000, 0.3, 2000, 0.25);
+		expect(budget).toBe(32000);
 	});
 
 	it("uses default parameters when not specified", () => {
@@ -435,82 +449,179 @@ describe("computeContextBudget", () => {
 	});
 });
 
+describe("computeRecencyBudget", () => {
+	it("returns a flat ratio × window budget", () => {
+		// No score scaling: the recency list is always injected at full width.
+		expect(computeRecencyBudget(128_000, 0.08)).toBe(10_240);
+		expect(computeRecencyBudget()).toBe(10_240);
+	});
+
+	it("floors small windows at the minimum budget", () => {
+		expect(computeRecencyBudget(16_000, 0.08)).toBe(2000);
+	});
+
+	it("keeps the minimum budget at ratio zero", () => {
+		expect(computeRecencyBudget(128_000, 0)).toBe(2000);
+	});
+
+	it("honors a custom budget ratio", () => {
+		expect(computeRecencyBudget(128_000, 0.25)).toBe(32_000);
+	});
+});
+
 describe("selectContextRounds", () => {
-	const makeRound = (name: string, prompt: string, responseLen: number): SearchRoundScore => ({
+	// Entry cost is the rendered injection (entry header + truncated prompt),
+	// not the round's full on-disk content (issue #106).
+	const makeRound = (name: string, prompt: string, score = 0.9): SearchRoundScore => ({
 		fileName: name,
 		data: {
 			userPrompt: prompt,
-			responseSequence: "x".repeat(responseLen),
+			responseSequence: "response content no longer counts toward the budget",
 			turnIndex: 0,
 		},
-		bestScore: 0.9,
+		bestScore: score,
 	});
+	const lenCost = (text: string) => text.length;
 
 	it("selects rounds within budget", () => {
-		const rounds = [makeRound("a.json", "hi", 20), makeRound("b.json", "yo", 30)];
-		// With enough budget, both should be selected
-		const result = selectContextRounds(rounds, null, () => null as unknown as RoundData, {
+		const rounds = [makeRound("a.json", "hi"), makeRound("b.json", "yo")];
+		const result = selectContextRounds(rounds, {
 			budgetTokens: 10000,
-			estimateTokensFn: (text: string) => text.length,
+			estimateTokensFn: lenCost,
 			minSimilarity: 0.3,
 		});
 		expect(result).toHaveLength(2);
 	});
 
+	it("charges the truncated entry size, not the full round content", () => {
+		// A 20K-char prompt renders as a ~470-char entry after the unit-001 clamp.
+		const rounds = [makeRound("a.json", "x".repeat(20_000)), makeRound("b.json", "y".repeat(20_000))];
+		const result = selectContextRounds(rounds, {
+			budgetTokens: 1000,
+			estimateTokensFn: lenCost,
+			minSimilarity: 0.3,
+		});
+		expect(result).toHaveLength(2);
+	});
+
+	it("selects nothing for oversized prompts when truncation is disabled", () => {
+		const rounds = [makeRound("a.json", "x".repeat(20_000))];
+		const result = selectContextRounds(rounds, {
+			budgetTokens: 1000,
+			estimateTokensFn: lenCost,
+			minSimilarity: 0.3,
+			truncation: { headChars: 0, tailChars: 0 },
+		});
+		expect(result).toHaveLength(0);
+	});
+
 	it("stops when budget is exhausted", () => {
-		const rounds = [makeRound("a.json", "hi", 5000), makeRound("b.json", "yo", 5000)];
-		const result = selectContextRounds(rounds, null, () => null as unknown as RoundData, {
-			budgetTokens: 6000,
-			estimateTokensFn: (text: string) => text.length,
+		const rounds = [makeRound("a.json", "x".repeat(2000)), makeRound("b.json", "y".repeat(2000))];
+		// Each truncated entry costs ~470 chars; a 700-char budget admits one.
+		const result = selectContextRounds(rounds, {
+			budgetTokens: 700,
+			estimateTokensFn: lenCost,
 			minSimilarity: 0.3,
 		});
 		expect(result).toHaveLength(1);
+		expect(result[0].fileName).toBe("a.json");
+	});
+
+	it("hard-caps entries regardless of budget", () => {
+		const rounds = Array.from({ length: 25 }, (_, i) => makeRound(`${i}.json`, "hi"));
+		const result = selectContextRounds(rounds, {
+			budgetTokens: 1_000_000,
+			estimateTokensFn: lenCost,
+			minSimilarity: 0.3,
+		});
+		expect(result).toHaveLength(20);
+	});
+
+	it("honors a smaller maxEntries override", () => {
+		const rounds = Array.from({ length: 25 }, (_, i) => makeRound(`${i}.json`, "hi"));
+		const result = selectContextRounds(rounds, {
+			budgetTokens: 1_000_000,
+			estimateTokensFn: lenCost,
+			minSimilarity: 0.3,
+			maxEntries: 5,
+		});
+		expect(result).toHaveLength(5);
+	});
+
+	// issue #107 F1: the lastRoundFileName append was removed — selection contains
+	// only scored rounds and never exceeds the cap/budget. The previous round is
+	// carried by the recency list, which is built independently of this selection.
+
+	it("charges reserved header/boilerplate tokens against the budget", () => {
+		const rounds = [makeRound("a.json", "h".repeat(300)), makeRound("b.json", "h".repeat(300))];
+		const select = (reservedTokens: number) =>
+			selectContextRounds(rounds, {
+				budgetTokens: 700,
+				estimateTokensFn: lenCost,
+				minSimilarity: 0.3,
+				reservedTokens,
+			});
+		// Each entry costs ~341 chars; the reserve must shrink the selection.
+		expect(select(0)).toHaveLength(2);
+		expect(select(100)).toHaveLength(1);
+		expect(select(400)).toHaveLength(0);
+	});
+
+	// issue #107 F4: the relevance list renders ` | 12.34KB` size tags that
+	// selection previously never charged — the charged==injected invariant
+	// (issue #106) drifted by ~3 tokens/entry.
+
+	it("charges the size tag — drift vs the rendered list", () => {
+		const rounds = [makeRound("a.json", "x".repeat(300)), makeRound("b.json", "y".repeat(300))];
+		const getRoundSizeFn = () => "12.34KB";
+		// ~341/entry untagged (682 ≤ 700 both fit) vs ~351 tagged (702 > 700).
+		const opts = {
+			budgetTokens: 700,
+			estimateTokensFn: lenCost,
+			minSimilarity: 0.3,
+			getRoundSizeFn,
+		};
+		expect(selectContextRounds(rounds, opts)).toHaveLength(1);
+		// Without the tag source, selection is unchanged (no tag → no drift).
+		expect(selectContextRounds(rounds, { ...opts, getRoundSizeFn: undefined })).toHaveLength(2);
+	});
+
+	it("charged cost equals the rendered entry byte-for-byte (drift == 0)", () => {
+		const round = makeRound("a.json", "x".repeat(300));
+		const rendered = buildRelevanceEntry(
+			1,
+			{ fileName: round.fileName, bestScore: round.bestScore, data: round.data },
+			DEFAULT_PROMPT_TRUNCATION,
+			"12.34KB",
+		).join("\n");
+		const cost = rendered.length;
+		// The budget threshold sits exactly at the rendered-with-tag cost:
+		// admitted at cost, rejected one char earlier.
+		const select = (budgetTokens: number) =>
+			selectContextRounds([round], {
+				budgetTokens,
+				estimateTokensFn: lenCost,
+				minSimilarity: 0.3,
+				getRoundSizeFn: () => "12.34KB",
+			});
+		expect(select(cost)).toHaveLength(1);
+		expect(select(cost - 1)).toHaveLength(0);
 	});
 
 	it("skips rounds below minSimilarity", () => {
-		const rounds = [
-			{ ...makeRound("a.json", "hi", 20), bestScore: 0.5 },
-			{ ...makeRound("b.json", "yo", 20), bestScore: 0.2 },
-		];
-		const result = selectContextRounds(rounds, null, () => null as unknown as RoundData, {
+		const rounds = [makeRound("a.json", "hi", 0.5), makeRound("b.json", "yo", 0.2)];
+		const result = selectContextRounds(rounds, {
 			budgetTokens: 10000,
-			estimateTokensFn: (text: string) => text.length,
-			minSimilarity: 0.3,
-		});
-		expect(result).toHaveLength(1);
-	});
-
-	it("includes lastRoundFileName at the end with score 0", () => {
-		const rounds = [makeRound("a.json", "hi", 20)];
-		const lastData: RoundData = {
-			userPrompt: "last",
-			responseSequence: "last response",
-			turnIndex: 0,
-		};
-		const readRound = (fp: string) => (fp === "last.json" ? lastData : null);
-		const result = selectContextRounds(rounds, "last.json", readRound, {
-			budgetTokens: 10000,
-			estimateTokensFn: (text: string) => text.length,
-			minSimilarity: 0.3,
-		});
-		expect(result[result.length - 1].fileName).toBe("last.json");
-		expect(result[result.length - 1].bestScore).toBe(0);
-	});
-
-	it("handles null lastRoundFileName", () => {
-		const rounds = [makeRound("a.json", "hi", 20)];
-		const result = selectContextRounds(rounds, null, () => null as unknown as RoundData, {
-			budgetTokens: 10000,
-			estimateTokensFn: (text: string) => text.length,
+			estimateTokensFn: lenCost,
 			minSimilarity: 0.3,
 		});
 		expect(result).toHaveLength(1);
 	});
 
 	it("handles empty scored rounds", () => {
-		const result = selectContextRounds([], null, () => null as unknown as RoundData, {
+		const result = selectContextRounds([], {
 			budgetTokens: 10000,
-			estimateTokensFn: (text: string) => text.length,
+			estimateTokensFn: lenCost,
 			minSimilarity: 0.3,
 		});
 		expect(result).toHaveLength(0);

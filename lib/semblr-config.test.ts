@@ -33,6 +33,14 @@ describe("loadSemblrConfig", () => {
 			embedBackoffMs: 1000,
 			hybridSemanticWeight: 0.7,
 			summaryThresholdExtra: 0,
+			contextPromptHeadChars: 260,
+			contextPromptTailChars: 140,
+			contextBudgetRatio: 0.08,
+			contextRelevanceMaxEntries: 20,
+			contextRecencyMaxEntries: 20,
+			promptNoiseFenceMaxChars: 600,
+			promptNoiseJsonMaxChars: 600,
+			promptNoiseRepeatMaxChars: 200,
 		});
 	});
 
@@ -50,6 +58,14 @@ describe("loadSemblrConfig", () => {
 				SEMBLR_EMBEDDING_MAX_TOKENS: "3000",
 				SEMBLR_EMBEDDING_API_URL: "https://embeddings.example/v1",
 				SEMBLR_HYBRID_SEMANTIC_WEIGHT: "0.4",
+				SEMBLR_CONTEXT_PROMPT_HEAD_CHARS: "600",
+				SEMBLR_CONTEXT_PROMPT_TAIL_CHARS: "300",
+				SEMBLR_CONTEXT_BUDGET_RATIO: "0.12",
+				SEMBLR_CONTEXT_RELEVANCE_MAX_ENTRIES: "5",
+				SEMBLR_CONTEXT_RECENCY_MAX_ENTRIES: "7",
+				SEMBLR_PROMPT_NOISE_FENCE_MAX_CHARS: "1200",
+				SEMBLR_PROMPT_NOISE_JSON_MAX_CHARS: "800",
+				SEMBLR_PROMPT_NOISE_REPEAT_MAX_CHARS: "250",
 			},
 			fsImpl,
 		});
@@ -58,6 +74,14 @@ describe("loadSemblrConfig", () => {
 		expect(config.embeddingMaxTokens).toBe(3000);
 		expect(config.embeddingApiUrl).toBe("https://embeddings.example/v1");
 		expect(config.hybridSemanticWeight).toBe(0.4);
+		expect(config.contextPromptHeadChars).toBe(600);
+		expect(config.contextPromptTailChars).toBe(300);
+		expect(config.contextBudgetRatio).toBe(0.12);
+		expect(config.contextRelevanceMaxEntries).toBe(5);
+		expect(config.contextRecencyMaxEntries).toBe(7);
+		expect(config.promptNoiseFenceMaxChars).toBe(1200);
+		expect(config.promptNoiseJsonMaxChars).toBe(800);
+		expect(config.promptNoiseRepeatMaxChars).toBe(250);
 	});
 
 	it("lets project settings override global settings per key", () => {
@@ -73,6 +97,29 @@ describe("loadSemblrConfig", () => {
 		expect(config.embeddingProvider).toBe("global-provider");
 		expect(config.embeddingModel).toBe("project-model");
 		expect(config.minSimilarity).toBe(0.4);
+	});
+
+	it("clamps context budget ratio and list entry caps to sane ranges", () => {
+		const config = loadSemblrConfig({
+			cwd: "/repo",
+			agentDir: "/agent",
+			env: {
+				SEMBLR_CONTEXT_BUDGET_RATIO: "7",
+				SEMBLR_CONTEXT_RELEVANCE_MAX_ENTRIES: "-3",
+				SEMBLR_CONTEXT_RECENCY_MAX_ENTRIES: "-1",
+				SEMBLR_PROMPT_NOISE_FENCE_MAX_CHARS: "-9",
+				SEMBLR_PROMPT_NOISE_JSON_MAX_CHARS: "-4",
+				SEMBLR_PROMPT_NOISE_REPEAT_MAX_CHARS: "-2",
+			},
+			fsImpl: fsFromFiles({}),
+		});
+
+		expect(config.contextBudgetRatio).toBe(1);
+		expect(config.contextRelevanceMaxEntries).toBe(0);
+		expect(config.contextRecencyMaxEntries).toBe(0);
+		expect(config.promptNoiseFenceMaxChars).toBe(0);
+		expect(config.promptNoiseJsonMaxChars).toBe(0);
+		expect(config.promptNoiseRepeatMaxChars).toBe(0);
 	});
 
 	it("merges global and project semblr sections without reading unrelated settings", () => {

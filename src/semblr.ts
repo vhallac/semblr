@@ -32,6 +32,7 @@ import {
 	buildRelevanceList,
 	buildSessionArchitecture,
 	buildWorkingMemorySection,
+	RELEVANCE_LIST_HEADER,
 	splitCommandArgs,
 } from "../lib/context-format.ts";
 import {
@@ -39,6 +40,7 @@ import {
 	prepareContextMessages,
 	shouldDropEmbedding,
 	shouldDropRelevanceList,
+	stripEnvPreamble,
 } from "../lib/context-messages.ts";
 import { embedText, getApiKey } from "../lib/embedding-client.ts";
 import { assignToGroup, formatGroupStats } from "../lib/grouping.ts";
@@ -56,6 +58,7 @@ import {
 	buildAgentEndChainEntry,
 	buildAgentEndEmbeddingTexts,
 	buildAgentEndRoundData,
+	buildPromptEmbeddingInput,
 	embeddingMaxTokensToResponseBytes,
 	extractAgentEndResponseText,
 	extractAgentEndUserPrompt,
@@ -76,6 +79,7 @@ import {
 	collectMultiModelSearchRoundScores,
 	collectSearchRoundScores,
 	computeContextBudget,
+	computeRecencyBudget,
 	normalizeSearchInteractionsParams,
 	prepareMultiModelQueryVectors,
 	renderSearchInteractionsToolResult,
@@ -92,13 +96,7 @@ import {
 } from "../lib/search-tools.ts";
 import { loadSemblrConfig, type SemblrConfig } from "../lib/semblr-config.ts";
 import type { CheckpointSummary, ToolCallDetail } from "../lib/state.ts";
-import {
-	contextCacheSnapshot,
-	contextCacheStore,
-	contextCacheValid,
-	createRound,
-	createSession,
-} from "../lib/state.ts";
+import { contextCacheStore, contextCacheValid, createRound, createSession } from "../lib/state.ts";
 import {
 	flushStatsFile,
 	formatChainReadStatsReport,
@@ -106,7 +104,7 @@ import {
 	recordPresented,
 	recordRead,
 } from "../lib/stats.ts";
-import { estimateMessagesTokens } from "../lib/tokens.ts";
+import { estimateMessagesTokens, estimateTokens } from "../lib/tokens.ts";
 import { normalize } from "../lib/vector.ts";
 import {
 	addSlot,
@@ -135,6 +133,7 @@ export {
 	buildAgentEndEmbeddingTexts,
 	buildAgentEndRoundData,
 	buildAgentEndToolSummary,
+	buildPromptEmbeddingInput,
 	extractAgentEndResponseText,
 	extractAgentEndUserPrompt,
 	getAgentEndParentId,
@@ -196,6 +195,19 @@ let session = createSession();
 let round = createRound();
 
 const SEMBLR_GROUP_THRESHOLD = SEMBLR_CONFIG.groupThreshold;
+
+/** Injection clamp for recency/relevance list prompts (issue #106): keep head+tail, elide the middle. */
+const PROMPT_TRUNCATION = {
+	headChars: SEMBLR_CONFIG.contextPromptHeadChars,
+	tailChars: SEMBLR_CONFIG.contextPromptTailChars,
+};
+
+/** Embedding-input noise cleanup (issue #106 Stage 1): collapse large code fences / JSON dumps / repetition runs. */
+const PROMPT_NOISE_CLEANUP = {
+	fenceMaxChars: SEMBLR_CONFIG.promptNoiseFenceMaxChars,
+	jsonMaxChars: SEMBLR_CONFIG.promptNoiseJsonMaxChars,
+	repeatMaxChars: SEMBLR_CONFIG.promptNoiseRepeatMaxChars,
+};
 
 /** Build a flat text representation of a checkpoint summary for embedding. */
 function buildCheckpointSummaryText(summary: CheckpointSummary): string {
@@ -357,8 +369,8 @@ function buildCheckpointContext(fileName: string): string | null {
 // Thread-local pending tool call IDs — cleared per tool call, not per round
 const _agentPendingToolCallIds: Map<string, ToolCallDetail> = new Map(); // toolCallId → partial detail
 
-function appendToIndex(filePath: string, vector: number[], model?: string) {
-	appendToIndexPath(INDEX_PATH, ROUNDS_DIR, filePath, vector, {}, model);
+function appendToIndex(filePath: string, vector: number[], model?: string, embeddingInputHash?: string) {
+	appendToIndexPath(INDEX_PATH, ROUNDS_DIR, filePath, vector, {}, model, embeddingInputHash);
 }
 
 let searchBm25Index: ReturnType<typeof loadOrRebuildBm25Index> | null = null;
@@ -667,6 +679,55 @@ export default function (pi: ExtensionAPI) {
 			return { messages: finalMessages } as any;
 		}
 
+		// --- Recency list: built once, independent of the relevance/search outcome ───
+		//     Recency is the always-on causal context (issue #107 F1): the previous
+		//     round is the newest causal-chain entry and always leads the list, so
+		//     relevance selection needs no last-round exception, and the no-match /
+		//     unavailable-search paths below still ship recency.
+		//     Selection sources the causal chain itself (issue #107 F2), so a round
+		//     whose agent_end embedding failed — assigned to no topic group — still
+		//     renders (as a singleton group) instead of vanishing from recency.
+		const recencyList = buildGroupedRecencyList(
+			session.roundGroups,
+			session.causalChain,
+			getRoundSize,
+			PROMPT_TRUNCATION,
+			{
+				maxEntries: SEMBLR_CONFIG.contextRecencyMaxEntries,
+				budgetTokens: computeRecencyBudget(ctx.model?.contextWindow ?? 128_000, SEMBLR_CONFIG.contextBudgetRatio),
+			},
+		);
+
+		// Degraded-path assembly shared by the short-prompt, no-API-key, empty-index,
+		// no-relevance, and error paths (issue #107 F1): recency still travels with
+		// the prompt — only the relevance list is absent. Cached for the agent cycle
+		// like the full path.
+		const assembleDegradedContext = (): { messages: unknown[] } => {
+			const { followUpMsg, checkpointMsg } = resolveCompoundInjections();
+			const preamble = buildContextPreamble(!!recencyList, false);
+			const prefixMsgs = assembleContextPrefix({
+				systemMsg,
+				sessionArchitecture: buildSessionArchitecture(),
+				workingMemory: buildWorkingMemorySection(session.miniMemStore),
+				preamble,
+				recencyList,
+				relevanceList: null,
+				followUpMsg,
+				checkpointMsg,
+				contractMsg: {
+					role: "user" as const,
+					content: [{ type: "text" as const, text: buildFinalResponseContract() }],
+				},
+			});
+			contextCacheStore(round.contextCache, envPreamble, [...prefixMsgs], userPrompt);
+			const finalMessages: unknown[] = applyContextSizeWarning(
+				round.contextCache.messages!,
+				currentMessages,
+				systemMsg,
+			);
+			return { messages: finalMessages };
+		};
+
 		// --- Short-prompt fast path: skip embedding and retrieval but keep ───
 		//     recency list, follow-up injection, and preamble (all zero API cost).
 		// Short prompts ("yes", "do it", "continue") produce noisy embeddings.
@@ -675,37 +736,7 @@ export default function (pi: ExtensionAPI) {
 			// Per https://github.com/vhallac/semblr/issues/38#issuecomment-4629826478
 			round.skipPromptEmbedding = true;
 			round.promptVec = null;
-			round.contextCache.envPreamble = envPreamble;
-			round.contextCache.userPrompt = userPrompt;
-
-			// Build non-embedding context sections (all in-memory / disk, zero API cost)
-			const recencyList = buildGroupedRecencyList(session.roundGroups, session.causalChain, getRoundSize);
-			const preamble = buildContextPreamble(!!recencyList, false);
-
-			const { followUpMsg, checkpointMsg } = resolveCompoundInjections();
-
-			const workingMem = buildWorkingMemorySection(session.miniMemStore);
-
-			const sessionArchitecture = buildSessionArchitecture();
-
-			const contractMsg = {
-				role: "user" as const,
-				content: [{ type: "text" as const, text: buildFinalResponseContract() }],
-			};
-
-			// Assemble context prefix via assembleContextPrefix — single call, consistent order
-			const prefixMsgs = assembleContextPrefix({
-				systemMsg,
-				sessionArchitecture,
-				workingMemory: workingMem,
-				preamble,
-				recencyList,
-				relevanceList: null,
-				followUpMsg,
-				checkpointMsg,
-				contractMsg,
-			});
-			contextCacheSnapshot(round.contextCache, [...prefixMsgs]);
+			round.promptVecHash = null;
 
 			// ══ Stats: record all 5 positions presented ══
 			if (!round.presentedRecorded) {
@@ -713,46 +744,44 @@ export default function (pi: ExtensionAPI) {
 				round.presentedRecorded = true;
 			}
 
-			const finalMessages: unknown[] = applyContextSizeWarning(
-				round.contextCache.messages!,
-				currentMessages,
-				systemMsg,
-			);
-			return { messages: finalMessages } as any;
+			return assembleDegradedContext();
 		}
 
-		// round.promptVec is stashed after embedding below for agent_end to reuse
+		// round.promptVec (+ promptVecHash) are stashed after embedding below for
+		// agent_end to reuse (issue #107 F3): the stash is computed over the exact
+		// :prompt embedding input, so agent_end reuses it instead of re-embedding.
 
 		try {
 			const apiKey = await getApiKey(ctx, { config: SEMBLR_CONFIG });
 			if (!apiKey) {
-				const prefixMsgs = assembleContextPrefix({
-					systemMsg,
-					sessionArchitecture: buildSessionArchitecture(),
-					workingMemory: buildWorkingMemorySection(session.miniMemStore),
-					preamble: null,
-					recencyList: null,
-					relevanceList: null,
-					followUpMsg: null,
-					checkpointMsg: null,
-					contractMsg: {
-						role: "user" as const,
-						content: [{ type: "text" as const, text: buildFinalResponseContract() }],
-					},
-				});
-				const finalMessages: unknown[] = applyContextSizeWarning(prefixMsgs, currentMessages, systemMsg);
-				return { messages: finalMessages } as any;
+				// Embedding unavailable — recency still ships (issue #107 F1).
+				return assembleDegradedContext();
 			}
 
-			// Embed the user prompt — cached per agent cycle to avoid redundant API calls
-			// across multiple tool turns within the same user prompt.
+			// Embed the semantic query over the SAME preprocessing domain as the stored
+			// :prompt rows (issue #107 F3): the stored vectors are embedded over
+			// buildPromptEmbeddingInput(rawPrompt), so the query must be too — otherwise
+			// query and stored vectors come from different preprocessing domains and the
+			// cosine comparison is systematically degraded. The derived userPrompt carries
+			// the env preamble this hook added (and a 200-word clip for string content),
+			// so strip the exact prefix back off before cleaning; the derivation below is
+			// byte-identical to agent_end's :prompt embedding input, which is what makes
+			// the round.promptVec stash exactly reusable (hash-gated).
+			// Cached per agent cycle to avoid redundant API calls across multiple tool
+			// turns within the same user prompt.
 			let queryVec: number[];
 			if (userPrompt === round.lastContextUserPrompt) {
 				queryVec = round.lastContextVec;
 			} else {
-				queryVec = normalize(await embedText(userPrompt, apiKey, embeddingClientDeps(ctx)));
+				const { text: queryEmbeddingInput, hash: queryInputHash } = buildPromptEmbeddingInput(
+					stripEnvPreamble(userPrompt, envPreamble),
+					PROMPT_NOISE_CLEANUP,
+					SEMBLR_CONFIG.embeddingMaxTokens,
+				);
+				queryVec = normalize(await embedText(queryEmbeddingInput, apiKey, embeddingClientDeps(ctx)));
 				round.lastContextUserPrompt = userPrompt;
 				round.lastContextVec = queryVec;
+				round.promptVecHash = queryInputHash;
 			}
 			// Stash for agent_end to reuse (saves 1 embedding call per round)
 			round.promptVec = queryVec;
@@ -760,32 +789,13 @@ export default function (pi: ExtensionAPI) {
 			// Load and score the index
 			const index = loadIndex();
 			if (index.length === 0) {
-				// Final response contract + current messages (no context lists)
-				round.contextCache.envPreamble = envPreamble;
-				round.contextCache.userPrompt = userPrompt;
-				const emptyIdxMsgs = assembleContextPrefix({
-					systemMsg,
-					sessionArchitecture: buildSessionArchitecture(),
-					workingMemory: buildWorkingMemorySection(session.miniMemStore),
-					preamble: null,
-					recencyList: null,
-					relevanceList: null,
-					followUpMsg: null,
-					checkpointMsg: null,
-					contractMsg: {
-						role: "user" as const,
-						content: [{ type: "text" as const, text: buildFinalResponseContract() }],
-					},
-				});
-				contextCacheSnapshot(round.contextCache, emptyIdxMsgs);
-				const finalMessages: unknown[] = applyContextSizeWarning(
-					round.contextCache.messages!,
-					currentMessages,
-					systemMsg,
-				);
-				return { messages: finalMessages } as any;
+				// Empty index — recency still ships (issue #107 F1).
+				return assembleDegradedContext();
 			}
 
+			// BM25 deliberately scores the RAW prompt (issue #107 F3): the lexical path
+			// stays on the derived prompt text, un-cleaned — only the semantic query goes
+			// through buildPromptEmbeddingInput above.
 			const bm25Scores = normalizeBm25Scores(scoreBm25Query(loadSearchBm25Index(), userPrompt));
 			const scoredRounds = collectSearchRoundScores(index, queryVec, readRoundFile, {
 				bm25Scores,
@@ -798,39 +808,30 @@ export default function (pi: ExtensionAPI) {
 				bestScore,
 				ctx.model?.contextWindow ?? 128_000,
 				SEMBLR_CONFIG.minSimilarity,
+				undefined,
+				SEMBLR_CONFIG.contextBudgetRatio,
 			);
 
-			const selectedRounds = selectContextRounds(scoredRounds, lastRoundFileName, readRoundFile, {
+			// Reserve the static section overhead (relevance header + preamble) so
+			// the budget bounds the full injected section, not just round entries.
+			const reservedTokens =
+				estimateTokens(RELEVANCE_LIST_HEADER) + estimateTokens(buildContextPreamble(true, true) ?? "");
+			const selectedRounds = selectContextRounds(scoredRounds, {
 				minSimilarity: SEMBLR_CONFIG.minSimilarity,
 				budgetTokens,
+				maxEntries: SEMBLR_CONFIG.contextRelevanceMaxEntries,
+				reservedTokens,
+				truncation: PROMPT_TRUNCATION,
+				// Same size fn the relevance list renders with, so the charged
+				// entry includes the size tag (charged == injected, #107 F4).
+				getRoundSizeFn: getRoundSize,
 			});
 
 			if (selectedRounds.length === 0) {
 				ctx.ui.setStatus("semblr", `🧠 no relevant context (best: ${bestScore.toFixed(3)})`);
-				// Cache the empty-context result so subsequent turns reuse it
-				round.contextCache.envPreamble = envPreamble;
-				round.contextCache.userPrompt = userPrompt;
-				const zeroResultMsgs = assembleContextPrefix({
-					systemMsg,
-					sessionArchitecture: buildSessionArchitecture(),
-					workingMemory: buildWorkingMemorySection(session.miniMemStore),
-					preamble: null,
-					recencyList: null,
-					relevanceList: null,
-					followUpMsg: null,
-					checkpointMsg: null,
-					contractMsg: {
-						role: "user" as const,
-						content: [{ type: "text" as const, text: buildFinalResponseContract() }],
-					},
-				});
-				contextCacheSnapshot(round.contextCache, zeroResultMsgs);
-				const finalMessages: unknown[] = applyContextSizeWarning(
-					round.contextCache.messages!,
-					currentMessages,
-					systemMsg,
-				);
-				return { messages: finalMessages } as any;
+				// No semantic matches → relevanceList is null, recency still ships
+				// (issue #107 F1).
+				return assembleDegradedContext();
 			}
 
 			// ── Build the three-section context block ──
@@ -840,8 +841,8 @@ export default function (pi: ExtensionAPI) {
 				: buildRelevanceList(
 						selectedRounds.map((r) => ({ fileName: r.fileName, bestScore: r.bestScore, data: r.data })),
 						getRoundSize,
+						PROMPT_TRUNCATION,
 					);
-			const recencyList = buildGroupedRecencyList(session.roundGroups, session.causalChain, getRoundSize);
 			const preamble = buildContextPreamble(!!recencyList, !!relevanceList);
 
 			// ══ Stats: record all 5 positions presented ══
@@ -891,6 +892,13 @@ export default function (pi: ExtensionAPI) {
 			return { messages: resultMessages } as any;
 		} catch (err) {
 			ctx.ui.setStatus("semblr", `🧠 error: ${(err as Error).message}`);
+			try {
+				// Degraded but always-on: when the embedding/search pipeline throws,
+				// recency still travels with the prompt (issue #107 F1).
+				return assembleDegradedContext();
+			} catch {
+				// Fall back to the unmodified messages rather than throw from the hook.
+			}
 		}
 	});
 
@@ -1066,16 +1074,28 @@ export default function (pi: ExtensionAPI) {
 			}
 		} else {
 			try {
-				// Strip context-injection REDACTED markers and clip to the configured embedding budget.
-				const { clippedResponse, combinedText } = buildAgentEndEmbeddingTexts(
+				// Embedding-input noise cleanup (issue #106 Stage 1, derived-not-stored): collapse large
+				// code fences and JSON dumps before embedding. The round file keeps the raw prompt.
+				const { text: cleanedPrompt, hash: promptInputHash } = buildPromptEmbeddingInput(
 					userPrompt,
+					PROMPT_NOISE_CLEANUP,
+					SEMBLR_CONFIG.embeddingMaxTokens,
+				);
+				const { clippedResponse, combinedText } = buildAgentEndEmbeddingTexts(
+					cleanedPrompt,
 					responseText,
 					EMBEDDING_RESPONSE_MAX_BYTES,
 				);
 
-				// Embedding #1: prompt (reuse cached round.promptVec if available)
+				// Embedding #1: prompt — reuse the round.promptVec stashed by the context hook.
+				// Since issue #107 F3 the hook embeds over the identical
+				// buildPromptEmbeddingInput derivation, so the stash is already in the
+				// :prompt domain; the hash gate keeps the reuse exact (stale or divergent
+				// derivations — e.g. the hook's 200-word clip on long string prompts — fall
+				// through to a fresh embed so the row's hash stamp stays honest).
+				const cachedPromptVec = round.promptVecHash === promptInputHash ? round.promptVec : null;
 				const promptVec =
-					round.promptVec ?? normalize(await embedText(userPrompt, apiKey, embeddingClientDeps(ctx)));
+					cachedPromptVec ?? normalize(await embedText(cleanedPrompt, apiKey, embeddingClientDeps(ctx)));
 
 				// Embedding #2 + #3 in parallel
 				const [responseVec, combinedVec] = await Promise.all([
@@ -1083,8 +1103,14 @@ export default function (pi: ExtensionAPI) {
 					embedText(combinedText, apiKey, embeddingClientDeps(ctx)),
 				]);
 
-				// Save to index: :prompt and :response (normalized for cosine similarity)
-				appendToIndex(`${roundFileName}:prompt`, normalize(promptVec), SEMBLR_CONFIG.embeddingModel);
+				// Save to index: :prompt and :response (normalized for cosine similarity).
+				// The :prompt row carries the embedding-input hash stamp (issue #106 migration).
+				appendToIndex(
+					`${roundFileName}:prompt`,
+					normalize(promptVec),
+					SEMBLR_CONFIG.embeddingModel,
+					promptInputHash,
+				);
 				appendToIndex(`${roundFileName}:response`, normalize(responseVec), SEMBLR_CONFIG.embeddingModel);
 
 				// Embed checkpoint summary if present

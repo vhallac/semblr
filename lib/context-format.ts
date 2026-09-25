@@ -1,3 +1,4 @@
+import { estimateTokens } from "./tokens.ts";
 import type { MiniMemStore } from "./working-memory.ts";
 
 export interface ContextChainEntry {
@@ -30,6 +31,45 @@ export interface RelevanceRound {
 	data: ContextRoundData;
 }
 
+export interface PromptTruncationOptions {
+	/** Characters kept from the start of the prompt. Non-positive disables truncation. */
+	headChars: number;
+	/** Characters kept from the end of the prompt. Non-positive disables truncation. */
+	tailChars: number;
+}
+
+/** Default injection clamp: keep ~400 chars of head+tail per list entry (issue #106). */
+export const DEFAULT_PROMPT_TRUNCATION: PromptTruncationOptions = {
+	headChars: 260,
+	tailChars: 140,
+};
+
+/**
+ * Clamp a user prompt for list injection: keep head and tail (first/last
+ * lines carry intent), elide the middle with a marker. Prompts at or below
+ * the head+tail budget pass through unchanged. When a window can snap to a
+ * line boundary inside it, complete lines are preferred over partial ones.
+ */
+export function truncateUserPrompt(
+	prompt: string,
+	options: PromptTruncationOptions = DEFAULT_PROMPT_TRUNCATION,
+): string {
+	const { headChars, tailChars } = options;
+	if (headChars <= 0 || tailChars <= 0) return prompt;
+	if (prompt.length <= headChars + tailChars) return prompt;
+
+	let head = prompt.slice(0, headChars);
+	let tail = prompt.slice(prompt.length - tailChars);
+
+	const headBreak = head.lastIndexOf("\n");
+	if (headBreak > 0) head = head.slice(0, headBreak);
+	const tailBreak = tail.indexOf("\n");
+	if (tailBreak !== -1 && tailBreak < tail.length - 1) tail = tail.slice(tailBreak + 1);
+
+	const elided = prompt.length - head.length - tail.length;
+	return `${head}\n… [${elided} chars elided] …\n${tail}`;
+}
+
 export function formatRoundEntry(
 	idx: number,
 	fileName: string,
@@ -37,8 +77,11 @@ export function formatRoundEntry(
 	toolSummary: string,
 	userPrompt: string,
 	sizeStr?: string,
+	truncation: PromptTruncationOptions = DEFAULT_PROMPT_TRUNCATION,
 ): string[] {
-	const promptLines = userPrompt.split("\n").map((line, i) => (i === 0 ? `  user: ${line}` : `  ${line}`));
+	const promptLines = truncateUserPrompt(userPrompt, truncation)
+		.split("\n")
+		.map((line, i) => (i === 0 ? `  user: ${line}` : `  ${line}`));
 	const sizePart = sizeStr ? ` | ${sizeStr}` : "";
 	return [`${idx}. ${fileName} [${score} | ${toolSummary}${sizePart}]:`, ...promptLines, "  ---"];
 }
@@ -49,20 +92,20 @@ export function formatGroupedRoundEntry(
 	toolSummary: string,
 	userPrompt: string,
 	sizeStr?: string,
+	truncation: PromptTruncationOptions = DEFAULT_PROMPT_TRUNCATION,
 ): string[] {
-	const promptLines = userPrompt.split("\n").map((line, i) => (i === 0 ? `  user: ${line}` : `  ${line}`));
+	const promptLines = truncateUserPrompt(userPrompt, truncation)
+		.split("\n")
+		.map((line, i) => (i === 0 ? `  user: ${line}` : `  ${line}`));
 	const sizePart = sizeStr ? ` | ${sizeStr}` : "";
 	return [`- [index: ${index}] ${fileName} [n/a | ${toolSummary}${sizePart}]:`, ...promptLines, "  ---"];
 }
 
-export function buildGroupedRecencyList<T extends ContextChainEntry>(
-	groups: Array<ContextRoundGroup<T>>,
-	causalChain: T[],
-	getRoundSize: (fileName: string) => string | null = () => null,
-): string | null {
-	if (groups.length === 0) return null;
-	const lines: string[] = [];
-	const header = `--- RECENCY LIST (current session, by topic) ---
+/** Default recency list entry cap (issue #106): hard bound across all groups. */
+export const DEFAULT_MAX_RECENCY_ENTRIES = 20;
+
+/** Static header for the recency list section (issue #106: counted against the injection budget). */
+export const RECENCY_LIST_HEADER = `--- RECENCY LIST (current session, by topic) ---
 These rounds have n/a scores because they are presented by recency — they form
 the immediate conversational context from this session.
 
@@ -97,44 +140,123 @@ When NOT to expand:
 
 Rule: When in doubt, expand. A verification tool call is cheaper than a wrong
 answer.`;
-	lines.push(header);
+
+/**
+ * Build the recency list in two phases (issue #107 F2):
+ *
+ * Phase 1 — selection walks the causal chain newest-first and retains rounds
+ * under the entry cap and token budget by GLOBAL chronology, never by topic
+ * group: with topics interleaved in the chain (A1,B1,A2,B2), a 2-entry cap
+ * keeps B2 and A2 — a group-major walk would keep B2 and B1, discarding A2
+ * although it is newer than B1. Rounds that never reached a topic group
+ * (agent_end embedding failed, so assignToGroup never ran) stay visible: they
+ * render as singleton groups keyed by file name.
+ *
+ * Phase 2 — renders the retained subset grouped by topic. Groups emit in the
+ * order their newest retained round was selected (i.e. global recency order),
+ * rounds within a group render newest-first, and a group header renders — and
+ * is charged to the budget — exactly when the group keeps at least one
+ * retained round. A group's first-selected round is the round that leads it in
+ * the render, so the header charge is known during selection and the
+ * accounting matches the emitted output exactly (issue #106: what is charged
+ * is what is injected).
+ *
+ * The most recent round (kept === 0) is always kept: the recency list is the
+ * always-on causal context and must never be emptied by a tight budget — the
+ * budget bounds growth, not existence.
+ */
+export function buildGroupedRecencyList<T extends ContextChainEntry>(
+	groups: Array<ContextRoundGroup<T>>,
+	causalChain: T[],
+	getRoundSize: (fileName: string) => string | null = () => null,
+	truncation: PromptTruncationOptions = DEFAULT_PROMPT_TRUNCATION,
+	options: {
+		/** Hard cap on entries across all groups (default 20, issue #106). `0` disables the list. */
+		maxEntries?: number;
+		/** Total token budget for the whole list (header + group headers + entries). Non-positive disables the bound. */
+		budgetTokens?: number;
+		estimateTokensFn?: (text: string) => number;
+	} = {},
+): string | null {
+	const maxEntries = options.maxEntries ?? DEFAULT_MAX_RECENCY_ENTRIES;
+	if (causalChain.length === 0 || maxEntries <= 0) return null;
+	const budgetTokens = options.budgetTokens ?? 0;
+	const bounded = budgetTokens > 0;
+	const estimateTokensFn = options.estimateTokensFn ?? estimateTokens;
+
+	// Map each causal-chain entry to its topic group by object identity (the
+	// same entry object is pushed into a group by assignToGroup at agent_end).
+	// Chain entries found in no group have no topic — they render as singleton
+	// groups keyed by file name.
+	const entryToGroup = new Map<T, number>();
+	for (let gi = 0; gi < groups.length; gi++) {
+		for (const round of groups[gi].rounds) {
+			if (!entryToGroup.has(round)) entryToGroup.set(round, gi);
+		}
+	}
+
+	// Groups in render order: a group is created the first time one of its
+	// rounds is retained, led by that round (its newest retained member), and
+	// holds its retained entry lines. Groups whose rounds are all dropped by
+	// the cap or budget are never created — no stray headers.
+	const orderedGroups: Array<{ headerLines: string[]; items: string[][] }> = [];
+	const groupByKey = new Map<string, { headerLines: string[]; items: string[][] }>();
+
+	let usedTokens = bounded ? estimateTokensFn(RECENCY_LIST_HEADER) : 0;
+	let kept = 0;
+	for (let i = causalChain.length - 1; i >= 0 && kept < maxEntries; i--) {
+		const entry = causalChain[i];
+		const sizeStr = getRoundSize(entry.fileName) ?? undefined;
+		const entryLines = formatGroupedRoundEntry(
+			kept + 1,
+			entry.fileName,
+			entry.toolSummary,
+			entry.userPrompt,
+			sizeStr,
+			truncation,
+		);
+		const topicGroupIdx = entryToGroup.get(entry);
+		const groupKey = topicGroupIdx === undefined ? `u:${entry.fileName}` : `t:${topicGroupIdx}`;
+
+		// A group first encountered in this walk renders as the next group; its
+		// header block (separator + heading) is charged together with its leading
+		// entry, so cost and output cannot drift (issue #106). The block is only
+		// committed when the leading entry is retained, so a group emptied by the
+		// cap or budget never leaves a stray header.
+		const headerLines: string[] = [];
+		if (!groupByKey.has(groupKey)) {
+			if (orderedGroups.length > 0) headerLines.push("", "---", "");
+			headerLines.push(`**Group ${orderedGroups.length + 1}**`, "");
+		}
+
+		let entryTokens = 0;
+		if (bounded) {
+			entryTokens = estimateTokensFn(entryLines.join("\n"));
+			if (headerLines.length > 0) entryTokens += estimateTokensFn(headerLines.join("\n"));
+			// kept === 0 is always kept (see doc comment); later rounds must fit,
+			// and the walk stops at the first entry that does not — what remains
+			// is strictly the most recent context.
+			if (kept > 0 && usedTokens + entryTokens > budgetTokens) break;
+		}
+
+		usedTokens += entryTokens;
+		let group = groupByKey.get(groupKey);
+		if (!group) {
+			group = { headerLines, items: [] };
+			orderedGroups.push(group);
+			groupByKey.set(groupKey, group);
+		}
+		group.items.push(entryLines);
+		kept++;
+	}
+
+	const lines: string[] = [];
+	lines.push(RECENCY_LIST_HEADER);
 	lines.push("");
-
-	const sortedGroups = [...groups].sort((a, b) => {
-		const aLast = a.rounds[a.rounds.length - 1];
-		const bLast = b.rounds[b.rounds.length - 1];
-		return causalChain.indexOf(bLast) - causalChain.indexOf(aLast);
-	});
-
-	const globalIndices = new Map<T, number>();
-	let globalIdx = 0;
-	for (const group of sortedGroups) {
-		const reversed = [...group.rounds].reverse();
-		for (const entry of reversed) {
-			globalIdx++;
-			globalIndices.set(entry, globalIdx);
-		}
+	for (const group of orderedGroups) {
+		lines.push(...group.headerLines);
+		for (const entryLines of group.items) lines.push(...entryLines);
 	}
-
-	let groupNumber = 0;
-	for (const group of sortedGroups) {
-		groupNumber++;
-		if (groupNumber > 1) {
-			lines.push("");
-			lines.push("---");
-			lines.push("");
-		}
-		lines.push(`**Group ${groupNumber}**`);
-		lines.push("");
-
-		const reversed = [...group.rounds].reverse();
-		for (const entry of reversed) {
-			const idx = globalIndices.get(entry) ?? 0;
-			const sizeStr = getRoundSize(entry.fileName) ?? undefined;
-			lines.push(...formatGroupedRoundEntry(idx, entry.fileName, entry.toolSummary, entry.userPrompt, sizeStr));
-		}
-	}
-
 	return lines.join("\n");
 }
 
@@ -160,13 +282,8 @@ export function buildToolSummary(toolCalls: ContextToolCallDetail[], totalCount:
 	return `${totalCount} tools (${parts.join(", ")})`;
 }
 
-export function buildRelevanceList(
-	rounds: RelevanceRound[],
-	getRoundSize: (fileName: string) => string | null = () => null,
-): string | null {
-	if (rounds.length === 0) return null;
-	const lines: string[] = [];
-	const header = `--- RELEVANCE LIST (all sessions, by hybrid relevance) ---
+/** Static header for the relevance list section (issue #106: counted against the injection budget). */
+export const RELEVANCE_LIST_HEADER = `--- RELEVANCE LIST (all sessions, by hybrid relevance) ---
 These rounds have numeric similarity scores (0.0–1.0). Higher = stronger
 match. They combine semantic vector similarity with exact keyword matching.
 They come from ALL past sessions, not just the current one.
@@ -179,30 +296,49 @@ Use this list when the prompt asks about past work, decisions, or findings
 from prior sessions, or requires cross-session continuity (same project,
 recurring topic, long-running task). If nothing here matches but the query
 clearly needs past context, use search_interactions.`;
-	lines.push(header);
+
+/**
+ * Render one relevance-list entry. Shared by buildRelevanceList (rendering)
+ * and selectContextRounds (injection-cost accounting) so both stay in
+ * lockstep: what is charged to the budget is exactly what is injected.
+ */
+export function buildRelevanceEntry(
+	idx: number,
+	round: RelevanceRound,
+	truncation: PromptTruncationOptions = DEFAULT_PROMPT_TRUNCATION,
+	sizeStr?: string,
+): string[] {
+	const toolCount = round.data.toolCallCount ?? 0;
+	let toolSummary = `${toolCount} tools`;
+	if (round.data.toolCalls && round.data.toolCalls.length > 0) {
+		toolSummary = buildToolSummary(round.data.toolCalls, toolCount);
+	}
+	return formatRoundEntry(
+		idx,
+		round.fileName,
+		round.bestScore.toFixed(2),
+		toolSummary,
+		round.data.userPrompt,
+		sizeStr,
+		truncation,
+	);
+}
+
+export function buildRelevanceList(
+	rounds: RelevanceRound[],
+	getRoundSize: (fileName: string) => string | null = () => null,
+	truncation: PromptTruncationOptions = DEFAULT_PROMPT_TRUNCATION,
+): string | null {
+	if (rounds.length === 0) return null;
+	const lines: string[] = [];
+	lines.push(RELEVANCE_LIST_HEADER);
 	lines.push("");
 
 	let idx = 0;
 	for (const round of rounds) {
 		idx++;
-		const toolCount = round.data.toolCallCount ?? 0;
 		const sizeStr = getRoundSize(round.fileName) ?? undefined;
-
-		let toolSummary = `${toolCount} tools`;
-		if (round.data.toolCalls && round.data.toolCalls.length > 0) {
-			toolSummary = buildToolSummary(round.data.toolCalls, toolCount);
-		}
-
-		lines.push(
-			...formatRoundEntry(
-				idx,
-				round.fileName,
-				round.bestScore.toFixed(2),
-				toolSummary,
-				round.data.userPrompt,
-				sizeStr,
-			),
-		);
+		lines.push(...buildRelevanceEntry(idx, round, truncation, sizeStr));
 	}
 	return lines.join("\n");
 }
@@ -214,7 +350,9 @@ The lists below show past conversation rounds. Each entry contains only the user
 Use get_round_details("hash.json") to expand a round's full conversation.
 Use get_tool_details("hash.json", N) to inspect tool call N within a round.
 
-Format: [index: N] hash.json [score | N tools | size]: followed by the full user prompt (indented).
+Format: [index: N] hash.json [score | N tools | size]: followed by the user
+prompt (indented). Very long prompts are elided mid-section — use get_round_details
+for the full text.
 
 These tools fill in what the context summaries leave out — use them to expand hidden parts of past rounds and build up the full picture. See the SESSION ARCHITECTURE section for details.`;
 }

@@ -107,6 +107,7 @@ describe("createRound", () => {
 		expect(Array.isArray(r.lastContextVec)).toBe(true);
 		expect(r.lastContextVec.length).toBe(0);
 		expect(r.promptVec).toBeNull();
+		expect(r.promptVecHash).toBeNull();
 		expect(r.skipPromptEmbedding).toBe(false);
 		expect(r.presentedRecorded).toBe(false);
 

@@ -1,6 +1,9 @@
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { DEFAULT_MAX_RECENCY_ENTRIES, DEFAULT_PROMPT_TRUNCATION } from "./context-format.ts";
+import { DEFAULT_PROMPT_NOISE_CLEANUP } from "./round-capture.ts";
+import { DEFAULT_CONTEXT_BUDGET_RATIO, DEFAULT_MAX_RELEVANCE_ENTRIES } from "./search-interactions.ts";
 
 export interface SemblrConfig {
 	agentDir: string;
@@ -18,6 +21,22 @@ export interface SemblrConfig {
 	hybridSemanticWeight: number;
 	/** 0 disables the automatic context-size warning; set a positive token count to enable it. */
 	summaryThresholdExtra: number;
+	/** Chars kept from the head of each recency/relevance list prompt; non-positive disables truncation. */
+	contextPromptHeadChars: number;
+	/** Chars kept from the tail of each recency/relevance list prompt. */
+	contextPromptTailChars: number;
+	/** Fraction of the context window the relevance-list injection may occupy at best score (0–1). */
+	contextBudgetRatio: number;
+	/** Hard cap on relevance-list entries. */
+	contextRelevanceMaxEntries: number;
+	/** Hard cap on recency-list entries across all groups. */
+	contextRecencyMaxEntries: number;
+	/** Code fences longer than this many chars collapse to a placeholder in embedding inputs; 0 disables. */
+	promptNoiseFenceMaxChars: number;
+	/** JSON dumps longer than this many chars collapse to a placeholder in embedding inputs; 0 disables. */
+	promptNoiseJsonMaxChars: number;
+	/** Repetition runs (hammered chars, solid long tokens) longer than this collapse in embedding inputs; 0 disables. */
+	promptNoiseRepeatMaxChars: number;
 }
 
 export interface SemblrConfigEnv {
@@ -34,6 +53,14 @@ export interface SemblrConfigEnv {
 	SEMBLR_EMBED_BACKOFF?: string;
 	SEMBLR_HYBRID_SEMANTIC_WEIGHT?: string;
 	SEMBLR_SUMMARY_THRESHOLD_EXTRA?: string;
+	SEMBLR_CONTEXT_PROMPT_HEAD_CHARS?: string;
+	SEMBLR_CONTEXT_PROMPT_TAIL_CHARS?: string;
+	SEMBLR_CONTEXT_BUDGET_RATIO?: string;
+	SEMBLR_CONTEXT_RELEVANCE_MAX_ENTRIES?: string;
+	SEMBLR_CONTEXT_RECENCY_MAX_ENTRIES?: string;
+	SEMBLR_PROMPT_NOISE_FENCE_MAX_CHARS?: string;
+	SEMBLR_PROMPT_NOISE_JSON_MAX_CHARS?: string;
+	SEMBLR_PROMPT_NOISE_REPEAT_MAX_CHARS?: string;
 }
 
 export interface SemblrConfigDeps {
@@ -60,6 +87,14 @@ const DEFAULTS = {
 	embedBackoffMs: 1000,
 	hybridSemanticWeight: 0.7,
 	summaryThresholdExtra: 0,
+	contextPromptHeadChars: DEFAULT_PROMPT_TRUNCATION.headChars,
+	contextPromptTailChars: DEFAULT_PROMPT_TRUNCATION.tailChars,
+	contextBudgetRatio: DEFAULT_CONTEXT_BUDGET_RATIO,
+	contextRelevanceMaxEntries: DEFAULT_MAX_RELEVANCE_ENTRIES,
+	contextRecencyMaxEntries: DEFAULT_MAX_RECENCY_ENTRIES,
+	promptNoiseFenceMaxChars: DEFAULT_PROMPT_NOISE_CLEANUP.fenceMaxChars,
+	promptNoiseJsonMaxChars: DEFAULT_PROMPT_NOISE_CLEANUP.jsonMaxChars,
+	promptNoiseRepeatMaxChars: DEFAULT_PROMPT_NOISE_CLEANUP.repeatMaxChars,
 };
 
 const ENV_KEYS = {
@@ -75,6 +110,14 @@ const ENV_KEYS = {
 	embedBackoffMs: "SEMBLR_EMBED_BACKOFF",
 	hybridSemanticWeight: "SEMBLR_HYBRID_SEMANTIC_WEIGHT",
 	summaryThresholdExtra: "SEMBLR_SUMMARY_THRESHOLD_EXTRA",
+	contextPromptHeadChars: "SEMBLR_CONTEXT_PROMPT_HEAD_CHARS",
+	contextPromptTailChars: "SEMBLR_CONTEXT_PROMPT_TAIL_CHARS",
+	contextBudgetRatio: "SEMBLR_CONTEXT_BUDGET_RATIO",
+	contextRelevanceMaxEntries: "SEMBLR_CONTEXT_RELEVANCE_MAX_ENTRIES",
+	contextRecencyMaxEntries: "SEMBLR_CONTEXT_RECENCY_MAX_ENTRIES",
+	promptNoiseFenceMaxChars: "SEMBLR_PROMPT_NOISE_FENCE_MAX_CHARS",
+	promptNoiseJsonMaxChars: "SEMBLR_PROMPT_NOISE_JSON_MAX_CHARS",
+	promptNoiseRepeatMaxChars: "SEMBLR_PROMPT_NOISE_REPEAT_MAX_CHARS",
 } satisfies Record<ConfigKey, keyof SemblrConfigEnv>;
 
 function defaultAgentDir(env: SemblrConfigEnv): string {
@@ -239,6 +282,70 @@ export function loadSemblrConfig(deps: SemblrConfigDeps = {}): SemblrConfig {
 			mergedSettings,
 			{},
 			warn,
+		),
+		contextPromptHeadChars: resolveNumber(
+			"contextPromptHeadChars",
+			DEFAULTS.contextPromptHeadChars,
+			env,
+			mergedSettings,
+			{},
+			warn,
+		),
+		contextPromptTailChars: resolveNumber(
+			"contextPromptTailChars",
+			DEFAULTS.contextPromptTailChars,
+			env,
+			mergedSettings,
+			{},
+			warn,
+		),
+		contextBudgetRatio: Math.max(
+			0,
+			Math.min(1, resolveNumber("contextBudgetRatio", DEFAULTS.contextBudgetRatio, env, mergedSettings, {}, warn)),
+		),
+		contextRelevanceMaxEntries: Math.max(
+			0,
+			Math.floor(
+				resolveNumber(
+					"contextRelevanceMaxEntries",
+					DEFAULTS.contextRelevanceMaxEntries,
+					env,
+					mergedSettings,
+					{},
+					warn,
+				),
+			),
+		),
+		contextRecencyMaxEntries: Math.max(
+			0,
+			Math.floor(
+				resolveNumber("contextRecencyMaxEntries", DEFAULTS.contextRecencyMaxEntries, env, mergedSettings, {}, warn),
+			),
+		),
+		promptNoiseFenceMaxChars: Math.max(
+			0,
+			Math.floor(
+				resolveNumber("promptNoiseFenceMaxChars", DEFAULTS.promptNoiseFenceMaxChars, env, mergedSettings, {}, warn),
+			),
+		),
+		promptNoiseJsonMaxChars: Math.max(
+			0,
+			Math.floor(
+				resolveNumber("promptNoiseJsonMaxChars", DEFAULTS.promptNoiseJsonMaxChars, env, mergedSettings, {}, warn),
+			),
+		),
+		promptNoiseRepeatMaxChars: Math.max(
+			0,
+			Math.floor(
+				resolveNumber(
+					"promptNoiseRepeatMaxChars",
+					DEFAULTS.promptNoiseRepeatMaxChars,
+					env,
+					mergedSettings,
+					{},
+					warn,
+				),
+			),
 		),
 	};
 }

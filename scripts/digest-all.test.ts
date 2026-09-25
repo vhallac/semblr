@@ -4,6 +4,7 @@ import * as path from "node:path";
 import { describe, expect, it, vi } from "vitest";
 import { computeContentHash } from "../lib/hash.ts";
 import { encodeVectorIndexLine, loadVectorIndex, readIndexLines } from "../lib/index-io.ts";
+import { hashEmbeddingInput } from "../lib/round-capture.ts";
 import { loadToolIndex, toolIndexPathForRoundsDir } from "../lib/search-tools.ts";
 import { isMainModule, runDigestAll } from "./digest-all.ts";
 
@@ -154,13 +155,13 @@ describe("digest-all script", () => {
 		const index = loadVectorIndex(indexPath);
 		expect(index).toHaveLength(4); // 2 prompts + 2 responses
 
-		// Prompt text is truncated to 8000 chars
+		// Prompt text is noise-cleaned (full cleaned text, no slice); response stays sliced to 8000 chars
 		expect(requests).toEqual([
 			{
 				input: "https://openrouter.ai/api/v1/embeddings",
 				method: "POST",
 				headers: { Authorization: "Bearer key", "Content-Type": "application/json" },
-				body: { model: "openai/text-embedding-3-small", input: "p".repeat(8000) },
+				body: { model: "openai/text-embedding-3-small", input: "[REPEAT: 'p' × 8100]" },
 			},
 			{
 				input: "https://openrouter.ai/api/v1/embeddings",
@@ -328,11 +329,19 @@ describe("digest-all script", () => {
 		).resolves.toBe(0);
 
 		expect(requests).toHaveLength(2);
-		expect((requests[0] as any).body).toEqual({ model: "openai/text-embedding-3-small", input: userPrompt });
+		expect((requests[0] as any).body).toEqual({
+			model: "openai/text-embedding-3-small",
+			input: userPrompt,
+		});
 		expect((requests[1] as any).body).toEqual({ model: "openai/text-embedding-3-small", input: responseSequence });
 		expect(loadVectorIndex(indexPath)).toEqual([
 			{ vector: [9], filePath: "unrelated.json:prompt", model: "old-model" },
-			{ vector: [0.6, 0.8], filePath: `${roundFile}:prompt`, model: "openai/text-embedding-3-small" },
+			{
+				vector: [0.6, 0.8],
+				filePath: `${roundFile}:prompt`,
+				model: "openai/text-embedding-3-small",
+				embeddingInputHash: hashEmbeddingInput(userPrompt),
+			},
 			{ vector: [0, 1], filePath: `${roundFile}:response`, model: "openai/text-embedding-3-small" },
 		]);
 	});
@@ -434,7 +443,7 @@ describe("digest-all script", () => {
 		expect(logs.stdout.join("\n")).toContain("1 rounds embedded, 1 errors");
 	});
 
-	it("truncates long prompt and response text to MAX chars", async () => {
+	it("noise-cleans long prompts and truncates long response text", async () => {
 		const root = tmpDir();
 		const sessionsDir = path.join(root, "sessions");
 		const sDir = path.join(sessionsDir, "--test");
@@ -467,9 +476,9 @@ describe("digest-all script", () => {
 			}),
 		).resolves.toBe(0);
 
-		// Both prompt and response were truncated to 8000 chars
+		// Prompt input is the noise-cleaned full text (repetition collapsed); response stays sliced to 8000 chars
 		expect(requests).toHaveLength(2);
-		expect((requests[0] as any).body.input).toBe("A".repeat(8000));
+		expect((requests[0] as any).body.input).toBe("[REPEAT: 'A' × 10000]");
 		expect((requests[1] as any).body.input).toBe("B".repeat(8000));
 	});
 

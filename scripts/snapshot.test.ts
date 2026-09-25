@@ -26,6 +26,14 @@ function testConfig(root: string): SemblrConfig {
 		embedBackoffMs: 1000,
 		hybridSemanticWeight: 0.7,
 		summaryThresholdExtra: 40_000,
+		contextPromptHeadChars: 260,
+		contextPromptTailChars: 140,
+		contextBudgetRatio: 0.08,
+		contextRelevanceMaxEntries: 20,
+		contextRecencyMaxEntries: 20,
+		promptNoiseFenceMaxChars: 600,
+		promptNoiseJsonMaxChars: 600,
+		promptNoiseRepeatMaxChars: 200,
 	};
 }
 

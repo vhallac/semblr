@@ -5,12 +5,16 @@ import {
 	buildAgentEndEmbeddingTexts,
 	buildAgentEndRoundData,
 	buildAgentEndToolSummary,
+	buildPromptEmbeddingInput,
+	cleanPromptNoise,
+	DEFAULT_PROMPT_NOISE_CLEANUP,
 	embeddingMaxTokensToResponseBytes,
 	extractAgentEndResponseText,
 	extractAgentEndUserPrompt,
 	extractAndStripFollowupMarker,
 	getAgentEndParentId,
 	getRelatedParentIdFromGroup,
+	hashEmbeddingInput,
 	type MessageEndProcessingState,
 	readAndClearFollowupFlag,
 } from "./round-capture.ts";
@@ -246,6 +250,268 @@ describe("buildAgentEndEmbeddingTexts", () => {
 		const longResponse = "x".repeat(50000);
 		const result = buildAgentEndEmbeddingTexts("prompt", longResponse, 100);
 		expect(Buffer.byteLength(result.clippedResponse, "utf-8")).toBeLessThanOrEqual(120);
+	});
+});
+
+describe("hashEmbeddingInput / buildPromptEmbeddingInput (issue #106 migration stamp)", () => {
+	it("hashes text deterministically and distinctly (sha256 base64url)", () => {
+		expect(hashEmbeddingInput("abc")).toBe(hashEmbeddingInput("abc"));
+		expect(hashEmbeddingInput("abc")).not.toBe(hashEmbeddingInput("abd"));
+		expect(hashEmbeddingInput("abc")).toMatch(/^[A-Za-z0-9_-]+$/);
+	});
+
+	it("buildPromptEmbeddingInput returns cleaned full text and its hash", () => {
+		const noisy = `explain\n${"-".repeat(500)}\nend`;
+		const { text, hash } = buildPromptEmbeddingInput(noisy);
+		expect(text).toContain("[REPEAT: '-'");
+		expect(hash).toBe(hashEmbeddingInput(text));
+	});
+
+	it("respects custom noise options", () => {
+		const noisy = `explain\n${"-".repeat(500)}\nend`;
+		const noCollapse = buildPromptEmbeddingInput(noisy, { fenceMaxChars: 600, jsonMaxChars: 600, repeatMaxChars: 0 });
+		expect(noCollapse.text).toBe(noisy);
+		expect(noCollapse.hash).toBe(hashEmbeddingInput(noisy));
+	});
+});
+
+describe("buildPromptEmbeddingInput prompt clip (issue #107 F4)", () => {
+	it("clips the cleaned prompt to the budget and hashes the exact final input", () => {
+		// Varied prose: cleanup is a no-op here (no fences, JSON, or repeat runs), so
+		// the clip is the only transform — and the hash stamps the exact clipped input.
+		const raw = Array.from({ length: 400 }, (_, i) => `word${i}`).join(" ");
+		const { text, hash } = buildPromptEmbeddingInput(raw, DEFAULT_PROMPT_NOISE_CLEANUP, 100);
+		expect(text).toBe(raw.slice(0, 100));
+		expect(hash).toBe(hashEmbeddingInput(text));
+	});
+
+	it("runs cleanup BEFORE the clip: collapsed noise keeps the prompt under budget (tail survives)", () => {
+		// The legacy convention clipped the RAW prompt; the restored convention cleans
+		// first, so a prompt whose noise collapses under the budget keeps its whole
+		// cleaned text — the budget never cuts the meaningful tail.
+		const fenceBody = Array.from({ length: 100 }, (_, i) => `line-${i} = ${i};`).join("\n");
+		const raw = `Analyze this:\n\`\`\`ts\n${fenceBody}\n\`\`\`\nConcluding sentence.`;
+		const budget = 400;
+		expect(raw.length).toBeGreaterThan(budget);
+		const cleaned = cleanPromptNoise(raw);
+		expect(cleaned.length).toBeLessThanOrEqual(budget);
+		const { text, hash } = buildPromptEmbeddingInput(raw, DEFAULT_PROMPT_NOISE_CLEANUP, budget);
+		expect(text).toBe(cleaned);
+		expect(text.endsWith("Concluding sentence.")).toBe(true);
+		expect(hash).toBe(hashEmbeddingInput(text));
+	});
+
+	it("clips AFTER cleanup when the cleaned text still exceeds the budget", () => {
+		// High-entropy prose is not collapsible noise: the clip is what bounds it
+		// (the F4 concern — unbounded embedding inputs for cleanup-proof prompts).
+		const raw = Array.from({ length: 2000 }, (_, i) => `word${i}`).join(" ");
+		const budget = 500;
+		const { text, hash } = buildPromptEmbeddingInput(raw, DEFAULT_PROMPT_NOISE_CLEANUP, budget);
+		expect(text).toBe(cleanPromptNoise(raw).slice(0, budget));
+		expect(text.length).toBe(budget);
+		expect(hash).toBe(hashEmbeddingInput(text));
+	});
+
+	it("leaves under-budget prompts untouched and hashes them verbatim", () => {
+		const raw = "a short prompt";
+		const { text, hash } = buildPromptEmbeddingInput(raw, DEFAULT_PROMPT_NOISE_CLEANUP, 8000);
+		expect(text).toBe(raw);
+		expect(hash).toBe(hashEmbeddingInput(raw));
+	});
+
+	it("treats a non-positive budget as clip disabled (noise-option convention)", () => {
+		const raw = Array.from({ length: 400 }, (_, i) => `word${i}`).join(" ");
+		const { text, hash } = buildPromptEmbeddingInput(raw, DEFAULT_PROMPT_NOISE_CLEANUP, 0);
+		expect(text).toBe(raw);
+		expect(hash).toBe(hashEmbeddingInput(raw));
+	});
+});
+
+describe("cleanPromptNoise", () => {
+	it("leaves small fences and plain prose untouched", () => {
+		const prompt = "Fix this:\n```ts\nconst a = 1;\n```\nthen run tests.";
+		expect(cleanPromptNoise(prompt)).toBe(prompt);
+	});
+
+	it("collapses a large code fence to a placeholder with lang and first/last line", () => {
+		const body = Array.from({ length: 50 }, (_, i) => `line-${i} = ${i};`).join("\n");
+		const prompt = `Intro text here.\n\n\`\`\`python\n${body}\n\`\`\`\n\nOutro.`;
+		const cleaned = cleanPromptNoise(prompt, { fenceMaxChars: 100, jsonMaxChars: 0, repeatMaxChars: 200 });
+		expect(cleaned).toContain("Intro text here.");
+		expect(cleaned).toContain("Outro.");
+		expect(cleaned).toContain("[CODE_BLOCK: ~");
+		expect(cleaned).toContain("python");
+		expect(cleaned).toContain('first line: "line-0 = 0;"');
+		expect(cleaned).toContain('last line: "line-49 = 49;"');
+		expect(cleaned).not.toContain("line-25");
+	});
+
+	it("falls back to plain when the fence info is not a language token", () => {
+		const body = "x".repeat(400);
+		const cleaned = cleanPromptNoise(`\`\`\`[\n${body}\n\`\`\``, {
+			fenceMaxChars: 100,
+			jsonMaxChars: 0,
+			repeatMaxChars: 200,
+		});
+		expect(cleaned).toContain("[CODE_BLOCK: ~401 chars, plain,");
+	});
+
+	it("collapses a tilde fence and clips long placeholder lines", () => {
+		const body = `start ${"y".repeat(200)}\n${"z".repeat(200)} end`;
+		const cleaned = cleanPromptNoise(`before\n~~~ruby\n${body}\n~~~\nafter`, {
+			fenceMaxChars: 50,
+			jsonMaxChars: 0,
+			repeatMaxChars: 200,
+		});
+		expect(cleaned).toContain("ruby");
+		expect(cleaned).toContain('first line: "start');
+		expect(cleaned).toContain("last line: ");
+		expect(cleaned).not.toContain("y".repeat(200));
+	});
+
+	it("leaves an unterminated fence alone", () => {
+		const body = Array.from({ length: 40 }, (_, i) => `value-${i} = ${i * 7};`).join("\n");
+		const prompt = `prose\n\`\`\`ts\n${body}`;
+		expect(cleanPromptNoise(prompt, { fenceMaxChars: 100, jsonMaxChars: 0, repeatMaxChars: 200 })).toBe(prompt);
+	});
+
+	it("collapses a large pretty-printed JSON dump", () => {
+		const dump = JSON.stringify(
+			{ items: Array.from({ length: 40 }, (_, i) => ({ id: i, name: `item-${i}` })) },
+			null,
+			2,
+		);
+		const prompt = `Load this config:\n${dump}\nthanks`;
+		const cleaned = cleanPromptNoise(prompt, { fenceMaxChars: 0, jsonMaxChars: 200, repeatMaxChars: 200 });
+		expect(cleaned).toContain("Load this config:");
+		expect(cleaned).toContain("thanks");
+		expect(cleaned).toMatch(/\[JSON_DUMP: ~\d+ chars\]/);
+		expect(cleaned).not.toContain("item-20");
+	});
+
+	it("collapses a large minified single-line JSON array", () => {
+		const dump = JSON.stringify(Array.from({ length: 60 }, (_, i) => `entry-${i}`));
+		const cleaned = cleanPromptNoise(`data: ${dump}`, { fenceMaxChars: 0, jsonMaxChars: 100, repeatMaxChars: 200 });
+		expect(cleaned).toContain("data: ");
+		expect(cleaned).toMatch(/\[JSON_DUMP: ~/);
+	});
+
+	it("does not collapse parse-failing braces in prose or code", () => {
+		const prompt = `Use {"key": value} shapes. Also:\nif (a) {\n\tlog("${"x".repeat(300)}");\n}`;
+		const cleaned = cleanPromptNoise(prompt, { fenceMaxChars: 0, jsonMaxChars: 50, repeatMaxChars: 0 });
+		expect(cleaned).toBe(prompt);
+	});
+
+	it("prefers the fence collapse for fenced JSON and does not double-process placeholders", () => {
+		const dump = JSON.stringify({ rows: Array.from({ length: 30 }, (_, i) => [i, `r-${i}`]) }, null, 2);
+		const prompt = `\`\`\`json\n${dump}\n\`\`\``;
+		const cleaned = cleanPromptNoise(prompt, { fenceMaxChars: 100, jsonMaxChars: 100, repeatMaxChars: 200 });
+		expect(cleaned).toContain("[CODE_BLOCK:");
+		expect(cleaned).toContain("json");
+		expect(cleaned).not.toContain("[JSON_DUMP:");
+	});
+
+	it("disables collapse with non-positive thresholds", () => {
+		const dump = JSON.stringify({ items: Array.from({ length: 40 }, (_, i) => `x-${i}`) }, null, 2);
+		const prompt = `\`\`\`ts\n${"c".repeat(300)}\n\`\`\`\n${dump}`;
+		expect(cleanPromptNoise(prompt, { fenceMaxChars: 0, jsonMaxChars: 0, repeatMaxChars: 0 })).toBe(prompt);
+	});
+
+	it("collapses a long single-char repeat run to a REPEAT placeholder", () => {
+		const cleaned = cleanPromptNoise(`oops:${"p".repeat(8100)}end`, {
+			fenceMaxChars: 0,
+			jsonMaxChars: 0,
+			repeatMaxChars: 200,
+		});
+		expect(cleaned).toContain("oops:");
+		expect(cleaned).toContain("[REPEAT: 'p' × 8100]");
+		expect(cleaned).toContain("end");
+		expect(cleaned).not.toContain("ppppp");
+	});
+
+	it("leaves repeat runs at or below the threshold untouched", () => {
+		const prompt = `sep\n${"─".repeat(178)}\n${"━".repeat(44)}\nprose`;
+		expect(cleanPromptNoise(prompt, { fenceMaxChars: 0, jsonMaxChars: 0, repeatMaxChars: 200 })).toBe(prompt);
+	});
+
+	it("collapses a solid base64-like token to a LONG_TOKEN placeholder", () => {
+		const blob = Array.from({ length: 40 }, (_, i) => Buffer.from(`segment-${i}-`).toString("base64")).join("");
+		const cleaned = cleanPromptNoise(`key: ${blob}`, { fenceMaxChars: 0, jsonMaxChars: 0, repeatMaxChars: 200 });
+		expect(cleaned).toBe(`key: [LONG_TOKEN: ~${blob.length} chars]`);
+	});
+
+	it("collapses periodic junk runs via the long-token guard", () => {
+		const cleaned = cleanPromptNoise(`noise ${"ab".repeat(150)} done`, {
+			fenceMaxChars: 0,
+			jsonMaxChars: 0,
+			repeatMaxChars: 200,
+		});
+		expect(cleaned).toBe("noise [LONG_TOKEN: ~300 chars] done");
+	});
+
+	it("escapes whitespace characters in REPEAT placeholders", () => {
+		const cleaned = cleanPromptNoise(`a${"\n".repeat(250)}b`, {
+			fenceMaxChars: 0,
+			jsonMaxChars: 0,
+			repeatMaxChars: 200,
+		});
+		expect(cleaned).toBe("a[REPEAT: '\\n' × 250]b");
+	});
+
+	it("prefers the fence collapse for degenerate runs inside fences", () => {
+		const cleaned = cleanPromptNoise(`\`\`\`text\n${"p".repeat(500)}\n\`\`\``, {
+			fenceMaxChars: 100,
+			jsonMaxChars: 0,
+			repeatMaxChars: 200,
+		});
+		expect(cleaned).toContain("[CODE_BLOCK: ~501 chars, text,");
+		expect(cleaned).not.toContain("[REPEAT:");
+	});
+
+	it("handles empty prompt", () => {
+		expect(cleanPromptNoise("")).toBe("");
+	});
+});
+
+describe("cleanPromptNoise JSON-scan depth cap (issue #107 r4 F3)", () => {
+	/** A `depth`-deep nested JSON array wrapping `leaf`. */
+	function nestedArrayDump(depth: number, leaf: unknown): string {
+		let value: unknown = leaf;
+		for (let i = 0; i < depth; i++) value = [value];
+		return JSON.stringify(value);
+	}
+
+	it("still collapses sane-depth nested JSON", () => {
+		const dump = nestedArrayDump(40, `leaf ${"x".repeat(700)}`);
+		const cleaned = cleanPromptNoise(`data: ${dump}`, {
+			fenceMaxChars: 0,
+			jsonMaxChars: 600,
+			repeatMaxChars: 0,
+		});
+		expect(cleaned).toContain("data: ");
+		expect(cleaned).toMatch(/\[JSON_DUMP: ~\d+ chars\]/);
+	});
+
+	it("does not collapse JSON nested beyond the scan-depth cap", () => {
+		// 400 levels ≈ 802 chars: the whole dump exceeds jsonMaxChars (and parses), but every
+		// inner sub-candidate is ~130 chars — so pre-fix it collapsed wholesale, post-fix the
+		// depth bail leaves it verbatim (the pathological outer scans abort).
+		const dump = nestedArrayDump(400, 1);
+		const cleaned = cleanPromptNoise(`data: ${dump}`, {
+			fenceMaxChars: 0,
+			jsonMaxChars: 600,
+			repeatMaxChars: 0,
+		});
+		expect(cleaned).toBe(`data: ${dump}`);
+	});
+
+	it("aborts the per-opener scan on unbalanced opener runs (perf smoke, generous bound)", () => {
+		const input = "[".repeat(50_000); // pre-fix this run cost ~2.2s of quadratic per-opener scans
+		const t0 = Date.now();
+		const cleaned = cleanPromptNoise(input);
+		const elapsed = Date.now() - t0;
+		expect(cleaned).toBe("[REPEAT: '[' × 50000]");
+		expect(elapsed).toBeLessThan(500);
 	});
 });
 

@@ -8,7 +8,10 @@ import {
 	shouldDropEmbedding,
 	shouldDropRelevanceList,
 	startsWithEnvironmentPreamble,
+	stripEnvPreamble,
 } from "./context-messages.ts";
+import { extractText } from "./message-content.ts";
+import { buildPromptEmbeddingInput, DEFAULT_PROMPT_NOISE_CLEANUP } from "./round-capture.ts";
 
 describe("startsWithEnvironmentPreamble", () => {
 	it("returns true when content starts with [ENVIRONMENT]", () => {
@@ -217,6 +220,131 @@ describe("prepareContextMessages", () => {
 		expect(result.systemMsg).toBeNull();
 		expect(result.hasUserMessage).toBe(false);
 		expect(result.rawPromptWordCount).toBe(0);
+	});
+});
+
+/**
+ * Issue #107 F3 boundary evidence: the semantic query embedding input must be
+ * byte-identical to the stored :prompt embedding input for the same round.
+ * The hook derives userPrompt from the AUGMENTED message (preamble + marker +
+ * raw), so it must strip the exact prefix back off before applying
+ * buildPromptEmbeddingInput — the same derivation agent_end uses for the
+ * stored :prompt row (whose hash stamp lands in index.csv).
+ */
+describe("stripEnvPreamble (issue #107 F3 query-domain parity)", () => {
+	const envPreamble = "[ENVIRONMENT]\nHost: test\nCurrent date/time: 20260925T000000Z";
+	const marker = "\n\n[ACTIONABLE PROMPT]\n";
+
+	it("strips the exact augmented prefix", () => {
+		const raw = "fix the failing test";
+		expect(stripEnvPreamble(`${envPreamble}${marker}${raw}`, envPreamble)).toBe(raw);
+	});
+
+	it("passes through text without the exact prefix untouched", () => {
+		const raw = "just a plain prompt";
+		expect(stripEnvPreamble(raw, envPreamble)).toBe(raw);
+		expect(stripEnvPreamble("", envPreamble)).toBe("");
+	});
+
+	it("passes through foreign env-style blocks untouched (exact-match guarantee)", () => {
+		// A different preamble (e.g. host-injected, different timestamp) must NOT be
+		// stripped even though it starts with [ENVIRONMENT] and carries the marker.
+		const foreign = `[ENVIRONMENT]\nHost: other\nCurrent date/time: 20990101T000000Z${marker}do something`;
+		expect(stripEnvPreamble(foreign, envPreamble)).toBe(foreign);
+	});
+
+	it("round-trips: derive(augmented string prompt) → strip == raw prompt", () => {
+		const raw = "explain the recency selection change";
+		const { userPrompt } = prepareContextMessages([{ role: "user", content: raw }], envPreamble);
+		expect(userPrompt).not.toBeNull();
+		// The derivation carries the preamble (pinned by the augmentation tests)…
+		expect(userPrompt).not.toBe(raw);
+		// …and stripping it recovers exactly what agent_end would save/embed.
+		expect(stripEnvPreamble(userPrompt!, envPreamble)).toBe(raw);
+	});
+
+	it("round-trips multi-block array content to the text agent_end extracts", () => {
+		const content = [
+			{ type: "text", text: "first part" },
+			{ type: "text", text: "second part" },
+		];
+		const { userPrompt } = prepareContextMessages([{ role: "user", content }], envPreamble);
+		expect(userPrompt).not.toBeNull();
+		// agent_end's extractAgentEndUserPrompt yields extractText(original content)
+		// for array content — the strip must recover exactly that.
+		expect(stripEnvPreamble(userPrompt!, envPreamble)).toBe(extractText(content));
+	});
+
+	it("recovers a leading fragment when the derived prompt was clipped (hash gate catches it)", () => {
+		// String content is clipped to the first 200 words of the AUGMENTED text by
+		// extractContextPrompt, so a long prompt cannot be fully recovered. The strip
+		// still removes the preamble; the residual is a strict prefix of the raw
+		// prompt, so its embedding-input hash differs from agent_end's derivation —
+		// the hash gate at agent_end then falls through to a fresh embed instead of
+		// persisting a vector over the wrong text.
+		const raw = Array.from({ length: 400 }, (_, i) => `word${i}`).join(" ");
+		const { userPrompt } = prepareContextMessages([{ role: "user", content: raw }], envPreamble);
+		const recovered = stripEnvPreamble(userPrompt!, envPreamble);
+		expect(recovered).not.toBe(raw);
+		expect(raw.startsWith(recovered)).toBe(true);
+		expect(buildPromptEmbeddingInput(recovered).hash).not.toBe(buildPromptEmbeddingInput(raw).hash);
+	});
+
+	it("yields the stored :prompt embedding-input hash for prose and noisy prompts alike", () => {
+		// The externally visible F3 property: the query-side derivation (strip →
+		// buildPromptEmbeddingInput) produces the same hash the stored :prompt row
+		// carries (agent_end: buildPromptEmbeddingInput(rawPrompt)) — for a plain
+		// prose prompt and for one where noise cleanup actually fires (so raw vs
+		// cleaned domains genuinely differ).
+		const prose = "summarize the review findings and fix them";
+		const fenceBody = Array.from({ length: 50 }, (_, i) => `line-${i} = ${i};`).join("\n");
+		const noisy = `Fix this:\n\`\`\`ts\n${fenceBody}\n\`\`\`\nthen run the tests.`;
+		for (const raw of [prose, noisy]) {
+			const { userPrompt } = prepareContextMessages([{ role: "user", content: raw }], envPreamble);
+			const queryInput = buildPromptEmbeddingInput(stripEnvPreamble(userPrompt!, envPreamble));
+			const storedInput = buildPromptEmbeddingInput(raw);
+			expect(queryInput.hash).toBe(storedInput.hash);
+			expect(queryInput.text).toBe(storedInput.text);
+		}
+		// Sanity: the noisy case is load-bearing — cleanup actually changed the text.
+		expect(buildPromptEmbeddingInput(noisy).text).not.toBe(noisy);
+	});
+
+	it("keeps the query == stored hash parity when the F4 clip fires (both sides share the budget)", () => {
+		// 100 words survives the hook's 200-word derivation clip (so the strip recovers
+		// the full raw prompt) but exceeds a small configured budget — the #107 F4 clip
+		// fires on BOTH sides and must not break the F3 query-domain parity: identical
+		// hashes keep the agent_end stash-reuse gate matching.
+		const raw = Array.from({ length: 100 }, (_, i) => `word${i}`).join(" ");
+		const budget = 50;
+		const { userPrompt } = prepareContextMessages([{ role: "user", content: raw }], envPreamble);
+		const queryInput = buildPromptEmbeddingInput(
+			stripEnvPreamble(userPrompt!, envPreamble),
+			DEFAULT_PROMPT_NOISE_CLEANUP,
+			budget,
+		);
+		const storedInput = buildPromptEmbeddingInput(raw, DEFAULT_PROMPT_NOISE_CLEANUP, budget);
+		expect(storedInput.text).toHaveLength(budget); // the clip actually fired
+		expect(queryInput.hash).toBe(storedInput.hash);
+		expect(queryInput.text).toBe(storedInput.text);
+	});
+
+	it("leaves a divergent derivation for non-text-first array content (hash gate catches it)", () => {
+		// When the first content block is not text, augmentation PREPENDS a standalone
+		// preamble block; the derived prompt then joins it with the following text
+		// block via a space, so stripping the prefix leaves a leading space that
+		// agent_end's extractText(original) does not have. The prefix IS removed; the
+		// residual hash differs, so agent_end re-embeds fresh instead of reusing the
+		// stash — correctness is preserved by the gate, only the reuse is skipped.
+		const content = [
+			{ type: "image", url: "http://example.com/img.png" },
+			{ type: "text", text: "describe the screenshot" },
+		];
+		const { userPrompt } = prepareContextMessages([{ role: "user", content }], envPreamble);
+		const recovered = stripEnvPreamble(userPrompt!, envPreamble);
+		expect(recovered).toBe(" describe the screenshot");
+		expect(recovered).not.toBe(extractText(content));
+		expect(buildPromptEmbeddingInput(recovered).hash).not.toBe(buildPromptEmbeddingInput(extractText(content)).hash);
 	});
 });
 

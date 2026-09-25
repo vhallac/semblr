@@ -4,6 +4,7 @@ import * as path from "node:path";
 import { describe, expect, it, vi } from "vitest";
 import { computeContentHash } from "../lib/hash.ts";
 import { encodeVectorIndexLine, loadVectorIndex, readIndexLines } from "../lib/index-io.ts";
+import { hashEmbeddingInput } from "../lib/round-capture.ts";
 import { embed, isMainModule, normalize, runDigestSession } from "./digest-session.ts";
 
 function tmpDir(): string {
@@ -93,7 +94,12 @@ describe("digest-session script", () => {
 		const roundFile = `${computeContentHash(userPrompt, responseSequence, [])}.json`;
 		expect(fs.existsSync(path.join(roundsDir, roundFile))).toBe(true);
 		expect(loadVectorIndex(indexPath)).toEqual([
-			{ vector: [0.6, 0.8], filePath: `${roundFile}:prompt`, model: "openai/text-embedding-3-small" },
+			{
+				vector: [0.6, 0.8],
+				filePath: `${roundFile}:prompt`,
+				model: "openai/text-embedding-3-small",
+				embeddingInputHash: hashEmbeddingInput("[REPEAT: 'p' × 8100]"),
+			},
 			{ vector: [0, 0], filePath: `${roundFile}:response`, model: "openai/text-embedding-3-small" },
 		]);
 		expect(requests).toEqual([
@@ -101,7 +107,7 @@ describe("digest-session script", () => {
 				input: "https://openrouter.ai/api/v1/embeddings",
 				method: "POST",
 				headers: { Authorization: "Bearer key", "Content-Type": "application/json" },
-				body: { model: "openai/text-embedding-3-small", input: "p".repeat(8000) },
+				body: { model: "openai/text-embedding-3-small", input: "[REPEAT: 'p' × 8100]" },
 			},
 			{
 				input: "https://openrouter.ai/api/v1/embeddings",
@@ -156,8 +162,15 @@ describe("digest-session script", () => {
 
 		const roundFile = `${computeContentHash("123456", "abcdef", [])}.json`;
 		expect(fs.existsSync(path.join(configuredRoundsDir, roundFile))).toBe(true);
+		// The prompt is clipped to the configured budget too (issue #107 F4): 6-char
+		// prompt at embeddingMaxTokens 4 → "1234". The response clip is unchanged.
 		expect(loadVectorIndex(path.join(configuredRoundsDir, "index.csv"))).toEqual([
-			{ vector: [1], filePath: `${roundFile}:prompt`, model: "configured-embedding-model" },
+			{
+				vector: [1],
+				filePath: `${roundFile}:prompt`,
+				model: "configured-embedding-model",
+				embeddingInputHash: hashEmbeddingInput("1234"),
+			},
 			{ vector: [1], filePath: `${roundFile}:response`, model: "configured-embedding-model" },
 		]);
 		expect(requests).toEqual([

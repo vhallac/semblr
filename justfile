@@ -66,7 +66,9 @@ fix-round-ids *args:
         npx tsx scripts/fix-round-tool-ids.ts {{args}}
 
 # Run all pending round migrations (idempotent — safe to re-run)
-# Round migrations first, then index migration (model column)
+# Round migrations first, then index migration (model column), then the
+# #106 prompt re-embed sweep (detect changed embedding inputs via the
+# :prompt-row hash stamp and re-embed stale ones).
 migrate *args:
     SEMBLR_ROUNDS_DIR="{{SEMBLR_ROUNDS_DIR}}" \
         npx tsx scripts/migrate-rounds.ts
@@ -74,6 +76,9 @@ migrate *args:
         npx tsx scripts/migrate-content-hash.ts {{args}}
     SEMBLR_ROUNDS_DIR="{{SEMBLR_ROUNDS_DIR}}" \
         npx tsx scripts/migrate-model-column.ts {{args}}
+    OPENROUTER_API_KEY="${OPENROUTER_API_KEY:-$(pass show ai/openrouter 2>/dev/null || true)}" \
+        SEMBLR_ROUNDS_DIR="{{SEMBLR_ROUNDS_DIR}}" \
+        npx tsx scripts/migrate-prompt-embeddings.ts {{args}}
 
 # Erase embeddings for short prompts from index.csv and round JSON files
 # (Idempotent — safe to re-run)
