@@ -59,6 +59,7 @@ import {
 	splitVectorIndexMetadata,
 	writeIndexLines,
 } from "../lib/index-io.ts";
+import { type AcquireIndexLockDeps, acquireIndexLock } from "../lib/index-storage.ts";
 import {
 	buildAgentEndEmbeddingTexts,
 	buildPromptEmbeddingInput,
@@ -72,7 +73,6 @@ import {
 	type ScriptConfigOptions,
 	scriptEmbeddingConfig,
 } from "../lib/script-config.ts";
-import { type AcquireIndexLockDeps, acquireIndexLock } from "../lib/index-storage.ts";
 
 // ─────────────────────────────────────────────
 // Types
@@ -394,7 +394,9 @@ export async function runPromptEmbeddingsMigration(options: MigratePromptEmbeddi
 	// from minutes of re-embedding to the seconds-long merge phase).
 	const lock = acquireIndexLock(indexPath, options.lockDeps);
 	if (lock === null) {
-		err.error(`❌ Could not acquire the index lock (${indexPath}.lock) after all retries — the index was NOT written.`);
+		err.error(
+			`❌ Could not acquire the index lock (${indexPath}.lock) after all retries — the index was NOT written.`,
+		);
 		err.error(
 			"   A live session is likely holding it. This run's re-embed results were discarded; re-run the migration (already-restamped rows cost zero API calls).",
 		);
