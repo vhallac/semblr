@@ -40,6 +40,7 @@ import {
 	prepareContextMessages,
 	shouldDropEmbedding,
 	shouldDropRelevanceList,
+	stripEnvPreamble,
 } from "../lib/context-messages.ts";
 import { embedText, getApiKey } from "../lib/embedding-client.ts";
 import { assignToGroup, formatGroupStats } from "../lib/grouping.ts";
@@ -735,6 +736,7 @@ export default function (pi: ExtensionAPI) {
 			// Per https://github.com/vhallac/semblr/issues/38#issuecomment-4629826478
 			round.skipPromptEmbedding = true;
 			round.promptVec = null;
+			round.promptVecHash = null;
 
 			// ══ Stats: record all 5 positions presented ══
 			if (!round.presentedRecorded) {
@@ -745,7 +747,9 @@ export default function (pi: ExtensionAPI) {
 			return assembleDegradedContext();
 		}
 
-		// round.promptVec is stashed after embedding below for agent_end to reuse
+		// round.promptVec (+ promptVecHash) are stashed after embedding below for
+		// agent_end to reuse (issue #107 F3): the stash is computed over the exact
+		// :prompt embedding input, so agent_end reuses it instead of re-embedding.
 
 		try {
 			const apiKey = await getApiKey(ctx, { config: SEMBLR_CONFIG });
@@ -754,15 +758,29 @@ export default function (pi: ExtensionAPI) {
 				return assembleDegradedContext();
 			}
 
-			// Embed the user prompt — cached per agent cycle to avoid redundant API calls
-			// across multiple tool turns within the same user prompt.
+			// Embed the semantic query over the SAME preprocessing domain as the stored
+			// :prompt rows (issue #107 F3): the stored vectors are embedded over
+			// buildPromptEmbeddingInput(rawPrompt), so the query must be too — otherwise
+			// query and stored vectors come from different preprocessing domains and the
+			// cosine comparison is systematically degraded. The derived userPrompt carries
+			// the env preamble this hook added (and a 200-word clip for string content),
+			// so strip the exact prefix back off before cleaning; the derivation below is
+			// byte-identical to agent_end's :prompt embedding input, which is what makes
+			// the round.promptVec stash exactly reusable (hash-gated).
+			// Cached per agent cycle to avoid redundant API calls across multiple tool
+			// turns within the same user prompt.
 			let queryVec: number[];
 			if (userPrompt === round.lastContextUserPrompt) {
 				queryVec = round.lastContextVec;
 			} else {
-				queryVec = normalize(await embedText(userPrompt, apiKey, embeddingClientDeps(ctx)));
+				const { text: queryEmbeddingInput, hash: queryInputHash } = buildPromptEmbeddingInput(
+					stripEnvPreamble(userPrompt, envPreamble),
+					PROMPT_NOISE_CLEANUP,
+				);
+				queryVec = normalize(await embedText(queryEmbeddingInput, apiKey, embeddingClientDeps(ctx)));
 				round.lastContextUserPrompt = userPrompt;
 				round.lastContextVec = queryVec;
+				round.promptVecHash = queryInputHash;
 			}
 			// Stash for agent_end to reuse (saves 1 embedding call per round)
 			round.promptVec = queryVec;
@@ -774,6 +792,9 @@ export default function (pi: ExtensionAPI) {
 				return assembleDegradedContext();
 			}
 
+			// BM25 deliberately scores the RAW prompt (issue #107 F3): the lexical path
+			// stays on the derived prompt text, un-cleaned — only the semantic query goes
+			// through buildPromptEmbeddingInput above.
 			const bm25Scores = normalizeBm25Scores(scoreBm25Query(loadSearchBm25Index(), userPrompt));
 			const scoredRounds = collectSearchRoundScores(index, queryVec, readRoundFile, {
 				bm25Scores,
@@ -1061,9 +1082,13 @@ export default function (pi: ExtensionAPI) {
 					EMBEDDING_RESPONSE_MAX_BYTES,
 				);
 
-				// Embedding #1: prompt (reuse cached round.promptVec if available — only when the
-				// cleanup was a no-op, since the stashed vector was computed over the raw prompt)
-				const cachedPromptVec = cleanedPrompt === userPrompt ? round.promptVec : null;
+				// Embedding #1: prompt — reuse the round.promptVec stashed by the context hook.
+				// Since issue #107 F3 the hook embeds over the identical
+				// buildPromptEmbeddingInput derivation, so the stash is already in the
+				// :prompt domain; the hash gate keeps the reuse exact (stale or divergent
+				// derivations — e.g. the hook's 200-word clip on long string prompts — fall
+				// through to a fresh embed so the row's hash stamp stays honest).
+				const cachedPromptVec = round.promptVecHash === promptInputHash ? round.promptVec : null;
 				const promptVec =
 					cachedPromptVec ?? normalize(await embedText(cleanedPrompt, apiKey, embeddingClientDeps(ctx)));
 

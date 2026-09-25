@@ -86,6 +86,11 @@ export interface RoundState {
 	lastContextUserPrompt: string | null;
 	lastContextVec: number[];
 	promptVec: number[] | null;
+	// hash of the embedding input the promptVec was computed over (issue #107 F3):
+	// agent_end reuses the stashed vector for the :prompt row only when this equals
+	// the hash of its own buildPromptEmbeddingInput derivation — the gate that keeps
+	// the reuse exact even if the hook saw a divergent prompt derivation.
+	promptVecHash: string | null;
 	skipPromptEmbedding: boolean;
 	presentedRecorded: boolean;
 	// full-message cache (triple wrapped in ContextCache — see helpers above)
@@ -107,6 +112,7 @@ export function createRound(): RoundState {
 		lastContextUserPrompt: null,
 		lastContextVec: [],
 		promptVec: null,
+		promptVecHash: null,
 		skipPromptEmbedding: false,
 		presentedRecorded: false,
 		contextCache: createContextCache(),
