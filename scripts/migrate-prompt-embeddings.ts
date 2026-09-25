@@ -2,31 +2,33 @@
  * migrate-prompt-embeddings.ts — Detect stale prompt embeddings and re-embed them
  * (issue #106 re-embed migration).
  *
- * Before the #106 embedding-input cleanup, :prompt index rows were embedded over
- * the raw user prompt. The extension now embeds the noise-cleaned prompt, clipped
- * to the configured `embeddingMaxTokens` budget (clip restored post-cleanup in
- * #107 F4), and stamps the row with `hashEmbeddingInput(final input)` (4th CSV
- * column). This sweep:
+ * The current convention (post-#106 cleanup, post-#107 F3/F4 provenance + clip):
+ * the extension embeds the noise-cleaned prompt, clipped to the configured
+ * `embeddingMaxTokens` budget, and stamps the :prompt row with
+ * `hashEmbeddingInput(final input)` (4th CSV column). This sweep:
  *
- *   1. Stamped rows: recompute the current embedding input; stamp mismatch means
- *      the convention (cleanup heuristics, thresholds, clip budget) changed since
- *      capture → re-embed.
- *   2. Legacy rows (no stamp): if the current convention (cleanup + clip)
- *      transforms the stored raw prompt, the old raw-based vector is stale →
- *      re-embed. If the convention is a no-op for that prompt, the old vector is
- *      still valid → stamp the row without an embedding API call.
+ *   1. Post-#107-F3 rows (round.json carries `promptVecHash`): capture embedded a
+ *      verifiable input and stamped it, so a bare-hash mismatch against the current
+ *      derivation means the convention (cleanup heuristics, thresholds, clip
+ *      budget) changed since the vector was computed → re-embed, restamp plain.
+ *   2. Legacy rows (round.json has no `promptVecHash` — captured before #107 F3):
+ *      the stored vector was computed by the capture hook over its augmented
+ *      prompt, and no plain stamp proves otherwise (the pre-F1 stamp-only branch
+ *      wrote hash(clean(raw)) over exactly such augmented-domain vectors, and a
+ *      false stamp is indistinguishable from a digest-corrected one). These rows
+ *      are re-embedded over the current derivation and stamped `assumed-<hash>`;
+ *      a matching assumed- stamp classifies the row current on later runs (zero
+ *      API calls — the sweep stays idempotent).
  *
  * Re-embeds the round.json combined vector (`promptEmbedding`) alongside the
  * :prompt row whenever it exists — combined = cleanedPrompt + "\n\n" + response
  * clipped to the configured budget (same convention as capture). :response and
  * :summary rows are not prompt-derived and are left untouched.
  *
- * Known limitation: legacy digest rows embedded over `raw.slice(0, embeddingMaxTokens)`
- * carry no stamp. When cleanup is a no-op and the prompt fits the budget, the old
- * vector matches the current convention input → stamp-only. When cleanup is a no-op
- * and the prompt exceeds the budget, the current clipped input differs from the
- * stored raw prompt → the row is detected stale and re-embedded (over the same
- * prefix bytes when the budget is unchanged), gaining a correct stamp.
+ * Known limitations: `assumed-` stamps record a re-derivation from round.json, not
+ * the original capture input (unverifiable for legacy rows — #107 F1). A later
+ * digest re-embed of a legacy round writes a fresh plain stamp, shedding the
+ * marker, so the row re-enters this sweep once (one redundant re-embed; accepted).
  * Response-clipping budget changes are also not detected (out of #106 scope).
  *
  * Usage:
@@ -43,8 +45,11 @@ import * as path from "node:path";
 import { pathToFileURL } from "node:url";
 import { embedText, normalize } from "../lib/embed.ts";
 import {
+	ASSUMED_STAMP_PREFIX,
+	bareEmbeddingInputHash,
 	encodeVectorIndexLine,
 	indexRoundFileFromPath,
+	makeAssumedStamp,
 	readIndexLines,
 	splitVectorIndexMetadata,
 	writeIndexLines,
@@ -84,7 +89,8 @@ export interface MigratePromptEmbeddingsOptions extends ScriptConfigOptions {
 interface PromptRowDecision {
 	lineIndex: number;
 	roundFile: string;
-	reason: "hash-mismatch" | "legacy-clean" | "current" | "stamp-only";
+	/** legacy = pre-#107-F3 capture, provenance unverified → re-embed + assumed- stamp. */
+	reason: "hash-mismatch" | "legacy" | "current";
 	rawLength: number;
 	cleanedLength: number;
 	/** Hash of the current embedding input, computed during detection. */
@@ -95,6 +101,8 @@ interface RoundJsonLike {
 	userPrompt?: unknown;
 	responseSequence?: unknown;
 	promptEmbedding?: unknown;
+	/** Present (string or null) iff the round was captured with the #107 F3 fix. */
+	promptVecHash?: unknown;
 }
 
 interface PromptRowGroup {
@@ -179,14 +187,26 @@ export async function runPromptEmbeddingsMigration(options: MigratePromptEmbeddi
 		const userPrompt = typeof round.userPrompt === "string" ? round.userPrompt : "";
 		const current = buildPromptEmbeddingInput(userPrompt, noiseOptions, config.embeddingMaxTokens);
 		const existingHash = splitVectorIndexMetadata(line.slice(firstComma + 1)).embeddingInputHash;
+		const bareHash = existingHash !== undefined ? bareEmbeddingInputHash(existingHash) : undefined;
+		const hasAssumedStamp = existingHash !== undefined && existingHash.startsWith(ASSUMED_STAMP_PREFIX);
+		// Provenance discriminator (#107 F1): round.json gains `promptVecHash` with the
+		// #107 F3 capture fix, so its absence marks a legacy capture whose :prompt vector
+		// was computed from the hook's augmented prompt. A plain stamp cannot vouch for
+		// such a row: the pre-F1 stamp-only branch wrote hash(clean(raw)) over
+		// augmented-domain vectors, byte-identical to a digest-corrected stamp.
+		const isLegacyCapture = !("promptVecHash" in round);
 
 		let reason: PromptRowDecision["reason"];
-		if (existingHash !== undefined) {
-			reason = existingHash === current.hash ? "current" : "hash-mismatch";
+		if (isLegacyCapture) {
+			// Only a matching assumed- stamp proves a previous sweep already re-embedded
+			// this row over the current derivation (idempotent run 2+). Anything else —
+			// unstamped, or plainly stamped — is unverified → re-embed and restamp
+			// assumed-.
+			reason = hasAssumedStamp && bareHash === current.hash ? "current" : "legacy";
 		} else {
-			// Legacy row (pre-#106): embedded over the raw prompt. Stale iff the current
-			// cleanup transforms the stored prompt; otherwise stamp it without re-embedding.
-			reason = current.text !== userPrompt ? "legacy-clean" : "stamp-only";
+			// Post-F3 capture: the row's stamp was written over a verifiable input, so
+			// the bare-hash comparison decides (missing or mismatched → re-embed).
+			reason = bareHash === current.hash ? "current" : "hash-mismatch";
 		}
 
 		const existing: PromptRowGroup = promptRows.get(roundFile) ?? { lineIndexes: [], decision: null };
@@ -199,12 +219,11 @@ export async function runPromptEmbeddingsMigration(options: MigratePromptEmbeddi
 			cleanedLength: current.text.length,
 			currentHash: current.hash,
 		};
-		// Escalate: any stale row for a round wins over stamp-only/current.
+		// Escalate: any stale row for a round wins over current.
 		const rank: Record<PromptRowDecision["reason"], number> = {
 			current: 0,
-			"stamp-only": 1,
-			"legacy-clean": 2,
-			"hash-mismatch": 3,
+			legacy: 1,
+			"hash-mismatch": 2,
 		};
 		if (!existing.decision || rank[reason] > rank[existing.decision.reason]) {
 			existing.decision = decision;
@@ -213,14 +232,14 @@ export async function runPromptEmbeddingsMigration(options: MigratePromptEmbeddi
 	}
 
 	const staleRounds = [...promptRows.values()].filter(
-		(r) => r.decision && (r.decision.reason === "legacy-clean" || r.decision.reason === "hash-mismatch"),
+		(r) => r.decision && (r.decision.reason === "legacy" || r.decision.reason === "hash-mismatch"),
 	);
-	const stampOnlyRounds = [...promptRows.values()].filter((r) => r.decision?.reason === "stamp-only");
+	const legacyStaleRounds = staleRounds.filter((r) => r.decision?.reason === "legacy");
 	const currentRounds = [...promptRows.values()].filter((r) => r.decision?.reason === "current");
 
 	out.log(`📊 Index: ${lines.length} rows, ${promptRowCount} :prompt rows`);
 	out.log(
-		`   stale (re-embed): ${staleRounds.length} | stamp-only: ${stampOnlyRounds.length} | current: ${currentRounds.length}`,
+		`   stale (re-embed): ${staleRounds.length} (${legacyStaleRounds.length} legacy-unverified) | current: ${currentRounds.length}`,
 	);
 	if (missingRoundFiles > 0) out.log(`   ⚠ ${missingRoundFiles} :prompt rows without a round file (skipped)`);
 	if (corruptRoundFiles > 0) out.log(`   ⚠ ${corruptRoundFiles} unreadable round files (skipped)`);
@@ -237,8 +256,7 @@ export async function runPromptEmbeddingsMigration(options: MigratePromptEmbeddi
 		return 0;
 	}
 
-	const needsEmbedding = staleRounds.length > 0;
-	if (!needsEmbedding && stampOnlyRounds.length === 0) {
+	if (staleRounds.length === 0) {
 		out.log("\n✅ All :prompt rows are current. Nothing to migrate.");
 		return 0;
 	}
@@ -258,37 +276,17 @@ export async function runPromptEmbeddingsMigration(options: MigratePromptEmbeddi
 	});
 	const embeddingConfig = scriptEmbeddingConfig(config);
 
-	if (needsEmbedding && !apiKey) {
+	if (!apiKey) {
 		err.error("❌ Embedding API key required to re-embed stale rows (no key resolved).");
 		err.error("   Set OPENROUTER_API_KEY (or the provider key) and re-run, or use --dry-run to preview.");
 		return 1;
-	}
-
-	// Stamp-only rows: rewrite the line with the current input hash, no API call.
-	// The vector is untouched (the old raw-based input equals the current cleaned input).
-	// The CSV schema is positional (vector,filePath,model[,hash]), so a stamped row on a
-	// line without a model column gets the current model filled in (same convention as
-	// migrate-model-column.ts for unlabeled rows).
-	for (const { lineIndexes, decision } of stampOnlyRounds) {
-		if (!decision) continue;
-		for (const lineIndex of lineIndexes) {
-			const line = lines[lineIndex];
-			const firstComma = line.indexOf(",");
-			const { filePath, model } = splitVectorIndexMetadata(line.slice(firstComma + 1));
-			const vector = JSON.parse(Buffer.from(line.slice(0, firstComma), "base64url").toString("utf-8")) as number[];
-			lines[lineIndex] = encodeVectorIndexLine(
-				vector,
-				filePath,
-				model ?? config.embeddingModel,
-				decision.currentHash,
-			);
-		}
 	}
 
 	// Stale rows: re-embed via the configured provider/model, update round.json
 	// combined vector, and rewrite the :prompt line(s).
 	let reembedded = 0;
 	let combinedReembedded = 0;
+	let assumedStamped = 0;
 	for (const { lineIndexes, decision } of staleRounds) {
 		if (!decision) continue;
 		const roundPath = path.resolve(roundsDir, decision.roundFile);
@@ -327,18 +325,23 @@ export async function runPromptEmbeddingsMigration(options: MigratePromptEmbeddi
 			combinedReembedded++;
 		}
 
+		// Legacy rounds get an assumed- provenance stamp: the fresh vector is a
+		// re-derivation from round.json, not the unverifiable original capture input.
+		// Post-F3 rounds get a plain stamp: capture used the same derivation.
+		const stamp = decision.reason === "legacy" ? makeAssumedStamp(current.hash) : current.hash;
 		for (const lineIndex of lineIndexes) {
 			const { filePath } = splitVectorIndexMetadata(lines[lineIndex].slice(lines[lineIndex].indexOf(",") + 1));
-			lines[lineIndex] = encodeVectorIndexLine(normalize(promptVec), filePath, config.embeddingModel, current.hash);
+			lines[lineIndex] = encodeVectorIndexLine(normalize(promptVec), filePath, config.embeddingModel, stamp);
 		}
 		reembedded++;
+		if (decision.reason === "legacy") assumedStamped++;
 		out.log(`  ✅ [${reembedded}/${staleRounds.length}] ${decision.roundFile} (${decision.reason})`);
 	}
 
 	writeIndexLines(indexPath, lines);
 
 	out.log(
-		`\n✅ Done. ${reembedded} rounds re-embedded (${combinedReembedded} combined vectors), ${stampOnlyRounds.length} stamped without embedding.`,
+		`\n✅ Done. ${reembedded} rounds re-embedded (${combinedReembedded} combined vectors), ${assumedStamped} legacy rows re-stamped with assumed- provenance.`,
 	);
 	out.log(`   Index: ${indexPath} (${lines.length} rows)`);
 	return 0;

@@ -10,6 +10,14 @@ export interface VectorIndexEntry {
 	 * Optional 4th CSV column: sha256-base64url of the exact prompt-side embedding
 	 * input text the vector was computed from (issue #106 re-embed migration stamp).
 	 * Only meaningful on :prompt rows; consumers must treat it as opaque metadata.
+	 *
+	 * Provenance contract (#107 F1): a plain stamp asserts the vector was computed
+	 * from the exact input it hashes, and is only written when that derivation was
+	 * verifiable at write time (post-#107-F3 capture, digest re-embeds, or the
+	 * migration's post-F3 re-embed path). Rows captured earlier have no verifiable
+	 * capture input (the hook embedded its augmented prompt), so the migration
+	 * restamps them with an `assumed-` marker after re-embedding over the round-file
+	 * derivation — see `ASSUMED_STAMP_PREFIX`.
 	 */
 	embeddingInputHash?: string;
 }
@@ -57,6 +65,27 @@ export function splitVectorIndexMetadata(rest: string): {
 		return { filePath: segments[0], model: segments[1] };
 	}
 	return { filePath: segments[0] ?? "" };
+}
+
+/**
+ * Prefix marking an assumed-provenance embedding-input stamp (#107 F1): the vector
+ * was computed over the assumed cleaned-raw derivation from round.json, not over the
+ * original capture input (which is unverifiable for rows captured before #107 F3 —
+ * the capture hook embedded its augmented prompt). The re-embed migration treats a
+ * matching `assumed-<hash>` stamp as proof the row was already swept; plain stamps
+ * on such rows are untrusted, because a false stamp and a digest-corrected one are
+ * byte-identical. The prefix is ASCII and the hash is base64url, so the combined
+ * stamp stays CSV-safe.
+ */
+export const ASSUMED_STAMP_PREFIX = "assumed-";
+
+export function makeAssumedStamp(hash: string): string {
+	return `${ASSUMED_STAMP_PREFIX}${hash}`;
+}
+
+/** Strip the assumed-provenance prefix; any other stamp passes through unchanged. */
+export function bareEmbeddingInputHash(stamp: string): string {
+	return stamp.startsWith(ASSUMED_STAMP_PREFIX) ? stamp.slice(ASSUMED_STAMP_PREFIX.length) : stamp;
 }
 
 function parseVectorIndexLine(line: string): VectorIndexEntry {

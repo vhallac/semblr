@@ -4,7 +4,9 @@ import * as path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { computeContentHash } from "./hash.ts";
 import {
+	ASSUMED_STAMP_PREFIX,
 	appendVectorIndexEntry,
+	bareEmbeddingInputHash,
 	encodeVectorIndexLine,
 	filterIndexLinesExcludingFilenames,
 	findStaleContentMatches,
@@ -13,6 +15,7 @@ import {
 	loadIndexedRoundFiles,
 	loadRoundFilesWithDifferentModel,
 	loadVectorIndex,
+	makeAssumedStamp,
 	migrateIndexEntries,
 	migrateIndexEntryLine,
 	readIndexByFilename,
@@ -210,5 +213,27 @@ describe("4th-column embedding-input hash (issue #106 re-embed migration)", () =
 		]);
 
 		expect(loadRoundFilesWithDifferentModel(indexPath(), "current-model")).toEqual(new Set(["different.json"]));
+	});
+});
+
+describe("assumed- provenance stamps (#107 F1)", () => {
+	it("makeAssumedStamp prefixes the hash; bareEmbeddingInputHash strips the prefix", () => {
+		const hash = "abc-123_xyz"; // base64url alphabet — CSV-safe alongside the ASCII prefix
+		const stamp = makeAssumedStamp(hash);
+		expect(stamp).toBe(`${ASSUMED_STAMP_PREFIX}${hash}`);
+		expect(stamp).not.toMatch(","); // stays a single CSV column
+		expect(bareEmbeddingInputHash(stamp)).toBe(hash);
+	});
+
+	it("bareEmbeddingInputHash passes plain stamps through unchanged", () => {
+		expect(bareEmbeddingInputHash("plain-hash")).toBe("plain-hash");
+	});
+
+	it("round-trips an assumed- stamp through the 4th CSV column", () => {
+		writeIndexLines(indexPath(), [encodeVectorIndexLine([1], "a.json:prompt", "model-x", makeAssumedStamp("h1"))]);
+
+		expect(loadVectorIndex(indexPath())).toEqual([
+			{ vector: [1], filePath: "a.json:prompt", model: "model-x", embeddingInputHash: "assumed-h1" },
+		]);
 	});
 });
