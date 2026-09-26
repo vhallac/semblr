@@ -1,3 +1,4 @@
+import { splitAndExtractPrompt } from "./envelope-extract.ts";
 import { createRoundFilePath } from "./hash.ts";
 
 interface ParsedToolCallDetail {
@@ -97,7 +98,7 @@ export function parsePiSessionJsonl(raw: string, options: ParsePiSessionOptions 
 		if (isFinal && options.skipShortFinalResponse && responseSequence.length < 20 && roundIndex === 0) return;
 		const round: ParsedPiRound = {
 			id: currentUserMsg.id ?? "",
-			userPrompt: parsePiTextContent(currentUserMsg.message?.content),
+			userPrompt: splitAndExtractPrompt(parsePiTextContent(currentUserMsg.message?.content)).userText,
 			responseSequence,
 			responseSegments,
 			userTimestamp: currentUserMsg.message?.timestamp ?? 0,
