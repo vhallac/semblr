@@ -8,8 +8,8 @@
   },
   "scripts": {
     "typecheck": "tsc --noEmit",
-    "lint": "biome check",
-    "lint:fix": "biome check --write",
+    "lint": "sh scripts/run-biome.sh check",
+    "lint:fix": "sh scripts/run-biome.sh check --write",
     "knip": "knip",
     "test": "vitest run",
     "test:coverage": "vitest run --coverage",
@@ -24,6 +24,7 @@
     "@sinclair/typebox": "^0.34.49"
   },
   "devDependencies": {
+    "@biomejs/biome": "^2.5.14",
     "@earendil-works/pi-coding-agent": "^0.74.2",
     "@stryker-mutator/core": "^9.6.1",
     "@stryker-mutator/vitest-runner": "^9.6.1",

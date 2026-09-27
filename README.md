@@ -25,7 +25,7 @@ Semblr runs as a [pi coding agent](https://pi.dev) extension.
 
 - **[Node.js](https://nodejs.org/)** >= 22 with npm
 - **TypeScript** (`typescript`) — type checking the extension and scripts
-- **Biome** — linting and formatting (version >= 2.4.0; provided by the environment, not installed via npm)
+- **Biome** — linting and formatting (installed as the `@biomejs/biome` devDependency; on NixOS an environment-provided binary is used instead — see the NixOS note below)
 - **`@earendil-works/pi-coding-agent`** — pi SDK types for type checking
 - **`@types/node`** — Node.js type declarations
 
@@ -502,7 +502,7 @@ Configuration:
 - `tsconfig.json` — TypeScript with strict mode, ES2022 target, Node16 modules
 - `biome.json` — Biome linter and formatter (recommended rules, tabs, 120 char width)
 
-> **NixOS note:** Biome must come from the environment, not npm — the npm-installed binary is dynamically linked and won't run on NixOS. Add `biome` to `shell.nix` (or the user profile) so `biome check` resolves from PATH. When the environment's Biome version changes, run `biome migrate` to keep `biome.json` in sync.
+> **NixOS note:** The npm-installed Biome binary is dynamically linked and won't run on NixOS. `npm run lint` and `npm run lint:fix` therefore go through `scripts/run-biome.sh`, which picks the first `biome` on PATH that can actually run: the npm-installed one on CI/generic Linux, or an environment-provided one on NixOS. Add `biome` to `shell.nix` (or the user profile) so a working binary resolves from PATH. When the Biome version changes (npm devDependency or environment), run `biome migrate` to keep `biome.json` in sync.
 
 ### Retrieval evaluation
 
