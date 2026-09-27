@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import * as fs from "node:fs";
+import { splitAndExtractPrompt } from "./envelope-extract.ts";
 import { computeContentHash } from "./hash.ts";
 import { extractText } from "./message-content.ts";
 import type { ChainEntry, CheckpointSummary, ResponseSegment, RoundData, ToolCallDetail } from "./round-data.ts";
@@ -17,7 +18,7 @@ export function extractAgentEndUserPrompt(cachedPrompt: string | null, messages?
 			}
 		}
 	}
-	return userPrompt;
+	return splitAndExtractPrompt(userPrompt).userText;
 }
 
 export function extractAgentEndResponseText(accumulatedText: readonly string[], messages?: readonly unknown[]): string {

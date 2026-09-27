@@ -1,5 +1,6 @@
 import crypto from "node:crypto";
 import * as path from "node:path";
+import { splitAndExtractPrompt } from "./envelope-extract.ts";
 
 interface ClaudeToolCallDetail {
 	index: number;
@@ -110,7 +111,9 @@ export function parseClaudeCodeJsonl(raw: string, options: ParseClaudeCodeOption
 
 	function flush() {
 		if (!currentUser) return;
-		const userPrompt = textFromClaudeContent((currentUser.message as ClaudeEntry | undefined)?.content);
+		const userPrompt = splitAndExtractPrompt(
+			textFromClaudeContent((currentUser.message as ClaudeEntry | undefined)?.content),
+		).userText;
 		const responseSequence = responseParts.join("\n\n").trim();
 		if (!userPrompt || responseSequence.length < 20) return;
 		const cwd = currentUser.cwd as string | undefined;
