@@ -45,6 +45,22 @@ describe("splitAndExtractPrompt", () => {
 		expect(result.userText).not.toContain('"role": "system"');
 	});
 
+	it("falls back to extracted user text when a fenced envelope has no surrounding prose", () => {
+		const fence = `\`\`\`\n${JSON.stringify(messages, null, 2)}\n\`\`\``;
+		const result = splitAndExtractPrompt(fence);
+		expect(result.wasEnvelope).toBe(true);
+		expect(result.userText).toBe("[ENVIRONMENT]\nreal user text here");
+	});
+
+	it("uses a placeholder when a fenced-only envelope has no extractable user text", () => {
+		const assistantOnly = [{ role: "assistant", content: "thinking out loud" }];
+		const fence = `\`\`\`\n${JSON.stringify(assistantOnly, null, 2)}\n\`\`\``;
+		const result = splitAndExtractPrompt(fence);
+		expect(result.wasEnvelope).toBe(true);
+		expect(result.userText).toMatch(/\[MESSAGE_ENVELOPE: ~\d+ chars\]/);
+		expect(result.userText).not.toContain("thinking out loud");
+	});
+
 	it("does not collapse a fence whose body is not a message envelope", () => {
 		const text = "```\nsome ordinary code\nconst x = 1;\n```\nafter";
 		const result = splitAndExtractPrompt(text);

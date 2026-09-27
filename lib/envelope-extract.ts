@@ -141,6 +141,14 @@ export function splitAndExtractPrompt(text: string): SplitExtractResult {
 	const fenced = findFencedEnvelope(text);
 	if (fenced) {
 		const prose = text.replace(fenced.full, makePlaceholder(fenced.body));
+		// Fenced-only envelope: no surrounding prose survived the collapse, so
+		// fall back to the user's words inside the parsed messages (I-1).
+		if (text.replace(fenced.full, "").trim().length === 0) {
+			return {
+				userText: extractUserTextFromMessages(fenced.parsed) ?? makePlaceholder(fenced.body),
+				wasEnvelope: true,
+			};
+		}
 		return { userText: prose, wasEnvelope: true };
 	}
 
