@@ -93,6 +93,7 @@ import {
 	toolIndexPathForRoundsDir,
 } from "../lib/search-tools.ts";
 import { loadSemblrConfig, type SemblrConfig } from "../lib/semblr-config.ts";
+import { backfillMissingRounds } from "../lib/session-backfill.ts";
 import type { CheckpointSummary, ToolCallDetail } from "../lib/state.ts";
 import { contextCacheStore, contextCacheValid, createRound, createSession } from "../lib/state.ts";
 import {
@@ -1213,9 +1214,28 @@ export default function (pi: ExtensionAPI) {
 	// ─────────────────────────────────────────────
 	// registerTool is called inside session_start because factory-level
 	// registration doesn't reliably make tools visible to the LLM.
-	pi.on("session_start", async (_event, ctx) => {
+	pi.on("session_start", async (event, ctx) => {
 		// Clear session scoped state — new session starts fresh
 		session = createSession();
+
+		// Issue #130: recover rounds lost to process death in the previous session.
+		if (event.previousSessionFile) {
+			try {
+				const backfill = backfillMissingRounds(event.previousSessionFile, ROUNDS_DIR);
+				if (backfill.recoveredFiles.length > 0) {
+					for (const fileName of backfill.recoveredFiles) {
+						const roundData = readRoundJson(ROUNDS_DIR, fileName);
+						if (roundData) upsertRoundInBm25Index(fileName, roundData as unknown as RoundData);
+					}
+					ctx.ui.setStatus(
+						"semblr",
+						`🧠 backfill: recovered ${backfill.recoveredFiles.length} round(s) from previous session`,
+					);
+				}
+			} catch (err) {
+				ctx.ui.setStatus("semblr", `🧠 backfill failed: ${(err as Error).message}`);
+			}
+		}
 
 		const index = loadSessionStartIndex();
 		ctx.ui.setStatus("semblr", buildSessionStartStatus(index));
