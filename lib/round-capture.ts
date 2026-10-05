@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import * as fs from "node:fs";
 import { splitAndExtractPrompt } from "./envelope-extract.ts";
-import { computeContentHash } from "./hash.ts";
+import { computeContentHash, createRoundFilePath } from "./hash.ts";
 import { extractText } from "./message-content.ts";
 import type { ChainEntry, CheckpointSummary, ResponseSegment, RoundData, ToolCallDetail } from "./round-data.ts";
 
@@ -90,6 +90,37 @@ export function buildAgentEndRoundData(args: {
 		relatedParentId: null,
 		needsFollowup: args.needsFollowup ?? false,
 		...(args.summary ? { summary: args.summary } : {}),
+	};
+}
+
+export interface AgentEndRoundFile {
+	userPrompt: string;
+	responseText: string;
+	needsFollowup: boolean;
+	fileName: string;
+}
+
+/**
+ * Assemble everything needed to write the round file at agent_end (issue #130):
+ * prompt extraction, response extraction with followup-marker strip, and the
+ * content-hash file name. Returns null when there is no user prompt to save.
+ * Pure derivation — the caller owns mkdir/write and error policy.
+ */
+export function buildAgentEndRoundFile(
+	cachedPrompt: string | null,
+	accumulatedText: readonly string[],
+	messages: readonly unknown[] | undefined,
+	toolCalls: readonly ToolCallDetail[],
+): AgentEndRoundFile | null {
+	const userPrompt = extractAgentEndUserPrompt(cachedPrompt, messages);
+	if (!userPrompt) return null;
+	const rawResponseText = extractAgentEndResponseText(accumulatedText, messages);
+	const { cleanedText, needsFollowup } = extractAndStripFollowupMarker(rawResponseText);
+	return {
+		userPrompt,
+		responseText: cleanedText,
+		needsFollowup,
+		fileName: createRoundFilePath(userPrompt, cleanedText, [...toolCalls]),
 	};
 }
 

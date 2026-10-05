@@ -54,16 +54,14 @@ import {
 	loadSessionStartIndex as loadSessionStartIndexCore,
 } from "../lib/index-storage.ts";
 import {
+	type AgentEndRoundFile,
 	applyMessageEndToState,
 	buildAgentEndChainEntry,
 	buildAgentEndEmbeddingTexts,
 	buildAgentEndRoundData,
+	buildAgentEndRoundFile,
 	buildPromptEmbeddingInput,
 	embeddingMaxTokensToResponseBytes,
-	extractAgentEndResponseText,
-	extractAgentEndUserPrompt,
-	extractAndStripFollowupMarker,
-	getAgentEndParentId,
 	getRelatedParentIdFromGroup,
 	type MessageEndProcessingState,
 } from "../lib/round-capture.ts";
@@ -932,30 +930,57 @@ export default function (pi: ExtensionAPI) {
 	pi.on("agent_end", async (event, ctx) => {
 		const { messages } = event;
 
-		// Get user prompt -- prefer agent_start cached value, fall back to messages
-		const userPrompt = extractAgentEndUserPrompt(round.userPrompt, messages);
-
-		if (!userPrompt) {
+		// Issue #130: pi's extension runner swallows handler exceptions — a throw
+		// anywhere before writeFileSync loses the round silently. Assembly is
+		// wrapped so any failure falls back to an emergency raw write from
+		// in-memory state instead of losing the round.
+		let saved: AgentEndRoundFile | null = null;
+		try {
+			saved = buildAgentEndRoundFile(round.userPrompt, round.accumulatedText, messages, round.toolCalls);
+		} catch (err) {
+			// Emergency: write a raw round from whatever in-memory state survived.
+			const fbPrompt = round.userPrompt ?? "";
+			const fbText = round.accumulatedText.join("\n\n").trim();
+			try {
+				fs.mkdirSync(ROUNDS_DIR, { recursive: true });
+				const fbName = fbPrompt ? createRoundFilePath(fbPrompt, fbText, []) : `emergency-${Date.now()}.json`;
+				const fbPath = `${ROUNDS_DIR}/${fbName}`;
+				if (!fs.existsSync(fbPath)) {
+					fs.writeFileSync(
+						fbPath,
+						JSON.stringify(
+							buildAgentEndRoundData({
+								userPrompt: fbPrompt || fbName,
+								responseText: fbText,
+								turnIndex: round.turnIndex,
+								toolCallCount: round.toolCallCount,
+								toolCallNames: round.toolCallNames,
+								toolCalls: round.toolCalls,
+								responseSegments: round.responseSegments,
+								parentId: null,
+							}),
+							null,
+							2,
+						),
+					);
+				}
+				ctx.ui.setStatus("semblr", `\u{1f9e0} emergency round write (${fbName}): ${(err as Error).message}`);
+			} catch {
+				ctx.ui.setStatus("semblr", `\u{1f9e0} round write failed: ${(err as Error).message}`);
+			}
+			round.accumulatedText = [];
+			round.userPrompt = null;
+			round.turnIndex = null;
+			return;
+		}
+		if (!saved) {
 			ctx.ui.setStatus("semblr", "\u{1f9e0} agent_end: no user prompt to save");
 			return;
 		}
-
-		// Build response text from accumulated assistant text across all tool iterations
-		const rawResponseText = extractAgentEndResponseText(round.accumulatedText, messages);
-		// Detect and strip the round_needs_followup marker, flagging for follow-up
-		// injection on the next context assembly.
-		const { cleanedText: responseText, needsFollowup } = extractAndStripFollowupMarker(rawResponseText);
-
-		fs.mkdirSync(ROUNDS_DIR, { recursive: true });
-
-		const roundFileName = createRoundFilePath(userPrompt, responseText, round.toolCalls);
+		const { userPrompt, responseText, needsFollowup, fileName: roundFileName } = saved;
 		const roundPath = `${ROUNDS_DIR}/${roundFileName}`;
 
-		// Push to causal chain — even on dedup, this ensures the in-memory buffer
-		// tracks every round seen in this session.
-		session.causalChain.push(
-			buildAgentEndChainEntry(roundFileName, userPrompt, responseText, round.toolCalls.length, round.toolCallNames),
-		);
+		fs.mkdirSync(ROUNDS_DIR, { recursive: true });
 
 		// Skip if already saved (deduplication by content hash)
 		if (fs.existsSync(roundPath)) {
@@ -985,8 +1010,13 @@ export default function (pi: ExtensionAPI) {
 			return;
 		}
 
-		// Compute parentId from session.causalChain
-		const parentId = getAgentEndParentId(session.causalChain);
+		// Issue #130 (write-first): the round file is written BEFORE any fallible
+		// post-write step (chain push, bm25, tool index, embeddings) so a failure
+		// there can only cost derived data, never the round itself.
+		// Compute parentId from the chain tail — identical to getAgentEndParentId
+		// after the push below (chain[len-2] post-push == tail pre-push).
+		const parentId =
+			session.causalChain.length >= 1 ? session.causalChain[session.causalChain.length - 1].fileName : null;
 
 		// Write round file
 		const roundData = buildAgentEndRoundData({
@@ -1004,13 +1034,24 @@ export default function (pi: ExtensionAPI) {
 
 		try {
 			fs.writeFileSync(roundPath, JSON.stringify(roundData, null, 2));
-			upsertRoundInBm25Index(roundFileName, roundData as unknown as RoundData);
 		} catch (err) {
 			ctx.ui.setStatus("semblr", `\u{1f9e0} write error: ${(err as Error).message}`);
 			round.accumulatedText = [];
 			round.userPrompt = null;
 			round.turnIndex = null;
 			return;
+		}
+
+		// Push to causal chain — even on dedup, this ensures the in-memory buffer
+		// tracks every round seen in this session. Only after the write (issue #130).
+		session.causalChain.push(
+			buildAgentEndChainEntry(roundFileName, userPrompt, responseText, round.toolCalls.length, round.toolCallNames),
+		);
+
+		try {
+			upsertRoundInBm25Index(roundFileName, roundData as unknown as RoundData);
+		} catch (err) {
+			ctx.ui.setStatus("semblr", `\u{1f9e0} bm25 index error: ${(err as Error).message}`);
 		}
 
 		// Tool-call fulltext index — independent of embedding availability, so this
@@ -1032,7 +1073,14 @@ export default function (pi: ExtensionAPI) {
 		// Embedding a single concatenated text (rather than averaging separate prompt
 		// and response vectors) preserves the semantic relationship between them.
 		// See https://github.com/vhallac/semblr/issues/36
-		const apiKey = await getApiKey(ctx, { config: SEMBLR_CONFIG });
+		// Issue #130: getApiKey itself can throw (config/env failure) — a throw here
+		// would skip the round-state reset and stats flush below. Treat like "no key".
+		let apiKey: string | null = null;
+		try {
+			apiKey = await getApiKey(ctx, { config: SEMBLR_CONFIG });
+		} catch (err) {
+			ctx.ui.setStatus("semblr", `\u{1f9e0} api key error: ${(err as Error).message}`);
+		}
 		if (!apiKey) {
 			ctx.ui.setStatus("semblr", "\u{1f9e0} saved but not embedded (no API key)");
 			lastRoundFileName = roundFileName;
