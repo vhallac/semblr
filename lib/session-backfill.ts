@@ -30,6 +30,38 @@ export interface BackfillWrite {
 }
 
 /**
+ * Locate the previous session file when pi does not provide one (fresh launch:
+ * session_start fires with reason "startup" and no previousSessionFile). The
+ * session directory is per-cwd, so the most recent other .jsonl file in the
+ * same directory as the current session file is the previous session.
+ */
+export function findPreviousSessionFile(
+	sessionDir: string,
+	currentSessionFile: string,
+	fsImpl: Pick<typeof fs, "readdirSync" | "statSync"> = fs,
+): string | null {
+	let candidates: string[];
+	try {
+		candidates = fsImpl.readdirSync(sessionDir).filter((f) => f.endsWith(".jsonl"));
+	} catch {
+		return null;
+	}
+	let best: { file: string; mtime: number } | null = null;
+	for (const name of candidates) {
+		const file = path.join(sessionDir, name);
+		if (path.resolve(file) === path.resolve(currentSessionFile)) continue;
+		let mtime: number;
+		try {
+			mtime = fsImpl.statSync(file).mtimeMs;
+		} catch {
+			continue;
+		}
+		if (!best || mtime > best.mtime) best = { file, mtime };
+	}
+	return best?.file ?? null;
+}
+
+/**
  * Parse a session JSONL and return the round files missing from roundsDir.
  * Exported for testing / inspection without side effects.
  */

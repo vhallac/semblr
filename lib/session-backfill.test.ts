@@ -3,7 +3,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { createRoundFilePath } from "./hash.ts";
-import { backfillMissingRounds, findMissingRounds } from "./session-backfill.ts";
+import { backfillMissingRounds, findMissingRounds, findPreviousSessionFile } from "./session-backfill.ts";
 
 function writeSessionFile(dir: string, lines: object[]): string {
 	const file = path.join(dir, "session.jsonl");
@@ -110,5 +110,37 @@ describe("session-backfill", () => {
 			writeFileSync: fs.writeFileSync,
 		});
 		expect(outcome.recoveredFiles).toEqual([]);
+	});
+});
+
+describe("findPreviousSessionFile", () => {
+	let tmp: string;
+	beforeEach(() => {
+		tmp = fs.mkdtempSync(path.join(os.tmpdir(), "prev-session-"));
+	});
+	afterEach(() => {
+		fs.rmSync(tmp, { recursive: true, force: true });
+	});
+
+	it("returns the most recent other .jsonl in the session dir", () => {
+		const older = path.join(tmp, "a.jsonl");
+		const newer = path.join(tmp, "b.jsonl");
+		fs.writeFileSync(older, "{}");
+		fs.writeFileSync(newer, "{}");
+		fs.utimesSync(older, new Date(1000), new Date(1000));
+		fs.utimesSync(newer, new Date(2000), new Date(2000));
+		const current = path.join(tmp, "c.jsonl");
+		fs.writeFileSync(current, "{}");
+		expect(findPreviousSessionFile(tmp, current)).toBe(newer);
+	});
+
+	it("excludes the current session file", () => {
+		const current = path.join(tmp, "c.jsonl");
+		fs.writeFileSync(current, "{}");
+		expect(findPreviousSessionFile(tmp, current)).toBeNull();
+	});
+
+	it("returns null for a missing session dir", () => {
+		expect(findPreviousSessionFile(path.join(tmp, "nope"), path.join(tmp, "cur.jsonl"))).toBeNull();
 	});
 });

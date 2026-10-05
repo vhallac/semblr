@@ -94,7 +94,7 @@ import {
 	toolIndexPathForRoundsDir,
 } from "../lib/search-tools.ts";
 import { loadSemblrConfig, type SemblrConfig } from "../lib/semblr-config.ts";
-import { backfillMissingRounds } from "../lib/session-backfill.ts";
+import { backfillMissingRounds, findPreviousSessionFile } from "../lib/session-backfill.ts";
 import type { CheckpointSummary, ToolCallDetail } from "../lib/state.ts";
 import { contextCacheStore, contextCacheValid, createRound, createSession } from "../lib/state.ts";
 import {
@@ -1190,9 +1190,20 @@ export default function (pi: ExtensionAPI) {
 		session = createSession();
 
 		// Issue #130: recover rounds lost to process death in the previous session.
-		if (event.previousSessionFile) {
+		// pi only provides previousSessionFile for "new"/"resume"/"fork" — a fresh
+		// launch emits reason "startup" without one, so locate the previous session
+		// file ourselves (most recent other .jsonl in the current session's dir).
+		const backfillSource =
+			event.previousSessionFile ??
+			(() => {
+				if (event.reason !== "startup" && event.reason !== "resume") return null;
+				const sessionFile = ctx.sessionManager?.getSessionFile?.();
+				if (!sessionFile) return null;
+				return findPreviousSessionFile(path.dirname(sessionFile), sessionFile);
+			})();
+		if (backfillSource) {
 			try {
-				const backfill = backfillMissingRounds(event.previousSessionFile, ROUNDS_DIR);
+				const backfill = backfillMissingRounds(backfillSource, ROUNDS_DIR);
 				if (backfill.recoveredFiles.length > 0) {
 					for (const fileName of backfill.recoveredFiles) {
 						const roundData = readRoundJson(ROUNDS_DIR, fileName);
