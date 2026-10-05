@@ -14,6 +14,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import type { ContextEvent, ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Type } from "@sinclair/typebox";
+import { defaultAgentEndPersistFs, persistAgentEndRound } from "../lib/agent-end-persist.ts";
 import {
 	bm25IndexPathForRoundsDir,
 	loadOrRebuildBm25Index,
@@ -932,138 +933,108 @@ export default function (pi: ExtensionAPI) {
 		const { messages } = event;
 
 		// Issue #130: pi's extension runner swallows handler exceptions — a throw
-		// anywhere before writeFileSync loses the round silently. Assembly is
-		// wrapped so any failure falls back to an emergency raw write from
-		// in-memory state instead of losing the round.
-		let saved: AgentEndRoundFile | null = null;
-		try {
-			saved = buildAgentEndRoundFile(round.userPrompt, round.accumulatedText, messages, round.toolCalls);
-		} catch (err) {
-			// Emergency: write a raw round from whatever in-memory state survived.
-			const fbPrompt = round.userPrompt ?? "";
-			const fbText = round.accumulatedText.join("\n\n").trim();
-			try {
-				fs.mkdirSync(ROUNDS_DIR, { recursive: true });
-				const fbName = fbPrompt ? createRoundFilePath(fbPrompt, fbText, []) : `emergency-${Date.now()}.json`;
-				const fbPath = `${ROUNDS_DIR}/${fbName}`;
-				if (!fs.existsSync(fbPath)) {
-					fs.writeFileSync(
-						fbPath,
-						JSON.stringify(
-							buildAgentEndRoundData({
-								userPrompt: fbPrompt || fbName,
-								responseText: fbText,
-								turnIndex: round.turnIndex,
-								toolCallCount: round.toolCallCount,
-								toolCallNames: round.toolCallNames,
-								toolCalls: round.toolCalls,
-								responseSegments: round.responseSegments,
-								parentId: null,
-							}),
-							null,
-							2,
-						),
-					);
+		// anywhere before writeFileSync loses the round silently. persistAgentEndRound
+		// assembles and writes the round file FIRST; every fallible step below the
+		// write (chain push, bm25, tool index, embeddings) is guarded and can only
+		// cost derived data, never the round itself.
+		const persist = persistAgentEndRound(
+			{ fs: defaultAgentEndPersistFs, roundsDir: ROUNDS_DIR },
+			{
+				cachedUserPrompt: round.userPrompt,
+				accumulatedText: round.accumulatedText,
+				messages,
+				turnIndex: round.turnIndex,
+				toolCallCount: round.toolCallCount,
+				toolCallNames: round.toolCallNames,
+				toolCalls: round.toolCalls,
+				responseSegments: round.responseSegments,
+				parentId:
+					session.causalChain.length >= 1 ? session.causalChain[session.causalChain.length - 1].fileName : null,
+				...(round.lastCheckpointSummary ? { summary: round.lastCheckpointSummary } : {}),
+			},
+			() => {
+				// Push to causal chain — even on dedup, this ensures the in-memory buffer
+				// tracks every round seen in this session. Only after the write (issue #130).
+				session.causalChain.push(
+					buildAgentEndChainEntry(
+						saved.fileName,
+						saved.userPrompt,
+						saved.responseText,
+						round.toolCalls.length,
+						round.toolCallNames,
+					),
+				);
+				try {
+					upsertRoundInBm25Index(saved.fileName, roundData as unknown as RoundData);
+				} catch (err) {
+					ctx.ui.setStatus("semblr", `\u{1f9e0} bm25 index error: ${(err as Error).message}`);
 				}
-				ctx.ui.setStatus("semblr", `\u{1f9e0} emergency round write (${fbName}): ${(err as Error).message}`);
-			} catch {
-				ctx.ui.setStatus("semblr", `\u{1f9e0} round write failed: ${(err as Error).message}`);
+				if (round.toolCalls.length > 0) {
+					try {
+						appendToolIndexRows(
+							TOOLS_INDEX_PATH,
+							ROUNDS_DIR,
+							buildToolIndexRows(saved.fileName, round.toolCalls),
+						);
+					} catch (err) {
+						ctx.ui.setStatus("semblr", `\u{1f9e0} tool index error: ${(err as Error).message}`);
+					}
+				}
+			},
+		);
+		switch (persist.kind) {
+			case "no-prompt":
+				ctx.ui.setStatus("semblr", "\u{1f9e0} agent_end: no user prompt to save");
+				return;
+			case "failed": {
+				ctx.ui.setStatus("semblr", `\u{1f9e0} round write failed: ${persist.message}`);
+				round.accumulatedText = [];
+				round.userPrompt = null;
+				round.turnIndex = null;
+				return;
 			}
-			round.accumulatedText = [];
-			round.userPrompt = null;
-			round.turnIndex = null;
-			return;
+			case "emergency": {
+				ctx.ui.setStatus("semblr", `\u{1f9e0} emergency round write (${persist.fileName}): ${persist.message}`);
+				round.accumulatedText = [];
+				round.userPrompt = null;
+				round.turnIndex = null;
+				return;
+			}
+			case "dedup": {
+				// Even on dedup, run grouping if the round has a combined embedding
+				// (or if this is a short-prompt round with embedding skipped, use null)
+				const roundFileName = persist.saved.fileName;
+				const roundPath = `${ROUNDS_DIR}/${roundFileName}`;
+				try {
+					const existing = JSON.parse(fs.readFileSync(roundPath, "utf-8"));
+					if (existing.promptEmbedding) {
+						const vec = existing.promptEmbedding || null;
+						assignToGroup(
+							session.roundGroups,
+							session.causalChain[session.causalChain.length - 1],
+							vec,
+							SEMBLR_GROUP_THRESHOLD,
+							persist.saved.needsFollowup ? session.lastFollowupGroupIdx : null,
+						);
+					}
+				} catch {
+					/* best-effort */
+				}
+				ctx.ui.setStatus("semblr", `\u{1f9e0} round already saved (${roundFileName})`);
+				lastRoundFileName = roundFileName;
+				round.accumulatedText = [];
+				round.userPrompt = null;
+				round.turnIndex = null;
+				flushStatsFile(statsState, STATS_PATH, SEMBLR_DIR); // causal chain was pushed, so position scores may have changed
+				return;
+			}
 		}
-		if (!saved) {
-			ctx.ui.setStatus("semblr", "\u{1f9e0} agent_end: no user prompt to save");
-			return;
+		const { saved, roundData } = persist;
+		if (persist.postWriteError) {
+			ctx.ui.setStatus("semblr", `\u{1f9e0} post-save error: ${persist.postWriteError}`);
 		}
 		const { userPrompt, responseText, needsFollowup, fileName: roundFileName } = saved;
 		const roundPath = `${ROUNDS_DIR}/${roundFileName}`;
-
-		fs.mkdirSync(ROUNDS_DIR, { recursive: true });
-
-		// Skip if already saved (deduplication by content hash)
-		if (fs.existsSync(roundPath)) {
-			// Even on dedup, run grouping if the round has a combined embedding
-			// (or if this is a short-prompt round with embedding skipped, use null)
-			try {
-				const existing = JSON.parse(fs.readFileSync(roundPath, "utf-8"));
-				if (existing.promptEmbedding) {
-					const vec = existing.promptEmbedding || null;
-					assignToGroup(
-						session.roundGroups,
-						session.causalChain[session.causalChain.length - 1],
-						vec,
-						SEMBLR_GROUP_THRESHOLD,
-						needsFollowup ? session.lastFollowupGroupIdx : null,
-					);
-				}
-			} catch {
-				/* best-effort */
-			}
-			ctx.ui.setStatus("semblr", `\u{1f9e0} round already saved (${roundFileName})`);
-			lastRoundFileName = roundFileName;
-			round.accumulatedText = [];
-			round.userPrompt = null;
-			round.turnIndex = null;
-			flushStatsFile(statsState, STATS_PATH, SEMBLR_DIR); // causal chain was pushed, so position scores may have changed
-			return;
-		}
-
-		// Issue #130 (write-first): the round file is written BEFORE any fallible
-		// post-write step (chain push, bm25, tool index, embeddings) so a failure
-		// there can only cost derived data, never the round itself.
-		// Compute parentId from the chain tail — identical to getAgentEndParentId
-		// after the push below (chain[len-2] post-push == tail pre-push).
-		const parentId =
-			session.causalChain.length >= 1 ? session.causalChain[session.causalChain.length - 1].fileName : null;
-
-		// Write round file
-		const roundData = buildAgentEndRoundData({
-			userPrompt,
-			responseText,
-			turnIndex: round.turnIndex,
-			toolCallCount: round.toolCallCount,
-			toolCallNames: round.toolCallNames,
-			toolCalls: round.toolCalls,
-			responseSegments: round.responseSegments,
-			parentId,
-			needsFollowup,
-			summary: round.lastCheckpointSummary ?? undefined,
-		});
-
-		try {
-			fs.writeFileSync(roundPath, JSON.stringify(roundData, null, 2));
-		} catch (err) {
-			ctx.ui.setStatus("semblr", `\u{1f9e0} write error: ${(err as Error).message}`);
-			round.accumulatedText = [];
-			round.userPrompt = null;
-			round.turnIndex = null;
-			return;
-		}
-
-		// Push to causal chain — even on dedup, this ensures the in-memory buffer
-		// tracks every round seen in this session. Only after the write (issue #130).
-		session.causalChain.push(
-			buildAgentEndChainEntry(roundFileName, userPrompt, responseText, round.toolCalls.length, round.toolCallNames),
-		);
-
-		try {
-			upsertRoundInBm25Index(roundFileName, roundData as unknown as RoundData);
-		} catch (err) {
-			ctx.ui.setStatus("semblr", `\u{1f9e0} bm25 index error: ${(err as Error).message}`);
-		}
-
-		// Tool-call fulltext index — independent of embedding availability, so this
-		// runs even when no API key is configured below.
-		if (round.toolCalls.length > 0) {
-			try {
-				appendToolIndexRows(TOOLS_INDEX_PATH, ROUNDS_DIR, buildToolIndexRows(roundFileName, round.toolCalls));
-			} catch (err) {
-				ctx.ui.setStatus("semblr", `\u{1f9e0} tool index error: ${(err as Error).message}`);
-			}
-		}
 
 		// Three embeddings for each round:
 		//   1. prompt embedding → index.csv as :prompt
