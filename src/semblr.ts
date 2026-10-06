@@ -45,7 +45,7 @@ import {
 } from "../lib/context-messages.ts";
 import { embedText, getApiKey } from "../lib/embedding-client.ts";
 import { assignToGroup, formatGroupStats } from "../lib/grouping.ts";
-import { indexRoundFileFromPath } from "../lib/index-io.ts";
+import { indexRoundFileFromPath, loadVectorIndex } from "../lib/index-io.ts";
 import {
 	appendToIndexPath,
 	buildSessionStartStatus,
@@ -1045,7 +1045,7 @@ export default function (pi: ExtensionAPI) {
 				return;
 			}
 		}
-		const { saved, roundData } = persist;
+		const { saved } = persist;
 		if (persist.postWriteError) {
 			ctx.ui.setStatus("semblr", `\u{1f9e0} post-save error: ${persist.postWriteError}`);
 		}
@@ -1258,6 +1258,10 @@ export default function (pi: ExtensionAPI) {
 								const embedResult = await embedRecoveredRounds(backfill.recoveredFiles, ROUNDS_DIR, {
 									embed: (text) => embedText(text, embedKey, embeddingClientDeps(ctx)),
 									appendIndexRow: (label, vec) => appendToIndex(label, vec, SEMBLR_CONFIG.embeddingModel),
+									// F5 (PR !131): label-guard so a re-run after a crash between the
+									// appends and the embedding write does not duplicate index rows.
+									hasIndexRow: (label) =>
+										loadVectorIndex(INDEX_PATH).some((entry) => entry.filePath === label),
 									writeRoundEmbedding: (fileName, vec) => {
 										const p = `${ROUNDS_DIR}/${fileName}`;
 										const existing = JSON.parse(fs.readFileSync(p, "utf-8"));

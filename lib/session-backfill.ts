@@ -264,6 +264,12 @@ export interface RecoveredEmbedDeps {
 	embed: (text: string) => Promise<number[]>;
 	/** Append an index row for the given round file label (e.g. "x.json:prompt"). */
 	appendIndexRow: (label: string, vector: number[]) => void;
+	/**
+	 * Optional duplicate guard (F5): when it reports the label already present
+	 * in the index, the append is skipped. Makes re-runs idempotent when a
+	 * previous pass died between the appends and the embedding write.
+	 */
+	hasIndexRow?: (label: string) => boolean;
 	/** Update the round file's promptEmbedding atomically. */
 	writeRoundEmbedding: (fileName: string, vector: number[]) => void;
 }
@@ -273,8 +279,10 @@ export interface RecoveredEmbedDeps {
  * retrieval (F4, PR #131): embeds the prompt, the clipped response, and the
  * combined text, appends :prompt/:response index rows, and stores the combined
  * vector as the round's promptEmbedding (same convention as agent_end).
- * Rounds that already carry a promptEmbedding are skipped. Errors are
- * per-round and reported — one bad round never aborts the queue.
+ * Rounds that already carry a promptEmbedding are skipped. With `hasIndexRow`,
+ * index appends are label-guarded, so a re-run after a crash that landed
+ * between the appends and the embedding write does not duplicate rows (F5).
+ * Errors are per-round and reported — one bad round never aborts the queue.
  */
 export async function embedRecoveredRounds(
 	fileNames: string[],
@@ -299,8 +307,14 @@ export async function embedRecoveredRounds(
 				deps.embed(clippedResponse),
 				deps.embed(combinedText),
 			]);
-			deps.appendIndexRow(`${fileName}:prompt`, normalize(promptVec));
-			deps.appendIndexRow(`${fileName}:response`, normalize(responseVec));
+			const promptLabel = `${fileName}:prompt`;
+			const responseLabel = `${fileName}:response`;
+			if (!deps.hasIndexRow?.(promptLabel)) {
+				deps.appendIndexRow(promptLabel, normalize(promptVec));
+			}
+			if (!deps.hasIndexRow?.(responseLabel)) {
+				deps.appendIndexRow(responseLabel, normalize(responseVec));
+			}
 			deps.writeRoundEmbedding(fileName, normalize(combinedVec));
 			embedded.push(fileName);
 		} catch (err) {

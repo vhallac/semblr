@@ -216,8 +216,52 @@ describe("session-backfill", () => {
 				writeRoundEmbedding: () => {},
 			});
 			expect(second.embedded).toEqual([]);
+		});
 
-			// A round that fails to read reports an error without aborting the queue
+		it("F5: re-run after a crash between appends and embedding write does not duplicate rows", async () => {
+			const roundsDir = path.join(tmp, "rounds");
+			const outcome = backfillMissingRounds(
+				writeSessionFile(tmp, [userMsg("crash q", "u2"), assistantMsg("crash answer")]),
+				roundsDir,
+				undefined,
+				{ liveWindowMs: 0 },
+			);
+			const crashFile = outcome.recoveredFiles[0];
+			const preexisting = new Set([`${crashFile}:prompt`, `${crashFile}:response`]);
+			const rows: string[] = [];
+			const recovered = await embedRecoveredRounds([crashFile], roundsDir, {
+				embed: (text) => Promise.resolve([text.length, 2]),
+				appendIndexRow: (label) => rows.push(label),
+				hasIndexRow: (label) => preexisting.has(label),
+				writeRoundEmbedding: (name, vec) => {
+					const p = path.join(roundsDir, name);
+					const existing = JSON.parse(fs.readFileSync(p, "utf-8"));
+					existing.promptEmbedding = vec;
+					fs.writeFileSync(p, JSON.stringify(existing, null, 2));
+				},
+			});
+			expect(recovered.embedded).toEqual([crashFile]);
+			expect(recovered.errors).toEqual([]);
+			// guarded labels were skipped — no duplicate rows appended
+			expect(rows).toEqual([]);
+			expect(JSON.parse(fs.readFileSync(path.join(roundsDir, crashFile), "utf-8")).promptEmbedding).toBeDefined();
+		});
+
+		// A round that fails to read reports an error without aborting the queue
+		it("reports per-round errors without aborting the queue", async () => {
+			const roundsDir = path.join(tmp, "rounds");
+			const outcome = backfillMissingRounds(
+				writeSessionFile(tmp, [userMsg("err q", "u3"), assistantMsg("err answer")]),
+				roundsDir,
+				undefined,
+				{ liveWindowMs: 0 },
+			);
+			const fileName = outcome.recoveredFiles[0];
+			// pre-embed the round so it is skipped on this pass
+			const pre = path.join(roundsDir, fileName);
+			const preRound = JSON.parse(fs.readFileSync(pre, "utf-8"));
+			preRound.promptEmbedding = [1];
+			fs.writeFileSync(pre, JSON.stringify(preRound, null, 2));
 			const failing = await embedRecoveredRounds([fileName, "missing-round.json"], roundsDir, {
 				embed: () => Promise.resolve([1]),
 				appendIndexRow: () => {},
