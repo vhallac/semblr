@@ -952,9 +952,8 @@ export default function (pi: ExtensionAPI) {
 					session.causalChain.length >= 1 ? session.causalChain[session.causalChain.length - 1].fileName : null,
 				...(round.lastCheckpointSummary ? { summary: round.lastCheckpointSummary } : {}),
 			},
-			() => {
-				// Push to causal chain — even on dedup, this ensures the in-memory buffer
-				// tracks every round seen in this session. Only after the write (issue #130).
+			(saved, roundData) => {
+				// Push to causal chain after the write (issue #130).
 				session.causalChain.push(
 					buildAgentEndChainEntry(
 						saved.fileName,
@@ -981,6 +980,19 @@ export default function (pi: ExtensionAPI) {
 					}
 				}
 			},
+			(savedDedup) => {
+				// F1 (PR #131): on dedup the postWrite step does not run, so the causal-chain
+				// entry must be pushed here to keep the in-memory buffer tracking every round.
+				session.causalChain.push(
+					buildAgentEndChainEntry(
+						savedDedup.fileName,
+						savedDedup.userPrompt,
+						savedDedup.responseText,
+						round.toolCalls.length,
+						round.toolCallNames,
+					),
+				);
+			},
 		);
 		switch (persist.kind) {
 			case "no-prompt":
@@ -1001,6 +1013,9 @@ export default function (pi: ExtensionAPI) {
 				return;
 			}
 			case "dedup": {
+				if (persist.dedupError) {
+					ctx.ui.setStatus("semblr", `\u{1f9e0} dedup step error: ${persist.dedupError}`);
+				}
 				// Even on dedup, run grouping if the round has a combined embedding
 				// (or if this is a short-prompt round with embedding skipped, use null)
 				const roundFileName = persist.saved.fileName;

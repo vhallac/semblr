@@ -42,9 +42,17 @@ export interface AgentEndPersistInput {
  */
 export type PostWriteStep = (saved: AgentEndRoundFile, roundData: Record<string, unknown>) => void;
 
+/**
+ * Runs only on the dedup path, after the content-hash collision is detected.
+ * Used for in-memory bookkeeping that must happen even when the round file is
+ * not rewritten (e.g. the causal-chain push). Exceptions are captured and
+ * reported on the result — they never change the dedup outcome.
+ */
+export type DedupStep = (saved: AgentEndRoundFile) => void;
+
 export type PersistAgentEndResult =
 	| { kind: "saved"; saved: AgentEndRoundFile; roundData: Record<string, unknown>; postWriteError?: string }
-	| { kind: "dedup"; saved: AgentEndRoundFile }
+	| { kind: "dedup"; saved: AgentEndRoundFile; dedupError?: string }
 	| { kind: "emergency"; fileName: string; message: string }
 	| { kind: "failed"; message: string }
 	| { kind: "no-prompt" };
@@ -65,6 +73,7 @@ export function persistAgentEndRound(
 	deps: AgentEndPersistDeps,
 	input: AgentEndPersistInput,
 	postWrite?: PostWriteStep,
+	onDedup?: DedupStep,
 ): PersistAgentEndResult {
 	const { fs, roundsDir } = deps;
 	const buildRoundFile = deps.buildRoundFile ?? buildAgentEndRoundFile;
@@ -113,6 +122,13 @@ export function persistAgentEndRound(
 
 	// Skip if already saved (deduplication by content hash)
 	if (fs.existsSync(roundPath)) {
+		if (onDedup) {
+			try {
+				onDedup(saved);
+			} catch (err) {
+				return { kind: "dedup", saved, dedupError: (err as Error).message };
+			}
+		}
 		return { kind: "dedup", saved };
 	}
 

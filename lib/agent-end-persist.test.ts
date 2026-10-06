@@ -123,6 +123,32 @@ describe("persistAgentEndRound (issue #130 handler-ordering)", () => {
 		expect(deps.fs.files.size).toBe(0);
 	});
 
+	it("dedup: onDedup step runs with the existing round file, without postWrite", () => {
+		const deps = makeDeps({ existsSync: (path: string) => path.endsWith(".json") });
+		const seen: string[] = [];
+		const result = persistAgentEndRound(
+			deps,
+			baseInput,
+			() => seen.push("postWrite"),
+			(saved) => seen.push(`onDedup:${saved.fileName}`),
+		);
+		expect(result.kind).toBe("dedup");
+		if (result.kind !== "dedup") return;
+		// onDedup receives the existing saved file; postWrite never runs on dedup
+		expect(seen).toEqual([`onDedup:${result.saved.fileName}`]);
+		expect(deps.fs.files.size).toBe(0);
+	});
+
+	it("dedup: onDedup throwing reports dedupError and stays dedup", () => {
+		const deps = makeDeps({ existsSync: (path: string) => path.endsWith(".json") });
+		const result = persistAgentEndRound(deps, baseInput, undefined, () => {
+			throw new Error("chain push exploded");
+		});
+		expect(result.kind).toBe("dedup");
+		if (result.kind !== "dedup") return;
+		expect(result.dedupError).toBe("chain push exploded");
+	});
+
 	it("write-first: postWrite step throwing does not lose the round file", () => {
 		const deps = makeDeps();
 		const result = persistAgentEndRound(deps, baseInput, () => {
