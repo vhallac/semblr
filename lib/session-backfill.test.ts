@@ -3,6 +3,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { createRoundFilePath } from "./hash.ts";
+import { buildAgentEndRoundFile } from "./round-capture.ts";
 import {
 	backfillMissingRounds,
 	embedRecoveredRounds,
@@ -219,6 +220,49 @@ describe("session-backfill", () => {
 		expect(skippedComplete).toBe(true);
 		expect(missing).toEqual([]);
 		expect(scanned).toBe(0);
+	});
+
+	it("F1: early exit recognizes a live-derived filename for a marker round (PR !131)", () => {
+		const sessionFile = writeSessionFile(tmp, [
+			userMsg("marker q"),
+			{
+				type: "message",
+				message: { role: "assistant", content: [{ type: "text", text: "marker a\nround_needs_followup" }] },
+			},
+		]);
+		const roundsDir = path.join(tmp, "rounds");
+		// Filename as the LIVE agent_end write would derive it (marker stripped
+		// before hashing). Pre-fix, the early exit hashed the raw marker text
+		// and missed this file.
+		fs.mkdirSync(roundsDir, { recursive: true });
+		const live = buildAgentEndRoundFile("marker q", ["marker a\nround_needs_followup"], undefined, []);
+		fs.writeFileSync(path.join(roundsDir, live!.fileName), "{}");
+		const { missing, scanned, skippedComplete } = findMissingRounds(sessionFile, roundsDir);
+		expect(skippedComplete).toBe(true);
+		expect(missing).toEqual([]);
+		expect(scanned).toBe(0);
+	});
+
+	it("F1: recovered marker rounds are stored with cleaned text, needsFollowup, and the live filename (PR !131)", () => {
+		const sessionFile = writeSessionFile(tmp, [
+			userMsg("marker q"),
+			{
+				type: "message",
+				message: { role: "assistant", content: [{ type: "text", text: "marker a\nround_needs_followup" }] },
+			},
+		]);
+		const roundsDir = path.join(tmp, "rounds");
+		// liveWindowMs: 0 — the fixture session file was just written and would
+		// otherwise be classified as a live source (F3 gating).
+		const outcome = backfillMissingRounds(sessionFile, roundsDir, fs, { liveWindowMs: 0 });
+		const live = buildAgentEndRoundFile("marker q", ["marker a\nround_needs_followup"], undefined, []);
+		expect(outcome.recoveredFiles).toEqual([live!.fileName]);
+		const stored = JSON.parse(fs.readFileSync(path.join(roundsDir, live!.fileName), "utf-8")) as {
+			responseSequence: string;
+			needsFollowup: boolean;
+		};
+		expect(stored.responseSequence).toBe("marker a");
+		expect(stored.needsFollowup).toBe(true);
 	});
 
 	it("does not early-exit when the last fileable round is missing", () => {

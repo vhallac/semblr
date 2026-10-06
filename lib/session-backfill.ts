@@ -13,9 +13,8 @@
 
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { createRoundFilePath } from "./hash.ts";
 import { parsePiSessionJsonl, reconstructPiSessionRounds } from "./pi-session.ts";
-import { buildAgentEndEmbeddingTexts, buildAgentEndRoundData } from "./round-capture.ts";
+import { buildAgentEndEmbeddingTexts, buildAgentEndRoundData, deriveRoundFile } from "./round-capture.ts";
 import type { RoundData, ToolCallDetail } from "./round-data.ts";
 import { normalize } from "./vector.ts";
 
@@ -93,7 +92,9 @@ export function findMissingRounds(
 	// skip per-round reconstruction and hashing entirely.
 	for (let i = parsed.length - 1; i >= 0; i--) {
 		if (!parsed[i].userPrompt) continue;
-		const lastFile = createRoundFilePath(parsed[i].userPrompt, parsed[i].responseSequence, parsed[i].toolCalls);
+		// F1 (PR !131): hash via the shared derivation so the early exit agrees
+		// with the live write's filename for followup-marker rounds.
+		const lastFile = deriveRoundFile(parsed[i].userPrompt, parsed[i].responseSequence, parsed[i].toolCalls).fileName;
 		if (fsImpl.existsSync(path.join(roundsDir, lastFile))) {
 			return { missing: [], scanned: 0, skippedComplete: true };
 		}
@@ -118,6 +119,9 @@ export function findMissingRounds(
 				responseSegments: round.responseSegments,
 				parentId: null,
 				userTimestamp: round.userTimestamp,
+				// F1 (PR !131): recovered copies carry the marker state the live
+				// write would have persisted instead of the default false.
+				needsFollowup: round.needsFollowup,
 			}),
 			// F4 (PR #131): mark recovered rounds so they are distinguishable from
 			// live-saved rounds (second-class retrieval provenance).

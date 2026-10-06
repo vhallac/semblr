@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import * as fs from "node:fs";
 import { splitAndExtractPrompt } from "./envelope-extract.ts";
-import { computeContentHash, createRoundFilePath } from "./hash.ts";
+import { computeContentHash, createRoundFilePath, type HashToolCallDetail } from "./hash.ts";
 import { extractText } from "./message-content.ts";
 import type { ChainEntry, CheckpointSummary, ResponseSegment, RoundData, ToolCallDetail } from "./round-data.ts";
 
@@ -100,6 +100,35 @@ export interface AgentEndRoundFile {
 	fileName: string;
 }
 
+export interface DerivedRoundFile {
+	userPrompt: string;
+	cleanedText: string;
+	needsFollowup: boolean;
+	fileName: string;
+}
+
+/**
+ * The shared round-file derivation (F1, PR !131 — the hash contract): raw
+ * response text → followup-marker strip → `needsFollowup` + cleaned text →
+ * content-hash filename. Single source of truth for the live agent_end write,
+ * session reconstruction, the backfill early exit, and the digest scripts, so
+ * every path derives identical filenames for the same conversation (marker
+ * rounds previously hashed divergently: 155/155 in the review measurement).
+ */
+export function deriveRoundFile(
+	userPrompt: string,
+	rawResponseText: string,
+	toolCalls?: readonly HashToolCallDetail[],
+): DerivedRoundFile {
+	const { cleanedText, needsFollowup } = extractAndStripFollowupMarker(rawResponseText);
+	return {
+		userPrompt,
+		cleanedText,
+		needsFollowup,
+		fileName: createRoundFilePath(userPrompt, cleanedText, toolCalls ? [...toolCalls] : undefined),
+	};
+}
+
 /**
  * Assemble everything needed to write the round file at agent_end (issue #130):
  * prompt extraction, response extraction with followup-marker strip, and the
@@ -115,12 +144,12 @@ export function buildAgentEndRoundFile(
 	const userPrompt = extractAgentEndUserPrompt(cachedPrompt, messages);
 	if (!userPrompt) return null;
 	const rawResponseText = extractAgentEndResponseText(accumulatedText, messages);
-	const { cleanedText, needsFollowup } = extractAndStripFollowupMarker(rawResponseText);
+	const derived = deriveRoundFile(userPrompt, rawResponseText, toolCalls);
 	return {
 		userPrompt,
-		responseText: cleanedText,
-		needsFollowup,
-		fileName: createRoundFilePath(userPrompt, cleanedText, [...toolCalls]),
+		responseText: derived.cleanedText,
+		needsFollowup: derived.needsFollowup,
+		fileName: derived.fileName,
 	};
 }
 

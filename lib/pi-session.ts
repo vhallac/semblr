@@ -1,5 +1,6 @@
 import { splitAndExtractPrompt } from "./envelope-extract.ts";
 import { createRoundFilePath } from "./hash.ts";
+import { extractAndStripFollowupMarker } from "./round-capture.ts";
 
 interface ParsedToolCallDetail {
 	index: number;
@@ -29,6 +30,8 @@ export interface ParsedPiRound {
 	toolCallCount: number;
 	toolCallNames: string[];
 	toolCalls: ParsedToolCallDetail[];
+	/** True when the response ended with the followup marker (F1, PR !131); marker is stripped from responseSequence. */
+	needsFollowup: boolean;
 }
 
 export interface ParsePiSessionOptions {
@@ -94,12 +97,17 @@ export function parsePiSessionJsonl(raw: string, options: ParsePiSessionOptions 
 
 	const flush = (responseEndTimestamp: number, isFinal: boolean) => {
 		if (!currentUserMsg) return;
-		const responseSequence = responseParts.join("\n\n").trim();
-		if (isFinal && options.skipShortFinalResponse && responseSequence.length < 20 && roundIndex === 0) return;
+		const rawSequence = responseParts.join("\n\n").trim();
+		if (isFinal && options.skipShortFinalResponse && rawSequence.length < 20 && roundIndex === 0) return;
+		// F1 (PR !131): strip the followup marker here — reconstruction, the
+		// backfill early exit, and the digest scripts all hash the parsed
+		// responseSequence, so it must carry the same cleaned text the live
+		// agent_end write hashes.
+		const { cleanedText, needsFollowup } = extractAndStripFollowupMarker(rawSequence);
 		const round: ParsedPiRound = {
 			id: currentUserMsg.id ?? "",
 			userPrompt: splitAndExtractPrompt(parsePiTextContent(currentUserMsg.message?.content)).userText,
-			responseSequence,
+			responseSequence: cleanedText,
 			responseSegments,
 			userTimestamp: currentUserMsg.message?.timestamp ?? 0,
 			responseEndTimestamp,
@@ -107,6 +115,7 @@ export function parsePiSessionJsonl(raw: string, options: ParsePiSessionOptions 
 			toolCallCount,
 			toolCallNames: [...new Set(toolNames)],
 			toolCalls,
+			needsFollowup,
 		};
 		if (options.sessionLabel) round.sessionLabel = options.sessionLabel;
 		rounds.push(round);

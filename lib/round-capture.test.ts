@@ -1,13 +1,16 @@
 import { describe, expect, it } from "vitest";
+import { createRoundFilePath } from "./hash.ts";
 import {
 	applyMessageEndToState,
 	buildAgentEndChainEntry,
 	buildAgentEndEmbeddingTexts,
 	buildAgentEndRoundData,
+	buildAgentEndRoundFile,
 	buildAgentEndToolSummary,
 	buildPromptEmbeddingInput,
 	cleanPromptNoise,
 	DEFAULT_PROMPT_NOISE_CLEANUP,
+	deriveRoundFile,
 	embeddingMaxTokensToResponseBytes,
 	extractAgentEndResponseText,
 	extractAgentEndUserPrompt,
@@ -894,5 +897,34 @@ describe("applyMessageEndToState", () => {
 		);
 		expect(state.toolCallNames).toEqual(["bash", "edit"]);
 		expect(state.toolCallCount).toBe(2);
+	});
+});
+
+describe("deriveRoundFile (F1 shared hash derivation, PR !131)", () => {
+	it("strips the marker, flags needsFollowup, and hashes the cleaned text", () => {
+		const derived = deriveRoundFile("prompt", "answer body\nround_needs_followup", [
+			{ arguments: "{}", result_summary: "ok" },
+		]);
+		expect(derived.cleanedText).toBe("answer body");
+		expect(derived.needsFollowup).toBe(true);
+		expect(derived.fileName).toBe(
+			createRoundFilePath("prompt", "answer body", [{ arguments: "{}", result_summary: "ok" }]),
+		);
+	});
+
+	it("leaves marker-less text untouched with needsFollowup=false", () => {
+		const derived = deriveRoundFile("prompt", "answer body");
+		expect(derived.cleanedText).toBe("answer body");
+		expect(derived.needsFollowup).toBe(false);
+		expect(derived.fileName).toBe(createRoundFilePath("prompt", "answer body"));
+	});
+
+	it("live↔derivation parity: buildAgentEndRoundFile derives the same filename for a marker round", () => {
+		const live = buildAgentEndRoundFile("prompt", ["answer body\nround_needs_followup"], undefined, []);
+		expect(live).not.toBeNull();
+		const derived = deriveRoundFile("prompt", "answer body\nround_needs_followup", []);
+		expect(live?.fileName).toBe(derived.fileName);
+		expect(live?.needsFollowup).toBe(true);
+		expect(live?.responseText).toBe(derived.cleanedText);
 	});
 });

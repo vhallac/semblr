@@ -23,7 +23,6 @@ import {
 	writeBm25Index,
 } from "../lib/bm25-index.ts";
 import { type EmbeddingModelRegistry, embedText, normalize } from "../lib/embed.ts";
-import { computeContentHash } from "../lib/hash.ts";
 import {
 	appendVectorIndexEntry,
 	findStaleContentMatches as findStaleContentMatchesInDir,
@@ -34,7 +33,7 @@ import {
 	type VectorIndexEntry,
 } from "../lib/index-io.ts";
 import { type ParsedPiRound, parsePiSessionJsonl } from "../lib/pi-session.ts";
-import { buildPromptEmbeddingInput } from "../lib/round-capture.ts";
+import { buildPromptEmbeddingInput, deriveRoundFile } from "../lib/round-capture.ts";
 import {
 	resolveScriptApiKey,
 	resolveScriptConfig,
@@ -186,7 +185,7 @@ export async function runDigestAll(options: DigestAllOptions = {}): Promise<numb
 	for (const { filePath, label } of jsonlFiles) {
 		const rounds = parseSessionFile(filePath, label, { fsImpl: f });
 		const newRounds = rounds.filter((t) => {
-			const key = `${computeContentHash(t.userPrompt, t.responseSequence, t.toolCalls)}.json`;
+			const key = deriveRoundFile(t.userPrompt, t.responseSequence, t.toolCalls).fileName;
 			return !existingRounds.has(key) || modelMismatchedRounds.has(key);
 		});
 		skippedTotal += rounds.length - newRounds.length;
@@ -206,7 +205,7 @@ export async function runDigestAll(options: DigestAllOptions = {}): Promise<numb
 	let errors = 0;
 
 	async function processRound(round: Round): Promise<void> {
-		const roundFile = `${computeContentHash(round.userPrompt, round.responseSequence, round.toolCalls)}.json`;
+		const roundFile = deriveRoundFile(round.userPrompt, round.responseSequence, round.toolCalls).fileName;
 		const roundId = `${round.sessionLabel}/${roundFile}`;
 
 		// Check for stale files whose stored full hash material belongs under this
