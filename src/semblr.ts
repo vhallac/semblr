@@ -1257,7 +1257,17 @@ export default function (pi: ExtensionAPI) {
 							if (embedKey) {
 								const embedResult = await embedRecoveredRounds(backfill.recoveredFiles, ROUNDS_DIR, {
 									embed: (text) => embedText(text, embedKey, embeddingClientDeps(ctx)),
-									appendIndexRow: (label, vec) => appendToIndex(label, vec, SEMBLR_CONFIG.embeddingModel),
+									appendIndexRow: (label, vec, hash) =>
+										appendToIndex(label, vec, SEMBLR_CONFIG.embeddingModel, hash),
+									// F4 (PR !131): live-parity prompt derivation — recovered prompts go
+									// through the same buildPromptEmbeddingInput cleanup + hash stamp
+									// as agent_end, keeping :prompt rows in the same domain as queries.
+									preparePrompt: (userPrompt) =>
+										buildPromptEmbeddingInput(
+											userPrompt,
+											PROMPT_NOISE_CLEANUP,
+											SEMBLR_CONFIG.embeddingMaxTokens,
+										),
 									// F5 (PR !131): label-guard so a re-run after a crash between the
 									// appends and the embedding write does not duplicate index rows.
 									hasIndexRow: (label) =>

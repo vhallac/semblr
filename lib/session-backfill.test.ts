@@ -3,7 +3,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { createRoundFilePath } from "./hash.ts";
-import { buildAgentEndRoundFile } from "./round-capture.ts";
+import { buildAgentEndRoundFile, buildPromptEmbeddingInput } from "./round-capture.ts";
 import type { ToolCallDetail } from "./round-data.ts";
 import {
 	backfillMissingRounds,
@@ -216,6 +216,42 @@ describe("session-backfill", () => {
 				writeRoundEmbedding: () => {},
 			});
 			expect(second.embedded).toEqual([]);
+		});
+
+		it("F4 parity: prompt goes through buildPromptEmbeddingInput cleanup and the :prompt row carries the hash stamp", async () => {
+			const sessionFile = writeSessionFile(tmp, [
+				userMsg("explain this\n```python\n" + "x = 1\n".repeat(200) + "```"),
+			]);
+			const roundsDir = path.join(tmp, "rounds");
+			const outcome = backfillMissingRounds(sessionFile, roundsDir, undefined, { liveWindowMs: 0 });
+			const fileName = outcome.recoveredFiles[0];
+			const embedded: string[] = [];
+			const rowHashes = new Map<string, string | undefined>();
+			const result = await embedRecoveredRounds(outcome.recoveredFiles, roundsDir, {
+				embed: (text) => {
+					embedded.push(text);
+					return Promise.resolve([text.length, 3]);
+				},
+				appendIndexRow: (label, _vec, hash) => rowHashes.set(label, hash),
+				// live-parity derivation (same convention as semblr.ts agent_end),
+				// with a small clip so the collapsed fence shrinks the input
+				preparePrompt: (userPrompt) =>
+					buildPromptEmbeddingInput(userPrompt, { fenceMaxChars: 4, jsonMaxChars: 0, repeatMaxChars: 0 }, 8000),
+				writeRoundEmbedding: () => {},
+			});
+			expect(result.embedded).toEqual([fileName]);
+			// the prompt embedding input is the cleaned prompt, not the raw round text
+			const raw = JSON.parse(fs.readFileSync(path.join(roundsDir, fileName), "utf-8")).userPrompt as string;
+			const { text: expected, hash } = buildPromptEmbeddingInput(
+				raw,
+				{ fenceMaxChars: 4, jsonMaxChars: 0, repeatMaxChars: 0 },
+				8000,
+			);
+			expect(embedded[0]).toBe(expected);
+			expect(expected.length).toBeLessThan(raw.length);
+			// the :prompt row is hash-stamped (same domain as live rows); :response is not
+			expect(rowHashes.get(`${fileName}:prompt`)).toBe(hash);
+			expect(rowHashes.get(`${fileName}:response`)).toBeUndefined();
 		});
 
 		it("F5: re-run after a crash between appends and embedding write does not duplicate rows", async () => {

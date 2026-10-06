@@ -263,7 +263,14 @@ export interface RecoveredEmbedDeps {
 	/** Embed a text input; must return the raw (unnormalized) vector. */
 	embed: (text: string) => Promise<number[]>;
 	/** Append an index row for the given round file label (e.g. "x.json:prompt"). */
-	appendIndexRow: (label: string, vector: number[]) => void;
+	appendIndexRow: (label: string, vector: number[], embeddingInputHash?: string) => void;
+	/**
+	 * Optional live-parity prompt derivation (F4): noise-cleanup + clip + input
+	 * hash over the raw user prompt (the `buildPromptEmbeddingInput` convention).
+	 * When absent, the raw prompt is embedded as-is and the :prompt row carries
+	 * no hash stamp (matches the pre-#106 live convention).
+	 */
+	preparePrompt?: (userPrompt: string) => { text: string; hash: string };
 	/**
 	 * Optional duplicate guard (F5): when it reports the label already present
 	 * in the index, the append is skipped. Makes re-runs idempotent when a
@@ -278,7 +285,11 @@ export interface RecoveredEmbedDeps {
  * Embed recovered (backfilled) rounds so they participate in semantic
  * retrieval (F4, PR #131): embeds the prompt, the clipped response, and the
  * combined text, appends :prompt/:response index rows, and stores the combined
- * vector as the round's promptEmbedding (same convention as agent_end).
+ * vector as the round's promptEmbedding (same convention as agent_end). With
+ * `preparePrompt`, the prompt input goes through the live path's
+ * `buildPromptEmbeddingInput` cleanup and the :prompt row is stamped with the
+ * embedding-input hash, keeping recovered rows in the same domain as live ones
+ * (query embedding is cleaned via the same derivation).
  * Rounds that already carry a promptEmbedding are skipped. With `hasIndexRow`,
  * index appends are label-guarded, so a re-run after a crash that landed
  * between the appends and the embedding write does not duplicate rows (F5).
@@ -297,20 +308,24 @@ export async function embedRecoveredRounds(
 		try {
 			const round = JSON.parse(fsImpl.readFileSync(path.join(roundsDir, fileName), "utf-8")) as RoundData;
 			if (round.promptEmbedding) continue;
+			const { text: promptInput, hash: promptInputHash } = deps.preparePrompt?.(round.userPrompt) ?? {
+				text: round.userPrompt,
+				hash: undefined as string | undefined,
+			};
 			const { clippedResponse, combinedText } = buildAgentEndEmbeddingTexts(
-				round.userPrompt,
+				promptInput,
 				round.responseSequence,
 				opts.maxResponseBytes,
 			);
 			const [promptVec, responseVec, combinedVec] = await Promise.all([
-				deps.embed(round.userPrompt),
+				deps.embed(promptInput),
 				deps.embed(clippedResponse),
 				deps.embed(combinedText),
 			]);
 			const promptLabel = `${fileName}:prompt`;
 			const responseLabel = `${fileName}:response`;
 			if (!deps.hasIndexRow?.(promptLabel)) {
-				deps.appendIndexRow(promptLabel, normalize(promptVec));
+				deps.appendIndexRow(promptLabel, normalize(promptVec), promptInputHash);
 			}
 			if (!deps.hasIndexRow?.(responseLabel)) {
 				deps.appendIndexRow(responseLabel, normalize(responseVec));
