@@ -113,7 +113,7 @@ export function persistAgentEndRound(
 							toolCallNames: input.toolCallNames,
 							toolCalls: input.toolCalls,
 							responseSegments: input.responseSegments,
-							parentId: null,
+							parentId: input.parentId,
 							needsFollowup: fbNeedsFollowup,
 						}),
 						null,

@@ -124,6 +124,19 @@ describe("persistAgentEndRound (issue #130 handler-ordering)", () => {
 		expect(round.needsFollowup).toBe(true);
 	});
 
+	it("emergency: parent linkage is preserved — parentId persists instead of null (F7)", () => {
+		const deps = makeDeps({
+			buildRoundFile: () => {
+				throw new Error("assembly blew up");
+			},
+		});
+		const linked = { ...baseInput, parentId: "parent.json" };
+		const result = persistAgentEndRound(deps, linked);
+		if (result.kind !== "emergency") return;
+		const round = JSON.parse([...deps.fs.files.values()][0]);
+		expect(round.parentId).toBe("parent.json");
+	});
+
 	it("failed: emergency write failing loses nothing silently — reports failure", () => {
 		const deps = makeDeps({
 			buildRoundFile: () => {
