@@ -13,6 +13,7 @@
 
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { createRoundFilePath } from "./hash.ts";
 import { parsePiSessionJsonl, reconstructPiSessionRounds } from "./pi-session.ts";
 import { buildAgentEndEmbeddingTexts, buildAgentEndRoundData } from "./round-capture.ts";
 import type { RoundData, ToolCallDetail } from "./round-data.ts";
@@ -25,6 +26,8 @@ export interface BackfillOutcome {
 	scanned: number;
 	/** True when the source file looked live and backfill was skipped (F3). */
 	skippedLive?: boolean;
+	/** True when the last-round early exit determined the session is fully backed up. */
+	skippedComplete?: boolean;
 }
 
 /**
@@ -80,9 +83,23 @@ export function findMissingRounds(
 	sessionFile: string,
 	roundsDir: string,
 	fsImpl: Pick<typeof fs, "existsSync"> = fs,
-): { missing: BackfillWrite[]; scanned: number } {
+): { missing: BackfillWrite[]; scanned: number; skippedComplete?: boolean } {
 	const raw = fs.readFileSync(sessionFile, "utf-8");
-	const reconstructed = reconstructPiSessionRounds(parsePiSessionJsonl(raw));
+	const parsed = parsePiSessionJsonl(raw);
+	// Startup-cost early exit (PR #131 note): rounds are persisted in order at
+	// each agent_end, with the round file written before any fallible post-write
+	// step — so a mid-round death loses only the round in progress. If the LAST
+	// fileable round's file already exists, all earlier rounds are on disk too;
+	// skip per-round reconstruction and hashing entirely.
+	for (let i = parsed.length - 1; i >= 0; i--) {
+		if (!parsed[i].userPrompt) continue;
+		const lastFile = createRoundFilePath(parsed[i].userPrompt, parsed[i].responseSequence, parsed[i].toolCalls);
+		if (fsImpl.existsSync(path.join(roundsDir, lastFile))) {
+			return { missing: [], scanned: 0, skippedComplete: true };
+		}
+		break;
+	}
+	const reconstructed = reconstructPiSessionRounds(parsed);
 	const missing: BackfillWrite[] = [];
 	let scanned = 0;
 	for (const { roundFile, round } of reconstructed) {
@@ -133,14 +150,14 @@ export function backfillMissingRounds(
 	} catch {
 		// Unreadable mtime: fall through and attempt the backfill.
 	}
-	const { missing, scanned } = findMissingRounds(sessionFile, roundsDir, fsImpl);
+	const { missing, scanned, skippedComplete } = findMissingRounds(sessionFile, roundsDir, fsImpl);
 	const recovered: string[] = [];
 	for (const { fileName, roundData } of missing) {
 		fsImpl.mkdirSync(roundsDir, { recursive: true });
 		fsImpl.writeFileSync(path.join(roundsDir, fileName), JSON.stringify(roundData, null, 2));
 		recovered.push(fileName);
 	}
-	return { recoveredFiles: recovered, scanned };
+	return { recoveredFiles: recovered, scanned, ...(skippedComplete ? { skippedComplete: true } : {}) };
 }
 
 /** Injectable embedding + index-update surface for recovered-round embedding (F4). */

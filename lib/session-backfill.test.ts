@@ -61,8 +61,11 @@ describe("session-backfill", () => {
 		const first = fs.readFileSync(path.join(roundsDir, createRoundFilePath("q", "a", [])), "utf-8");
 
 		const outcome = backfillMissingRounds(sessionFile, roundsDir, undefined, { liveWindowMs: 0 });
+		// Startup-cost early exit: with every round on disk, the last-round check
+		// short-circuits before the full scan.
 		expect(outcome.recoveredFiles).toEqual([]);
-		expect(outcome.scanned).toBe(1);
+		expect(outcome.scanned).toBe(0);
+		expect(outcome.skippedComplete).toBe(true);
 		expect(fs.readFileSync(path.join(roundsDir, createRoundFilePath("q", "a", [])), "utf-8")).toBe(first);
 	});
 
@@ -198,6 +201,42 @@ describe("session-backfill", () => {
 			expect(failing.errors).toHaveLength(1);
 			expect(failing.errors[0]).toContain("missing-round.json");
 		});
+	});
+
+	it("early-exits when the last fileable round already exists (startup cost note)", () => {
+		const sessionFile = writeSessionFile(tmp, [
+			userMsg("first q"),
+			assistantMsg("first a"),
+			userMsg("second q", "u2"),
+			assistantMsg("second a"),
+		]);
+		const roundsDir = path.join(tmp, "rounds");
+		// Only the LAST round's file exists — earlier rounds are "missing" but the
+		// write-first persist order guarantees they are present in reality.
+		fs.mkdirSync(roundsDir, { recursive: true });
+		fs.writeFileSync(path.join(roundsDir, createRoundFilePath("second q", "second a", [])), "{}");
+		const { missing, scanned, skippedComplete } = findMissingRounds(sessionFile, roundsDir);
+		expect(skippedComplete).toBe(true);
+		expect(missing).toEqual([]);
+		expect(scanned).toBe(0);
+	});
+
+	it("does not early-exit when the last fileable round is missing", () => {
+		const sessionFile = writeSessionFile(tmp, [
+			userMsg("first q"),
+			assistantMsg("first a"),
+			userMsg("second q", "u2"),
+			assistantMsg("second a"),
+		]);
+		const roundsDir = path.join(tmp, "rounds");
+		// Only an EARLIER round's file exists — full scan must still run.
+		fs.mkdirSync(roundsDir, { recursive: true });
+		fs.writeFileSync(path.join(roundsDir, createRoundFilePath("first q", "first a", [])), "{}");
+		const { missing, scanned, skippedComplete } = findMissingRounds(sessionFile, roundsDir);
+		expect(skippedComplete).toBeUndefined();
+		expect(scanned).toBe(2);
+		expect(missing).toHaveLength(1);
+		expect(missing[0].fileName).toBe(createRoundFilePath("second q", "second a", []));
 	});
 });
 
