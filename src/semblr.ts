@@ -1219,6 +1219,9 @@ export default function (pi: ExtensionAPI) {
 		if (backfillSource) {
 			try {
 				const backfill = backfillMissingRounds(backfillSource, ROUNDS_DIR);
+				if (backfill.skippedLive) {
+					ctx.ui.setStatus("semblr", "\u{1f9e0} backfill skipped: previous session looks live (F3)");
+				}
 				if (backfill.recoveredFiles.length > 0) {
 					for (const fileName of backfill.recoveredFiles) {
 						const roundData = readRoundJson(ROUNDS_DIR, fileName);

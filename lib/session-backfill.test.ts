@@ -38,7 +38,7 @@ describe("session-backfill", () => {
 		expect(missing).toHaveLength(1);
 		expect(missing[0].fileName).toBe(expected);
 
-		const outcome = backfillMissingRounds(sessionFile, roundsDir);
+		const outcome = backfillMissingRounds(sessionFile, roundsDir, undefined, { liveWindowMs: 0 });
 		expect(outcome.recoveredFiles).toEqual([expected]);
 		expect(outcome.scanned).toBe(1);
 
@@ -51,10 +51,10 @@ describe("session-backfill", () => {
 	it("is idempotent — existing round files are skipped", () => {
 		const sessionFile = writeSessionFile(tmp, [userMsg("q"), assistantMsg("a")]);
 		const roundsDir = path.join(tmp, "rounds");
-		backfillMissingRounds(sessionFile, roundsDir);
+		backfillMissingRounds(sessionFile, roundsDir, undefined, { liveWindowMs: 0 });
 		const first = fs.readFileSync(path.join(roundsDir, createRoundFilePath("q", "a", [])), "utf-8");
 
-		const outcome = backfillMissingRounds(sessionFile, roundsDir);
+		const outcome = backfillMissingRounds(sessionFile, roundsDir, undefined, { liveWindowMs: 0 });
 		expect(outcome.recoveredFiles).toEqual([]);
 		expect(outcome.scanned).toBe(1);
 		expect(fs.readFileSync(path.join(roundsDir, createRoundFilePath("q", "a", [])), "utf-8")).toBe(first);
@@ -84,7 +84,7 @@ describe("session-backfill", () => {
 			assistantMsg("second answer"),
 		]);
 		const roundsDir = path.join(tmp, "rounds");
-		const outcome = backfillMissingRounds(sessionFile, roundsDir);
+		const outcome = backfillMissingRounds(sessionFile, roundsDir, undefined, { liveWindowMs: 0 });
 		expect(outcome.recoveredFiles).toHaveLength(2);
 		const toolRound = JSON.parse(fs.readFileSync(path.join(roundsDir, outcome.recoveredFiles[1]), "utf-8"));
 		expect(toolRound.toolCalls).toHaveLength(1);
@@ -108,8 +108,28 @@ describe("session-backfill", () => {
 			existsSync: () => true,
 			mkdirSync: fs.mkdirSync,
 			writeFileSync: fs.writeFileSync,
+			statSync: fs.statSync,
 		});
 		expect(outcome.recoveredFiles).toEqual([]);
+	});
+
+	it("skips a live source session (mtime within the live window) — F3", () => {
+		const sessionFile = writeSessionFile(tmp, [userMsg("q"), assistantMsg("a")]);
+		const roundsDir = path.join(tmp, "rounds");
+		// Fresh file — mtime is now, inside the default live window.
+		const outcome = backfillMissingRounds(sessionFile, roundsDir, undefined, { nowMs: Date.now() });
+		expect(outcome.skippedLive).toBe(true);
+		expect(outcome.recoveredFiles).toEqual([]);
+		expect(fs.existsSync(roundsDir)).toBe(false);
+	});
+
+	it("backfills a stale source session whose mtime is older than the live window — F3", () => {
+		const sessionFile = writeSessionFile(tmp, [userMsg("q"), assistantMsg("a")]);
+		const roundsDir = path.join(tmp, "rounds");
+		fs.utimesSync(sessionFile, new Date(0), new Date(0));
+		const outcome = backfillMissingRounds(sessionFile, roundsDir, undefined, { nowMs: Date.now() });
+		expect(outcome.skippedLive).toBeUndefined();
+		expect(outcome.recoveredFiles).toEqual([createRoundFilePath("q", "a", [])]);
 	});
 });
 

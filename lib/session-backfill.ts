@@ -22,7 +22,17 @@ export interface BackfillOutcome {
 	recoveredFiles: string[];
 	/** Number of fileable rounds found in the session file. */
 	scanned: number;
+	/** True when the source file looked live and backfill was skipped (F3). */
+	skippedLive?: boolean;
 }
+
+/**
+ * A source file modified within this window is considered live (still being
+ * written by a running pi process) and backfilling from it is skipped (F3,
+ * PR #131): a live session's tail round is incomplete and will be written by
+ * the live process itself. Tests can shrink the window for determinism.
+ */
+export const LIVE_SESSION_WINDOW_MS = 5 * 60 * 1000;
 
 export interface BackfillWrite {
 	fileName: string;
@@ -97,13 +107,26 @@ export function findMissingRounds(
 
 /**
  * Recover lost rounds from a previous session file. Writes any missing round
- * file into roundsDir and returns what was recovered.
+ * file into roundsDir and returns what was recovered. Sources modified within
+ * the live window are treated as live sessions and skipped (F3).
  */
 export function backfillMissingRounds(
 	sessionFile: string,
 	roundsDir: string,
-	fsImpl: Pick<typeof fs, "existsSync" | "mkdirSync" | "writeFileSync"> = fs,
+	fsImpl: Pick<typeof fs, "existsSync" | "mkdirSync" | "writeFileSync" | "statSync"> = fs,
+	opts: { liveWindowMs?: number; nowMs?: number } = {},
 ): BackfillOutcome {
+	const window = opts.liveWindowMs ?? LIVE_SESSION_WINDOW_MS;
+	try {
+		// Truncate sub-ms precision — a just-written file must not look like a
+		// future timestamp and be misclassified as live.
+		const ageMs = (opts.nowMs ?? Date.now()) - Math.floor(fsImpl.statSync(sessionFile).mtimeMs);
+		if (ageMs < window) {
+			return { recoveredFiles: [], scanned: 0, skippedLive: true };
+		}
+	} catch {
+		// Unreadable mtime: fall through and attempt the backfill.
+	}
 	const { missing, scanned } = findMissingRounds(sessionFile, roundsDir, fsImpl);
 	const recovered: string[] = [];
 	for (const { fileName, roundData } of missing) {
