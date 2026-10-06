@@ -133,7 +133,7 @@ function collectMissingRounds(
 			// F4 (PR #131): mark recovered rounds so they are distinguishable from
 			// live-saved rounds (second-class retrieval provenance).
 			recovered: true,
-		} as unknown as RoundData;
+		} satisfies RoundData;
 		missing.push({ fileName: roundFile, roundData });
 	}
 	return { missing, scanned };

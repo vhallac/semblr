@@ -62,6 +62,9 @@ export function getAgentEndParentId(chain: readonly { fileName: string }[]): str
 	return chain.length >= 2 ? chain[chain.length - 2].fileName : null;
 }
 
+/** The complete round shape buildAgentEndRoundData produces (minus backfill-only flags). */
+export type AgentEndRoundData = Omit<RoundData, "recovered">;
+
 export function buildAgentEndRoundData(args: {
 	userPrompt: string;
 	responseText: string;
@@ -74,7 +77,7 @@ export function buildAgentEndRoundData(args: {
 	userTimestamp?: number;
 	needsFollowup?: boolean;
 	summary?: CheckpointSummary;
-}): Record<string, unknown> {
+}): AgentEndRoundData {
 	return {
 		id: computeContentHash(args.userPrompt, args.responseText, args.toolCalls),
 		userPrompt: args.userPrompt,

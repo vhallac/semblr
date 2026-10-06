@@ -22,6 +22,8 @@ export interface ToolCallDetail {
 }
 
 export interface RoundData {
+	/** Content hash (MD5 of userPrompt + responseSequence) — matches the round filename stem. */
+	id?: string;
 	userPrompt: string;
 	responseSequence: string;
 	turnIndex: number;
@@ -29,10 +31,13 @@ export interface RoundData {
 	toolCallCount?: number;
 	toolCallNames?: string[];
 	toolCalls?: ToolCallDetail[];
+	responseSegments?: ResponseSegment[];
 	promptEmbedding?: number[];
 	parentId?: string | null;
 	relatedParentId?: string | null;
 	needsFollowup?: boolean;
+	/** Set on rounds recovered from previous session files (backfill), not live-saved rounds. */
+	recovered?: boolean;
 	summary?: CheckpointSummary;
 }
 
