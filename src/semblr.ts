@@ -94,7 +94,7 @@ import {
 	toolIndexPathForRoundsDir,
 } from "../lib/search-tools.ts";
 import { loadSemblrConfig, type SemblrConfig } from "../lib/semblr-config.ts";
-import { backfillMissingRounds, findPreviousSessionFile } from "../lib/session-backfill.ts";
+import { backfillMissingRounds, embedRecoveredRounds, findPreviousSessionFile } from "../lib/session-backfill.ts";
 import type { CheckpointSummary, ToolCallDetail } from "../lib/state.ts";
 import { contextCacheStore, contextCacheValid, createRound, createSession } from "../lib/state.ts";
 import {
@@ -1229,8 +1229,38 @@ export default function (pi: ExtensionAPI) {
 					}
 					ctx.ui.setStatus(
 						"semblr",
-						`🧠 backfill: recovered ${backfill.recoveredFiles.length} round(s) from previous session`,
+						`\u{1f9e0} backfill: recovered ${backfill.recoveredFiles.length} round(s) from previous session`,
 					);
+					// F4 (PR #131): queue recovered rounds for embedding so they reach
+					// semantic retrieval, not just bm25. Best-effort — a failure here
+					// costs embeddings, never the recovered round files.
+					try {
+						const embedKey = await getApiKey(ctx, { config: SEMBLR_CONFIG });
+						if (embedKey) {
+							const embedResult = await embedRecoveredRounds(backfill.recoveredFiles, ROUNDS_DIR, {
+								embed: (text) => embedText(text, embedKey, embeddingClientDeps(ctx)),
+								appendIndexRow: (label, vec) => appendToIndex(label, vec, SEMBLR_CONFIG.embeddingModel),
+								writeRoundEmbedding: (fileName, vec) => {
+									const p = `${ROUNDS_DIR}/${fileName}`;
+									const existing = JSON.parse(fs.readFileSync(p, "utf-8"));
+									existing.promptEmbedding = vec;
+									fs.writeFileSync(p + ".tmp." + process.pid, JSON.stringify(existing, null, 2));
+									fs.renameSync(p + ".tmp." + process.pid, p);
+								},
+							});
+							if (embedResult.embedded.length > 0) {
+								ctx.ui.setStatus(
+									"semblr",
+									`\u{1f9e0} backfill: embedded ${embedResult.embedded.length} recovered round(s)`,
+								);
+							}
+							for (const message of embedResult.errors) {
+								ctx.ui.setStatus("semblr", `\u{1f9e0} backfill embed error: ${message}`);
+							}
+						}
+					} catch (err) {
+						ctx.ui.setStatus("semblr", `\u{1f9e0} backfill embed failed: ${(err as Error).message}`);
+					}
 				}
 			} catch (err) {
 				ctx.ui.setStatus("semblr", `🧠 backfill failed: ${(err as Error).message}`);

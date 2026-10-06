@@ -14,8 +14,9 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { parsePiSessionJsonl, reconstructPiSessionRounds } from "./pi-session.ts";
-import { buildAgentEndRoundData } from "./round-capture.ts";
+import { buildAgentEndEmbeddingTexts, buildAgentEndRoundData } from "./round-capture.ts";
 import type { RoundData, ToolCallDetail } from "./round-data.ts";
+import { normalize } from "./vector.ts";
 
 export interface BackfillOutcome {
 	/** Round files that were written by this backfill run. */
@@ -89,17 +90,22 @@ export function findMissingRounds(
 		if (!round.userPrompt) continue;
 		scanned++;
 		if (fsImpl.existsSync(path.join(roundsDir, roundFile))) continue;
-		const roundData = buildAgentEndRoundData({
-			userPrompt: round.userPrompt,
-			responseText: round.responseSequence,
-			turnIndex: round.turnIndex,
-			toolCallCount: round.toolCallCount,
-			toolCallNames: round.toolCallNames,
-			toolCalls: round.toolCalls as ToolCallDetail[],
-			responseSegments: round.responseSegments,
-			parentId: null,
-			userTimestamp: round.userTimestamp,
-		}) as unknown as RoundData;
+		const roundData = {
+			...buildAgentEndRoundData({
+				userPrompt: round.userPrompt,
+				responseText: round.responseSequence,
+				turnIndex: round.turnIndex,
+				toolCallCount: round.toolCallCount,
+				toolCallNames: round.toolCallNames,
+				toolCalls: round.toolCalls as ToolCallDetail[],
+				responseSegments: round.responseSegments,
+				parentId: null,
+				userTimestamp: round.userTimestamp,
+			}),
+			// F4 (PR #131): mark recovered rounds so they are distinguishable from
+			// live-saved rounds (second-class retrieval provenance).
+			recovered: true,
+		} as unknown as RoundData;
 		missing.push({ fileName: roundFile, roundData });
 	}
 	return { missing, scanned };
@@ -135,4 +141,56 @@ export function backfillMissingRounds(
 		recovered.push(fileName);
 	}
 	return { recoveredFiles: recovered, scanned };
+}
+
+/** Injectable embedding + index-update surface for recovered-round embedding (F4). */
+export interface RecoveredEmbedDeps {
+	/** Embed a text input; must return the raw (unnormalized) vector. */
+	embed: (text: string) => Promise<number[]>;
+	/** Append an index row for the given round file label (e.g. "x.json:prompt"). */
+	appendIndexRow: (label: string, vector: number[]) => void;
+	/** Update the round file's promptEmbedding atomically. */
+	writeRoundEmbedding: (fileName: string, vector: number[]) => void;
+}
+
+/**
+ * Embed recovered (backfilled) rounds so they participate in semantic
+ * retrieval (F4, PR #131): embeds the prompt, the clipped response, and the
+ * combined text, appends :prompt/:response index rows, and stores the combined
+ * vector as the round's promptEmbedding (same convention as agent_end).
+ * Rounds that already carry a promptEmbedding are skipped. Errors are
+ * per-round and reported — one bad round never aborts the queue.
+ */
+export async function embedRecoveredRounds(
+	fileNames: string[],
+	roundsDir: string,
+	deps: RecoveredEmbedDeps,
+	fsImpl: Pick<typeof fs, "readFileSync"> = fs,
+	opts: { maxResponseBytes?: number } = {},
+): Promise<{ embedded: string[]; errors: string[] }> {
+	const embedded: string[] = [];
+	const errors: string[] = [];
+	for (const fileName of fileNames) {
+		try {
+			const round = JSON.parse(fsImpl.readFileSync(path.join(roundsDir, fileName), "utf-8")) as RoundData;
+			if (round.promptEmbedding) continue;
+			const { clippedResponse, combinedText } = buildAgentEndEmbeddingTexts(
+				round.userPrompt,
+				round.responseSequence,
+				opts.maxResponseBytes,
+			);
+			const [promptVec, responseVec, combinedVec] = await Promise.all([
+				deps.embed(round.userPrompt),
+				deps.embed(clippedResponse),
+				deps.embed(combinedText),
+			]);
+			deps.appendIndexRow(`${fileName}:prompt`, normalize(promptVec));
+			deps.appendIndexRow(`${fileName}:response`, normalize(responseVec));
+			deps.writeRoundEmbedding(fileName, normalize(combinedVec));
+			embedded.push(fileName);
+		} catch (err) {
+			errors.push(`${fileName}: ${(err as Error).message}`);
+		}
+	}
+	return { embedded, errors };
 }

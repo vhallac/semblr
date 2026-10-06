@@ -3,7 +3,12 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { createRoundFilePath } from "./hash.ts";
-import { backfillMissingRounds, findMissingRounds, findPreviousSessionFile } from "./session-backfill.ts";
+import {
+	backfillMissingRounds,
+	embedRecoveredRounds,
+	findMissingRounds,
+	findPreviousSessionFile,
+} from "./session-backfill.ts";
 
 function writeSessionFile(dir: string, lines: object[]): string {
 	const file = path.join(dir, "session.jsonl");
@@ -46,6 +51,7 @@ describe("session-backfill", () => {
 		expect(written.userPrompt).toBe("hello world");
 		expect(written.responseSequence).toBe("hi there");
 		expect(written.promptEmbedding).toBeUndefined();
+		expect(written.recovered).toBe(true);
 	});
 
 	it("is idempotent — existing round files are skipped", () => {
@@ -130,6 +136,68 @@ describe("session-backfill", () => {
 		const outcome = backfillMissingRounds(sessionFile, roundsDir, undefined, { nowMs: Date.now() });
 		expect(outcome.skippedLive).toBeUndefined();
 		expect(outcome.recoveredFiles).toEqual([createRoundFilePath("q", "a", [])]);
+	});
+
+	describe("embedRecoveredRounds (F4)", () => {
+		it("embeds prompt, clipped response, and combined text; stores combined as promptEmbedding", async () => {
+			const sessionFile = writeSessionFile(tmp, [userMsg("q"), assistantMsg("a long answer")]);
+			const roundsDir = path.join(tmp, "rounds");
+			const outcome = backfillMissingRounds(sessionFile, roundsDir, undefined, { liveWindowMs: 0 });
+			const fileName = outcome.recoveredFiles[0];
+			const rows: Array<[string, number[]]> = [];
+			const result = await embedRecoveredRounds(outcome.recoveredFiles, roundsDir, {
+				embed: (text) => Promise.resolve([text.length, 1]),
+				appendIndexRow: (label, vec) => rows.push([label, vec]),
+				writeRoundEmbedding: (name, vec) => {
+					const p = path.join(roundsDir, name);
+					const existing = JSON.parse(fs.readFileSync(p, "utf-8"));
+					existing.promptEmbedding = vec;
+					fs.writeFileSync(p, JSON.stringify(existing, null, 2));
+				},
+			});
+			expect(result.embedded).toEqual([fileName]);
+			expect(result.errors).toEqual([]);
+			// :prompt and :response rows appended; combined vector stored on the round
+			expect(rows.map(([label]) => label)).toEqual([`${fileName}:prompt`, `${fileName}:response`]);
+			const written = JSON.parse(fs.readFileSync(path.join(roundsDir, fileName), "utf-8"));
+			expect(written.promptEmbedding).toBeDefined();
+		});
+
+		it("skips rounds that already have a promptEmbedding, and reports per-round errors", async () => {
+			const sessionFile = writeSessionFile(tmp, [userMsg("q"), assistantMsg("a")]);
+			const roundsDir = path.join(tmp, "rounds");
+			const outcome = backfillMissingRounds(sessionFile, roundsDir, undefined, { liveWindowMs: 0 });
+			const fileName = outcome.recoveredFiles[0];
+			// Pre-embed the round: second queue pass must skip it.
+			const first = await embedRecoveredRounds(outcome.recoveredFiles, roundsDir, {
+				embed: () => Promise.resolve([1]),
+				appendIndexRow: () => {},
+				writeRoundEmbedding: (name, vec) => {
+					const p = path.join(roundsDir, name);
+					const existing = JSON.parse(fs.readFileSync(p, "utf-8"));
+					existing.promptEmbedding = vec;
+					fs.writeFileSync(p, JSON.stringify(existing, null, 2));
+				},
+			});
+			expect(first.embedded).toEqual([fileName]);
+			const second = await embedRecoveredRounds(outcome.recoveredFiles, roundsDir, {
+				embed: () => Promise.resolve([1]),
+				appendIndexRow: () => {},
+				writeRoundEmbedding: () => {},
+			});
+			expect(second.embedded).toEqual([]);
+
+			// A round that fails to read reports an error without aborting the queue
+			const failing = await embedRecoveredRounds([fileName, "missing-round.json"], roundsDir, {
+				embed: () => Promise.resolve([1]),
+				appendIndexRow: () => {},
+				writeRoundEmbedding: () => {},
+			});
+			// already-embedded round is skipped, missing round is reported
+			expect(failing.embedded).toEqual([]);
+			expect(failing.errors).toHaveLength(1);
+			expect(failing.errors[0]).toContain("missing-round.json");
+		});
 	});
 });
 
