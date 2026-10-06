@@ -8,12 +8,12 @@ import {
 	backfillMissingRounds,
 	embedRecoveredRounds,
 	findMissingRounds,
-	findPreviousSessionFile,
+	listBackfillCandidates,
 } from "./session-backfill.ts";
 
 function writeSessionFile(dir: string, lines: object[]): string {
 	const file = path.join(dir, "session.jsonl");
-	fs.writeFileSync(file, lines.map((l) => JSON.stringify(l)).join("\n") + "\n");
+	fs.writeFileSync(file, `${lines.map((l) => JSON.stringify(l)).join("\n")}\n`);
 	return file;
 }
 
@@ -123,14 +123,37 @@ describe("session-backfill", () => {
 		expect(outcome.recoveredFiles).toEqual([]);
 	});
 
-	it("skips a live source session (mtime within the live window) — F3", () => {
+	it("defers a live source session whose tail round is missing (retried later) — F2", () => {
 		const sessionFile = writeSessionFile(tmp, [userMsg("q"), assistantMsg("a")]);
 		const roundsDir = path.join(tmp, "rounds");
-		// Fresh file — mtime is now, inside the default live window.
+		// Fresh file — mtime is now, inside the default live window; tail is missing.
 		const outcome = backfillMissingRounds(sessionFile, roundsDir, undefined, { nowMs: Date.now() });
-		expect(outcome.skippedLive).toBe(true);
+		expect(outcome.deferredLive).toBe(1);
 		expect(outcome.recoveredFiles).toEqual([]);
 		expect(fs.existsSync(roundsDir)).toBe(false);
+	});
+
+	it("defers only the live file and recovers from stale files in the same run — F2", () => {
+		const roundsDir = path.join(tmp, "rounds");
+		const stale = writeSessionFile(tmp, [userMsg("old q"), assistantMsg("old a")]);
+		fs.utimesSync(stale, new Date(0), new Date(0));
+		const live = path.join(tmp, "live.jsonl");
+		fs.writeFileSync(live, `${[userMsg("new q"), assistantMsg("new a")].map((l) => JSON.stringify(l)).join("\n")}\n`);
+		const outcome = backfillMissingRounds([live, stale], roundsDir, undefined, { nowMs: Date.now() });
+		expect(outcome.deferredLive).toBe(1);
+		expect(outcome.recoveredFiles).toEqual([createRoundFilePath("old q", "old a", [])]);
+	});
+
+	it("recovers a live-looking file whose tail is already on disk (complete beats live) — F2", () => {
+		const roundsDir = path.join(tmp, "rounds");
+		const complete = writeSessionFile(tmp, [userMsg("q"), assistantMsg("a")]);
+		const rounds = backfillMissingRounds(complete, roundsDir, undefined, { liveWindowMs: 0 });
+		expect(rounds.recoveredFiles).toEqual([createRoundFilePath("q", "a", [])]);
+		// File still looks live, but the tail round is on disk → fully backed up.
+		const outcome = backfillMissingRounds(complete, roundsDir, undefined, { nowMs: Date.now() });
+		expect(outcome.deferredLive).toBeUndefined();
+		expect(outcome.skippedComplete).toBe(true);
+		expect(outcome.recoveredFiles).toEqual([]);
 	});
 
 	it("backfills a stale source session whose mtime is older than the live window — F3", () => {
@@ -138,7 +161,7 @@ describe("session-backfill", () => {
 		const roundsDir = path.join(tmp, "rounds");
 		fs.utimesSync(sessionFile, new Date(0), new Date(0));
 		const outcome = backfillMissingRounds(sessionFile, roundsDir, undefined, { nowMs: Date.now() });
-		expect(outcome.skippedLive).toBeUndefined();
+		expect(outcome.deferredLive).toBeUndefined();
 		expect(outcome.recoveredFiles).toEqual([createRoundFilePath("q", "a", [])]);
 	});
 
@@ -284,7 +307,7 @@ describe("session-backfill", () => {
 	});
 });
 
-describe("findPreviousSessionFile", () => {
+describe("listBackfillCandidates", () => {
 	let tmp: string;
 	beforeEach(() => {
 		tmp = fs.mkdtempSync(path.join(os.tmpdir(), "prev-session-"));
@@ -293,7 +316,7 @@ describe("findPreviousSessionFile", () => {
 		fs.rmSync(tmp, { recursive: true, force: true });
 	});
 
-	it("returns the most recent other .jsonl in the session dir", () => {
+	it("returns all other .jsonl files in the session dir, newest first", () => {
 		const older = path.join(tmp, "a.jsonl");
 		const newer = path.join(tmp, "b.jsonl");
 		fs.writeFileSync(older, "{}");
@@ -302,16 +325,16 @@ describe("findPreviousSessionFile", () => {
 		fs.utimesSync(newer, new Date(2000), new Date(2000));
 		const current = path.join(tmp, "c.jsonl");
 		fs.writeFileSync(current, "{}");
-		expect(findPreviousSessionFile(tmp, current)).toBe(newer);
+		expect(listBackfillCandidates(tmp, current)).toEqual([newer, older]);
 	});
 
 	it("excludes the current session file", () => {
 		const current = path.join(tmp, "c.jsonl");
 		fs.writeFileSync(current, "{}");
-		expect(findPreviousSessionFile(tmp, current)).toBeNull();
+		expect(listBackfillCandidates(tmp, current)).toEqual([]);
 	});
 
-	it("returns null for a missing session dir", () => {
-		expect(findPreviousSessionFile(path.join(tmp, "nope"), path.join(tmp, "cur.jsonl"))).toBeNull();
+	it("returns [] for a missing session dir", () => {
+		expect(listBackfillCandidates(path.join(tmp, "nope"), path.join(tmp, "cur.jsonl"))).toEqual([]);
 	});
 });

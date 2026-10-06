@@ -45,7 +45,6 @@ import {
 } from "../lib/context-messages.ts";
 import { embedText, getApiKey } from "../lib/embedding-client.ts";
 import { assignToGroup, formatGroupStats } from "../lib/grouping.ts";
-import { createRoundFilePath } from "../lib/hash.ts";
 import { indexRoundFileFromPath } from "../lib/index-io.ts";
 import {
 	appendToIndexPath,
@@ -55,12 +54,9 @@ import {
 	loadSessionStartIndex as loadSessionStartIndexCore,
 } from "../lib/index-storage.ts";
 import {
-	type AgentEndRoundFile,
 	applyMessageEndToState,
 	buildAgentEndChainEntry,
 	buildAgentEndEmbeddingTexts,
-	buildAgentEndRoundData,
-	buildAgentEndRoundFile,
 	buildPromptEmbeddingInput,
 	embeddingMaxTokensToResponseBytes,
 	getRelatedParentIdFromGroup,
@@ -94,7 +90,7 @@ import {
 	toolIndexPathForRoundsDir,
 } from "../lib/search-tools.ts";
 import { loadSemblrConfig, type SemblrConfig } from "../lib/semblr-config.ts";
-import { backfillMissingRounds, embedRecoveredRounds, findPreviousSessionFile } from "../lib/session-backfill.ts";
+import { backfillMissingRounds, embedRecoveredRounds, listBackfillCandidates } from "../lib/session-backfill.ts";
 import type { CheckpointSummary, ToolCallDetail } from "../lib/state.ts";
 import { contextCacheStore, contextCacheValid, createRound, createSession } from "../lib/state.ts";
 import {
@@ -1204,69 +1200,76 @@ export default function (pi: ExtensionAPI) {
 		// Clear session scoped state — new session starts fresh
 		session = createSession();
 
-		// Issue #130: recover rounds lost to process death in the previous session.
-		// pi only provides previousSessionFile for "new"/"resume"/"fork" — a fresh
-		// launch emits reason "startup" without one, so locate the previous session
-		// file ourselves (most recent other .jsonl in the current session's dir).
-		const backfillSource =
-			event.previousSessionFile ??
-			(() => {
-				if (event.reason !== "startup" && event.reason !== "resume") return null;
-				const sessionFile = ctx.sessionManager?.getSessionFile?.();
-				if (!sessionFile) return null;
-				return findPreviousSessionFile(path.dirname(sessionFile), sessionFile);
-			})();
-		if (backfillSource) {
-			try {
-				const backfill = backfillMissingRounds(backfillSource, ROUNDS_DIR);
-				if (backfill.skippedLive) {
-					ctx.ui.setStatus("semblr", "\u{1f9e0} backfill skipped: previous session looks live (F3)");
-				}
-				if (backfill.recoveredFiles.length > 0) {
-					for (const fileName of backfill.recoveredFiles) {
-						const roundData = readRoundJson(ROUNDS_DIR, fileName);
-						if (roundData) upsertRoundInBm25Index(fileName, roundData as unknown as RoundData);
+		// Issue #130: recover rounds lost to process death in previous sessions.
+		// F2 (PR !131): scan ALL prior session files in the session dir (newest
+		// first, per-file tail-completeness early exit) — a source deferred as live
+		// on one startup is retried automatically on the next. pi only provides
+		// previousSessionFile for "new"/"resume"/"fork"; for a fresh startup launch
+		// (reason "startup" with no previousSessionFile) we still scan the dir,
+		// which covers it. Sessions outside the current cwd's dir are not ours.
+		if (event.reason === "startup" || event.reason === "resume") {
+			const sessionFile = ctx.sessionManager?.getSessionFile?.();
+			if (sessionFile) {
+				try {
+					const candidates = listBackfillCandidates(path.dirname(sessionFile), sessionFile);
+					if (
+						event.previousSessionFile &&
+						!candidates.some((c) => path.resolve(c) === path.resolve(event.previousSessionFile!))
+					) {
+						candidates.unshift(event.previousSessionFile);
 					}
-					ctx.ui.setStatus(
-						"semblr",
-						`\u{1f9e0} backfill: recovered ${backfill.recoveredFiles.length} round(s) from previous session`,
-					);
-					// F4 (PR #131): queue recovered rounds for embedding so they reach
-					// semantic retrieval, not just bm25. Best-effort — a failure here
-					// costs embeddings, never the recovered round files.
-					try {
-						const embedKey = await getApiKey(ctx, { config: SEMBLR_CONFIG });
-						if (embedKey) {
-							const embedResult = await embedRecoveredRounds(backfill.recoveredFiles, ROUNDS_DIR, {
-								embed: (text) => embedText(text, embedKey, embeddingClientDeps(ctx)),
-								appendIndexRow: (label, vec) => appendToIndex(label, vec, SEMBLR_CONFIG.embeddingModel),
-								writeRoundEmbedding: (fileName, vec) => {
-									const p = `${ROUNDS_DIR}/${fileName}`;
-									const existing = JSON.parse(fs.readFileSync(p, "utf-8"));
-									existing.promptEmbedding = vec;
-									fs.writeFileSync(p + ".tmp." + process.pid, JSON.stringify(existing, null, 2));
-									fs.renameSync(p + ".tmp." + process.pid, p);
-								},
-							});
-							if (embedResult.embedded.length > 0) {
-								ctx.ui.setStatus(
-									"semblr",
-									`\u{1f9e0} backfill: embedded ${embedResult.embedded.length} recovered round(s)`,
-								);
-							}
-							for (const message of embedResult.errors) {
-								ctx.ui.setStatus("semblr", `\u{1f9e0} backfill embed error: ${message}`);
-							}
+					const backfill = backfillMissingRounds(candidates, ROUNDS_DIR);
+					if (backfill.deferredLive) {
+						ctx.ui.setStatus(
+							"semblr",
+							`\u{1f9e0} backfill deferred: ${backfill.deferredLive} previous session(s) look live (F2/F3)`,
+						);
+					}
+					if (backfill.recoveredFiles.length > 0) {
+						for (const fileName of backfill.recoveredFiles) {
+							const roundData = readRoundJson(ROUNDS_DIR, fileName);
+							if (roundData) upsertRoundInBm25Index(fileName, roundData as unknown as RoundData);
 						}
-					} catch (err) {
-						ctx.ui.setStatus("semblr", `\u{1f9e0} backfill embed failed: ${(err as Error).message}`);
+						ctx.ui.setStatus(
+							"semblr",
+							`\u{1f9e0} backfill: recovered ${backfill.recoveredFiles.length} round(s) from previous session`,
+						);
+						// F4 (PR #131): queue recovered rounds for embedding so they reach
+						// semantic retrieval, not just bm25. Best-effort — a failure here
+						// costs embeddings, never the recovered round files.
+						try {
+							const embedKey = await getApiKey(ctx, { config: SEMBLR_CONFIG });
+							if (embedKey) {
+								const embedResult = await embedRecoveredRounds(backfill.recoveredFiles, ROUNDS_DIR, {
+									embed: (text) => embedText(text, embedKey, embeddingClientDeps(ctx)),
+									appendIndexRow: (label, vec) => appendToIndex(label, vec, SEMBLR_CONFIG.embeddingModel),
+									writeRoundEmbedding: (fileName, vec) => {
+										const p = `${ROUNDS_DIR}/${fileName}`;
+										const existing = JSON.parse(fs.readFileSync(p, "utf-8"));
+										existing.promptEmbedding = vec;
+										fs.writeFileSync(p + ".tmp." + process.pid, JSON.stringify(existing, null, 2));
+										fs.renameSync(p + ".tmp." + process.pid, p);
+									},
+								});
+								if (embedResult.embedded.length > 0) {
+									ctx.ui.setStatus(
+										"semblr",
+										`\u{1f9e0} backfill: embedded ${embedResult.embedded.length} recovered round(s)`,
+									);
+								}
+								for (const message of embedResult.errors) {
+									ctx.ui.setStatus("semblr", `\u{1f9e0} backfill embed error: ${message}`);
+								}
+							}
+						} catch (err) {
+							ctx.ui.setStatus("semblr", `\u{1f9e0} backfill embed failed: ${(err as Error).message}`);
+						}
 					}
+				} catch (err) {
+					ctx.ui.setStatus("semblr", `🧠 backfill failed: ${(err as Error).message}`);
 				}
-			} catch (err) {
-				ctx.ui.setStatus("semblr", `🧠 backfill failed: ${(err as Error).message}`);
 			}
 		}
-
 		const index = loadSessionStartIndex();
 		ctx.ui.setStatus("semblr", buildSessionStartStatus(index));
 

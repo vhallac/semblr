@@ -21,19 +21,21 @@ import { normalize } from "./vector.ts";
 export interface BackfillOutcome {
 	/** Round files that were written by this backfill run. */
 	recoveredFiles: string[];
-	/** Number of fileable rounds found in the session file. */
+	/** Number of fileable rounds found across scanned session files. */
 	scanned: number;
-	/** True when the source file looked live and backfill was skipped (F3). */
-	skippedLive?: boolean;
-	/** True when the last-round early exit determined the session is fully backed up. */
+	/** True when at least one source session was fully backed up (early exit). */
 	skippedComplete?: boolean;
+	/** Number of source sessions whose tail round is missing but which look live; recovery is deferred to a later startup (F2). */
+	deferredLive?: number;
 }
 
 /**
  * A source file modified within this window is considered live (still being
- * written by a running pi process) and backfilling from it is skipped (F3,
- * PR #131): a live session's tail round is incomplete and will be written by
- * the live process itself. Tests can shrink the window for determinism.
+ * written by a running pi process). A live session whose tail round is missing
+ * gets its recovery DEFERRED, not skipped outright (F2, PR !131): because the
+ * candidate scan covers all prior session files on every startup, the file is
+ * retried later once the session has ended. Tests can shrink the window for
+ * determinism.
  */
 export const LIVE_SESSION_WINDOW_MS = 5 * 60 * 1000;
 
@@ -43,35 +45,30 @@ export interface BackfillWrite {
 }
 
 /**
- * Locate the previous session file when pi does not provide one (fresh launch:
- * session_start fires with reason "startup" and no previousSessionFile). The
- * session directory is per-cwd, so the most recent other .jsonl file in the
- * same directory as the current session file is the previous session.
+ * All prior session files in the session dir, newest first, excluding the
+ * current session (F2, PR !131): the candidate scan covers every previous
+ * session so a file deferred as live on one startup is retried on the next.
  */
-export function findPreviousSessionFile(
+export function listBackfillCandidates(
 	sessionDir: string,
 	currentSessionFile: string,
 	fsImpl: Pick<typeof fs, "readdirSync" | "statSync"> = fs,
-): string | null {
-	let candidates: string[];
+): string[] {
+	let names: string[];
 	try {
-		candidates = fsImpl.readdirSync(sessionDir).filter((f) => f.endsWith(".jsonl"));
+		names = fsImpl.readdirSync(sessionDir).filter((f) => f.endsWith(".jsonl"));
 	} catch {
-		return null;
+		return [];
 	}
-	let best: { file: string; mtime: number } | null = null;
-	for (const name of candidates) {
+	const candidates: { file: string; mtime: number }[] = [];
+	for (const name of names) {
 		const file = path.join(sessionDir, name);
 		if (path.resolve(file) === path.resolve(currentSessionFile)) continue;
-		let mtime: number;
 		try {
-			mtime = fsImpl.statSync(file).mtimeMs;
-		} catch {
-			continue;
-		}
-		if (!best || mtime > best.mtime) best = { file, mtime };
+			candidates.push({ file, mtime: fsImpl.statSync(file).mtimeMs });
+		} catch {}
 	}
-	return best?.file ?? null;
+	return candidates.sort((a, b) => b.mtime - a.mtime).map((c) => c.file);
 }
 
 /**
@@ -83,13 +80,23 @@ export function findMissingRounds(
 	roundsDir: string,
 	fsImpl: Pick<typeof fs, "existsSync"> = fs,
 ): { missing: BackfillWrite[]; scanned: number; skippedComplete?: boolean } {
-	const raw = fs.readFileSync(sessionFile, "utf-8");
-	const parsed = parsePiSessionJsonl(raw);
-	// Startup-cost early exit (PR #131 note): rounds are persisted in order at
-	// each agent_end, with the round file written before any fallible post-write
-	// step — so a mid-round death loses only the round in progress. If the LAST
-	// fileable round's file already exists, all earlier rounds are on disk too;
-	// skip per-round reconstruction and hashing entirely.
+	const parsed = parsePiSessionJsonl(fs.readFileSync(sessionFile, "utf-8"));
+	return collectMissingRounds(parsed, roundsDir, fsImpl);
+}
+
+/**
+ * Startup-cost early exit (PR #131 note): rounds are persisted in order at
+ * each agent_end, with the round file written before any fallible post-write
+ * step — so a mid-round death loses only the round in progress. If the LAST
+ * fileable round's file already exists, all earlier rounds are on disk too;
+ * skip per-round reconstruction and hashing entirely. Doubles as the F2
+ * tail-completeness check.
+ */
+function collectMissingRounds(
+	parsed: ReturnType<typeof parsePiSessionJsonl>,
+	roundsDir: string,
+	fsImpl: Pick<typeof fs, "existsSync">,
+): { missing: BackfillWrite[]; scanned: number; skippedComplete?: boolean } {
 	for (let i = parsed.length - 1; i >= 0; i--) {
 		if (!parsed[i].userPrompt) continue;
 		// F1 (PR !131): hash via the shared derivation so the early exit agrees
@@ -133,35 +140,65 @@ export function findMissingRounds(
 }
 
 /**
- * Recover lost rounds from a previous session file. Writes any missing round
- * file into roundsDir and returns what was recovered. Sources modified within
- * the live window are treated as live sessions and skipped (F3).
+ * Recover lost rounds from previous session files. Writes any missing round
+ * file into roundsDir and returns what was recovered.
+ *
+ * F2 (PR !131) gating per source file, replacing the old one-shot mtime skip:
+ * - tail round already on disk → session fully backed up, skip (cheap).
+ * - tail missing and file looks live (mtime inside the window) → DEFER: a live
+ *   session's tail is incomplete and will be written by the live process;
+ *   the all-sessions candidate scan retries this file on a later startup.
+ * - tail missing and file is stale → recover.
  */
 export function backfillMissingRounds(
-	sessionFile: string,
+	sessionFiles: string | string[],
 	roundsDir: string,
 	fsImpl: Pick<typeof fs, "existsSync" | "mkdirSync" | "writeFileSync" | "statSync"> = fs,
 	opts: { liveWindowMs?: number; nowMs?: number } = {},
 ): BackfillOutcome {
+	const files = Array.isArray(sessionFiles) ? sessionFiles : [sessionFiles];
 	const window = opts.liveWindowMs ?? LIVE_SESSION_WINDOW_MS;
-	try {
-		// Truncate sub-ms precision — a just-written file must not look like a
-		// future timestamp and be misclassified as live.
-		const ageMs = (opts.nowMs ?? Date.now()) - Math.floor(fsImpl.statSync(sessionFile).mtimeMs);
-		if (ageMs < window) {
-			return { recoveredFiles: [], scanned: 0, skippedLive: true };
-		}
-	} catch {
-		// Unreadable mtime: fall through and attempt the backfill.
-	}
-	const { missing, scanned, skippedComplete } = findMissingRounds(sessionFile, roundsDir, fsImpl);
+	const now = opts.nowMs ?? Date.now();
 	const recovered: string[] = [];
-	for (const { fileName, roundData } of missing) {
-		fsImpl.mkdirSync(roundsDir, { recursive: true });
-		fsImpl.writeFileSync(path.join(roundsDir, fileName), JSON.stringify(roundData, null, 2));
-		recovered.push(fileName);
+	let scanned = 0;
+	let skippedComplete = false;
+	let deferredLive = 0;
+	for (const sessionFile of files) {
+		let live = false;
+		try {
+			// Truncate sub-ms precision — a just-written file must not look like a
+			// future timestamp and be misclassified as live.
+			live = now - Math.floor(fsImpl.statSync(sessionFile).mtimeMs) < window;
+		} catch {
+			// Unreadable mtime: treat as stale and attempt the backfill.
+		}
+		const parsed = parsePiSessionJsonl(fs.readFileSync(sessionFile, "utf-8"));
+		const {
+			missing,
+			scanned: fileScanned,
+			skippedComplete: complete,
+		} = collectMissingRounds(parsed, roundsDir, fsImpl);
+		if (complete) {
+			skippedComplete = true;
+			continue;
+		}
+		if (live) {
+			deferredLive++;
+			continue;
+		}
+		scanned += fileScanned;
+		for (const { fileName, roundData } of missing) {
+			fsImpl.mkdirSync(roundsDir, { recursive: true });
+			fsImpl.writeFileSync(path.join(roundsDir, fileName), JSON.stringify(roundData, null, 2));
+			recovered.push(fileName);
+		}
 	}
-	return { recoveredFiles: recovered, scanned, ...(skippedComplete ? { skippedComplete: true } : {}) };
+	return {
+		recoveredFiles: recovered,
+		scanned,
+		...(skippedComplete ? { skippedComplete: true } : {}),
+		...(deferredLive > 0 ? { deferredLive } : {}),
+	};
 }
 
 /** Injectable embedding + index-update surface for recovered-round embedding (F4). */
