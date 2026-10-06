@@ -7,6 +7,7 @@ import {
 	persistAgentEndRound,
 } from "./agent-end-persist.ts";
 
+import { createRoundFilePath } from "./hash.ts";
 import type { ToolCallDetail } from "./round-data.ts";
 
 function makeFs(overrides: Partial<AgentEndPersistFs> = {}): AgentEndPersistFs & { files: Map<string, string> } {
@@ -99,6 +100,28 @@ describe("persistAgentEndRound (issue #130 handler-ordering)", () => {
 		const [name, data] = [...deps.fs.files.entries()][0];
 		expect(name.startsWith("/tmp/rounds/")).toBe(true);
 		expect(JSON.parse(data).userPrompt).toBe("fix the bug");
+	});
+
+	it("emergency: filename parity with the normal path — toolCalls hashed, followup marker stripped (F2)", () => {
+		const deps = makeDeps({
+			buildRoundFile: () => {
+				throw new Error("assembly blew up");
+			},
+		});
+		const withMarker = {
+			...baseInput,
+			accumulatedText: ["did the thing\n\nround_needs_followup"],
+		};
+		const result = persistAgentEndRound(deps, withMarker);
+		if (result.kind !== "emergency") return;
+		// The emergency filename must equal what the normal path computes for the
+		// same round: prompt + marker-stripped text + toolCalls feed the hash.
+		expect(result.fileName).toBe(createRoundFilePath("fix the bug", "did the thing", [toolCall]));
+		const [name, data] = [...deps.fs.files.entries()][0];
+		const round = JSON.parse(data);
+		expect(name.endsWith(result.fileName)).toBe(true);
+		expect(round.responseSequence).not.toContain("round_needs_followup");
+		expect(round.needsFollowup).toBe(true);
 	});
 
 	it("failed: emergency write failing loses nothing silently — reports failure", () => {

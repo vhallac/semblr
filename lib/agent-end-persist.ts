@@ -1,6 +1,11 @@
 import * as nodeFs from "node:fs";
 import { createRoundFilePath } from "./hash.ts";
-import { type AgentEndRoundFile, buildAgentEndRoundData, buildAgentEndRoundFile } from "./round-capture.ts";
+import {
+	type AgentEndRoundFile,
+	buildAgentEndRoundData,
+	buildAgentEndRoundFile,
+	extractAndStripFollowupMarker,
+} from "./round-capture.ts";
 import type { CheckpointSummary, ResponseSegment, ToolCallDetail } from "./round-data.ts";
 
 /**
@@ -84,10 +89,17 @@ export function persistAgentEndRound(
 	} catch (err) {
 		// Emergency: write a raw round from whatever in-memory state survived.
 		const fbPrompt = input.cachedUserPrompt ?? "";
-		const fbText = input.accumulatedText.join("\n\n").trim();
+		// F2 (PR #131): strip the followup marker and hash the toolCalls so the
+		// emergency filename matches what the normal path would have produced for
+		// the same round — startup backfill reconstruction relies on this parity.
+		const { cleanedText: fbText, needsFollowup: fbNeedsFollowup } = extractAndStripFollowupMarker(
+			input.accumulatedText.join("\n\n").trim(),
+		);
 		try {
 			fs.mkdirSync(roundsDir, { recursive: true });
-			const fbName = fbPrompt ? createRoundFilePath(fbPrompt, fbText, []) : `emergency-${Date.now()}.json`;
+			const fbName = fbPrompt
+				? createRoundFilePath(fbPrompt, fbText, input.toolCalls)
+				: `emergency-${Date.now()}.json`;
 			const fbPath = `${roundsDir}/${fbName}`;
 			if (!fs.existsSync(fbPath)) {
 				fs.writeFileSync(
@@ -102,6 +114,7 @@ export function persistAgentEndRound(
 							toolCalls: input.toolCalls,
 							responseSegments: input.responseSegments,
 							parentId: null,
+							needsFollowup: fbNeedsFollowup,
 						}),
 						null,
 						2,
