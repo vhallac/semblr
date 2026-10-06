@@ -150,6 +150,63 @@ function collectMissingRounds(
  *   the all-sessions candidate scan retries this file on a later startup.
  * - tail missing and file is stale → recover.
  */
+/**
+ * A minimal round-file shape — enough to decide whether tool-index rows exist.
+ * Real round files are wider (RoundData); extra fields are irrelevant here.
+ */
+export interface RecoveredRoundLike {
+	toolCalls?: ToolCallDetail[];
+}
+
+export interface IndexRecoveredRoundsDeps {
+	/** Read a recovered round file; null/throwing means the file is unusable. */
+	readRoundData: (fileName: string) => RecoveredRoundLike | null;
+	/** Upsert the round into the bm25 index. */
+	upsertBm25: (fileName: string, roundData: RecoveredRoundLike) => void;
+	/** Append tool-index rows for the round's tool calls. */
+	appendToolRows: (fileName: string, toolCalls: readonly ToolCallDetail[]) => void;
+}
+
+export interface RecoveredIndexReport {
+	/** Rounds successfully upserted into the bm25 index. */
+	bm25Indexed: number;
+	/** Rounds whose tool calls were appended to the tool index. */
+	toolIndexed: number;
+	/** Per-file error messages; empty when everything indexed. */
+	errors: string[];
+}
+
+/**
+ * Index recovered rounds (F3, PR !131): a backfill must feed every derived
+ * index the live agent_end path feeds — bm25 AND the tool fulltext index.
+ * Each round is guarded independently so one corrupt file or index failure
+ * costs only that derived index, never the other rounds.
+ */
+export function indexRecoveredRounds(
+	fileNames: readonly string[],
+	deps: IndexRecoveredRoundsDeps,
+): RecoveredIndexReport {
+	const report: RecoveredIndexReport = { bm25Indexed: 0, toolIndexed: 0, errors: [] };
+	for (const fileName of fileNames) {
+		try {
+			const roundData = deps.readRoundData(fileName);
+			if (!roundData) {
+				report.errors.push(`${fileName}: unreadable round file`);
+				continue;
+			}
+			deps.upsertBm25(fileName, roundData);
+			report.bm25Indexed++;
+			if (roundData.toolCalls && roundData.toolCalls.length > 0) {
+				deps.appendToolRows(fileName, roundData.toolCalls);
+				report.toolIndexed++;
+			}
+		} catch (err) {
+			report.errors.push(`${fileName}: ${(err as Error).message}`);
+		}
+	}
+	return report;
+}
+
 export function backfillMissingRounds(
 	sessionFiles: string | string[],
 	roundsDir: string,

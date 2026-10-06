@@ -90,7 +90,12 @@ import {
 	toolIndexPathForRoundsDir,
 } from "../lib/search-tools.ts";
 import { loadSemblrConfig, type SemblrConfig } from "../lib/semblr-config.ts";
-import { backfillMissingRounds, embedRecoveredRounds, listBackfillCandidates } from "../lib/session-backfill.ts";
+import {
+	backfillMissingRounds,
+	embedRecoveredRounds,
+	indexRecoveredRounds,
+	listBackfillCandidates,
+} from "../lib/session-backfill.ts";
 import type { CheckpointSummary, ToolCallDetail } from "../lib/state.ts";
 import { contextCacheStore, contextCacheValid, createRound, createSession } from "../lib/state.ts";
 import {
@@ -1226,9 +1231,19 @@ export default function (pi: ExtensionAPI) {
 						);
 					}
 					if (backfill.recoveredFiles.length > 0) {
-						for (const fileName of backfill.recoveredFiles) {
-							const roundData = readRoundJson(ROUNDS_DIR, fileName);
-							if (roundData) upsertRoundInBm25Index(fileName, roundData as unknown as RoundData);
+						// F3 (PR !131): index recovered rounds exactly like the live agent_end
+						// post-write — bm25 upsert AND tool-index rows — so a recovered round
+						// is reachable from every search surface, not just bm25. Each round is
+						// guarded independently (best-effort, never the round files).
+						const indexReport = indexRecoveredRounds(backfill.recoveredFiles, {
+							readRoundData: (fileName) => readRoundJson(ROUNDS_DIR, fileName),
+							upsertBm25: (fileName, roundData) =>
+								upsertRoundInBm25Index(fileName, roundData as unknown as RoundData),
+							appendToolRows: (fileName, toolCalls) =>
+								appendToolIndexRows(TOOLS_INDEX_PATH, ROUNDS_DIR, buildToolIndexRows(fileName, toolCalls)),
+						});
+						for (const message of indexReport.errors) {
+							ctx.ui.setStatus("semblr", `\u{1f9e0} backfill index error: ${message}`);
 						}
 						ctx.ui.setStatus(
 							"semblr",

@@ -4,11 +4,14 @@ import * as path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { createRoundFilePath } from "./hash.ts";
 import { buildAgentEndRoundFile } from "./round-capture.ts";
+import type { ToolCallDetail } from "./round-data.ts";
 import {
 	backfillMissingRounds,
 	embedRecoveredRounds,
 	findMissingRounds,
+	indexRecoveredRounds,
 	listBackfillCandidates,
+	type RecoveredRoundLike,
 } from "./session-backfill.ts";
 
 function writeSessionFile(dir: string, lines: object[]): string {
@@ -336,5 +339,70 @@ describe("listBackfillCandidates", () => {
 
 	it("returns [] for a missing session dir", () => {
 		expect(listBackfillCandidates(path.join(tmp, "nope"), path.join(tmp, "cur.jsonl"))).toEqual([]);
+	});
+});
+
+describe("indexRecoveredRounds", () => {
+	const toolCall: ToolCallDetail = { index: 0, id: "t1", name: "bash", arguments: "{}", result_summary: "" };
+
+	it("upserts bm25 for every readable round and appends tool rows only for rounds with toolCalls", () => {
+		const rounds: Record<string, RecoveredRoundLike | null> = {
+			"a.json": { toolCalls: [toolCall] },
+			"b.json": { toolCalls: [] },
+			"c.json": {},
+		};
+		const bm25: string[] = [];
+		const toolAppends: Array<{ fileName: string; toolCalls: readonly ToolCallDetail[] }> = [];
+		const report = indexRecoveredRounds(Object.keys(rounds), {
+			readRoundData: (f) => rounds[f] ?? null,
+			upsertBm25: (f) => bm25.push(f),
+			appendToolRows: (f, tcs) => toolAppends.push({ fileName: f, toolCalls: tcs }),
+		});
+		expect(report.errors).toEqual([]);
+		expect(report.bm25Indexed).toBe(3);
+		expect(report.toolIndexed).toBe(1);
+		expect(toolAppends).toEqual([{ fileName: "a.json", toolCalls: [toolCall] }]);
+	});
+
+	it("records unreadable round files as errors and skips indexing them", () => {
+		const bm25: string[] = [];
+		const report = indexRecoveredRounds(["bad.json"], {
+			readRoundData: () => null,
+			upsertBm25: (f) => bm25.push(f),
+			appendToolRows: () => {},
+		});
+		expect(bm25).toEqual([]);
+		expect(report.bm25Indexed).toBe(0);
+		expect(report.errors).toEqual(["bad.json: unreadable round file"]);
+	});
+
+	it("guards each round independently — a throwing index call costs only that round", () => {
+		const bm25: string[] = [];
+		const report = indexRecoveredRounds(["fail.json", "ok.json"], {
+			readRoundData: (f) => (f === "fail.json" ? { toolCalls: [] } : { toolCalls: [] }),
+			upsertBm25: (f) => {
+				if (f === "fail.json") throw new Error("bm25 boom");
+				bm25.push(f);
+			},
+			appendToolRows: () => {},
+		});
+		expect(bm25).toEqual(["ok.json"]);
+		expect(report.bm25Indexed).toBe(1);
+		expect(report.errors).toEqual(["fail.json: bm25 boom"]);
+	});
+
+	it("propagates appendToolRows failures into errors without blocking later rounds", () => {
+		const toolAppends: string[] = [];
+		const report = indexRecoveredRounds(["a.json", "b.json"], {
+			readRoundData: () => ({ toolCalls: [toolCall] }),
+			upsertBm25: () => {},
+			appendToolRows: (f) => {
+				if (f === "a.json") throw new Error("tool index boom");
+				toolAppends.push(f);
+			},
+		});
+		expect(toolAppends).toEqual(["b.json"]);
+		expect(report.toolIndexed).toBe(1);
+		expect(report.errors).toEqual(["a.json: tool index boom"]);
 	});
 });
