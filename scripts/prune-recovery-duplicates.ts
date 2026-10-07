@@ -116,7 +116,7 @@ export async function pruneRecoveryDuplicates(options: PruneOptions = {}): Promi
 
 	const records: RoundRecord[] = [];
 	for (const entry of fs.readdirSync(roundsDir)) {
-		if (!entry.endsWith(".json")) continue;
+		if (!entry.endsWith(".json") || entry.startsWith("index")) continue;
 		const filePath = path.join(roundsDir, entry);
 		const stat = fs.statSync(filePath);
 		let round: RoundLike;
@@ -170,7 +170,7 @@ export async function pruneRecoveryDuplicates(options: PruneOptions = {}): Promi
 	const bm25Path = bm25IndexPathForRoundsDir(roundsDir);
 	const documents = fs
 		.readdirSync(roundsDir)
-		.filter((f) => f.endsWith(".json"))
+		.filter((f) => f.endsWith(".json") && !f.startsWith("index"))
 		.map((f) => ({
 			fileName: f,
 			text: roundTextForBm25(JSON.parse(fs.readFileSync(path.join(roundsDir, f), "utf-8"))),
