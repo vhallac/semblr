@@ -981,7 +981,9 @@ export default function (pi: ExtensionAPI) {
 		);
 		switch (persist.kind) {
 			case "no-prompt":
-				ctx.ui.setStatus("semblr", "\u{1f9e0} agent_end: no user prompt to save");
+				// Covers both a missing user prompt and a prompt-only round (empty
+				// response, no tool calls — F1 PR !131): nothing fileable to save.
+				ctx.ui.setStatus("semblr", "\u{1f9e0} agent_end: nothing to save (no prompt or prompt-only round)");
 				return;
 			case "failed": {
 				ctx.ui.setStatus("semblr", `\u{1f9e0} round write failed: ${persist.message}`);

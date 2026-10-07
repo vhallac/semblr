@@ -338,6 +338,9 @@ describe("session-backfill", () => {
 		it("F4 parity: prompt goes through buildPromptEmbeddingInput cleanup and the :prompt row carries the hash stamp", async () => {
 			const sessionFile = writeSessionFile(tmp, [
 				userMsg("explain this\n```python\n" + "x = 1\n".repeat(200) + "```"),
+				// F1 (PR !131): a prompt-only session tail is no longer recovered —
+				// the fixture needs a response to produce a fileable round.
+				assistantMsg("the answer"),
 			]);
 			const roundsDir = path.join(tmp, "rounds");
 			const outcome = backfillMissingRounds(sessionFile, roundsDir, undefined, { liveWindowMs: 0 });
@@ -856,5 +859,54 @@ describe("extractCheckpointSummary (F7)", () => {
 		} finally {
 			fs.rmSync(tmpDir, { recursive: true, force: true });
 		}
+	});
+});
+
+describe("prompt-only round skip (PR !131 F1)", () => {
+	let tmp: string;
+	beforeEach(() => {
+		tmp = fs.mkdtempSync(path.join(os.tmpdir(), "semblr-prompt-only-"));
+	});
+	afterEach(() => {
+		fs.rmSync(tmp, { recursive: true, force: true });
+	});
+
+	it("does not recover a prompt-only tail round (EOF flush of a just-prompted live session)", () => {
+		const sessionFile = writeSessionFile(tmp, [
+			userMsg("first q"),
+			assistantMsg("first a"),
+			userMsg("second q", "u2"), // prompt with no assistant reply yet
+		]);
+		const roundsDir = path.join(tmp, "rounds");
+		const outcome = backfillMissingRounds(sessionFile, roundsDir, fs, { liveWindowMs: 0 });
+		expect(outcome.recoveredFiles).toEqual([createRoundFilePath("first q", "first a", [])]);
+	});
+
+	it("skips prompt-only rounds in the full scan but still recovers the real ones", () => {
+		const sessionFile = writeSessionFile(tmp, [
+			userMsg("only q", "u0"), // never answered — prompt-only, not fileable
+			userMsg("real q", "u1"),
+			assistantMsg("real a"),
+		]);
+		const roundsDir = path.join(tmp, "rounds");
+		const { missing, scanned } = findMissingRounds(sessionFile, roundsDir);
+		expect(scanned).toBe(1);
+		expect(missing).toHaveLength(1);
+		expect(missing[0].fileName).toBe(createRoundFilePath("real q", "real a", []));
+	});
+
+	it("early exit skips a prompt-only tail and still recognizes the earlier real round", () => {
+		const sessionFile = writeSessionFile(tmp, [
+			userMsg("real q"),
+			assistantMsg("real a"),
+			userMsg("tail q", "u2"), // prompt-only tail
+		]);
+		const roundsDir = path.join(tmp, "rounds");
+		fs.mkdirSync(roundsDir, { recursive: true });
+		fs.writeFileSync(path.join(roundsDir, createRoundFilePath("real q", "real a", [])), "{}");
+		const { missing, scanned, skippedComplete } = findMissingRounds(sessionFile, roundsDir);
+		expect(skippedComplete).toBe(true);
+		expect(missing).toEqual([]);
+		expect(scanned).toBe(0);
 	});
 });

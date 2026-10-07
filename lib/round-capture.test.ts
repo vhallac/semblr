@@ -18,9 +18,11 @@ import {
 	getAgentEndParentId,
 	getRelatedParentIdFromGroup,
 	hashEmbeddingInput,
+	isPromptOnlyRound,
 	type MessageEndProcessingState,
 	readAndClearFollowupFlag,
 } from "./round-capture.ts";
+import type { ToolCallDetail } from "./round-data.ts";
 
 describe("extractAndStripFollowupMarker", () => {
 	it("returns cleaned text and needsFollowup=true when marker is present", () => {
@@ -926,5 +928,29 @@ describe("deriveRoundFile (F1 shared hash derivation, PR !131)", () => {
 		expect(live?.fileName).toBe(derived.fileName);
 		expect(live?.needsFollowup).toBe(true);
 		expect(live?.responseText).toBe(derived.cleanedText);
+	});
+});
+
+describe("isPromptOnlyRound / buildAgentEndRoundFile prompt-only skip (PR !131 F1)", () => {
+	it("flags rounds with no response text and no tool calls", () => {
+		expect(isPromptOnlyRound("", [])).toBe(true);
+		expect(isPromptOnlyRound("", undefined)).toBe(true);
+	});
+
+	it("does not flag rounds with response text or tool calls", () => {
+		expect(isPromptOnlyRound("answer", [])).toBe(false);
+		expect(isPromptOnlyRound("", [{ name: "t", arguments: "{}", result_summary: "" } as ToolCallDetail])).toBe(false);
+	});
+
+	it("buildAgentEndRoundFile returns null for a prompt-only round", () => {
+		expect(buildAgentEndRoundFile("question", [], undefined, [])).toBeNull();
+		expect(buildAgentEndRoundFile("question", [""], undefined, [])).toBeNull();
+	});
+
+	it("buildAgentEndRoundFile still saves a round with empty text but tool calls", () => {
+		const toolCalls = [{ name: "bash", arguments: "{}", result_summary: "ok" } as ToolCallDetail];
+		const saved = buildAgentEndRoundFile("question", [], undefined, toolCalls);
+		expect(saved).not.toBeNull();
+		expect(saved!.userPrompt).toBe("question");
 	});
 });

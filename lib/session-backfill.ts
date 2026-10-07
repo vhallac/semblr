@@ -17,7 +17,7 @@ import * as path from "node:path";
 import { type EmbedRoundDeps, embedRound } from "./embed-round.ts";
 import { parsePiSessionJsonl, reconstructPiSessionRounds } from "./pi-session.ts";
 import type { PromptNoiseOptions } from "./round-capture.ts";
-import { buildAgentEndRoundData, deriveRoundFile } from "./round-capture.ts";
+import { buildAgentEndRoundData, deriveRoundFile, isPromptOnlyRound } from "./round-capture.ts";
 import {
 	buildCheckpointSummaryText,
 	type CheckpointSummary,
@@ -199,6 +199,10 @@ function collectMissingRounds(
 ): { missing: BackfillWrite[]; scanned: number; skippedComplete?: boolean } {
 	for (let i = parsed.length - 1; i >= 0; i--) {
 		if (!parsed[i].userPrompt) continue;
+		// F1 (PR !131): prompt-only tails (e.g. the parser's EOF flush of a
+		// just-prompted live session) are never written by the live path, so they
+		// must not anchor the early exit — skip them like unprompted rounds.
+		if (isPromptOnlyRound(parsed[i].responseSequence, parsed[i].toolCalls)) continue;
 		// F1 (PR !131): hash via the shared derivation so the early exit agrees
 		// with the live write's filename for followup-marker rounds.
 		const lastFile = deriveRoundFile(parsed[i].userPrompt, parsed[i].responseSequence, parsed[i].toolCalls).fileName;
@@ -213,6 +217,10 @@ function collectMissingRounds(
 	for (const { roundFile, round } of reconstructed) {
 		// Rounds without a user prompt cannot be filed (filename derives from it).
 		if (!round.userPrompt) continue;
+		// F1 (PR !131): prompt-only rounds (empty response, no tool calls) are
+		// skipped by the live save path too — never persist a bogus empty round
+		// from the parser's EOF flush.
+		if (isPromptOnlyRound(round.responseSequence, round.toolCalls)) continue;
 		scanned++;
 		if (fsImpl.existsSync(path.join(roundsDir, roundFile))) continue;
 		const roundData = {

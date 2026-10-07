@@ -133,9 +133,23 @@ export function deriveRoundFile(
 }
 
 /**
+ * F1 (PR !131): a prompt-only round — a user prompt with no response text and
+ * no tool calls — is not worth retaining in the rounds database. Backfill's
+ * parser flushes such a round at EOF whenever a live session's only tail
+ * entry is the user prompt (assistant reply not yet landed), which previously
+ * produced a permanently stored bogus round under hash(prompt, ""). Skipping
+ * it on the live path is harmless: a genuinely empty assistant turn carries
+ * no retrievable content either.
+ */
+export function isPromptOnlyRound(responseText: string, toolCalls?: readonly unknown[]): boolean {
+	return responseText.length === 0 && (!toolCalls || toolCalls.length === 0);
+}
+
+/**
  * Assemble everything needed to write the round file at agent_end (issue #130):
  * prompt extraction, response extraction with followup-marker strip, and the
- * content-hash file name. Returns null when there is no user prompt to save.
+ * content-hash file name. Returns null when there is no user prompt to save
+ * (or nothing fileable at all — prompt-only rounds are skipped, F1 PR !131).
  * Pure derivation — the caller owns mkdir/write and error policy.
  */
 export function buildAgentEndRoundFile(
@@ -148,6 +162,7 @@ export function buildAgentEndRoundFile(
 	if (!userPrompt) return null;
 	const rawResponseText = extractAgentEndResponseText(accumulatedText, messages);
 	const derived = deriveRoundFile(userPrompt, rawResponseText, toolCalls);
+	if (isPromptOnlyRound(derived.cleanedText, toolCalls)) return null;
 	return {
 		userPrompt,
 		responseText: derived.cleanedText,
