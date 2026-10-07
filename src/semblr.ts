@@ -43,6 +43,7 @@ import {
 	shouldDropRelevanceList,
 	stripEnvPreamble,
 } from "../lib/context-messages.ts";
+import { embedRound } from "../lib/embed-round.ts";
 import { embedText, getApiKey } from "../lib/embedding-client.ts";
 import { assignToGroup, formatGroupStats } from "../lib/grouping.ts";
 import { indexRoundFileFromPath, loadVectorIndex } from "../lib/index-io.ts";
@@ -56,7 +57,6 @@ import {
 import {
 	applyMessageEndToState,
 	buildAgentEndChainEntry,
-	buildAgentEndEmbeddingTexts,
 	buildPromptEmbeddingInput,
 	embeddingMaxTokensToResponseBytes,
 	getRelatedParentIdFromGroup,
@@ -1095,94 +1095,46 @@ export default function (pi: ExtensionAPI) {
 			return;
 		}
 
-		if (round.skipPromptEmbedding) {
-			// Short prompt: skip prompt embedding (noisy), but still embed response.
-			// Response is usually significant even when the prompt is short.
-			// Per https://github.com/vhallac/semblr/issues/38#issuecomment-4629826478
-			try {
-				const { clippedResponse } = buildAgentEndEmbeddingTexts("", responseText, EMBEDDING_RESPONSE_MAX_BYTES);
-
-				// Embed response only (no noisy prompt prefix)
-				const responseVec = normalize(await embedText(clippedResponse, apiKey, embeddingClientDeps(ctx)));
-
-				// Write :response row to index (skip :prompt -- prompt was noise)
-				appendToIndex(`${roundFileName}:response`, responseVec, SEMBLR_CONFIG.embeddingModel);
-
-				// Embed checkpoint summary if present
-				if (round.lastCheckpointSummary) {
-					const summaryText = buildCheckpointSummaryText(round.lastCheckpointSummary);
-					const summaryVec = normalize(await embedText(summaryText, apiKey, embeddingClientDeps(ctx)));
-					appendToIndex(`${roundFileName}:summary`, summaryVec, SEMBLR_CONFIG.embeddingModel);
-				}
-
-				ctx.ui.setStatus("semblr", `🧠 saved + response-embedded round (${roundFileName})`);
-
-				finalizeRoundEmbedding({
-					roundPath,
-					embeddingVec: responseVec,
-					needsFollowup,
-				});
-			} catch (err) {
-				ctx.ui.setStatus("semblr", `🧠 response embedding error: ${(err as Error).message}`);
-			}
-		} else {
-			try {
-				// Embedding-input noise cleanup (issue #106 Stage 1, derived-not-stored): collapse large
-				// code fences and JSON dumps before embedding. The round file keeps the raw prompt.
-				const { text: cleanedPrompt, hash: promptInputHash } = buildPromptEmbeddingInput(
+		// F4+F6 (PR !131): the embedding policy now lives in the shared core
+		// embedRound (lib/embed-round.ts), used identically by the recovery path.
+		// Live-only extras stay outside: the prompt-vec stash (hash-gated reuse
+		// from the context hook) is injected as embedPrompt, and grouping and
+		// follow-up handling run in finalizeRoundEmbedding afterward.
+		const summaryText = round.lastCheckpointSummary ? buildCheckpointSummaryText(round.lastCheckpointSummary) : null;
+		try {
+			const result = await embedRound(
+				{
+					fileName: roundFileName,
 					userPrompt,
-					PROMPT_NOISE_CLEANUP,
-					SEMBLR_CONFIG.embeddingMaxTokens,
-				);
-				const { clippedResponse, combinedText } = buildAgentEndEmbeddingTexts(
-					cleanedPrompt,
 					responseText,
-					EMBEDDING_RESPONSE_MAX_BYTES,
-				);
-
-				// Embedding #1: prompt — reuse the round.promptVec stashed by the context hook.
-				// Since issue #107 F3 the hook embeds over the identical
-				// buildPromptEmbeddingInput derivation, so the stash is already in the
-				// :prompt domain; the hash gate keeps the reuse exact (stale or divergent
-				// derivations — e.g. the hook's 200-word clip on long string prompts — fall
-				// through to a fresh embed so the row's hash stamp stays honest).
-				const cachedPromptVec = round.promptVecHash === promptInputHash ? round.promptVec : null;
-				const promptVec =
-					cachedPromptVec ?? normalize(await embedText(cleanedPrompt, apiKey, embeddingClientDeps(ctx)));
-
-				// Embedding #2 + #3 in parallel
-				const [responseVec, combinedVec] = await Promise.all([
-					embedText(clippedResponse, apiKey, embeddingClientDeps(ctx)),
-					embedText(combinedText, apiKey, embeddingClientDeps(ctx)),
-				]);
-
-				// Save to index: :prompt and :response (normalized for cosine similarity).
-				// The :prompt row carries the embedding-input hash stamp (issue #106 migration).
-				appendToIndex(
-					`${roundFileName}:prompt`,
-					normalize(promptVec),
-					SEMBLR_CONFIG.embeddingModel,
-					promptInputHash,
-				);
-				appendToIndex(`${roundFileName}:response`, normalize(responseVec), SEMBLR_CONFIG.embeddingModel);
-
-				// Embed checkpoint summary if present
-				if (round.lastCheckpointSummary) {
-					const summaryText = buildCheckpointSummaryText(round.lastCheckpointSummary);
-					const summaryVec = normalize(await embedText(summaryText, apiKey, embeddingClientDeps(ctx)));
-					appendToIndex(`${roundFileName}:summary`, summaryVec, SEMBLR_CONFIG.embeddingModel);
-				}
-
+					checkpointSummaryText: summaryText,
+					maxResponseBytes: EMBEDDING_RESPONSE_MAX_BYTES,
+					promptNoiseOptions: PROMPT_NOISE_CLEANUP,
+					promptMaxTokens: SEMBLR_CONFIG.embeddingMaxTokens,
+				},
+				{
+					embed: (text) => embedText(text, apiKey, embeddingClientDeps(ctx)),
+					embedPrompt: (text, hash) =>
+						round.promptVecHash === hash && round.promptVec
+							? Promise.resolve(round.promptVec as number[])
+							: embedText(text, apiKey, embeddingClientDeps(ctx)),
+					appendIndexRow: (label, vec, hash) => appendToIndex(label, vec, SEMBLR_CONFIG.embeddingModel, hash),
+					writeRoundEmbedding: (_fileName, vec) => {
+						finalizeRoundEmbedding({
+							roundPath,
+							embeddingVec: vec,
+							needsFollowup,
+						});
+					},
+				},
+			);
+			if (result.promptDropped) {
+				ctx.ui.setStatus("semblr", `\u{1f9e0} saved + response-embedded round (${roundFileName})`);
+			} else {
 				ctx.ui.setStatus("semblr", `\u{1f9e0} saved + embedded round (${roundFileName})`);
-
-				finalizeRoundEmbedding({
-					roundPath,
-					embeddingVec: combinedVec,
-					needsFollowup,
-				});
-			} catch (err) {
-				ctx.ui.setStatus("semblr", `\u{1f9e0} embedding error: ${(err as Error).message}`);
 			}
+		} catch (err) {
+			ctx.ui.setStatus("semblr", `\u{1f9e0} embedding error: ${(err as Error).message}`);
 		}
 
 		lastRoundFileName = roundFileName;
@@ -1279,15 +1231,9 @@ export default function (pi: ExtensionAPI) {
 										embed: (text) => embedText(text, embedKey, embeddingClientDeps(ctx)),
 										appendIndexRow: (label, vec, hash) =>
 											appendToIndex(label, vec, SEMBLR_CONFIG.embeddingModel, hash),
-										// F4 (PR !131): live-parity prompt derivation — recovered prompts go
-										// through the same buildPromptEmbeddingInput cleanup + hash stamp
-										// as agent_end, keeping :prompt rows in the same domain as queries.
-										preparePrompt: (userPrompt) =>
-											buildPromptEmbeddingInput(
-												userPrompt,
-												PROMPT_NOISE_CLEANUP,
-												SEMBLR_CONFIG.embeddingMaxTokens,
-											),
+										// F4+F6 (PR !131): prompt derivation, clipping, and row labels now
+										// come from the shared core, so recovered rows are in the same domain
+										// as agent_end by construction; only the config is passed here.
 										// F5 (PR !131): label-guard so a re-run after a crash between the
 										// appends and the embedding write does not duplicate index rows.
 										hasIndexRow: (label) =>
@@ -1302,7 +1248,11 @@ export default function (pi: ExtensionAPI) {
 									},
 									// F3 (PR !131): live-parity response budget — recovered embeddings are
 									// clipped with the same configured budget as agent_end, not the default.
-									{ maxResponseBytes: EMBEDDING_RESPONSE_MAX_BYTES },
+									{
+										maxResponseBytes: EMBEDDING_RESPONSE_MAX_BYTES,
+										promptNoiseOptions: PROMPT_NOISE_CLEANUP,
+										promptMaxTokens: SEMBLR_CONFIG.embeddingMaxTokens,
+									},
 								);
 								if (embedResult.embedded.length > 0) {
 									ctx.ui.setStatus(

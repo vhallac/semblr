@@ -166,6 +166,8 @@ describe("session-backfill", () => {
 		expect(outcome.deferredLive).toBe(1);
 		expect(outcome.recoveredFiles).toEqual([]);
 		// Once stale, the early exit reports skippedComplete without re-writing.
+		// Pin the mtime so the 1ms live window can't flake on clock resolution.
+		fs.utimesSync(complete, new Date(0), new Date(0));
 		const stale = backfillMissingRounds(complete, roundsDir, undefined, { nowMs: Date.now(), liveWindowMs: 1 });
 		expect(stale.skippedComplete).toBe(true);
 		expect(stale.recoveredFiles).toEqual([]);
@@ -239,7 +241,12 @@ describe("session-backfill", () => {
 
 	describe("embedRecoveredRounds (F4)", () => {
 		it("embeds prompt, clipped response, and combined text; stores combined as promptEmbedding", async () => {
-			const sessionFile = writeSessionFile(tmp, [userMsg("q"), assistantMsg("a long answer")]);
+			const sessionFile = writeSessionFile(tmp, [
+				userMsg(
+					"please tell me about the long war and its many causes and consequences for the border provinces and their people",
+				),
+				assistantMsg("a long answer"),
+			]);
 			const roundsDir = path.join(tmp, "rounds");
 			const outcome = backfillMissingRounds(sessionFile, roundsDir, undefined, { liveWindowMs: 0 });
 			const fileName = outcome.recoveredFiles[0];
@@ -260,6 +267,13 @@ describe("session-backfill", () => {
 			expect(rows.map(([label]) => label)).toEqual([`${fileName}:prompt`, `${fileName}:response`]);
 			const written = JSON.parse(fs.readFileSync(path.join(roundsDir, fileName), "utf-8"));
 			expect(written.promptEmbedding).toBeDefined();
+			// live scale convention: rows are normalized, the stored promptEmbedding
+			// is the raw combined vector (embed returns [len, 3], so rows have magnitude √2)
+			const responseRowVec = rows.find(([label]) => label === `${fileName}:response`)![1];
+			const promptRowVec = rows.find(([label]) => label === `${fileName}:prompt`)![1];
+			const rowMag = Math.sqrt(promptRowVec.reduce((s: number, x: number) => s + x * x, 0));
+			expect(rowMag).toBeCloseTo(1, 5);
+			expect(written.promptEmbedding).not.toEqual(responseRowVec);
 		});
 
 		it("skips rounds that already have a promptEmbedding, and reports per-round errors", async () => {
@@ -296,18 +310,21 @@ describe("session-backfill", () => {
 			const fileName = outcome.recoveredFiles[0];
 			const embedded: string[] = [];
 			const rowHashes = new Map<string, string | undefined>();
-			const result = await embedRecoveredRounds(outcome.recoveredFiles, roundsDir, {
-				embed: (text) => {
-					embedded.push(text);
-					return Promise.resolve([text.length, 3]);
+			const result = await embedRecoveredRounds(
+				outcome.recoveredFiles,
+				roundsDir,
+				{
+					embed: (text) => {
+						embedded.push(text);
+						return Promise.resolve([text.length, 3]);
+					},
+					appendIndexRow: (label, _vec, hash) => rowHashes.set(label, hash),
+					writeRoundEmbedding: () => {},
 				},
-				appendIndexRow: (label, _vec, hash) => rowHashes.set(label, hash),
 				// live-parity derivation (same convention as semblr.ts agent_end),
 				// with a small clip so the collapsed fence shrinks the input
-				preparePrompt: (userPrompt) =>
-					buildPromptEmbeddingInput(userPrompt, { fenceMaxChars: 4, jsonMaxChars: 0, repeatMaxChars: 0 }, 8000),
-				writeRoundEmbedding: () => {},
-			});
+				{ promptNoiseOptions: { fenceMaxChars: 4, jsonMaxChars: 0, repeatMaxChars: 0 }, promptMaxTokens: 8000 },
+			);
 			expect(result.embedded).toEqual([fileName]);
 			// the prompt embedding input is the cleaned prompt, not the raw round text
 			const raw = JSON.parse(fs.readFileSync(path.join(roundsDir, fileName), "utf-8")).userPrompt as string;
@@ -321,6 +338,36 @@ describe("session-backfill", () => {
 			// the :prompt row is hash-stamped (same domain as live rows); :response is not
 			expect(rowHashes.get(`${fileName}:prompt`)).toBe(hash);
 			expect(rowHashes.get(`${fileName}:response`)).toBeUndefined();
+		});
+
+		it("F6 parity: a short recovered prompt drops the :prompt row and stores the normalized response vector (shared-core policy)", async () => {
+			const sessionFile = writeSessionFile(tmp, [userMsg("continue"), assistantMsg("the walls hold for now")]);
+			const roundsDir = path.join(tmp, "rounds");
+			const outcome = backfillMissingRounds(sessionFile, roundsDir, undefined, { liveWindowMs: 0 });
+			const fileName = outcome.recoveredFiles[0];
+			const rows: Array<[string, number[]]> = [];
+			const embedded: string[] = [];
+			const result = await embedRecoveredRounds(outcome.recoveredFiles, roundsDir, {
+				embed: (text) => {
+					embedded.push(text);
+					return Promise.resolve([text.length, 1]);
+				},
+				appendIndexRow: (label, vec) => rows.push([label, vec]),
+				writeRoundEmbedding: (name, vec) => {
+					const p = path.join(roundsDir, name);
+					const existing = JSON.parse(fs.readFileSync(p, "utf-8"));
+					existing.promptEmbedding = vec;
+					fs.writeFileSync(p, JSON.stringify(existing, null, 2));
+				},
+			});
+			expect(result.embedded).toEqual([fileName]);
+			// the prompt embedding is dropped entirely — same policy as live agent_end
+			expect(embedded).toHaveLength(1);
+			expect(rows.map(([label]) => label)).toEqual([`${fileName}:response`]);
+			// scale convention: the round stores the normalized response vector
+			const written = JSON.parse(fs.readFileSync(path.join(roundsDir, fileName), "utf-8"));
+			const mag = Math.sqrt(written.promptEmbedding.reduce((s: number, x: number) => s + x * x, 0));
+			expect(mag).toBeCloseTo(1, 5);
 		});
 
 		it("F3 parity: response clip honors the caller-supplied maxResponseBytes budget (non-default embeddingMaxTokens)", async () => {
