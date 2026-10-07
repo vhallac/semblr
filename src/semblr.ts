@@ -1205,20 +1205,27 @@ export default function (pi: ExtensionAPI) {
 						try {
 							const embedKey = await getApiKey(ctx, { config: SEMBLR_CONFIG });
 							if (embedKey) {
+								// Label guard backed by a single index load: the index is read
+								// once before embedding, kept as an in-memory Set, and updated on
+								// every append. Previously hasIndexRow re-read the full index
+								// file per recovered round (O(n × index size) — minutes of
+								// blocking startup work with a large index).
+								const indexedLabels = new Set(loadVectorIndex(INDEX_PATH).map((entry) => entry.filePath));
 								const embedResult = await embedRecoveredRounds(
 									backfill.recoveredFiles,
 									ROUNDS_DIR,
 									{
 										embed: (text) => embedText(text, embedKey, embeddingClientDeps(ctx)),
-										appendIndexRow: (label, vec, hash) =>
-											appendToIndex(label, vec, SEMBLR_CONFIG.embeddingModel, hash),
+										appendIndexRow: (label, vec, hash) => {
+											appendToIndex(label, vec, SEMBLR_CONFIG.embeddingModel, hash);
+											indexedLabels.add(label);
+										},
 										// F4+F6 (PR !131): prompt derivation, clipping, and row labels now
 										// come from the shared core, so recovered rows are in the same domain
 										// as agent_end by construction; only the config is passed here.
 										// F5 (PR !131): label-guard so a re-run after a crash between the
 										// appends and the embedding write does not duplicate index rows.
-										hasIndexRow: (label) =>
-											loadVectorIndex(INDEX_PATH).some((entry) => entry.filePath === label),
+										hasIndexRow: (label) => indexedLabels.has(label),
 										writeRoundEmbedding: (fileName, vec) => {
 											const p = `${ROUNDS_DIR}/${fileName}`;
 											const existing = JSON.parse(fs.readFileSync(p, "utf-8"));
