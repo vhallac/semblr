@@ -1,5 +1,6 @@
 import { splitAndExtractPrompt } from "./envelope-extract.ts";
 import { createRoundFilePath } from "./hash.ts";
+import { extractText, type TextContentBlock } from "./message-content.ts";
 import { extractAndStripFollowupMarker } from "./round-capture.ts";
 
 interface ParsedToolCallDetail {
@@ -162,7 +163,10 @@ export function parsePiSessionJsonl(raw: string, options: ParsePiSessionOptions 
 			const toolName = entry.message.toolName;
 			if (toolName) toolNames.push(toolName);
 			const toolCallId = typeof entry.message.toolCallId === "string" ? entry.message.toolCallId : undefined;
-			const resultText = parsePiTextContent(entry.message.content);
+			// Must match the live capture path (round-capture.ts uses extractText, which
+			// does not trim). Trimming here changes the content hash and causes backfill to
+			// re-recover already-saved rounds under a new ID.
+			const resultText = extractText((entry.message.content ?? []) as unknown as TextContentBlock[]);
 
 			// Prefer ID-based matching for parallel tool call correctness.
 			// Falls back to reverse-sequential scan (most-recent pending) for

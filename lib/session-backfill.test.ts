@@ -115,6 +115,37 @@ describe("session-backfill", () => {
 		expect(toolRound.toolCallCount).toBe(1);
 	});
 
+	it("tool result text preserves trailing whitespace like the live capture path (hash parity)", () => {
+		const sessionFile = writeSessionFile(tmp, [
+			userMsg("q", "u1"),
+			{
+				type: "message",
+				message: {
+					role: "assistant",
+					content: [{ type: "toolCall", name: "bash", arguments: {}, id: "t1" }],
+				},
+			},
+			{
+				type: "message",
+				message: {
+					role: "toolResult",
+					toolName: "bash",
+					toolCallId: "t1",
+					content: [{ type: "text", text: "output line\n" }],
+				},
+			},
+			assistantMsg("a"),
+		]);
+		const roundsDir = path.join(tmp, "rounds");
+		backfillMissingRounds(sessionFile, roundsDir, undefined, { liveWindowMs: 0 });
+		const files = fs.readdirSync(roundsDir);
+		expect(files).toHaveLength(1);
+		const round = JSON.parse(fs.readFileSync(path.join(roundsDir, files[0]), "utf-8"));
+		// The live path (round-capture.ts extractText) does not trim; the backfill
+		// path must match or the content hash diverges and rounds get re-recovered.
+		expect(round.toolCalls[0].result_full).toBe("output line\n");
+	});
+
 	it("rounds with empty user prompt are not counted as scanned", () => {
 		const sessionFile = writeSessionFile(tmp, [userMsg("   ", "u1"), assistantMsg("response")]);
 		const roundsDir = path.join(tmp, "rounds");
