@@ -1,5 +1,7 @@
 import { splitAndExtractPrompt } from "./envelope-extract.ts";
 import { createRoundFilePath } from "./hash.ts";
+import { extractText, type TextContentBlock } from "./message-content.ts";
+import { extractAndStripFollowupMarker } from "./round-capture.ts";
 
 interface ParsedToolCallDetail {
 	index: number;
@@ -29,6 +31,8 @@ export interface ParsedPiRound {
 	toolCallCount: number;
 	toolCallNames: string[];
 	toolCalls: ParsedToolCallDetail[];
+	/** True when the response ended with the followup marker (F1, PR !131); marker is stripped from responseSequence. */
+	needsFollowup: boolean;
 }
 
 export interface ParsePiSessionOptions {
@@ -46,6 +50,8 @@ interface SessionEntry {
 		timestamp?: number;
 		toolName?: string;
 		toolCallId?: string;
+		/** Terminal-state marker (F2): "toolUse" means the turn is still open. */
+		stopReason?: string;
 	};
 }
 
@@ -94,12 +100,17 @@ export function parsePiSessionJsonl(raw: string, options: ParsePiSessionOptions 
 
 	const flush = (responseEndTimestamp: number, isFinal: boolean) => {
 		if (!currentUserMsg) return;
-		const responseSequence = responseParts.join("\n\n").trim();
-		if (isFinal && options.skipShortFinalResponse && responseSequence.length < 20 && roundIndex === 0) return;
+		const rawSequence = responseParts.join("\n\n").trim();
+		if (isFinal && options.skipShortFinalResponse && rawSequence.length < 20 && roundIndex === 0) return;
+		// F1 (PR !131): strip the followup marker here — reconstruction, the
+		// backfill early exit, and the digest scripts all hash the parsed
+		// responseSequence, so it must carry the same cleaned text the live
+		// agent_end write hashes.
+		const { cleanedText, needsFollowup } = extractAndStripFollowupMarker(rawSequence);
 		const round: ParsedPiRound = {
 			id: currentUserMsg.id ?? "",
 			userPrompt: splitAndExtractPrompt(parsePiTextContent(currentUserMsg.message?.content)).userText,
-			responseSequence,
+			responseSequence: cleanedText,
 			responseSegments,
 			userTimestamp: currentUserMsg.message?.timestamp ?? 0,
 			responseEndTimestamp,
@@ -107,6 +118,7 @@ export function parsePiSessionJsonl(raw: string, options: ParsePiSessionOptions 
 			toolCallCount,
 			toolCallNames: [...new Set(toolNames)],
 			toolCalls,
+			needsFollowup,
 		};
 		if (options.sessionLabel) round.sessionLabel = options.sessionLabel;
 		rounds.push(round);
@@ -151,7 +163,10 @@ export function parsePiSessionJsonl(raw: string, options: ParsePiSessionOptions 
 			const toolName = entry.message.toolName;
 			if (toolName) toolNames.push(toolName);
 			const toolCallId = typeof entry.message.toolCallId === "string" ? entry.message.toolCallId : undefined;
-			const resultText = parsePiTextContent(entry.message.content);
+			// Must match the live capture path (round-capture.ts uses extractText, which
+			// does not trim). Trimming here changes the content hash and causes backfill to
+			// re-recover already-saved rounds under a new ID.
+			const resultText = extractText((entry.message.content ?? []) as unknown as TextContentBlock[]);
 
 			// Prefer ID-based matching for parallel tool call correctness.
 			// Falls back to reverse-sequential scan (most-recent pending) for

@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import * as fs from "node:fs";
 import { splitAndExtractPrompt } from "./envelope-extract.ts";
-import { computeContentHash } from "./hash.ts";
+import { computeContentHash, createRoundFilePath, type HashToolCallDetail } from "./hash.ts";
 import { extractText } from "./message-content.ts";
 import type { ChainEntry, CheckpointSummary, ResponseSegment, RoundData, ToolCallDetail } from "./round-data.ts";
 
@@ -62,6 +62,9 @@ export function getAgentEndParentId(chain: readonly { fileName: string }[]): str
 	return chain.length >= 2 ? chain[chain.length - 2].fileName : null;
 }
 
+/** The complete round shape buildAgentEndRoundData produces (minus backfill-only flags). */
+export type AgentEndRoundData = Omit<RoundData, "recovered">;
+
 export function buildAgentEndRoundData(args: {
 	userPrompt: string;
 	responseText: string;
@@ -74,7 +77,7 @@ export function buildAgentEndRoundData(args: {
 	userTimestamp?: number;
 	needsFollowup?: boolean;
 	summary?: CheckpointSummary;
-}): Record<string, unknown> {
+}): AgentEndRoundData {
 	return {
 		id: computeContentHash(args.userPrompt, args.responseText, args.toolCalls),
 		userPrompt: args.userPrompt,
@@ -90,6 +93,81 @@ export function buildAgentEndRoundData(args: {
 		relatedParentId: null,
 		needsFollowup: args.needsFollowup ?? false,
 		...(args.summary ? { summary: args.summary } : {}),
+	};
+}
+
+export interface AgentEndRoundFile {
+	userPrompt: string;
+	responseText: string;
+	needsFollowup: boolean;
+	fileName: string;
+}
+
+export interface DerivedRoundFile {
+	userPrompt: string;
+	cleanedText: string;
+	needsFollowup: boolean;
+	fileName: string;
+}
+
+/**
+ * The shared round-file derivation (F1, PR !131 — the hash contract): raw
+ * response text → followup-marker strip → `needsFollowup` + cleaned text →
+ * content-hash filename. Single source of truth for the live agent_end write,
+ * session reconstruction, the backfill early exit, and the digest scripts, so
+ * every path derives identical filenames for the same conversation (marker
+ * rounds previously hashed divergently: 155/155 in the review measurement).
+ */
+export function deriveRoundFile(
+	userPrompt: string,
+	rawResponseText: string,
+	toolCalls?: readonly HashToolCallDetail[],
+): DerivedRoundFile {
+	const { cleanedText, needsFollowup } = extractAndStripFollowupMarker(rawResponseText);
+	return {
+		userPrompt,
+		cleanedText,
+		needsFollowup,
+		fileName: createRoundFilePath(userPrompt, cleanedText, toolCalls ? [...toolCalls] : undefined),
+	};
+}
+
+/**
+ * F1 (PR !131): a prompt-only round — a user prompt with no response text and
+ * no tool calls — is not worth retaining in the rounds database. Backfill's
+ * parser flushes such a round at EOF whenever a live session's only tail
+ * entry is the user prompt (assistant reply not yet landed), which previously
+ * produced a permanently stored bogus round under hash(prompt, ""). Skipping
+ * it on the live path is harmless: a genuinely empty assistant turn carries
+ * no retrievable content either.
+ */
+export function isPromptOnlyRound(responseText: string, toolCalls?: readonly unknown[]): boolean {
+	return responseText.length === 0 && (!toolCalls || toolCalls.length === 0);
+}
+
+/**
+ * Assemble everything needed to write the round file at agent_end (issue #130):
+ * prompt extraction, response extraction with followup-marker strip, and the
+ * content-hash file name. Returns null when there is no user prompt to save
+ * (or nothing fileable at all — prompt-only rounds are skipped, F1 PR !131).
+ * Pure derivation — the caller owns mkdir/write and error policy.
+ */
+export function buildAgentEndRoundFile(
+	cachedPrompt: string | null,
+	accumulatedText: readonly string[],
+	messages: readonly unknown[] | undefined,
+	toolCalls: readonly ToolCallDetail[],
+): AgentEndRoundFile | null {
+	const userPrompt = extractAgentEndUserPrompt(cachedPrompt, messages);
+	if (!userPrompt) return null;
+	const rawResponseText = extractAgentEndResponseText(accumulatedText, messages);
+	const derived = deriveRoundFile(userPrompt, rawResponseText, toolCalls);
+	if (isPromptOnlyRound(derived.cleanedText, toolCalls)) return null;
+	return {
+		userPrompt,
+		responseText: derived.cleanedText,
+		needsFollowup: derived.needsFollowup,
+		fileName: derived.fileName,
 	};
 }
 

@@ -131,3 +131,22 @@ describe("bm25 index", () => {
 		expect(index.documentCount).toBe(1);
 	});
 });
+
+describe("bm25 prototype-chain hygiene (PR !131)", () => {
+	it("indexes the token 'constructor' as a numeric frequency, not the inherited function", () => {
+		// `tf[token] ?? 0` resolved through the prototype chain: for the token
+		// "constructor" it produced "function Object() { [native code] }1".
+		const doc = buildBm25Index([{ fileName: "a.json", text: "constructor constructor field" }]).documents["a.json"];
+		expect(doc.termFrequencies.constructor).toBe(2);
+	});
+
+	it("a persisted index containing the token 'constructor' still validates on load", () => {
+		const dir = tmpDir();
+		const file = path.join(dir, "index.bm25.json");
+		const index = buildBm25Index([{ fileName: "a.json", text: "constructor constructor" }]);
+		writeBm25Index(file, index);
+		const loaded = loadBm25Index(file);
+		expect(Object.keys(loaded.documents)).toEqual(["a.json"]);
+		expect(loaded.documents["a.json"].termFrequencies.constructor).toBe(2);
+	});
+});

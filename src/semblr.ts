@@ -14,6 +14,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import type { ContextEvent, ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Type } from "@sinclair/typebox";
+import { defaultAgentEndPersistFs, persistAgentEndRound, type WriteGapGate } from "../lib/agent-end-persist.ts";
 import {
 	bm25IndexPathForRoundsDir,
 	loadOrRebuildBm25Index,
@@ -42,10 +43,10 @@ import {
 	shouldDropRelevanceList,
 	stripEnvPreamble,
 } from "../lib/context-messages.ts";
+import { embedRound } from "../lib/embed-round.ts";
 import { embedText, getApiKey } from "../lib/embedding-client.ts";
 import { assignToGroup, formatGroupStats } from "../lib/grouping.ts";
-import { createRoundFilePath } from "../lib/hash.ts";
-import { indexRoundFileFromPath } from "../lib/index-io.ts";
+import { indexRoundFileFromPath, loadVectorIndex } from "../lib/index-io.ts";
 import {
 	appendToIndexPath,
 	buildSessionStartStatus,
@@ -56,18 +57,12 @@ import {
 import {
 	applyMessageEndToState,
 	buildAgentEndChainEntry,
-	buildAgentEndEmbeddingTexts,
-	buildAgentEndRoundData,
 	buildPromptEmbeddingInput,
 	embeddingMaxTokensToResponseBytes,
-	extractAgentEndResponseText,
-	extractAgentEndUserPrompt,
-	extractAndStripFollowupMarker,
-	getAgentEndParentId,
 	getRelatedParentIdFromGroup,
 	type MessageEndProcessingState,
 } from "../lib/round-capture.ts";
-import type { RoundData } from "../lib/round-data.ts";
+import { buildCheckpointSummaryText, type RoundData } from "../lib/round-data.ts";
 import { getRoundFileSize, readRoundFileFromDir as readRoundFileFromDirLib, readRoundJson } from "../lib/round-io.ts";
 import {
 	loadRoundDataForToolDetails,
@@ -95,6 +90,13 @@ import {
 	toolIndexPathForRoundsDir,
 } from "../lib/search-tools.ts";
 import { loadSemblrConfig, type SemblrConfig } from "../lib/semblr-config.ts";
+import {
+	backfillMissingRounds,
+	buildBackfillCandidates,
+	embedRecoveredRounds,
+	indexRecoveredRounds,
+	isBackfillStartReason,
+} from "../lib/session-backfill.ts";
 import type { CheckpointSummary, ToolCallDetail } from "../lib/state.ts";
 import { contextCacheStore, contextCacheValid, createRound, createSession } from "../lib/state.ts";
 import {
@@ -209,28 +211,7 @@ const PROMPT_NOISE_CLEANUP = {
 	repeatMaxChars: SEMBLR_CONFIG.promptNoiseRepeatMaxChars,
 };
 
-/** Build a flat text representation of a checkpoint summary for embedding. */
-function buildCheckpointSummaryText(summary: CheckpointSummary): string {
-	const lines: string[] = [];
-	lines.push(`Current Task: ${summary.currentTask}`);
-	if (summary.progressMade.length > 0) {
-		lines.push("Progress Made:");
-		for (const item of summary.progressMade) lines.push(`- ${item}`);
-	}
-	if (summary.currentState.length > 0) {
-		lines.push("Current State:");
-		for (const item of summary.currentState) lines.push(`- ${item}`);
-	}
-	if (summary.nextSteps.length > 0) {
-		lines.push("Next Steps:");
-		for (const item of summary.nextSteps) lines.push(`- ${item}`);
-	}
-	if (summary.keyFindings.length > 0) {
-		lines.push("Key Findings / Decisions:");
-		for (const item of summary.keyFindings) lines.push(`- ${item}`);
-	}
-	return lines.join("\n");
-}
+/** Checkpoint embedding text lives in the shared core (lib/round-data.ts, F7 PR !131). */
 
 // Context formatting helpers live in lib/context-format.ts.
 
@@ -344,6 +325,10 @@ function readRoundFile(filePath: string): RoundData | null {
 }
 
 let lastRoundFileName: string | null = null; // tracks the most recent saved round (process-local)
+// F1 (PR !131 round 3): gap-free write ordering — once a round write fails, no
+// later round is persisted ahead of it in this process; a fresh process starts
+// with a clean gate and the startup backfill recovers the blocked rounds.
+const writeGapGate: WriteGapGate = { blockedBy: null };
 // Used in context hook to gate follow-up injection: checks metadata + in-memory state
 function needsFollowupInjection(fileName: string): boolean {
 	const round = readRoundJson(ROUNDS_DIR, fileName);
@@ -932,96 +917,139 @@ export default function (pi: ExtensionAPI) {
 	pi.on("agent_end", async (event, ctx) => {
 		const { messages } = event;
 
-		// Get user prompt -- prefer agent_start cached value, fall back to messages
-		const userPrompt = extractAgentEndUserPrompt(round.userPrompt, messages);
-
-		if (!userPrompt) {
-			ctx.ui.setStatus("semblr", "\u{1f9e0} agent_end: no user prompt to save");
-			return;
-		}
-
-		// Build response text from accumulated assistant text across all tool iterations
-		const rawResponseText = extractAgentEndResponseText(round.accumulatedText, messages);
-		// Detect and strip the round_needs_followup marker, flagging for follow-up
-		// injection on the next context assembly.
-		const { cleanedText: responseText, needsFollowup } = extractAndStripFollowupMarker(rawResponseText);
-
-		fs.mkdirSync(ROUNDS_DIR, { recursive: true });
-
-		const roundFileName = createRoundFilePath(userPrompt, responseText, round.toolCalls);
-		const roundPath = `${ROUNDS_DIR}/${roundFileName}`;
-
-		// Push to causal chain — even on dedup, this ensures the in-memory buffer
-		// tracks every round seen in this session.
-		session.causalChain.push(
-			buildAgentEndChainEntry(roundFileName, userPrompt, responseText, round.toolCalls.length, round.toolCallNames),
-		);
-
-		// Skip if already saved (deduplication by content hash)
-		if (fs.existsSync(roundPath)) {
-			// Even on dedup, run grouping if the round has a combined embedding
-			// (or if this is a short-prompt round with embedding skipped, use null)
-			try {
-				const existing = JSON.parse(fs.readFileSync(roundPath, "utf-8"));
-				if (existing.promptEmbedding) {
-					const vec = existing.promptEmbedding || null;
-					assignToGroup(
-						session.roundGroups,
-						session.causalChain[session.causalChain.length - 1],
-						vec,
-						SEMBLR_GROUP_THRESHOLD,
-						needsFollowup ? session.lastFollowupGroupIdx : null,
-					);
+		// Issue #130: pi's extension runner swallows handler exceptions — a throw
+		// anywhere before writeFileSync loses the round silently. persistAgentEndRound
+		// assembles and writes the round file FIRST; every fallible step below the
+		// write (chain push, bm25, tool index, embeddings) is guarded and can only
+		// cost derived data, never the round itself.
+		const persist = persistAgentEndRound(
+			{ fs: defaultAgentEndPersistFs, roundsDir: ROUNDS_DIR, gate: writeGapGate },
+			{
+				cachedUserPrompt: round.userPrompt,
+				accumulatedText: round.accumulatedText,
+				messages,
+				turnIndex: round.turnIndex,
+				toolCallCount: round.toolCallCount,
+				toolCallNames: round.toolCallNames,
+				toolCalls: round.toolCalls,
+				responseSegments: round.responseSegments,
+				parentId:
+					session.causalChain.length >= 1 ? session.causalChain[session.causalChain.length - 1].fileName : null,
+				...(round.lastCheckpointSummary ? { summary: round.lastCheckpointSummary } : {}),
+			},
+			(saved, roundData) => {
+				// Push to causal chain after the write (issue #130).
+				session.causalChain.push(
+					buildAgentEndChainEntry(
+						saved.fileName,
+						saved.userPrompt,
+						saved.responseText,
+						round.toolCalls.length,
+						round.toolCallNames,
+					),
+				);
+				try {
+					upsertRoundInBm25Index(saved.fileName, roundData as unknown as RoundData);
+				} catch (err) {
+					ctx.ui.setStatus("semblr", `\u{1f9e0} bm25 index error: ${(err as Error).message}`);
 				}
-			} catch {
-				/* best-effort */
+				if (round.toolCalls.length > 0) {
+					try {
+						appendToolIndexRows(
+							TOOLS_INDEX_PATH,
+							ROUNDS_DIR,
+							buildToolIndexRows(saved.fileName, round.toolCalls),
+						);
+					} catch (err) {
+						ctx.ui.setStatus("semblr", `\u{1f9e0} tool index error: ${(err as Error).message}`);
+					}
+				}
+			},
+			(savedDedup) => {
+				// F1 (PR #131): on dedup the postWrite step does not run, so the causal-chain
+				// entry must be pushed here to keep the in-memory buffer tracking every round.
+				session.causalChain.push(
+					buildAgentEndChainEntry(
+						savedDedup.fileName,
+						savedDedup.userPrompt,
+						savedDedup.responseText,
+						round.toolCalls.length,
+						round.toolCallNames,
+					),
+				);
+			},
+		);
+		switch (persist.kind) {
+			case "no-prompt":
+				// Covers both a missing user prompt and a prompt-only round (empty
+				// response, no tool calls — F1 PR !131): nothing fileable to save.
+				ctx.ui.setStatus("semblr", "\u{1f9e0} agent_end: nothing to save (no prompt or prompt-only round)");
+				return;
+			case "failed": {
+				ctx.ui.setStatus("semblr", `\u{1f9e0} round write failed: ${persist.message}`);
+				round.accumulatedText = [];
+				round.userPrompt = null;
+				round.turnIndex = null;
+				return;
 			}
-			ctx.ui.setStatus("semblr", `\u{1f9e0} round already saved (${roundFileName})`);
-			lastRoundFileName = roundFileName;
-			round.accumulatedText = [];
-			round.userPrompt = null;
-			round.turnIndex = null;
-			flushStatsFile(statsState, STATS_PATH, SEMBLR_DIR); // causal chain was pushed, so position scores may have changed
-			return;
-		}
-
-		// Compute parentId from session.causalChain
-		const parentId = getAgentEndParentId(session.causalChain);
-
-		// Write round file
-		const roundData = buildAgentEndRoundData({
-			userPrompt,
-			responseText,
-			turnIndex: round.turnIndex,
-			toolCallCount: round.toolCallCount,
-			toolCallNames: round.toolCallNames,
-			toolCalls: round.toolCalls,
-			responseSegments: round.responseSegments,
-			parentId,
-			needsFollowup,
-			summary: round.lastCheckpointSummary ?? undefined,
-		});
-
-		try {
-			fs.writeFileSync(roundPath, JSON.stringify(roundData, null, 2));
-			upsertRoundInBm25Index(roundFileName, roundData as unknown as RoundData);
-		} catch (err) {
-			ctx.ui.setStatus("semblr", `\u{1f9e0} write error: ${(err as Error).message}`);
-			round.accumulatedText = [];
-			round.userPrompt = null;
-			round.turnIndex = null;
-			return;
-		}
-
-		// Tool-call fulltext index — independent of embedding availability, so this
-		// runs even when no API key is configured below.
-		if (round.toolCalls.length > 0) {
-			try {
-				appendToolIndexRows(TOOLS_INDEX_PATH, ROUNDS_DIR, buildToolIndexRows(roundFileName, round.toolCalls));
-			} catch (err) {
-				ctx.ui.setStatus("semblr", `\u{1f9e0} tool index error: ${(err as Error).message}`);
+			case "blocked": {
+				// F1: an earlier round write failed; this round is intentionally not
+				// persisted so no round lands ahead of the gap. The session JSONL
+				// still has it — the startup backfill recovers it on next launch.
+				ctx.ui.setStatus(
+					"semblr",
+					`\u{1f9e0} round not persisted (write failed earlier at ${persist.blockedBy}); will be recovered at next startup`,
+				);
+				round.accumulatedText = [];
+				round.userPrompt = null;
+				round.turnIndex = null;
+				return;
+			}
+			case "emergency": {
+				ctx.ui.setStatus("semblr", `\u{1f9e0} emergency round write (${persist.fileName}): ${persist.message}`);
+				round.accumulatedText = [];
+				round.userPrompt = null;
+				round.turnIndex = null;
+				return;
+			}
+			case "dedup": {
+				if (persist.dedupError) {
+					ctx.ui.setStatus("semblr", `\u{1f9e0} dedup step error: ${persist.dedupError}`);
+				}
+				// Even on dedup, run grouping if the round has a combined embedding
+				// (or if this is a short-prompt round with embedding skipped, use null)
+				const roundFileName = persist.saved.fileName;
+				const roundPath = `${ROUNDS_DIR}/${roundFileName}`;
+				try {
+					const existing = JSON.parse(fs.readFileSync(roundPath, "utf-8"));
+					if (existing.promptEmbedding) {
+						const vec = existing.promptEmbedding || null;
+						assignToGroup(
+							session.roundGroups,
+							session.causalChain[session.causalChain.length - 1],
+							vec,
+							SEMBLR_GROUP_THRESHOLD,
+							persist.saved.needsFollowup ? session.lastFollowupGroupIdx : null,
+						);
+					}
+				} catch {
+					/* best-effort */
+				}
+				ctx.ui.setStatus("semblr", `\u{1f9e0} round already saved (${roundFileName})`);
+				lastRoundFileName = roundFileName;
+				round.accumulatedText = [];
+				round.userPrompt = null;
+				round.turnIndex = null;
+				flushStatsFile(statsState, STATS_PATH, SEMBLR_DIR); // causal chain was pushed, so position scores may have changed
+				return;
 			}
 		}
+		const { saved } = persist;
+		if (persist.postWriteError) {
+			ctx.ui.setStatus("semblr", `\u{1f9e0} post-save error: ${persist.postWriteError}`);
+		}
+		const { userPrompt, responseText, needsFollowup, fileName: roundFileName } = saved;
+		const roundPath = `${ROUNDS_DIR}/${roundFileName}`;
 
 		// Three embeddings for each round:
 		//   1. prompt embedding → index.csv as :prompt
@@ -1032,7 +1060,14 @@ export default function (pi: ExtensionAPI) {
 		// Embedding a single concatenated text (rather than averaging separate prompt
 		// and response vectors) preserves the semantic relationship between them.
 		// See https://github.com/vhallac/semblr/issues/36
-		const apiKey = await getApiKey(ctx, { config: SEMBLR_CONFIG });
+		// Issue #130: getApiKey itself can throw (config/env failure) — a throw here
+		// would skip the round-state reset and stats flush below. Treat like "no key".
+		let apiKey: string | null = null;
+		try {
+			apiKey = await getApiKey(ctx, { config: SEMBLR_CONFIG });
+		} catch (err) {
+			ctx.ui.setStatus("semblr", `\u{1f9e0} api key error: ${(err as Error).message}`);
+		}
 		if (!apiKey) {
 			ctx.ui.setStatus("semblr", "\u{1f9e0} saved but not embedded (no API key)");
 			lastRoundFileName = roundFileName;
@@ -1042,94 +1077,46 @@ export default function (pi: ExtensionAPI) {
 			return;
 		}
 
-		if (round.skipPromptEmbedding) {
-			// Short prompt: skip prompt embedding (noisy), but still embed response.
-			// Response is usually significant even when the prompt is short.
-			// Per https://github.com/vhallac/semblr/issues/38#issuecomment-4629826478
-			try {
-				const { clippedResponse } = buildAgentEndEmbeddingTexts("", responseText, EMBEDDING_RESPONSE_MAX_BYTES);
-
-				// Embed response only (no noisy prompt prefix)
-				const responseVec = normalize(await embedText(clippedResponse, apiKey, embeddingClientDeps(ctx)));
-
-				// Write :response row to index (skip :prompt -- prompt was noise)
-				appendToIndex(`${roundFileName}:response`, responseVec, SEMBLR_CONFIG.embeddingModel);
-
-				// Embed checkpoint summary if present
-				if (round.lastCheckpointSummary) {
-					const summaryText = buildCheckpointSummaryText(round.lastCheckpointSummary);
-					const summaryVec = normalize(await embedText(summaryText, apiKey, embeddingClientDeps(ctx)));
-					appendToIndex(`${roundFileName}:summary`, summaryVec, SEMBLR_CONFIG.embeddingModel);
-				}
-
-				ctx.ui.setStatus("semblr", `🧠 saved + response-embedded round (${roundFileName})`);
-
-				finalizeRoundEmbedding({
-					roundPath,
-					embeddingVec: responseVec,
-					needsFollowup,
-				});
-			} catch (err) {
-				ctx.ui.setStatus("semblr", `🧠 response embedding error: ${(err as Error).message}`);
-			}
-		} else {
-			try {
-				// Embedding-input noise cleanup (issue #106 Stage 1, derived-not-stored): collapse large
-				// code fences and JSON dumps before embedding. The round file keeps the raw prompt.
-				const { text: cleanedPrompt, hash: promptInputHash } = buildPromptEmbeddingInput(
+		// F4+F6 (PR !131): the embedding policy now lives in the shared core
+		// embedRound (lib/embed-round.ts), used identically by the recovery path.
+		// Live-only extras stay outside: the prompt-vec stash (hash-gated reuse
+		// from the context hook) is injected as embedPrompt, and grouping and
+		// follow-up handling run in finalizeRoundEmbedding afterward.
+		const summaryText = round.lastCheckpointSummary ? buildCheckpointSummaryText(round.lastCheckpointSummary) : null;
+		try {
+			const result = await embedRound(
+				{
+					fileName: roundFileName,
 					userPrompt,
-					PROMPT_NOISE_CLEANUP,
-					SEMBLR_CONFIG.embeddingMaxTokens,
-				);
-				const { clippedResponse, combinedText } = buildAgentEndEmbeddingTexts(
-					cleanedPrompt,
 					responseText,
-					EMBEDDING_RESPONSE_MAX_BYTES,
-				);
-
-				// Embedding #1: prompt — reuse the round.promptVec stashed by the context hook.
-				// Since issue #107 F3 the hook embeds over the identical
-				// buildPromptEmbeddingInput derivation, so the stash is already in the
-				// :prompt domain; the hash gate keeps the reuse exact (stale or divergent
-				// derivations — e.g. the hook's 200-word clip on long string prompts — fall
-				// through to a fresh embed so the row's hash stamp stays honest).
-				const cachedPromptVec = round.promptVecHash === promptInputHash ? round.promptVec : null;
-				const promptVec =
-					cachedPromptVec ?? normalize(await embedText(cleanedPrompt, apiKey, embeddingClientDeps(ctx)));
-
-				// Embedding #2 + #3 in parallel
-				const [responseVec, combinedVec] = await Promise.all([
-					embedText(clippedResponse, apiKey, embeddingClientDeps(ctx)),
-					embedText(combinedText, apiKey, embeddingClientDeps(ctx)),
-				]);
-
-				// Save to index: :prompt and :response (normalized for cosine similarity).
-				// The :prompt row carries the embedding-input hash stamp (issue #106 migration).
-				appendToIndex(
-					`${roundFileName}:prompt`,
-					normalize(promptVec),
-					SEMBLR_CONFIG.embeddingModel,
-					promptInputHash,
-				);
-				appendToIndex(`${roundFileName}:response`, normalize(responseVec), SEMBLR_CONFIG.embeddingModel);
-
-				// Embed checkpoint summary if present
-				if (round.lastCheckpointSummary) {
-					const summaryText = buildCheckpointSummaryText(round.lastCheckpointSummary);
-					const summaryVec = normalize(await embedText(summaryText, apiKey, embeddingClientDeps(ctx)));
-					appendToIndex(`${roundFileName}:summary`, summaryVec, SEMBLR_CONFIG.embeddingModel);
-				}
-
+					checkpointSummaryText: summaryText,
+					maxResponseBytes: EMBEDDING_RESPONSE_MAX_BYTES,
+					promptNoiseOptions: PROMPT_NOISE_CLEANUP,
+					promptMaxTokens: SEMBLR_CONFIG.embeddingMaxTokens,
+				},
+				{
+					embed: (text) => embedText(text, apiKey, embeddingClientDeps(ctx)),
+					embedPrompt: (text, hash) =>
+						round.promptVecHash === hash && round.promptVec
+							? Promise.resolve(round.promptVec as number[])
+							: embedText(text, apiKey, embeddingClientDeps(ctx)),
+					appendIndexRow: (label, vec, hash) => appendToIndex(label, vec, SEMBLR_CONFIG.embeddingModel, hash),
+					writeRoundEmbedding: (_fileName, vec) => {
+						finalizeRoundEmbedding({
+							roundPath,
+							embeddingVec: vec,
+							needsFollowup,
+						});
+					},
+				},
+			);
+			if (result.promptDropped) {
+				ctx.ui.setStatus("semblr", `\u{1f9e0} saved + response-embedded round (${roundFileName})`);
+			} else {
 				ctx.ui.setStatus("semblr", `\u{1f9e0} saved + embedded round (${roundFileName})`);
-
-				finalizeRoundEmbedding({
-					roundPath,
-					embeddingVec: combinedVec,
-					needsFollowup,
-				});
-			} catch (err) {
-				ctx.ui.setStatus("semblr", `\u{1f9e0} embedding error: ${(err as Error).message}`);
 			}
+		} catch (err) {
+			ctx.ui.setStatus("semblr", `\u{1f9e0} embedding error: ${(err as Error).message}`);
 		}
 
 		lastRoundFileName = roundFileName;
@@ -1165,10 +1152,117 @@ export default function (pi: ExtensionAPI) {
 	// ─────────────────────────────────────────────
 	// registerTool is called inside session_start because factory-level
 	// registration doesn't reliably make tools visible to the LLM.
-	pi.on("session_start", async (_event, ctx) => {
+	pi.on("session_start", async (event, ctx) => {
 		// Clear session scoped state — new session starts fresh
 		session = createSession();
 
+		// Issue #130: recover rounds lost to process death in previous sessions.
+		// F2 (PR !131): scan ALL prior session files in the session dir (newest
+		// first, per-file tail-completeness early exit) — a source deferred as live
+		// on one start is retried automatically on the next. F5 (PR !131): the
+		// gate covers every session_start reason, not just startup/resume — pi
+		// supplies previousSessionFile for "new"/"resume"/"fork" (pinned first
+		// when the dir scan misses it); "reload" carries none but still gets the
+		// dir scan, since a source live at startup may be closed by the time
+		// /reload restarts the extension. Sessions outside the current cwd's dir
+		// are not ours.
+		if (isBackfillStartReason(event.reason)) {
+			const sessionFile = ctx.sessionManager?.getSessionFile?.();
+			if (sessionFile) {
+				try {
+					const candidates = buildBackfillCandidates(
+						path.dirname(sessionFile),
+						sessionFile,
+						event.previousSessionFile,
+					);
+					const backfill = backfillMissingRounds(candidates, ROUNDS_DIR);
+					if (backfill.deferredLive) {
+						ctx.ui.setStatus(
+							"semblr",
+							`\u{1f9e0} backfill deferred: ${backfill.deferredLive} previous session(s) look live (F2/F3)`,
+						);
+					}
+					if (backfill.recoveredFiles.length > 0) {
+						// F3 (PR !131): index recovered rounds exactly like the live agent_end
+						// post-write — bm25 upsert AND tool-index rows — so a recovered round
+						// is reachable from every search surface, not just bm25. Each round is
+						// guarded independently (best-effort, never the round files).
+						const indexReport = indexRecoveredRounds(backfill.recoveredFiles, {
+							readRoundData: (fileName) => readRoundJson(ROUNDS_DIR, fileName),
+							upsertBm25: (fileName, roundData) =>
+								upsertRoundInBm25Index(fileName, roundData as unknown as RoundData),
+							appendToolRows: (fileName, toolCalls) =>
+								appendToolIndexRows(TOOLS_INDEX_PATH, ROUNDS_DIR, buildToolIndexRows(fileName, toolCalls)),
+						});
+						for (const message of indexReport.errors) {
+							ctx.ui.setStatus("semblr", `\u{1f9e0} backfill index error: ${message}`);
+						}
+						ctx.ui.setStatus(
+							"semblr",
+							`\u{1f9e0} backfill: recovered ${backfill.recoveredFiles.length} round(s) from previous session`,
+						);
+						// F4 (PR #131): queue recovered rounds for embedding so they reach
+						// semantic retrieval, not just bm25. Best-effort — a failure here
+						// costs embeddings, never the recovered round files.
+						try {
+							const embedKey = await getApiKey(ctx, { config: SEMBLR_CONFIG });
+							if (embedKey) {
+								// Label guard backed by a single index load: the index is read
+								// once before embedding, kept as an in-memory Set, and updated on
+								// every append. Previously hasIndexRow re-read the full index
+								// file per recovered round (O(n × index size) — minutes of
+								// blocking startup work with a large index).
+								const indexedLabels = new Set(loadVectorIndex(INDEX_PATH).map((entry) => entry.filePath));
+								const embedResult = await embedRecoveredRounds(
+									backfill.recoveredFiles,
+									ROUNDS_DIR,
+									{
+										embed: (text) => embedText(text, embedKey, embeddingClientDeps(ctx)),
+										appendIndexRow: (label, vec, hash) => {
+											appendToIndex(label, vec, SEMBLR_CONFIG.embeddingModel, hash);
+											indexedLabels.add(label);
+										},
+										// F4+F6 (PR !131): prompt derivation, clipping, and row labels now
+										// come from the shared core, so recovered rows are in the same domain
+										// as agent_end by construction; only the config is passed here.
+										// F5 (PR !131): label-guard so a re-run after a crash between the
+										// appends and the embedding write does not duplicate index rows.
+										hasIndexRow: (label) => indexedLabels.has(label),
+										writeRoundEmbedding: (fileName, vec) => {
+											const p = `${ROUNDS_DIR}/${fileName}`;
+											const existing = JSON.parse(fs.readFileSync(p, "utf-8"));
+											existing.promptEmbedding = vec;
+											fs.writeFileSync(p + ".tmp." + process.pid, JSON.stringify(existing, null, 2));
+											fs.renameSync(p + ".tmp." + process.pid, p);
+										},
+									},
+									// F3 (PR !131): live-parity response budget — recovered embeddings are
+									// clipped with the same configured budget as agent_end, not the default.
+									{
+										maxResponseBytes: EMBEDDING_RESPONSE_MAX_BYTES,
+										promptNoiseOptions: PROMPT_NOISE_CLEANUP,
+										promptMaxTokens: SEMBLR_CONFIG.embeddingMaxTokens,
+									},
+								);
+								if (embedResult.embedded.length > 0) {
+									ctx.ui.setStatus(
+										"semblr",
+										`\u{1f9e0} backfill: embedded ${embedResult.embedded.length} recovered round(s)`,
+									);
+								}
+								for (const message of embedResult.errors) {
+									ctx.ui.setStatus("semblr", `\u{1f9e0} backfill embed error: ${message}`);
+								}
+							}
+						} catch (err) {
+							ctx.ui.setStatus("semblr", `\u{1f9e0} backfill embed failed: ${(err as Error).message}`);
+						}
+					}
+				} catch (err) {
+					ctx.ui.setStatus("semblr", `🧠 backfill failed: ${(err as Error).message}`);
+				}
+			}
+		}
 		const index = loadSessionStartIndex();
 		ctx.ui.setStatus("semblr", buildSessionStartStatus(index));
 

@@ -14,9 +14,9 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { pathToFileURL } from "node:url";
-import { computeContentHash } from "../lib/hash.ts";
 import { migrateIndexEntryLine, readIndexLines } from "../lib/index-io.ts";
 import { parsePiSessionJsonl } from "../lib/pi-session.ts";
+import { deriveRoundFile } from "../lib/round-capture.ts";
 import { resolveScriptConfig, resolveScriptIndexPath, type ScriptConfigOptions } from "../lib/script-config.ts";
 
 // ─────────────────────────────────────────────
@@ -115,7 +115,7 @@ export async function runFixRoundToolIds(options: FixRoundToolIdsOptions = {}): 
 
 			for (const round of rounds) {
 				totalParsed++;
-				const newHash = `${computeContentHash(round.userPrompt, round.responseSequence, round.toolCalls)}.json`;
+				const newHash = deriveRoundFile(round.userPrompt, round.responseSequence, round.toolCalls).fileName;
 
 				if (f.existsSync(path.join(roundsDir, newHash))) {
 					// Already correct — file with this hash exists

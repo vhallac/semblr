@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
-import { parsePiSessionJsonl, parsePiTextContent } from "./pi-session.ts";
+import { parsePiSessionJsonl, parsePiTextContent, reconstructPiSessionRounds } from "./pi-session.ts";
+import { buildAgentEndRoundFile } from "./round-capture.ts";
 
 const line = (value: unknown) => JSON.stringify(value);
 
@@ -271,5 +272,49 @@ describe("pi session parsing", () => {
 		].join("\n");
 
 		expect(parsePiSessionJsonl(raw, { sessionLabel: "session-a", now: () => 1 })[0].sessionLabel).toBe("session-a");
+	});
+});
+
+describe("F1 shared hash derivation parity (PR !131)", () => {
+	it("strips the followup marker from parsed responseSequence and sets needsFollowup", () => {
+		const raw = [
+			line({ type: "message", id: "u1", message: { role: "user", content: [{ type: "text", text: "Prompt" }] } }),
+			line({
+				type: "message",
+				message: { role: "assistant", content: [{ type: "text", text: "Answer body\nround_needs_followup" }] },
+			}),
+		].join("\n");
+		const round = parsePiSessionJsonl(raw, { now: () => 1 })[0];
+		expect(round.responseSequence).toBe("Answer body");
+		expect(round.needsFollowup).toBe(true);
+	});
+
+	it("keeps needsFollowup=false when no marker is present", () => {
+		const raw = [
+			line({ type: "message", id: "u1", message: { role: "user", content: [{ type: "text", text: "Prompt" }] } }),
+			line({
+				type: "message",
+				message: { role: "assistant", content: [{ type: "text", text: "Answer body" }] },
+			}),
+		].join("\n");
+		const round = parsePiSessionJsonl(raw, { now: () => 1 })[0];
+		expect(round.responseSequence).toBe("Answer body");
+		expect(round.needsFollowup).toBe(false);
+	});
+
+	it("reconstruction derives the same filename as the live agent_end write for a marker round", () => {
+		const userPrompt = "Prompt";
+		const rawResponse = "Answer body\nround_needs_followup";
+		const raw = [
+			line({ type: "message", id: "u1", message: { role: "user", content: [{ type: "text", text: userPrompt }] } }),
+			line({
+				type: "message",
+				message: { role: "assistant", content: [{ type: "text", text: rawResponse }] },
+			}),
+		].join("\n");
+		const parsed = parsePiSessionJsonl(raw, { now: () => 1 });
+		const [reconstructed] = reconstructPiSessionRounds(parsed);
+		const live = buildAgentEndRoundFile(userPrompt, [rawResponse], undefined, []);
+		expect(reconstructed.roundFile).toBe(live?.fileName);
 	});
 });

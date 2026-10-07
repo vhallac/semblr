@@ -39,14 +39,15 @@ Within a session, as context grows past the window, summarization compresses it.
 4. Pull in rounds above a dynamic similarity threshold until the token budget is reached
 5. Construct context: system prompt + enriched environment + retrieved rounds + last round (pinned) + current messages
 
-**Two injection modes:**
-- **Collapsed (default):** Injects a compact numbered index of retrieved rounds. The LLM calls `get_round_details()` / `get_tool_details()` to expand individual rounds. Massively reduces token overhead while preserving full granularity.
-- **Full:** Injects complete historical round text. Rich enough for the model to work without tools, but expensive.
+**Collapsed-only injection:** Injects a compact numbered index of retrieved rounds. The LLM calls `get_round_details()` / `get_tool_details()` to expand individual rounds. Massively reduces token overhead while preserving full granularity. A full-text injection mode was tried and removed — removal had no day-to-day operational impact, but the code path is deliberately retained for future experimentation.
 
 ### Context Budget
-- A percentage of the model's max context size (default 50%)
-- Dynamic interpolation: at configured `minSimilarity` (default `0.30`) the budget is 2,000 tokens; at 1.0 it's 50% of the context window
+- A small fixed fraction of the model's max context size (default ratio 0.08 — at a 128K window the injection is capped at ~10K tokens)
+- Budgeted by injected size, not stored content: each entry is charged the lines it actually injects, with hard entry caps (relevance: 20 via `contextRelevanceMaxEntries`; recency: 20 via `contextRecencyMaxEntries`)
+- Dynamic interpolation: at configured `minSimilarity` (default `0.30`) the relevance budget is 2,000 tokens; at 1.0 it reaches the configured ratio of the context window
 - Room reserved for system prompt, current prompt, and model response
+
+The fixed small budget is the point, not a limitation: with 1M-token windows now commonplace, 50% would be a huge budget — it would dilute attention and crowd out the agent's ability to deliberately construct its own cache. A small dynamic context trades constant prefill for attention control (cache behavior itself is out of scope: cross-round cache coherence and a small dynamic context are mutually exclusive).
 
 ### Three-Section Context Injection
 The context block is assembled from three independently gated sections:
@@ -60,7 +61,7 @@ Each section is gated independently: the preamble only shows if any list exists,
 **Design decisions:**
 - **Simple recency:** No causality detection. Rounds are added in temporal order as they occur. Pending a future mechanism to trace parallel/divergent chains.
 - **No deduplication with semantic index:** Rounds that also appear in the semantic retrieval index are included in both sections. The duplication is intentional — the score contrast (`n/a` vs a number) is a signal the LLM can leverage.
-- **No truncation:** All consecutive rounds in the session are included. No limit on buffer size for now.
+- **Hard-capped:** The recency list is bounded at 20 entries (`contextRecencyMaxEntries`) within the flat context budget (8% of the window). When the bounds bite, rounds drop oldest-first; the most recent round is always kept.
 - **Flush on session start:** The buffer is cleared at `session_start`. No attempt is made to re-establish chains across session boundaries. This is consistent with the simple-recency approach — chain persistence would require causality metadata.
 - **Collapsed-only:** Full mode was removed. All injection uses the compact numbered-list format. Use `get_round_details()` to expand.
 
@@ -124,7 +125,7 @@ Because context is assembled dynamically, every prompt is a fresh embedding API 
 - [x] Query index by distance
 - [x] Assemble context from closest rounds up to token budget
 - [x] Inject into the agent as replaced messages
-- [x] Recency buffer — implemented as the [Recency List](#three-section-context-injection). Flushed on session start. No truncation. No causality detection yet.
+- [x] Recency buffer — implemented as the [Recency List](#three-section-context-injection). Flushed on session start. Hard-capped at 20 entries within the flat context budget, oldest-first drop. No causality detection yet.
 
 ### Phase 4 — Quality & Iteration
 - [x] Log context construction decisions (status bar)

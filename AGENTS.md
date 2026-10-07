@@ -7,11 +7,11 @@ Next-generation context management for AI agents. See [VISION.md](VISION.md) for
 The extension lives at `src/semblr.ts` (moved from `.pi/extensions/semblr.ts` to avoid pi auto-loading). It:
 
 - Saves every completed conversation round to a persistent round repository (`rounds/<hash>.json`)
-- Embeds combined prompt+response vectors to `index.csv` (via OpenRouter, `text-embedding-3-small`, inputs clipped to the configured embedding budget)
+- Embeds two separate vectors per round (prompt and response, noise-collapsed inputs) to an append-only `index.csv` (via OpenRouter, `text-embedding-3-small`, inputs clipped to the configured embedding budget)
 - On every user prompt, retrieves the most semantically similar rounds and injects them into context
 - Registers three native tools: `search_interactions`, `get_round_details`, `get_tool_details`
 - Integrates with pi's compaction system (captures summaries as rounds with referenced turn pointers)
-- Runs in two modes: `collapsed` (default, compact numbered index) or `full` (complete round text)
+- Runs collapsed-only: injects a compact numbered index of retrieved rounds; full round text is fetched on demand via `get_round_details` / `get_tool_details` (a full-injection mode was removed — tried, had no day-to-day impact when removed, and left in the code for future experimentation)
 
 
 

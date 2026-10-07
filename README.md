@@ -276,6 +276,14 @@ Semblr stores conversation data in two areas, both outside the project tree so t
 
 Round IDs are content-addressed (MD5 of `userPrompt + responseSequence`), so re-indexing is idempotent — same content produces the same file.
 
+### Recovery lifecycle (backfill)
+
+If pi exits before the final round of a session is persisted (crash, hard kill), those rounds can be lost. At startup, semblr backfills them from pi's session JSONL files:
+
+- **Backfill scan:** for each recent session file, reconstructed rounds that have no round file on disk are written. Rounds recovered this way are marked `"recovered": true` in the round JSON, distinguishing second-class (recovered) provenance from live-saved rounds.
+- **Defer semantics:** if a session's tail round is already on disk, that session is fully backed up and skipped. If the tail is missing and the session file looks live (modified recently), the backfill defers instead of racing the live process — the live process will write those rounds itself.
+- **Startup embedding cost:** recovered rounds are indexed (BM25 + tool index) and queued for embedding at startup, so they reach every retrieval surface. This costs embedding API calls for recovered rounds only — never for already-persisted round files, which are skipped by content hash.
+
 ### Configuration
 
 Semblr reads a `semblr` section from pi settings. Values are resolved per key in this order:
