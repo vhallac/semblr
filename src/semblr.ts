@@ -1272,31 +1272,38 @@ export default function (pi: ExtensionAPI) {
 						try {
 							const embedKey = await getApiKey(ctx, { config: SEMBLR_CONFIG });
 							if (embedKey) {
-								const embedResult = await embedRecoveredRounds(backfill.recoveredFiles, ROUNDS_DIR, {
-									embed: (text) => embedText(text, embedKey, embeddingClientDeps(ctx)),
-									appendIndexRow: (label, vec, hash) =>
-										appendToIndex(label, vec, SEMBLR_CONFIG.embeddingModel, hash),
-									// F4 (PR !131): live-parity prompt derivation — recovered prompts go
-									// through the same buildPromptEmbeddingInput cleanup + hash stamp
-									// as agent_end, keeping :prompt rows in the same domain as queries.
-									preparePrompt: (userPrompt) =>
-										buildPromptEmbeddingInput(
-											userPrompt,
-											PROMPT_NOISE_CLEANUP,
-											SEMBLR_CONFIG.embeddingMaxTokens,
-										),
-									// F5 (PR !131): label-guard so a re-run after a crash between the
-									// appends and the embedding write does not duplicate index rows.
-									hasIndexRow: (label) =>
-										loadVectorIndex(INDEX_PATH).some((entry) => entry.filePath === label),
-									writeRoundEmbedding: (fileName, vec) => {
-										const p = `${ROUNDS_DIR}/${fileName}`;
-										const existing = JSON.parse(fs.readFileSync(p, "utf-8"));
-										existing.promptEmbedding = vec;
-										fs.writeFileSync(p + ".tmp." + process.pid, JSON.stringify(existing, null, 2));
-										fs.renameSync(p + ".tmp." + process.pid, p);
+								const embedResult = await embedRecoveredRounds(
+									backfill.recoveredFiles,
+									ROUNDS_DIR,
+									{
+										embed: (text) => embedText(text, embedKey, embeddingClientDeps(ctx)),
+										appendIndexRow: (label, vec, hash) =>
+											appendToIndex(label, vec, SEMBLR_CONFIG.embeddingModel, hash),
+										// F4 (PR !131): live-parity prompt derivation — recovered prompts go
+										// through the same buildPromptEmbeddingInput cleanup + hash stamp
+										// as agent_end, keeping :prompt rows in the same domain as queries.
+										preparePrompt: (userPrompt) =>
+											buildPromptEmbeddingInput(
+												userPrompt,
+												PROMPT_NOISE_CLEANUP,
+												SEMBLR_CONFIG.embeddingMaxTokens,
+											),
+										// F5 (PR !131): label-guard so a re-run after a crash between the
+										// appends and the embedding write does not duplicate index rows.
+										hasIndexRow: (label) =>
+											loadVectorIndex(INDEX_PATH).some((entry) => entry.filePath === label),
+										writeRoundEmbedding: (fileName, vec) => {
+											const p = `${ROUNDS_DIR}/${fileName}`;
+											const existing = JSON.parse(fs.readFileSync(p, "utf-8"));
+											existing.promptEmbedding = vec;
+											fs.writeFileSync(p + ".tmp." + process.pid, JSON.stringify(existing, null, 2));
+											fs.renameSync(p + ".tmp." + process.pid, p);
+										},
 									},
-								});
+									// F3 (PR !131): live-parity response budget — recovered embeddings are
+									// clipped with the same configured budget as agent_end, not the default.
+									{ maxResponseBytes: EMBEDDING_RESPONSE_MAX_BYTES },
+								);
 								if (embedResult.embedded.length > 0) {
 									ctx.ui.setStatus(
 										"semblr",

@@ -336,14 +336,13 @@ export async function embedRecoveredRounds(
 	fileNames: string[],
 	roundsDir: string,
 	deps: RecoveredEmbedDeps,
-	fsImpl: Pick<typeof fs, "readFileSync"> = fs,
 	opts: { maxResponseBytes?: number } = {},
 ): Promise<{ embedded: string[]; errors: string[] }> {
 	const embedded: string[] = [];
 	const errors: string[] = [];
 	for (const fileName of fileNames) {
 		try {
-			const round = JSON.parse(fsImpl.readFileSync(path.join(roundsDir, fileName), "utf-8")) as RoundData;
+			const round = JSON.parse(fs.readFileSync(path.join(roundsDir, fileName), "utf-8")) as RoundData;
 			if (round.promptEmbedding) continue;
 			const { text: promptInput, hash: promptInputHash } = deps.preparePrompt?.(round.userPrompt) ?? {
 				text: round.userPrompt,

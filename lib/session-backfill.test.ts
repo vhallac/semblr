@@ -4,7 +4,12 @@ import * as path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { createRoundFilePath } from "./hash.ts";
 import { parsePiSessionJsonl } from "./pi-session.ts";
-import { buildAgentEndRoundFile, buildPromptEmbeddingInput } from "./round-capture.ts";
+import {
+	buildAgentEndEmbeddingTexts,
+	buildAgentEndRoundFile,
+	buildPromptEmbeddingInput,
+	embeddingMaxTokensToResponseBytes,
+} from "./round-capture.ts";
 import type { ToolCallDetail } from "./round-data.ts";
 import {
 	backfillMissingRounds,
@@ -316,6 +321,44 @@ describe("session-backfill", () => {
 			// the :prompt row is hash-stamped (same domain as live rows); :response is not
 			expect(rowHashes.get(`${fileName}:prompt`)).toBe(hash);
 			expect(rowHashes.get(`${fileName}:response`)).toBeUndefined();
+		});
+
+		it("F3 parity: response clip honors the caller-supplied maxResponseBytes budget (non-default embeddingMaxTokens)", async () => {
+			const roundsDir = path.join(tmp, "rounds");
+			const outcome = backfillMissingRounds(
+				writeSessionFile(tmp, [userMsg("q"), assistantMsg("x".repeat(1000))]),
+				roundsDir,
+				undefined,
+				{ liveWindowMs: 0 },
+			);
+			const fileName = outcome.recoveredFiles[0];
+			// non-default config: embeddingMaxTokens 100 → 300-byte response budget
+			const budget = embeddingMaxTokensToResponseBytes(100);
+			const responseInputs: string[] = [];
+			const result = await embedRecoveredRounds(
+				outcome.recoveredFiles,
+				roundsDir,
+				{
+					embed: (text) => {
+						responseInputs.push(text);
+						return Promise.resolve([text.length, 1]);
+					},
+					appendIndexRow: () => {},
+					writeRoundEmbedding: () => {},
+				},
+				{ maxResponseBytes: budget },
+			);
+			expect(result.embedded).toEqual([fileName]);
+			// the :response embedding input equals what the live agent_end path would
+			// clip to with the same configured budget (live/recovery parity)
+			const raw = JSON.parse(fs.readFileSync(path.join(roundsDir, fileName), "utf-8")).responseSequence as string;
+			const { clippedResponse } = buildAgentEndEmbeddingTexts("", raw, budget);
+			expect(Buffer.byteLength(clippedResponse, "utf-8")).toBe(budget);
+			expect(responseInputs).toContain(clippedResponse);
+			// and it is strictly shorter than the default-budget clip, proving the
+			// non-default budget was honored rather than the 8000-token default
+			const { clippedResponse: defaultClip } = buildAgentEndEmbeddingTexts("", raw);
+			expect(clippedResponse.length).toBeLessThan(defaultClip.length);
 		});
 
 		it("F5: re-run after a crash between appends and embedding write does not duplicate rows", async () => {
