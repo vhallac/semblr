@@ -49,6 +49,8 @@ interface SessionEntry {
 		timestamp?: number;
 		toolName?: string;
 		toolCallId?: string;
+		/** Terminal-state marker (F2): "toolUse" means the turn is still open. */
+		stopReason?: string;
 	};
 }
 

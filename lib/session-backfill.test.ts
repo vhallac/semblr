@@ -3,6 +3,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { createRoundFilePath } from "./hash.ts";
+import { parsePiSessionJsonl } from "./pi-session.ts";
 import { buildAgentEndRoundFile, buildPromptEmbeddingInput } from "./round-capture.ts";
 import type { ToolCallDetail } from "./round-data.ts";
 import {
@@ -10,6 +11,7 @@ import {
 	embedRecoveredRounds,
 	findMissingRounds,
 	indexRecoveredRounds,
+	isSessionTailClosed,
 	listBackfillCandidates,
 	type RecoveredRoundLike,
 } from "./session-backfill.ts";
@@ -152,11 +154,73 @@ describe("session-backfill", () => {
 		const complete = writeSessionFile(tmp, [userMsg("q"), assistantMsg("a")]);
 		const rounds = backfillMissingRounds(complete, roundsDir, undefined, { liveWindowMs: 0 });
 		expect(rounds.recoveredFiles).toEqual([createRoundFilePath("q", "a", [])]);
-		// File still looks live, but the tail round is on disk → fully backed up.
+		// F2 round 3: liveness now gates BEFORE the parse — a live-looking file
+		// defers unconditionally (review round 3 finding F2). Completeness is
+		// discovered via the early exit once the file goes stale.
 		const outcome = backfillMissingRounds(complete, roundsDir, undefined, { nowMs: Date.now() });
-		expect(outcome.deferredLive).toBeUndefined();
-		expect(outcome.skippedComplete).toBe(true);
+		expect(outcome.deferredLive).toBe(1);
 		expect(outcome.recoveredFiles).toEqual([]);
+		// Once stale, the early exit reports skippedComplete without re-writing.
+		const stale = backfillMissingRounds(complete, roundsDir, undefined, { nowMs: Date.now(), liveWindowMs: 1 });
+		expect(stale.skippedComplete).toBe(true);
+		expect(stale.recoveredFiles).toEqual([]);
+	});
+
+	it("defers a live file before parsing it at all — F2 round 3", () => {
+		const roundsDir = path.join(tmp, "rounds");
+		const live = writeSessionFile(tmp, [userMsg("q"), assistantMsg("a")]);
+		// Garbage content would previously abort the whole run once parsed; with
+		// the liveness gate ahead of the parse it is simply deferred.
+		fs.writeFileSync(live, "not json at all\n");
+		const outcome = backfillMissingRounds(live, roundsDir, undefined, { nowMs: Date.now() });
+		expect(outcome.deferredLive).toBe(1);
+		expect(outcome.recoveredFiles).toEqual([]);
+	});
+
+	it("defers a stale file whose tail turn is still open (toolUse stopReason) — F2 round 3", () => {
+		const roundsDir = path.join(tmp, "rounds");
+		const sessionFile = writeSessionFile(tmp, [
+			userMsg("q"),
+			{
+				type: "message",
+				message: { role: "assistant", content: [{ type: "text", text: "partial" }], stopReason: "toolUse" },
+			},
+		]);
+		fs.utimesSync(sessionFile, new Date(0), new Date(0)); // stale mtime — closedness must still gate
+		const outcome = backfillMissingRounds(sessionFile, roundsDir, undefined, { nowMs: Date.now() });
+		expect(outcome.deferredLive).toBe(1);
+		expect(outcome.recoveredFiles).toEqual([]);
+		expect(fs.existsSync(roundsDir)).toBe(false);
+	});
+
+	it("recovers a stale file whose tail turn ended (terminal stopReason) — F2 round 3", () => {
+		const roundsDir = path.join(tmp, "rounds");
+		const sessionFile = writeSessionFile(tmp, [
+			userMsg("q"),
+			{
+				type: "message",
+				message: { role: "assistant", content: [{ type: "text", text: "done" }], stopReason: "stop" },
+			},
+		]);
+		fs.utimesSync(sessionFile, new Date(0), new Date(0));
+		const outcome = backfillMissingRounds(sessionFile, roundsDir, undefined, { nowMs: Date.now() });
+		expect(outcome.deferredLive).toBeUndefined();
+		expect(outcome.recoveredFiles).toEqual([createRoundFilePath("q", "done", [])]);
+	});
+
+	it("isSessionTailClosed: no assistant message → closed (nothing in flight); toolUse → open; stop → closed", () => {
+		expect(isSessionTailClosed(JSON.stringify(userMsg("q")))).toBe(true);
+		expect(isSessionTailClosed([userMsg("q"), assistantMsg("a")].map((l) => JSON.stringify(l)).join("\n"))).toBe(
+			true,
+		);
+		expect(
+			isSessionTailClosed(
+				[userMsg("q"), { type: "message", message: { role: "assistant", content: [], stopReason: "toolUse" } }]
+					.map((l) => JSON.stringify(l))
+					.join("\n"),
+			),
+		).toBe(false);
+		expect(isSessionTailClosed("{truncated json")).toBe(true); // corrupt lines skipped; nothing in flight
 	});
 
 	it("backfills a stale source session whose mtime is older than the live window — F3", () => {

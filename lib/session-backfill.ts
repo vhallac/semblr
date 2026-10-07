@@ -72,6 +72,34 @@ export function listBackfillCandidates(
 }
 
 /**
+ * F2 (PR !131 round 3): a session's tail is closed only when its last
+ * assistant message ended the turn (stopReason other than "toolUse"). A tail
+ * still waiting on tool results is mid-round — its last round is incomplete
+ * and must not be recovered, no matter how old the file is (an mtime window
+ * alone misclassifies a paused-but-open session). A file with no assistant
+ * message at all has no turn in flight (the process died before responding)
+ * → treated as closed; the mtime gate covers the just-prompted live case.
+ */
+export function isSessionTailClosed(rawJsonl: string): boolean {
+	const lines = rawJsonl.split("\n");
+	for (let i = lines.length - 1; i >= 0; i--) {
+		const line = lines[i].trim();
+		if (!line) continue;
+		let entry: { type?: string; message?: { role?: string; stopReason?: string } };
+		try {
+			entry = JSON.parse(line);
+		} catch {
+			continue; // tolerate a truncated/corrupt trailing line, same as the parser
+		}
+		if (entry?.type !== "message") continue;
+		const msg = entry.message;
+		if (msg?.role !== "assistant") continue;
+		return msg.stopReason !== "toolUse";
+	}
+	return true;
+}
+
+/**
  * Parse a session JSONL and return the round files missing from roundsDir.
  * Exported for testing / inspection without side effects.
  */
@@ -229,7 +257,20 @@ export function backfillMissingRounds(
 		} catch {
 			// Unreadable mtime: treat as stale and attempt the backfill.
 		}
-		const parsed = parsePiSessionJsonl(fs.readFileSync(sessionFile, "utf-8"));
+		// F2: defer before paying for the parse at all — a live file's tail is
+		// incomplete by definition, so parsing it is wasted startup work.
+		if (live) {
+			deferredLive++;
+			continue;
+		}
+		const raw = fs.readFileSync(sessionFile, "utf-8");
+		// F2: mtime staleness is not closedness — the tail must have ended its
+		// turn (terminal stopReason) before any of its rounds are recoverable.
+		if (!isSessionTailClosed(raw)) {
+			deferredLive++;
+			continue;
+		}
+		const parsed = parsePiSessionJsonl(raw);
 		const {
 			missing,
 			scanned: fileScanned,
@@ -237,10 +278,6 @@ export function backfillMissingRounds(
 		} = collectMissingRounds(parsed, roundsDir, fsImpl);
 		if (complete) {
 			skippedComplete = true;
-			continue;
-		}
-		if (live) {
-			deferredLive++;
 			continue;
 		}
 		scanned += fileScanned;

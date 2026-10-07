@@ -14,7 +14,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import type { ContextEvent, ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Type } from "@sinclair/typebox";
-import { defaultAgentEndPersistFs, persistAgentEndRound } from "../lib/agent-end-persist.ts";
+import { defaultAgentEndPersistFs, persistAgentEndRound, type WriteGapGate } from "../lib/agent-end-persist.ts";
 import {
 	bm25IndexPathForRoundsDir,
 	loadOrRebuildBm25Index,
@@ -345,6 +345,10 @@ function readRoundFile(filePath: string): RoundData | null {
 }
 
 let lastRoundFileName: string | null = null; // tracks the most recent saved round (process-local)
+// F1 (PR !131 round 3): gap-free write ordering — once a round write fails, no
+// later round is persisted ahead of it in this process; a fresh process starts
+// with a clean gate and the startup backfill recovers the blocked rounds.
+const writeGapGate: WriteGapGate = { blockedBy: null };
 // Used in context hook to gate follow-up injection: checks metadata + in-memory state
 function needsFollowupInjection(fileName: string): boolean {
 	const round = readRoundJson(ROUNDS_DIR, fileName);
@@ -939,7 +943,7 @@ export default function (pi: ExtensionAPI) {
 		// write (chain push, bm25, tool index, embeddings) is guarded and can only
 		// cost derived data, never the round itself.
 		const persist = persistAgentEndRound(
-			{ fs: defaultAgentEndPersistFs, roundsDir: ROUNDS_DIR },
+			{ fs: defaultAgentEndPersistFs, roundsDir: ROUNDS_DIR, gate: writeGapGate },
 			{
 				cachedUserPrompt: round.userPrompt,
 				accumulatedText: round.accumulatedText,
@@ -1001,6 +1005,19 @@ export default function (pi: ExtensionAPI) {
 				return;
 			case "failed": {
 				ctx.ui.setStatus("semblr", `\u{1f9e0} round write failed: ${persist.message}`);
+				round.accumulatedText = [];
+				round.userPrompt = null;
+				round.turnIndex = null;
+				return;
+			}
+			case "blocked": {
+				// F1: an earlier round write failed; this round is intentionally not
+				// persisted so no round lands ahead of the gap. The session JSONL
+				// still has it — the startup backfill recovers it on next launch.
+				ctx.ui.setStatus(
+					"semblr",
+					`\u{1f9e0} round not persisted (write failed earlier at ${persist.blockedBy}); will be recovered at next startup`,
+				);
 				round.accumulatedText = [];
 				round.userPrompt = null;
 				round.turnIndex = null;

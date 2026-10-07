@@ -18,9 +18,23 @@ export interface AgentEndPersistFs {
 	readFileSync(path: string, encoding: "utf-8"): string;
 }
 
+/**
+ * Gap-free write ordering state (F1, PR !131 round 3): once a round write
+ * fails, no later round may be persisted ahead of it — otherwise the rounds
+ * directory has a hole that only a startup backfill can fill while later
+ * rounds keep landing. The gate is set by persistAgentEndRound on any write
+ * failure and cleared only by a fresh process (startup backfill then
+ * recovers the blocked rounds from the session JSONL).
+ */
+export interface WriteGapGate {
+	blockedBy: string | null;
+}
+
 export interface AgentEndPersistDeps {
 	fs: AgentEndPersistFs;
 	roundsDir: string;
+	/** Optional gap-free ordering gate (F1). Callers pass one per process. */
+	gate?: WriteGapGate;
 	/** Injectable assembly step (defaults to buildAgentEndRoundFile) — tests make this throw. */
 	buildRoundFile?: typeof buildAgentEndRoundFile;
 }
@@ -59,6 +73,7 @@ export type PersistAgentEndResult =
 	| { kind: "saved"; saved: AgentEndRoundFile; roundData: Record<string, unknown>; postWriteError?: string }
 	| { kind: "dedup"; saved: AgentEndRoundFile; dedupError?: string }
 	| { kind: "emergency"; fileName: string; message: string }
+	| { kind: "blocked"; blockedBy: string }
 	| { kind: "failed"; message: string }
 	| { kind: "no-prompt" };
 
@@ -83,6 +98,12 @@ export function persistAgentEndRound(
 	const { fs, roundsDir } = deps;
 	const buildRoundFile = deps.buildRoundFile ?? buildAgentEndRoundFile;
 
+	// F1: an earlier write failure must never be skipped over — later rounds
+	// stay unpersisted (recoverable from the session JSONL at next startup).
+	if (deps.gate?.blockedBy) {
+		return { kind: "blocked", blockedBy: deps.gate.blockedBy };
+	}
+
 	let saved: AgentEndRoundFile | null = null;
 	try {
 		saved = buildRoundFile(input.cachedUserPrompt, input.accumulatedText, input.messages, input.toolCalls);
@@ -95,11 +116,10 @@ export function persistAgentEndRound(
 		const { cleanedText: fbText, needsFollowup: fbNeedsFollowup } = extractAndStripFollowupMarker(
 			input.accumulatedText.join("\n\n").trim(),
 		);
+		let fbName: string | null = null;
 		try {
 			fs.mkdirSync(roundsDir, { recursive: true });
-			const fbName = fbPrompt
-				? createRoundFilePath(fbPrompt, fbText, input.toolCalls)
-				: `emergency-${Date.now()}.json`;
+			fbName = fbPrompt ? createRoundFilePath(fbPrompt, fbText, input.toolCalls) : `emergency-${Date.now()}.json`;
 			const fbPath = `${roundsDir}/${fbName}`;
 			if (!fs.existsSync(fbPath)) {
 				fs.writeFileSync(
@@ -123,6 +143,8 @@ export function persistAgentEndRound(
 			}
 			return { kind: "emergency", fileName: fbName, message: (err as Error).message };
 		} catch (fbErr) {
+			// F1: even the emergency write failed — this round is a gap.
+			if (deps.gate) deps.gate.blockedBy = fbName ?? "unknown";
 			return { kind: "failed", message: (fbErr as Error).message };
 		}
 	}
@@ -161,6 +183,8 @@ export function persistAgentEndRound(
 	try {
 		fs.writeFileSync(roundPath, JSON.stringify(roundData, null, 2));
 	} catch (err) {
+		// F1: record the gap so later rounds are never persisted ahead of it.
+		if (deps.gate) deps.gate.blockedBy = saved.fileName;
 		return { kind: "failed", message: (err as Error).message };
 	}
 

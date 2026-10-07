@@ -32,7 +32,9 @@ function makeFs(overrides: Partial<AgentEndPersistFs> = {}): AgentEndPersistFs &
 const toolCall: ToolCallDetail = {
 	index: 0,
 	name: "bash",
-	arguments: "ls",
+	// arguments is JSON.stringify'd by the session-parse derivation — keep the
+	// live ToolCallDetail in the same shape so content-hash names agree.
+	arguments: "{}",
 	result_summary: "ok",
 };
 
@@ -209,5 +211,130 @@ describe("persistAgentEndRound (issue #130 handler-ordering)", () => {
 		if (result.kind !== "saved") throw new Error(`expected saved, got ${result.kind}`);
 		expect(result.saved.needsFollowup).toBe(true);
 		expect(result.roundData.parentId).toBe("prev.json");
+	});
+
+	it("F1: write failure sets the gate to the failed round", () => {
+		const gate = { blockedBy: null as string | null };
+		const deps = makeDeps({
+			writeFileSync: () => {
+				throw new Error("ENOSPC");
+			},
+			gate,
+		});
+		const result = persistAgentEndRound(deps, baseInput);
+		expect(result.kind).toBe("failed");
+		if (result.kind !== "failed") return;
+		expect(gate.blockedBy).toBe(createRoundFilePath("fix the bug", "did the thing", [toolCall]));
+	});
+
+	it("F1: blocked gate persists no later round ahead of the gap", () => {
+		const gate = { blockedBy: "gap.json" };
+		const deps = makeDeps({ gate });
+		const result = persistAgentEndRound(deps, { ...baseInput, cachedUserPrompt: "later round" });
+		expect(result.kind).toBe("blocked");
+		if (result.kind !== "blocked") return;
+		expect(result.blockedBy).toBe("gap.json");
+		expect(deps.fs.files.size).toBe(0); // nothing was written
+	});
+
+	it("F1: composed — failed write at K, blocked K+1, fresh process + backfill recovers K", async () => {
+		const { backfillMissingRounds } = await import("./session-backfill.ts");
+		// Round K's write fails (disk full) — gate records the gap.
+		const gate = { blockedBy: null as string | null };
+		const failingFs = makeDeps({
+			writeFileSync: () => {
+				throw new Error("ENOSPC");
+			},
+			gate,
+		});
+		const kResult = persistAgentEndRound(failingFs, baseInput);
+		expect(kResult.kind).toBe("failed");
+		const kFileName = createRoundFilePath("fix the bug", "did the thing", [toolCall]);
+		expect(gate.blockedBy).toBe(kFileName);
+
+		// Next round (K+1) is blocked — never persisted ahead of K.
+		const liveFs = makeDeps({ gate });
+		const k1Result = persistAgentEndRound(liveFs, {
+			...baseInput,
+			cachedUserPrompt: "second round",
+			accumulatedText: ["second answer"],
+		});
+		expect(k1Result.kind).toBe("blocked");
+		expect(liveFs.fs.files.size).toBe(0);
+
+		// Fresh process (new gate): nothing was persisted for K or K+1 — the
+		// gap-free invariant means the rounds dir has no round ahead of the gap.
+		const nodeFs = await import("node:fs");
+		const os = await import("node:os");
+		const nodePath = await import("node:path");
+		const tmp = nodeFs.mkdtempSync(nodePath.join(os.tmpdir(), "f1-gap-"));
+		const roundsDir = nodePath.join(tmp, "rounds");
+		const k1FileName = createRoundFilePath("second round", "second answer", []); // fixture round K+1 has no tool calls
+		expect(nodeFs.existsSync(nodePath.join(roundsDir, kFileName))).toBe(false);
+		expect(nodeFs.existsSync(nodePath.join(roundsDir, k1FileName))).toBe(false);
+
+		// Startup backfill over the session JSONL recovers K and K+1.
+		try {
+			const sessionFile = nodePath.join(tmp, "session.jsonl");
+			nodeFs.writeFileSync(
+				sessionFile,
+				`${[
+					JSON.stringify({
+						type: "message",
+						message: { role: "user", content: [{ type: "text", text: "fix the bug" }] },
+					}),
+					// K's live write carried the tool call — the fixture must mirror it so
+					// the content-hash filename derivation agrees (shared derivation, F1).
+					JSON.stringify({
+						type: "message",
+						message: {
+							role: "assistant",
+							content: [{ type: "toolCall", name: "bash", arguments: {}, id: "t1" }],
+						},
+					}),
+					JSON.stringify({
+						type: "message",
+						message: {
+							role: "toolResult",
+							toolName: "bash",
+							toolCallId: "t1",
+							content: [{ type: "text", text: "ok" }],
+						},
+					}),
+					JSON.stringify({
+						type: "message",
+						message: {
+							role: "assistant",
+							content: [{ type: "text", text: "did the thing" }],
+							stopReason: "stop",
+						},
+					}),
+					JSON.stringify({
+						type: "message",
+						message: { role: "user", content: [{ type: "text", text: "second round" }] },
+					}),
+					JSON.stringify({
+						type: "message",
+						message: {
+							role: "assistant",
+							content: [{ type: "text", text: "second answer" }],
+							stopReason: "stop",
+						},
+					}),
+				].join("\n")}\n`,
+			);
+			const outcome = backfillMissingRounds(sessionFile, roundsDir, nodeFs, { liveWindowMs: 0 });
+			expect(outcome.recoveredFiles).toEqual([kFileName, k1FileName]);
+			// Both rounds now on disk via backfill.
+			expect(JSON.parse(nodeFs.readFileSync(nodePath.join(roundsDir, kFileName), "utf-8")).userPrompt).toBe(
+				"fix the bug",
+			);
+			expect(nodeFs.existsSync(nodePath.join(roundsDir, k1FileName))).toBe(true);
+			expect(JSON.parse(nodeFs.readFileSync(nodePath.join(roundsDir, k1FileName), "utf-8")).userPrompt).toBe(
+				"second round",
+			);
+		} finally {
+			nodeFs.rmSync(tmp, { recursive: true, force: true });
+		}
 	});
 });
