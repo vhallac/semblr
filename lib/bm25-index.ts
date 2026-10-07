@@ -62,7 +62,14 @@ function documentFromText(text: string): Bm25Document {
 	const termFrequencies: Record<string, number> = {};
 	const tokens = tokenizeBm25(text);
 	for (const token of tokens) {
-		termFrequencies[token] = (termFrequencies[token] ?? 0) + 1;
+		// Store hygiene (PR !131): `termFrequencies[token] ?? 0` reads through
+		// the prototype chain — for the token "constructor" it resolves to the
+		// inherited Object.prototype.constructor function, and `function + 1`
+		// stores the string "function Object() { [native code] }1". One corrupt
+		// doc makes isBm25Documents (the .every across all documents) reject the
+		// ENTIRE persisted index, forcing a full rebuild on every load. Use
+		// own-property semantics instead.
+		termFrequencies[token] = (Object.hasOwn(termFrequencies, token) ? termFrequencies[token] : 0) + 1;
 	}
 	return { length: tokens.length, termFrequencies };
 }
