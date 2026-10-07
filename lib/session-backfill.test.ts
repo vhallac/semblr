@@ -13,9 +13,11 @@ import {
 import type { ToolCallDetail } from "./round-data.ts";
 import {
 	backfillMissingRounds,
+	buildBackfillCandidates,
 	embedRecoveredRounds,
 	findMissingRounds,
 	indexRecoveredRounds,
+	isBackfillStartReason,
 	isSessionTailClosed,
 	listBackfillCandidates,
 	type RecoveredRoundLike,
@@ -573,6 +575,61 @@ describe("listBackfillCandidates", () => {
 
 	it("returns [] for a missing session dir", () => {
 		expect(listBackfillCandidates(path.join(tmp, "nope"), path.join(tmp, "cur.jsonl"))).toEqual([]);
+	});
+});
+
+describe("isBackfillStartReason (F5)", () => {
+	it("gates backfill on every session_start reason pi emits", () => {
+		for (const reason of ["startup", "resume", "reload", "new", "fork"]) {
+			expect(isBackfillStartReason(reason), reason).toBe(true);
+		}
+	});
+
+	it("rejects unknown reasons", () => {
+		for (const reason of ["", "shutdown", "compact", "resumed"]) {
+			expect(isBackfillStartReason(reason), reason).toBe(false);
+		}
+	});
+});
+
+describe("buildBackfillCandidates (F5)", () => {
+	let tmp: string;
+	beforeEach(() => {
+		tmp = fs.mkdtempSync(path.join(os.tmpdir(), "backfill-candidates-"));
+	});
+	afterEach(() => {
+		fs.rmSync(tmp, { recursive: true, force: true });
+	});
+
+	it("pins previousSessionFile first when the dir scan misses it", () => {
+		const scanned = path.join(tmp, "a.jsonl");
+		fs.writeFileSync(scanned, "{}");
+		const other = fs.mkdtempSync(path.join(os.tmpdir(), "backfill-external-"));
+		const external = path.join(other, "prev.jsonl");
+		fs.writeFileSync(external, "{}");
+		try {
+			expect(buildBackfillCandidates(tmp, path.join(tmp, "cur.jsonl"), external)).toEqual([external, scanned]);
+		} finally {
+			fs.rmSync(other, { recursive: true, force: true });
+		}
+	});
+
+	it("does not duplicate when the dir scan already includes previousSessionFile", () => {
+		const prev = path.join(tmp, "prev.jsonl");
+		fs.writeFileSync(prev, "{}");
+		expect(buildBackfillCandidates(tmp, path.join(tmp, "cur.jsonl"), prev)).toEqual([prev]);
+	});
+
+	it("returns just the dir scan when no previousSessionFile (startup/reload)", () => {
+		const scanned = path.join(tmp, "a.jsonl");
+		fs.writeFileSync(scanned, "{}");
+		expect(buildBackfillCandidates(tmp, path.join(tmp, "cur.jsonl"))).toEqual([scanned]);
+	});
+
+	it("excludes the current session file even when it is previousSessionFile (resume)", () => {
+		const current = path.join(tmp, "cur.jsonl");
+		fs.writeFileSync(current, "{}");
+		expect(buildBackfillCandidates(tmp, current, current)).toEqual([]);
 	});
 });
 

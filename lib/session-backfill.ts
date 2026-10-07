@@ -3,7 +3,8 @@
  *
  * When pi dies mid-run (kill / power loss), no agent_end fires and semblr
  * never writes the round file — but the pi session JSONL still contains the
- * full user prompt and assistant response. On the next session_start with a
+ * full user prompt and assistant response. On the next backfill-triggering
+ * session_start (see `isBackfillStartReason`) with a
  * `previousSessionFile`, parse that file and write round files for any round
  * whose content-hash file does not yet exist in the rounds directory.
  *
@@ -70,6 +71,42 @@ export function listBackfillCandidates(
 		} catch {}
 	}
 	return candidates.sort((a, b) => b.mtime - a.mtime).map((c) => c.file);
+}
+
+/**
+ * F5 (PR !131): session_start reasons that trigger backfill. `startup` and
+ * `resume` scan the session dir; `new`/`fork`/`reload` are included so a
+ * source deferred as live on one start is retried on the next transition,
+ * with pi's `previousSessionFile` (present for new/resume/fork) pinned as
+ * the first candidate. Reload carries no previousSessionFile but still gets
+ * the dir scan — a file live at startup may be closed by the time /reload
+ * restarts the extension.
+ */
+export function isBackfillStartReason(reason: string): boolean {
+	return reason === "startup" || reason === "resume" || reason === "reload" || reason === "new" || reason === "fork";
+}
+
+/**
+ * F5 (PR !131): build the backfill candidate list for a session_start —
+ * newest-first dir scan (current session excluded) with pi's
+ * `previousSessionFile` pinned first when pi supplied one and the scan
+ * missed it (e.g. outside the cwd's session dir).
+ */
+export function buildBackfillCandidates(
+	sessionDir: string,
+	currentSessionFile: string,
+	previousSessionFile?: string,
+	fsImpl: Pick<typeof fs, "readdirSync" | "statSync"> = fs,
+): string[] {
+	const candidates = listBackfillCandidates(sessionDir, currentSessionFile, fsImpl);
+	if (
+		previousSessionFile &&
+		path.resolve(previousSessionFile) !== path.resolve(currentSessionFile) &&
+		!candidates.some((c) => path.resolve(c) === path.resolve(previousSessionFile))
+	) {
+		candidates.unshift(previousSessionFile);
+	}
+	return candidates;
 }
 
 /**

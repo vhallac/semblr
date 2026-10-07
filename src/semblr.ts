@@ -92,9 +92,10 @@ import {
 import { loadSemblrConfig, type SemblrConfig } from "../lib/semblr-config.ts";
 import {
 	backfillMissingRounds,
+	buildBackfillCandidates,
 	embedRecoveredRounds,
 	indexRecoveredRounds,
-	listBackfillCandidates,
+	isBackfillStartReason,
 } from "../lib/session-backfill.ts";
 import type { CheckpointSummary, ToolCallDetail } from "../lib/state.ts";
 import { contextCacheStore, contextCacheValid, createRound, createSession } from "../lib/state.ts";
@@ -1177,21 +1178,22 @@ export default function (pi: ExtensionAPI) {
 		// Issue #130: recover rounds lost to process death in previous sessions.
 		// F2 (PR !131): scan ALL prior session files in the session dir (newest
 		// first, per-file tail-completeness early exit) — a source deferred as live
-		// on one startup is retried automatically on the next. pi only provides
-		// previousSessionFile for "new"/"resume"/"fork"; for a fresh startup launch
-		// (reason "startup" with no previousSessionFile) we still scan the dir,
-		// which covers it. Sessions outside the current cwd's dir are not ours.
-		if (event.reason === "startup" || event.reason === "resume") {
+		// on one start is retried automatically on the next. F5 (PR !131): the
+		// gate covers every session_start reason, not just startup/resume — pi
+		// supplies previousSessionFile for "new"/"resume"/"fork" (pinned first
+		// when the dir scan misses it); "reload" carries none but still gets the
+		// dir scan, since a source live at startup may be closed by the time
+		// /reload restarts the extension. Sessions outside the current cwd's dir
+		// are not ours.
+		if (isBackfillStartReason(event.reason)) {
 			const sessionFile = ctx.sessionManager?.getSessionFile?.();
 			if (sessionFile) {
 				try {
-					const candidates = listBackfillCandidates(path.dirname(sessionFile), sessionFile);
-					if (
-						event.previousSessionFile &&
-						!candidates.some((c) => path.resolve(c) === path.resolve(event.previousSessionFile!))
-					) {
-						candidates.unshift(event.previousSessionFile);
-					}
+					const candidates = buildBackfillCandidates(
+						path.dirname(sessionFile),
+						sessionFile,
+						event.previousSessionFile,
+					);
 					const backfill = backfillMissingRounds(candidates, ROUNDS_DIR);
 					if (backfill.deferredLive) {
 						ctx.ui.setStatus(
