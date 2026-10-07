@@ -21,6 +21,7 @@ import {
 	isBackfillStartReason,
 	isSessionTailClosed,
 	listBackfillCandidates,
+	planStartupEmbedding,
 	type RecoveredRoundLike,
 } from "./session-backfill.ts";
 
@@ -581,6 +582,34 @@ describe("session-backfill", () => {
 	});
 });
 
+describe("planStartupEmbedding (issue #133)", () => {
+	type Round = { promptEmbedding?: number[] };
+	const embedded = (n: number): [string, Round][] =>
+		Array.from({ length: n }, (_, i) => [`r${i}.json`, { promptEmbedding: [0.1] }]);
+
+	it("keeps embedding inline when the unembedded count is at or below the threshold", () => {
+		const files = new Map<string, Round>([...embedded(10), ["rX.json", { promptEmbedding: [0.2] }]]);
+		const plan = planStartupEmbedding([...files.keys()], (f) => files.get(f) ?? null);
+		expect(plan).toEqual({ mode: "inline", pendingCount: 0 });
+	});
+
+	it("defers when the unembedded count exceeds the threshold, reporting the pending count", () => {
+		const files = new Map<string, Round>([
+			...embedded(3),
+			...Array.from({ length: 11 }, (_, i) => [`p${i}.json`, {}] as const),
+		]);
+		const plan = planStartupEmbedding([...files.keys()], (f) => files.get(f) ?? null);
+		// Message built from this count: `🧠 11 rounds pending embedding backfill — run just index`
+		expect(plan).toEqual({ mode: "defer", pendingCount: 11 });
+	});
+
+	it("treats unreadable round files as pending", () => {
+		const files = new Map<string, { promptEmbedding: number[] }>([["a.json", { promptEmbedding: [1] }]]);
+		const plan = planStartupEmbedding(["a.json", "missing.json"], (f) => files.get(f) ?? null);
+		expect(plan).toEqual({ mode: "inline", pendingCount: 1 });
+	});
+});
+
 describe("listBackfillCandidates", () => {
 	let tmp: string;
 	beforeEach(() => {
@@ -757,6 +786,26 @@ describe("indexRecoveredRounds", () => {
 		});
 		expect(writes).toEqual([]);
 		expect(report.bm25Indexed).toBe(0);
+	});
+
+	it("is synchronous — all indexing effects have landed when it returns (issue #133: must-not-lose contract)", () => {
+		const bm25: string[] = [];
+		const toolAppends: string[] = [];
+		const report = indexRecoveredRounds(["a.json", "b.json"], {
+			readRoundData: () => ({ toolCalls: [toolCall] }),
+			upsertBm25: (f) => bm25.push(f),
+			flushBm25: () => {},
+			appendToolRows: (f) => toolAppends.push(f),
+		});
+		// Not a promise: the returned report is final the instant the call returns.
+		expect(report).not.toBeInstanceOf(Promise);
+		// Every effect is complete by return time — the caller's deferral of the
+		// embedding burst must never delay these indexes.
+		expect(bm25).toEqual(["a.json", "b.json"]);
+		expect(toolAppends).toEqual(["a.json", "b.json"]);
+		expect(report.bm25Indexed).toBe(2);
+		expect(report.toolIndexed).toBe(2);
+		expect(report.errors).toEqual([]);
 	});
 
 	it("propagates appendToolRows failures into errors without blocking later rounds", () => {

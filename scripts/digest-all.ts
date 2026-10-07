@@ -192,8 +192,42 @@ export async function runDigestAll(options: DigestAllOptions = {}): Promise<numb
 		allRounds.push(...newRounds);
 	}
 
+	// Rounds-dir sweep (issue #133): recovered round files written by the
+	// startup backfill may have no session JSONL left to scan from — but they
+	// also have no vector-index rows yet (the backfill writes the round file
+	// without embedding). Sweep every round file that is not already covered
+	// by the session scan and is missing index rows under the current model,
+	// so `just index` backfills their embeddings too. Rounds already indexed
+	// under the current model are skipped — index presence, not the
+	// promptEmbedding field, is the idempotence guard (embedRound writes both
+	// together, and the round's skip guard in processRound re-checks).
+	const queuedFiles = new Set(
+		allRounds.map((r) => deriveRoundFile(r.userPrompt, r.responseSequence, r.toolCalls).fileName),
+	);
+	let sweptTotal = 0;
+	if (f.existsSync(roundsDir)) {
+		for (const fileName of f.readdirSync(roundsDir)) {
+			if (!fileName.endsWith(".json") || fileName.startsWith("index")) continue;
+			if (queuedFiles.has(fileName)) continue;
+			if (existingRounds.has(fileName) && !modelMismatchedRounds.has(fileName)) continue;
+			let round: Round;
+			try {
+				round = JSON.parse(f.readFileSync(path.join(roundsDir, fileName), "utf-8")) as Round;
+			} catch {
+				err.error(`  ⚠️  Skipping unreadable round file: ${fileName}`);
+				continue;
+			}
+			// Rounds without a user prompt cannot be filed (filename derives from it).
+			if (!round.userPrompt) continue;
+			allRounds.push({ ...round, sessionLabel: "<rounds-dir>" });
+			sweptTotal++;
+		}
+	}
+
 	const totalNew = allRounds.length;
-	out.log(`📊 New rounds to embed: ${totalNew} (${skippedTotal} already indexed)\n`);
+	out.log(
+		`📊 New rounds to embed: ${totalNew} (${skippedTotal} already indexed, ${sweptTotal} swept from rounds dir)\n`,
+	);
 
 	if (totalNew === 0) {
 		out.log("✨ Nothing to do — all sessions already indexed!");

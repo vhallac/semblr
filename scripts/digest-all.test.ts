@@ -239,7 +239,9 @@ describe("digest-all script", () => {
 		).resolves.toBe(0);
 
 		expect(secondFetch).not.toHaveBeenCalled();
-		expect(secondLogs.stdout.join("\n")).toContain("📊 New rounds to embed: 0 (1 already indexed)");
+		expect(secondLogs.stdout.join("\n")).toContain(
+			"📊 New rounds to embed: 0 (1 already indexed, 0 swept from rounds dir)",
+		);
 		expect(secondLogs.stdout.join("\n")).toContain("✨ Nothing to do — all sessions already indexed!");
 	});
 
@@ -280,7 +282,9 @@ describe("digest-all script", () => {
 		expect(fetchImpl).not.toHaveBeenCalled();
 		expect(readIndexLines(indexPath)).toEqual([encodeVectorIndexLine([1], `${roundFile}:prompt`)]);
 		expect(logs.stdout.join("\n")).toContain("📊 Model-mismatched rounds to re-index: 0");
-		expect(logs.stdout.join("\n")).toContain("📊 New rounds to embed: 0 (1 already indexed)");
+		expect(logs.stdout.join("\n")).toContain(
+			"📊 New rounds to embed: 0 (1 already indexed, 0 swept from rounds dir)",
+		);
 	});
 
 	it("re-indexes rounds whose index rows were generated with a different explicit model", async () => {
@@ -562,6 +566,130 @@ describe("digest-all script", () => {
 			else process.env.OPENROUTER_API_KEY = oldKey;
 			globalThis.fetch = oldFetch;
 		}
+	});
+
+	it("sweeps recovered rounds from the rounds dir even when no session file exists", async () => {
+		const root = tmpDir();
+		const sessionsDir = tmpDir(); // no session files at all
+		const roundsDir = path.join(root, "rounds");
+		fs.mkdirSync(roundsDir, { recursive: true });
+		const indexPath = path.join(roundsDir, "index.csv");
+		const requests: unknown[] = [];
+
+		const userPrompt = "What was recovered after the crash?";
+		const responseSequence = "This round was recovered by the startup backfill.";
+		const roundFile = `${computeContentHash(userPrompt, responseSequence, [])}.json`;
+		fs.writeFileSync(
+			path.join(roundsDir, roundFile),
+			JSON.stringify({ userPrompt, responseSequence, toolCalls: [], recovered: true }),
+		);
+
+		const logs = logger();
+		await expect(
+			runDigestAll({
+				sessionsDir,
+				roundsDir,
+				indexPath,
+				apiKey: "key",
+				fetchImpl: embeddingFetch(
+					[
+						[1, 0],
+						[0, 1],
+					],
+					requests,
+				),
+				stdout: logs.out,
+				stderr: logs.err,
+			}),
+		).resolves.toBe(0);
+
+		// Prompt + response were embedded (digest-all's two-row convention).
+		expect(requests).toHaveLength(2);
+		expect(loadVectorIndex(indexPath)).toHaveLength(2);
+		const written = JSON.parse(fs.readFileSync(path.join(roundsDir, roundFile), "utf-8"));
+		expect(written.recovered).toBe(true);
+		expect(logs.stdout.join("\n")).toContain("1 swept from rounds dir");
+		expect(logs.stdout.join("\n")).toContain("1 rounds embedded, 0 errors");
+	});
+
+	it("rounds-dir sweep is idempotent — re-run adds no duplicate index rows", async () => {
+		const root = tmpDir();
+		const sessionsDir = tmpDir();
+		const roundsDir = path.join(root, "rounds");
+		fs.mkdirSync(roundsDir, { recursive: true });
+		const indexPath = path.join(roundsDir, "index.csv");
+
+		const userPrompt = "What is swept exactly once?";
+		const responseSequence = "The sweep must not duplicate index rows on re-run.";
+		const roundFile = `${computeContentHash(userPrompt, responseSequence, [])}.json`;
+		fs.writeFileSync(
+			path.join(roundsDir, roundFile),
+			JSON.stringify({ userPrompt, responseSequence, toolCalls: [], recovered: true }),
+		);
+
+		await expect(
+			runDigestAll({
+				sessionsDir,
+				roundsDir,
+				indexPath,
+				apiKey: "key",
+				fetchImpl: embeddingFetch([
+					[1, 0],
+					[0, 1],
+				]),
+				stdout: logger().out,
+			}),
+		).resolves.toBe(0);
+		const linesAfterFirst = readIndexLines(indexPath);
+		expect(linesAfterFirst).toHaveLength(2);
+
+		const secondFetch = vi.fn(async () => new Response("should not be called")) as typeof fetch;
+		const logs = logger();
+		await expect(
+			runDigestAll({
+				sessionsDir,
+				roundsDir,
+				indexPath,
+				apiKey: "key",
+				fetchImpl: secondFetch,
+				stdout: logs.out,
+				stderr: logs.err,
+			}),
+		).resolves.toBe(0);
+
+		expect(secondFetch).not.toHaveBeenCalled();
+		expect(readIndexLines(indexPath)).toEqual(linesAfterFirst);
+		expect(logs.stdout.join("\n")).toContain("0 swept from rounds dir");
+	});
+
+	it("sweep skips unreadable round files and files without a user prompt", async () => {
+		const root = tmpDir();
+		const sessionsDir = tmpDir();
+		const roundsDir = path.join(root, "rounds");
+		fs.mkdirSync(roundsDir, { recursive: true });
+		const indexPath = path.join(roundsDir, "index.csv");
+
+		fs.writeFileSync(path.join(roundsDir, "corrupt.json"), "{not json");
+		fs.writeFileSync(path.join(roundsDir, "no-prompt.json"), JSON.stringify({ responseSequence: "orphan" }));
+
+		const logs = logger();
+		const fetchImpl = vi.fn(async () => new Response("should not be called")) as typeof fetch;
+		await expect(
+			runDigestAll({
+				sessionsDir,
+				roundsDir,
+				indexPath,
+				apiKey: "key",
+				fetchImpl,
+				stdout: logs.out,
+				stderr: logs.err,
+			}),
+		).resolves.toBe(0);
+
+		expect(fetchImpl).not.toHaveBeenCalled();
+		expect(loadVectorIndex(indexPath)).toHaveLength(0);
+		expect(logs.stderr.join("\n")).toContain("Skipping unreadable round file: corrupt.json");
+		expect(logs.stdout.join("\n")).toContain("0 swept from rounds dir");
 	});
 
 	it("detects direct CLI execution", () => {

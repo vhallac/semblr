@@ -395,6 +395,39 @@ export function backfillMissingRounds(
  */
 export interface RecoveredEmbedDeps extends EmbedRoundDeps {}
 
+/**
+ * Issue #133: at most this many unembedded recovered rounds are embedded
+ * inline during session_start; above the threshold the embedding burst is
+ * deferred to `just index` (scripts/digest-all.ts) so startup never pays a
+ * large OpenRouter embedding bill.
+ */
+export const STARTUP_EMBED_INLINE_MAX = 10;
+
+export interface StartupEmbedPlan {
+	mode: "inline" | "defer";
+	pendingCount: number;
+}
+
+/**
+ * Issue #133: decide how startup should handle embedding for recovered
+ * rounds. A round is "pending" when its round file is missing/unreadable or
+ * carries no `promptEmbedding`. Pure — no I/O beyond the injected reader.
+ */
+export function planStartupEmbedding(
+	fileNames: readonly string[],
+	readRoundData: (fileName: string) => { promptEmbedding?: unknown } | null,
+): StartupEmbedPlan {
+	let pendingCount = 0;
+	for (const fileName of fileNames) {
+		const round = readRoundData(fileName);
+		if (!round?.promptEmbedding) pendingCount++;
+	}
+	return {
+		mode: pendingCount > STARTUP_EMBED_INLINE_MAX ? "defer" : "inline",
+		pendingCount,
+	};
+}
+
 export async function embedRecoveredRounds(
 	fileNames: string[],
 	roundsDir: string,
