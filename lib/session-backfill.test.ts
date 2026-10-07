@@ -15,6 +15,7 @@ import {
 	backfillMissingRounds,
 	buildBackfillCandidates,
 	embedRecoveredRounds,
+	extractCheckpointSummary,
 	findMissingRounds,
 	indexRecoveredRounds,
 	isBackfillStartReason,
@@ -695,5 +696,134 @@ describe("indexRecoveredRounds", () => {
 		expect(toolAppends).toEqual(["b.json"]);
 		expect(report.toolIndexed).toBe(1);
 		expect(report.errors).toEqual(["a.json: tool index boom"]);
+	});
+});
+
+describe("extractCheckpointSummary (F7)", () => {
+	const acceptedArgs = JSON.stringify({
+		currentTask: "task",
+		progressMade: ["a"],
+		currentState: ["b"],
+		nextSteps: ["c"],
+		keyFindings: ["d"],
+	});
+	const acceptedResult =
+		"Checkpoint recorded. Your progress summary has been saved. You may now stop — do not start new work.";
+
+	function tc(name: string, args: string, result: string): ToolCallDetail {
+		return { index: 0, id: "t1", name, arguments: args, result_summary: result.slice(0, 300) };
+	}
+
+	it("recovers the summary from an accepted semblr_checkpoint call", () => {
+		const summary = extractCheckpointSummary([tc("semblr_checkpoint", acceptedArgs, acceptedResult)]);
+		expect(summary).toEqual({
+			currentTask: "task",
+			progressMade: ["a"],
+			currentState: ["b"],
+			nextSteps: ["c"],
+			keyFindings: ["d"],
+		});
+	});
+
+	it("takes the LAST accepted call (live overwrite semantics)", () => {
+		const last = extractCheckpointSummary([
+			tc("semblr_checkpoint", JSON.stringify({ currentTask: "old", progressMade: [] }), acceptedResult),
+			tc("semblr_checkpoint", acceptedArgs, acceptedResult),
+		]);
+		expect(last?.currentTask).toBe("task");
+	});
+
+	it("ignores rejected calls (no context warning was active)", () => {
+		expect(
+			extractCheckpointSummary([tc("semblr_checkpoint", acceptedArgs, "No context size warning is active.")]),
+		).toBeNull();
+	});
+
+	it("ignores malformed arguments and unrelated tool calls", () => {
+		expect(extractCheckpointSummary([tc("read", "not json{", acceptedResult)])).toBeNull();
+		expect(
+			extractCheckpointSummary([tc("semblr_checkpoint", '{"currentTask":1,"progressMade":[]}', acceptedResult)]),
+		).toBeNull();
+		expect(extractCheckpointSummary([])).toBeNull();
+	});
+
+	it("backfill writes the recovered summary into the round file", () => {
+		const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "backfill-f7-"));
+		try {
+			const sessionFile = writeSessionFile(tmpDir, [
+				userMsg("big task"),
+				{
+					type: "message",
+					message: {
+						role: "assistant",
+						content: [
+							{ type: "toolCall", name: "semblr_checkpoint", arguments: JSON.parse(acceptedArgs), id: "c1" },
+						],
+					},
+				},
+				{
+					type: "message",
+					message: {
+						role: "toolResult",
+						toolName: "semblr_checkpoint",
+						toolCallId: "c1",
+						content: [{ type: "text", text: acceptedResult }],
+					},
+				},
+				assistantMsg("done"),
+			]);
+			const roundsDir = path.join(tmpDir, "rounds");
+			const outcome = backfillMissingRounds(sessionFile, roundsDir, undefined, { liveWindowMs: 0 });
+			const written = JSON.parse(fs.readFileSync(path.join(roundsDir, outcome.recoveredFiles[0]), "utf-8"));
+			expect(written.summary.currentTask).toBe("task");
+			expect(written.summary.keyFindings).toEqual(["d"]);
+		} finally {
+			fs.rmSync(tmpDir, { recursive: true, force: true });
+		}
+	});
+
+	it("recovered summary embeds as a :summary row like the live path", async () => {
+		const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "backfill-f7-embed-"));
+		try {
+			const sessionFile = writeSessionFile(tmpDir, [
+				userMsg("big task"),
+				{
+					type: "message",
+					message: {
+						role: "assistant",
+						content: [
+							{ type: "toolCall", name: "semblr_checkpoint", arguments: JSON.parse(acceptedArgs), id: "c1" },
+						],
+					},
+				},
+				{
+					type: "message",
+					message: {
+						role: "toolResult",
+						toolName: "semblr_checkpoint",
+						toolCallId: "c1",
+						content: [{ type: "text", text: acceptedResult }],
+					},
+				},
+				assistantMsg("done"),
+			]);
+			const roundsDir = path.join(tmpDir, "rounds");
+			const outcome = backfillMissingRounds(sessionFile, roundsDir, undefined, { liveWindowMs: 0 });
+			const fileName = outcome.recoveredFiles[0];
+			const labels: string[] = [];
+			const inputs: string[] = [];
+			await embedRecoveredRounds(outcome.recoveredFiles, roundsDir, {
+				embed: (text) => {
+					inputs.push(text);
+					return Promise.resolve([text.length, 1]);
+				},
+				appendIndexRow: (label) => labels.push(label),
+				writeRoundEmbedding: () => {},
+			});
+			expect(labels).toContain(`${fileName}:summary`);
+			expect(inputs.some((t) => t.startsWith("Current Task: task"))).toBe(true);
+		} finally {
+			fs.rmSync(tmpDir, { recursive: true, force: true });
+		}
 	});
 });

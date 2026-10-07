@@ -18,7 +18,41 @@ import { type EmbedRoundDeps, embedRound } from "./embed-round.ts";
 import { parsePiSessionJsonl, reconstructPiSessionRounds } from "./pi-session.ts";
 import type { PromptNoiseOptions } from "./round-capture.ts";
 import { buildAgentEndRoundData, deriveRoundFile } from "./round-capture.ts";
-import type { RoundData, ToolCallDetail } from "./round-data.ts";
+import {
+	buildCheckpointSummaryText,
+	type CheckpointSummary,
+	type RoundData,
+	type ToolCallDetail,
+} from "./round-data.ts";
+
+/**
+ * F7 (PR !131): recover a checkpoint summary from the round's parsed tool
+ * calls. The `semblr_checkpoint` call arguments carry the full structured
+ * summary, and the "Checkpoint recorded." result text confirms the live
+ * path accepted it (warning was active). The live path's
+ * `contextWarningIssued` state is process-local and unrecoverable, so the
+ * acceptance marker in the result is the authoritative evidence here. The
+ * LAST accepted call wins, matching the live overwrite semantics.
+ */
+export function extractCheckpointSummary(toolCalls: readonly ToolCallDetail[]): CheckpointSummary | null {
+	for (let i = toolCalls.length - 1; i >= 0; i--) {
+		const tc = toolCalls[i];
+		if (!tc.name.includes("semblr_checkpoint")) continue;
+		if (!tc.result_summary.includes("Checkpoint recorded")) continue;
+		try {
+			const parsed = JSON.parse(tc.arguments) as Partial<CheckpointSummary>;
+			if (typeof parsed.currentTask !== "string" || !Array.isArray(parsed.progressMade)) continue;
+			return {
+				currentTask: parsed.currentTask,
+				progressMade: parsed.progressMade,
+				currentState: Array.isArray(parsed.currentState) ? parsed.currentState : [],
+				nextSteps: Array.isArray(parsed.nextSteps) ? parsed.nextSteps : [],
+				keyFindings: Array.isArray(parsed.keyFindings) ? parsed.keyFindings : [],
+			};
+		} catch {}
+	}
+	return null;
+}
 
 export interface BackfillOutcome {
 	/** Round files that were written by this backfill run. */
@@ -195,6 +229,10 @@ function collectMissingRounds(
 				// F1 (PR !131): recovered copies carry the marker state the live
 				// write would have persisted instead of the default false.
 				needsFollowup: round.needsFollowup,
+				// F7 (PR !131): recover the checkpoint summary from the JSONL's
+				// semblr_checkpoint tool call so checkpoint injection works for
+				// recovered rounds too.
+				summary: extractCheckpointSummary(round.toolCalls as ToolCallDetail[]) ?? undefined,
 			}),
 			// F4 (PR #131): mark recovered rounds so they are distinguishable from
 			// live-saved rounds (second-class retrieval provenance).
@@ -357,6 +395,9 @@ export async function embedRecoveredRounds(
 					fileName,
 					userPrompt: round.userPrompt ?? "",
 					responseText: round.responseSequence ?? "",
+					// F7 (PR !131): recovered checkpoint summaries embed as a `:summary`
+					// row, same as the live path.
+					checkpointSummaryText: round.summary ? buildCheckpointSummaryText(round.summary) : null,
 					maxResponseBytes: opts.maxResponseBytes,
 					promptNoiseOptions: opts.promptNoiseOptions,
 					promptMaxTokens: opts.promptMaxTokens,

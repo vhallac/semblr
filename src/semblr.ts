@@ -62,7 +62,7 @@ import {
 	getRelatedParentIdFromGroup,
 	type MessageEndProcessingState,
 } from "../lib/round-capture.ts";
-import type { RoundData } from "../lib/round-data.ts";
+import { buildCheckpointSummaryText, type RoundData } from "../lib/round-data.ts";
 import { getRoundFileSize, readRoundFileFromDir as readRoundFileFromDirLib, readRoundJson } from "../lib/round-io.ts";
 import {
 	loadRoundDataForToolDetails,
@@ -211,28 +211,7 @@ const PROMPT_NOISE_CLEANUP = {
 	repeatMaxChars: SEMBLR_CONFIG.promptNoiseRepeatMaxChars,
 };
 
-/** Build a flat text representation of a checkpoint summary for embedding. */
-function buildCheckpointSummaryText(summary: CheckpointSummary): string {
-	const lines: string[] = [];
-	lines.push(`Current Task: ${summary.currentTask}`);
-	if (summary.progressMade.length > 0) {
-		lines.push("Progress Made:");
-		for (const item of summary.progressMade) lines.push(`- ${item}`);
-	}
-	if (summary.currentState.length > 0) {
-		lines.push("Current State:");
-		for (const item of summary.currentState) lines.push(`- ${item}`);
-	}
-	if (summary.nextSteps.length > 0) {
-		lines.push("Next Steps:");
-		for (const item of summary.nextSteps) lines.push(`- ${item}`);
-	}
-	if (summary.keyFindings.length > 0) {
-		lines.push("Key Findings / Decisions:");
-		for (const item of summary.keyFindings) lines.push(`- ${item}`);
-	}
-	return lines.join("\n");
-}
+/** Checkpoint embedding text lives in the shared core (lib/round-data.ts, F7 PR !131). */
 
 // Context formatting helpers live in lib/context-format.ts.
 
