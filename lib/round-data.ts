@@ -22,7 +22,7 @@ export interface ToolCallDetail {
 }
 
 export interface RoundData {
-	/** Content hash (MD5 of userPrompt + responseSequence) — matches the round filename stem. */
+	/** Content hash (MD5 of userPrompt + responseSequence + tool-call arguments/results) — matches the round filename stem. */
 	id?: string;
 	userPrompt: string;
 	responseSequence: string;
