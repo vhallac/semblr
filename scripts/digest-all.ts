@@ -22,7 +22,8 @@ import {
 	upsertBm25Round,
 	writeBm25Index,
 } from "../lib/bm25-index.ts";
-import { type EmbeddingModelRegistry, embedText, normalize } from "../lib/embed.ts";
+import { type EmbeddingModelRegistry, embedText } from "../lib/embed.ts";
+import { embedRound } from "../lib/embed-round.ts";
 import {
 	appendVectorIndexEntry,
 	findStaleContentMatches as findStaleContentMatchesInDir,
@@ -33,7 +34,8 @@ import {
 	type VectorIndexEntry,
 } from "../lib/index-io.ts";
 import { type ParsedPiRound, parsePiSessionJsonl } from "../lib/pi-session.ts";
-import { buildPromptEmbeddingInput, deriveRoundFile } from "../lib/round-capture.ts";
+import { deriveRoundFile, embeddingMaxTokensToResponseBytes } from "../lib/round-capture.ts";
+import { buildCheckpointSummaryText, type CheckpointSummary } from "../lib/round-data.ts";
 import {
 	resolveScriptApiKey,
 	resolveScriptConfig,
@@ -67,7 +69,13 @@ const CONCURRENCY = 1;
 // Types
 // ─────────────────────────────────────────────
 
-type Round = ParsedPiRound & { sessionLabel: string };
+type Round = ParsedPiRound & {
+	sessionLabel: string;
+	/** Checkpoint summary carried by recovered round files; embeds as a `:summary` row (F1 parity). */
+	summary?: CheckpointSummary;
+	/** Stored embedding marker (F2); written through embedRound's writeRoundEmbedding dep. */
+	promptEmbedding?: number[];
+};
 
 // ─────────────────────────────────────────────
 // Parse a single JSONL file into rounds
@@ -199,8 +207,11 @@ export async function runDigestAll(options: DigestAllOptions = {}): Promise<numb
 	// by the session scan and is missing index rows under the current model,
 	// so `just index` backfills their embeddings too. Rounds already indexed
 	// under the current model are skipped — index presence, not the
-	// promptEmbedding field, is the idempotence guard (embedRound writes both
-	// together, and the round's skip guard in processRound re-checks).
+	// promptEmbedding field, is the idempotence guard. Since F2 (PR #134
+	// review) processRound embeds through embedRound (lib/embed-round.ts),
+	// which writes the index rows and the promptEmbedding field together —
+	// but the guard stays index presence, so a round whose rows are missing
+	// is swept again even if a promptEmbedding marker survived.
 	const queuedFiles = new Set(
 		allRounds.map((r) => deriveRoundFile(r.userPrompt, r.responseSequence, r.toolCalls).fileName),
 	);
@@ -287,44 +298,49 @@ export async function runDigestAll(options: DigestAllOptions = {}): Promise<numb
 		}
 
 		try {
+			// F1+F2 (PR #134 review): redrive embedding goes through the shared policy
+			// core embedRound (lib/embed-round.ts) — the same call the live agent_end
+			// path and embedRecoveredRounds make. Response clip budget (24,000 bytes,
+			// not 8,000 code units), checkpoint `:summary` rows, the short-prompt drop,
+			// and the promptEmbedding write are parity by construction. Index rows are
+			// buffered here and flushed once the embed resolves (below): full replace on
+			// model re-index, append otherwise.
 			const entries: VectorIndexEntry[] = [];
-			// Prompt input: noise-cleaned, budget-clipped prompt text + embedding-input hash
-			// stamp (issue #106; clip restored post-cleanup in #107 F4), matching the
-			// extension capture path so `just migrate` stays churn-free.
-			const { text: promptInput, hash: promptInputHash } = buildPromptEmbeddingInput(
-				round.userPrompt,
+			await embedRound(
 				{
-					fenceMaxChars: config.promptNoiseFenceMaxChars,
-					jsonMaxChars: config.promptNoiseJsonMaxChars,
-					repeatMaxChars: config.promptNoiseRepeatMaxChars,
+					fileName: roundFile,
+					userPrompt: round.userPrompt,
+					responseText: round.responseSequence,
+					checkpointSummaryText: round.summary ? buildCheckpointSummaryText(round.summary) : null,
+					maxResponseBytes: embeddingMaxTokensToResponseBytes(config.embeddingMaxTokens),
+					promptNoiseOptions: {
+						fenceMaxChars: config.promptNoiseFenceMaxChars,
+						jsonMaxChars: config.promptNoiseJsonMaxChars,
+						repeatMaxChars: config.promptNoiseRepeatMaxChars,
+					},
+					promptMaxTokens: config.embeddingMaxTokens,
 				},
-				config.embeddingMaxTokens,
+				{
+					embed: (text) =>
+						embedText(text, apiKey, {
+							fetchImpl: options.fetchImpl,
+							config: embeddingConfig,
+							modelRegistry,
+						}),
+					appendIndexRow: (label, vec, hash) => {
+						entries.push({
+							vector: vec,
+							filePath: label,
+							model: config.embeddingModel,
+							embeddingInputHash: hash,
+						});
+					},
+					writeRoundEmbedding: (fileName, vec) => {
+						round.promptEmbedding = vec;
+						f.writeFileSync(path.resolve(roundsDir, fileName), JSON.stringify(round, null, 2));
+					},
+				},
 			);
-			const promptVector = await embedText(promptInput, apiKey, {
-				fetchImpl: options.fetchImpl,
-				config: embeddingConfig,
-				modelRegistry,
-			});
-			entries.push({
-				vector: normalize(promptVector),
-				filePath: `${roundFile}:prompt`,
-				model: config.embeddingModel,
-				embeddingInputHash: promptInputHash,
-			});
-
-			const respText = round.responseSequence.slice(0, config.embeddingMaxTokens);
-			if (respText) {
-				const respVector = await embedText(respText, apiKey, {
-					fetchImpl: options.fetchImpl,
-					config: embeddingConfig,
-					modelRegistry,
-				});
-				entries.push({
-					vector: normalize(respVector),
-					filePath: `${roundFile}:response`,
-					model: config.embeddingModel,
-				});
-			}
 
 			if (needsModelReindex) {
 				replaceIndexEntriesForRoundFile(indexPath, roundFile, entries);
