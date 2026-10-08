@@ -21,6 +21,7 @@ import {
 	isBackfillStartReason,
 	isSessionTailClosed,
 	listBackfillCandidates,
+	loadDiskCanonicalKeys,
 	planStartupEmbedding,
 	type RecoveredRoundLike,
 	startupEmbedStatusMessage,
@@ -148,6 +149,71 @@ describe("session-backfill", () => {
 		expect(round.toolCalls[0].result_full).toBe("output line\n");
 	});
 
+	it("skips a round already on disk under a legacy filename with whitespace-drifted content (duplicate regeneration fix)", () => {
+		// A legacy live save stripped the trailing newline from the tool result
+		// and omitted tool-call ids, so its filename is a historical hash that
+		// today's parser cannot reproduce. The content-based existence check must
+		// still recognize the round and skip re-recovery.
+		const sessionFile = writeSessionFile(tmp, [
+			userMsg("q", "u1"),
+			{
+				type: "message",
+				message: {
+					role: "assistant",
+					content: [{ type: "toolCall", name: "bash", arguments: {}, id: "t1" }],
+				},
+			},
+			{
+				type: "message",
+				message: {
+					role: "toolResult",
+					toolName: "bash",
+					toolCallId: "t1",
+					content: [{ type: "text", text: "output line\n" }],
+				},
+			},
+			assistantMsg("a"),
+		]);
+		const roundsDir = path.join(tmp, "rounds");
+		const legacyRound = {
+			userPrompt: "q",
+			responseSequence: "a",
+			toolCalls: [{ name: "bash", arguments: "{}", result_full: "output line" }],
+		};
+		fs.mkdirSync(roundsDir, { recursive: true });
+		// Arbitrary legacy filename — unreproducible by today's hashing.
+		fs.writeFileSync(path.join(roundsDir, "00000000000000000000000000000000.json"), JSON.stringify(legacyRound));
+
+		const { missing, scanned } = findMissingRounds(sessionFile, roundsDir);
+		expect(scanned).toBe(1);
+		expect(missing).toHaveLength(0);
+	});
+
+	it("does not let the content check absorb genuinely different rounds", () => {
+		const sessionFile = writeSessionFile(tmp, [userMsg("q one"), assistantMsg("a one")]);
+		const roundsDir = path.join(tmp, "rounds");
+		fs.mkdirSync(roundsDir, { recursive: true });
+		fs.writeFileSync(
+			path.join(roundsDir, "11111111111111111111111111111111.json"),
+			JSON.stringify({ userPrompt: "q two", responseSequence: "a two" }),
+		);
+		const { missing } = findMissingRounds(sessionFile, roundsDir);
+		expect(missing).toHaveLength(1);
+	});
+
+	it("loadDiskCanonicalKeys tolerates unreadable/corrupt round files", () => {
+		const roundsDir = path.join(tmp, "rounds");
+		fs.mkdirSync(roundsDir, { recursive: true });
+		fs.writeFileSync(path.join(roundsDir, "bad.json"), "{not json");
+		fs.writeFileSync(path.join(roundsDir, "notes.txt"), "ignored");
+		fs.writeFileSync(
+			path.join(roundsDir, "22222222222222222222222222222222.json"),
+			JSON.stringify({ userPrompt: "p", responseSequence: "r" }),
+		);
+		const keys = loadDiskCanonicalKeys(roundsDir);
+		expect(keys.size).toBe(1);
+	});
+
 	it("rounds with empty user prompt are not counted as scanned", () => {
 		const sessionFile = writeSessionFile(tmp, [userMsg("   ", "u1"), assistantMsg("response")]);
 		const roundsDir = path.join(tmp, "rounds");
@@ -162,6 +228,8 @@ describe("session-backfill", () => {
 		// Pretend every file exists — nothing should be recovered.
 		const outcome = backfillMissingRounds(sessionFile, roundsDir, {
 			existsSync: () => true,
+			readdirSync: fs.readdirSync,
+			readFileSync: fs.readFileSync,
 			mkdirSync: fs.mkdirSync,
 			writeFileSync: fs.writeFileSync,
 			statSync: fs.statSync,

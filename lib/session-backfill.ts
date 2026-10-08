@@ -15,6 +15,7 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { type EmbedRoundDeps, embedRound } from "./embed-round.ts";
+import { canonicalDuplicateKey, type DuplicateKeyRound } from "./hash.ts";
 import { parsePiSessionJsonl, reconstructPiSessionRounds } from "./pi-session.ts";
 import type { PromptNoiseOptions } from "./round-capture.ts";
 import { buildAgentEndRoundData, deriveRoundFile, isPromptOnlyRound } from "./round-capture.ts";
@@ -178,7 +179,7 @@ export function isSessionTailClosed(rawJsonl: string): boolean {
 export function findMissingRounds(
 	sessionFile: string,
 	roundsDir: string,
-	fsImpl: Pick<typeof fs, "existsSync"> = fs,
+	fsImpl: Pick<typeof fs, "existsSync" | "readdirSync" | "readFileSync"> = fs,
 ): { missing: BackfillWrite[]; scanned: number; skippedComplete?: boolean } {
 	const parsed = parsePiSessionJsonl(fs.readFileSync(sessionFile, "utf-8"));
 	return collectMissingRounds(parsed, roundsDir, fsImpl);
@@ -192,10 +193,36 @@ export function findMissingRounds(
  * skip per-round reconstruction and hashing entirely. Doubles as the F2
  * tail-completeness check.
  */
+/**
+ * Build the set of whitespace-insensitive content keys (canonicalDuplicateKey)
+ * for every round file currently on disk. Exported for testing. Unreadable or
+ * unparseable files are tolerated (skipped) — they cannot match a candidate.
+ */
+export function loadDiskCanonicalKeys(
+	roundsDir: string,
+	fsImpl: Pick<typeof fs, "readdirSync" | "readFileSync"> = fs,
+): Set<string> {
+	const keys = new Set<string>();
+	let names: string[];
+	try {
+		names = fsImpl.readdirSync(roundsDir);
+	} catch {
+		return keys;
+	}
+	for (const name of names) {
+		if (!name.endsWith(".json")) continue;
+		try {
+			const round = JSON.parse(fsImpl.readFileSync(path.join(roundsDir, name), "utf-8")) as DuplicateKeyRound;
+			keys.add(canonicalDuplicateKey(round));
+		} catch {}
+	}
+	return keys;
+}
+
 function collectMissingRounds(
 	parsed: ReturnType<typeof parsePiSessionJsonl>,
 	roundsDir: string,
-	fsImpl: Pick<typeof fs, "existsSync">,
+	fsImpl: Pick<typeof fs, "existsSync" | "readdirSync" | "readFileSync">,
 ): { missing: BackfillWrite[]; scanned: number; skippedComplete?: boolean } {
 	for (let i = parsed.length - 1; i >= 0; i--) {
 		if (!parsed[i].userPrompt) continue;
@@ -214,6 +241,9 @@ function collectMissingRounds(
 	const reconstructed = reconstructPiSessionRounds(parsed);
 	const missing: BackfillWrite[] = [];
 	let scanned = 0;
+	// Lazily built on the first exact-hash miss: content keys of every round
+	// file on disk (see the legacy-drift comment below).
+	let existingCanonicalKeys: Set<string> | null = null;
 	for (const { roundFile, round } of reconstructed) {
 		// Rounds without a user prompt cannot be filed (filename derives from it).
 		if (!round.userPrompt) continue;
@@ -223,6 +253,18 @@ function collectMissingRounds(
 		if (isPromptOnlyRound(round.responseSequence, round.toolCalls)) continue;
 		scanned++;
 		if (fsImpl.existsSync(path.join(roundsDir, roundFile))) continue;
+		// Legacy serialization drift: rounds stored by historical semblr code may
+		// hash differently from today's parser (trailing-newline handling in tool
+		// results, absent tool-call ids) even though the content is the same — and
+		// those historical filenames cannot be recomputed from today's parse. So
+		// on the first exact-hash miss, compare by whitespace-insensitive CONTENT
+		// (same canonicalization as scripts/prune-recovery-duplicates.ts) against
+		// every round file on disk; a content match means the round is already
+		// stored under a legacy name. Without this, every startup backfill
+		// re-recreates duplicates of legacy rounds, faster than pruning removes
+		// them. The disk scan is paid only when an exact miss occurs.
+		if (existingCanonicalKeys === null) existingCanonicalKeys = loadDiskCanonicalKeys(roundsDir, fsImpl);
+		if (existingCanonicalKeys.has(canonicalDuplicateKey(round))) continue;
 		const roundData = {
 			...buildAgentEndRoundData({
 				userPrompt: round.userPrompt,
@@ -331,7 +373,10 @@ export function indexRecoveredRounds(
 export function backfillMissingRounds(
 	sessionFiles: string | string[],
 	roundsDir: string,
-	fsImpl: Pick<typeof fs, "existsSync" | "mkdirSync" | "writeFileSync" | "statSync"> = fs,
+	fsImpl: Pick<
+		typeof fs,
+		"existsSync" | "readdirSync" | "readFileSync" | "mkdirSync" | "writeFileSync" | "statSync"
+	> = fs,
 	opts: { liveWindowMs?: number; nowMs?: number } = {},
 ): BackfillOutcome {
 	const files = Array.isArray(sessionFiles) ? sessionFiles : [sessionFiles];
