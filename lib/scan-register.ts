@@ -47,6 +47,21 @@ export function loadScanCutoff(stateDir: string, sessionDir: string, fsImpl: Sca
 	}
 }
 
+/**
+ * Max mtime (epoch ms) over the given files; null when none are statable.
+ * Files that can't be stat are skipped (they can't set a safe cutoff).
+ */
+export function computeMaxMtime(files: readonly string[], fsImpl: Pick<typeof fs, "statSync"> = fs): number | null {
+	let max: number | null = null;
+	for (const file of files) {
+		try {
+			const mtime = fsImpl.statSync(file).mtimeMs;
+			if (Number.isFinite(mtime) && (max === null || mtime > max)) max = mtime;
+		} catch {}
+	}
+	return max;
+}
+
 /** Persist the cutoff for this session dir. Best-effort: failures are ignored. */
 export function saveScanCutoff(
 	stateDir: string,

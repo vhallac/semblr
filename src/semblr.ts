@@ -71,6 +71,7 @@ import {
 	renderToolDetailsToolResult,
 	type ToolDetailsParams,
 } from "../lib/round-tool-results.ts";
+import { computeMaxMtime, saveScanCutoff } from "../lib/scan-register.ts";
 import {
 	collectMultiModelSearchRoundScores,
 	collectSearchRoundScores,
@@ -1177,8 +1178,20 @@ export default function (pi: ExtensionAPI) {
 						path.dirname(sessionFile),
 						sessionFile,
 						event.previousSessionFile,
+						fs,
+						{ stateDir: SEMBLR_DIR },
 					);
 					const backfill = backfillMissingRounds(candidates, ROUNDS_DIR);
+					// Issue #133 unit-003: advance the scan register only after a scan that
+					// recovered nothing — those scans found every round already on disk.
+					// Deferrals don't block the advance: a deferred file whose in-flight
+					// round completes later gets its mtime bumped above the cutoff and is
+					// re-examined; one that never completes has nothing to recover (F2
+					// defers it on every scan today as well).
+					if (backfill.recoveredFiles.length === 0) {
+						const maxMtime = computeMaxMtime([sessionFile, ...candidates]);
+						if (maxMtime !== null) saveScanCutoff(SEMBLR_DIR, path.dirname(sessionFile), maxMtime);
+					}
 					if (backfill.deferredLive) {
 						ctx.ui.setStatus(
 							"semblr",
