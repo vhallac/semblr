@@ -682,6 +682,7 @@ describe("indexRecoveredRounds", () => {
 		const report = indexRecoveredRounds(Object.keys(rounds), {
 			readRoundData: (f) => rounds[f] ?? null,
 			upsertBm25: (f) => bm25.push(f),
+			flushBm25: () => {},
 			appendToolRows: (f, tcs) => toolAppends.push({ fileName: f, toolCalls: tcs }),
 		});
 		expect(report.errors).toEqual([]);
@@ -695,6 +696,7 @@ describe("indexRecoveredRounds", () => {
 		const report = indexRecoveredRounds(["bad.json"], {
 			readRoundData: () => null,
 			upsertBm25: (f) => bm25.push(f),
+			flushBm25: () => {},
 			appendToolRows: () => {},
 		});
 		expect(bm25).toEqual([]);
@@ -710,6 +712,7 @@ describe("indexRecoveredRounds", () => {
 				if (f === "fail.json") throw new Error("bm25 boom");
 				bm25.push(f);
 			},
+			flushBm25: () => {},
 			appendToolRows: () => {},
 		});
 		expect(bm25).toEqual(["ok.json"]);
@@ -717,11 +720,51 @@ describe("indexRecoveredRounds", () => {
 		expect(report.errors).toEqual(["fail.json: bm25 boom"]);
 	});
 
+	it("writes the bm25 index file exactly once for an N-round batch (issue #137)", () => {
+		const bm25Upserts: string[] = [];
+		const writes: string[] = [];
+		const report = indexRecoveredRounds(["a.json", "b.json", "c.json"], {
+			readRoundData: (f) => (f === "c.json" ? null : { toolCalls: [] }),
+			upsertBm25: (f) => bm25Upserts.push(f),
+			flushBm25: () => writes.push("flush"),
+			appendToolRows: () => {},
+		});
+		expect(bm25Upserts).toEqual(["a.json", "b.json"]);
+		expect(writes).toEqual(["flush"]);
+		expect(report.errors).toEqual(["c.json: unreadable round file"]);
+	});
+
+	it("lands a failing batch flush in errors without corrupting the report", () => {
+		const report = indexRecoveredRounds(["a.json"], {
+			readRoundData: () => ({ toolCalls: [] }),
+			upsertBm25: () => {},
+			flushBm25: () => {
+				throw new Error("flush boom");
+			},
+			appendToolRows: () => {},
+		});
+		expect(report.bm25Indexed).toBe(1);
+		expect(report.errors).toEqual(["bm25 flush: flush boom"]);
+	});
+
+	it("does not flush when no round was bm25-indexed", () => {
+		const writes: string[] = [];
+		const report = indexRecoveredRounds(["bad.json"], {
+			readRoundData: () => null,
+			upsertBm25: () => {},
+			flushBm25: () => writes.push("flush"),
+			appendToolRows: () => {},
+		});
+		expect(writes).toEqual([]);
+		expect(report.bm25Indexed).toBe(0);
+	});
+
 	it("propagates appendToolRows failures into errors without blocking later rounds", () => {
 		const toolAppends: string[] = [];
 		const report = indexRecoveredRounds(["a.json", "b.json"], {
 			readRoundData: () => ({ toolCalls: [toolCall] }),
 			upsertBm25: () => {},
+			flushBm25: () => {},
 			appendToolRows: (f) => {
 				if (f === "a.json") throw new Error("tool index boom");
 				toolAppends.push(f);

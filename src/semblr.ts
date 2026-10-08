@@ -1189,8 +1189,13 @@ export default function (pi: ExtensionAPI) {
 						// guarded independently (best-effort, never the round files).
 						const indexReport = indexRecoveredRounds(backfill.recoveredFiles, {
 							readRoundData: (fileName) => readRoundJson(ROUNDS_DIR, fileName),
-							upsertBm25: (fileName, roundData) =>
-								upsertRoundInBm25Index(fileName, roundData as unknown as RoundData),
+							// Memory-only upsert; the whole batch commits with a single index
+							// write (issue #137: per-round rewrites dominated startup recovery).
+							upsertBm25: (fileName, roundData) => {
+								const index = loadSearchBm25Index();
+								upsertBm25Round(index, fileName, roundTextForBm25(roundData as unknown as RoundData));
+							},
+							flushBm25: () => writeBm25Index(BM25_INDEX_PATH, loadSearchBm25Index()),
 							appendToolRows: (fileName, toolCalls) =>
 								appendToolIndexRows(TOOLS_INDEX_PATH, ROUNDS_DIR, buildToolIndexRows(fileName, toolCalls)),
 						});
