@@ -228,8 +228,20 @@ export async function runDigestAll(options: DigestAllOptions = {}): Promise<numb
 				err.error(`  ⚠️  Skipping unreadable round file: ${fileName}`);
 				continue;
 			}
-			// Rounds without a user prompt cannot be filed (filename derives from it).
-			if (!round.userPrompt) continue;
+			// F5 (PR #134 review): parseable-but-incomplete rounds would throw in
+			// deriveRoundFile or the toolCalls length check inside processRound —
+			// outside its try/catch — and kill the whole run naming no file. Validate
+			// the fields the enqueue needs here; invalid files are skipped with a
+			// named warning, mirroring the unreadable-file skip above.
+			if (
+				typeof round.userPrompt !== "string" ||
+				round.userPrompt.length === 0 ||
+				typeof round.responseSequence !== "string" ||
+				!Array.isArray(round.toolCalls)
+			) {
+				err.error(`  ⚠️  Skipping invalid round file: ${fileName}`);
+				continue;
+			}
 			allRounds.push({ ...round, sessionLabel: "<rounds-dir>" });
 			sweptTotal++;
 		}

@@ -767,7 +767,57 @@ describe("digest-all script", () => {
 		expect(fetchImpl).not.toHaveBeenCalled();
 		expect(loadVectorIndex(indexPath)).toHaveLength(0);
 		expect(logs.stderr.join("\n")).toContain("Skipping unreadable round file: corrupt.json");
+		expect(logs.stderr.join("\n")).toContain("Skipping invalid round file: no-prompt.json");
 		expect(logs.stdout.join("\n")).toContain("0 swept from rounds dir");
+	});
+
+	it("sweep skips parseable-but-incomplete round files by name instead of failing the whole run", async () => {
+		const root = tmpDir();
+		const sessionsDir = tmpDir();
+		const roundsDir = path.join(root, "rounds");
+		fs.mkdirSync(roundsDir, { recursive: true });
+		const indexPath = path.join(roundsDir, "index.csv");
+		const requests: unknown[] = [];
+
+		// F5 shape: parseable JSON whose missing fields would throw inside
+		// processRound before its try/catch and abort the run.
+		fs.writeFileSync(path.join(roundsDir, "incomplete.json"), JSON.stringify({ userPrompt: "hi" }));
+
+		const userPrompt = "What survives an incomplete sibling round file?";
+		const responseSequence = "Well-formed rounds embed while invalid files are skipped by name.";
+		const roundFile = `${computeContentHash(userPrompt, responseSequence, [])}.json`;
+		fs.writeFileSync(
+			path.join(roundsDir, roundFile),
+			JSON.stringify({ userPrompt, responseSequence, toolCalls: [], recovered: true }),
+		);
+
+		const logs = logger();
+		await expect(
+			runDigestAll({
+				sessionsDir,
+				roundsDir,
+				indexPath,
+				apiKey: "key",
+				fetchImpl: embeddingFetch(
+					[
+						[1, 0],
+						[0, 1],
+						[2, 3],
+					],
+					requests,
+				),
+				stdout: logs.out,
+				stderr: logs.err,
+			}),
+		).resolves.toBe(0); // a fatal abort would reject instead of resolving 0
+
+		// The well-formed round is embedded (prompt + response rows, 3 embed calls
+		// including the combined vector); the bad file is named on stderr.
+		expect(requests).toHaveLength(3);
+		expect(loadVectorIndex(indexPath)).toHaveLength(2);
+		expect(logs.stderr.join("\n")).toContain("Skipping invalid round file: incomplete.json");
+		expect(logs.stdout.join("\n")).toContain("1 swept from rounds dir");
+		expect(logs.stdout.join("\n")).toContain("1 rounds embedded, 0 errors");
 	});
 
 	it("short prompts follow the shared drop policy: no :prompt row, response vector stored as promptEmbedding", async () => {
