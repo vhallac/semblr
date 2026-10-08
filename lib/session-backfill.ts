@@ -173,6 +173,123 @@ export function isSessionTailClosed(rawJsonl: string): boolean {
 }
 
 /**
+ * Unit-001 tail-only completeness check: bytes read from the END of a session
+ * file to decide completeness without a full read+parse. A session's last
+ * round is at EOF, so a bounded tail window suffices; larger files fall back
+ * to the full read when the window is inconclusive.
+ */
+export const TAIL_PEEK_BYTES = 256 * 1024;
+
+/**
+ * The tail-read fs surface is Partial so pre-existing minimal fsImpl injections
+ * (e.g. existsSync-only stubs) keep type-checking; a missing method makes the
+ * tail read throw → null → full-read fall-through, preserving old behavior.
+ */
+export type TailReadFs = Partial<Pick<typeof fs, "statSync" | "openSync" | "readSync" | "closeSync">>;
+
+function tailFs(fsImpl: TailReadFs): Pick<typeof fs, "statSync" | "openSync" | "readSync" | "closeSync"> {
+	return {
+		statSync: fsImpl.statSync ?? fs.statSync,
+		openSync: fsImpl.openSync ?? fs.openSync,
+		readSync: fsImpl.readSync ?? fs.readSync,
+		closeSync: fsImpl.closeSync ?? fs.closeSync,
+	};
+}
+
+/**
+ * Read the last `maxBytes` of a file. Returns the text plus whether the read
+ * started mid-file (so the first returned chunk may be a partial line that
+ * must be dropped). Null when the file cannot be stat'd/opened/read.
+ */
+export function readTailText(
+	sessionFile: string,
+	fsImpl: TailReadFs = fs,
+	maxBytes = TAIL_PEEK_BYTES,
+): { text: string; truncated: boolean } | null {
+	const f = tailFs(fsImpl);
+	try {
+		const size = f.statSync(sessionFile).size;
+		const start = Math.max(0, size - maxBytes);
+		const fd = f.openSync(sessionFile, "r");
+		try {
+			const buf = Buffer.alloc(size - start);
+			let read = 0;
+			while (read < buf.length) {
+				const n = f.readSync(fd, buf, read, buf.length - read, start + read);
+				if (n <= 0) break;
+				read += n;
+			}
+			return { text: buf.toString("utf-8", 0, read), truncated: start > 0 };
+		} finally {
+			f.closeSync(fd);
+		}
+	} catch {
+		return null;
+	}
+}
+
+/**
+ * Tail closedness with an explicit "no evidence" answer: like
+ * isSessionTailClosed, but returns null when the text contains NO assistant
+ * message at all — a tail window truncated mid tool-loop proves nothing about
+ * the file's real tail, so the caller must fall back to the full read.
+ */
+function tailClosedFromText(text: string): boolean | null {
+	for (let i = text.split("\n").length - 1; i >= 0; i--) {
+		const line = text.split("\n")[i].trim();
+		if (!line) continue;
+		let entry: { type?: string; message?: { role?: string; stopReason?: string } };
+		try {
+			entry = JSON.parse(line);
+		} catch {
+			continue;
+		}
+		if (entry?.type !== "message") continue;
+		const msg = entry.message;
+		if (msg?.role !== "assistant") continue;
+		return msg.stopReason !== "toolUse";
+	}
+	return null;
+}
+
+/**
+ * Unit-001: decide completeness from a bounded tail read only — no full-file
+ * read or parse. Returns:
+ * - true  → the tail round's file is on disk; the session is fully backed up.
+ * - false → the tail turn is still open (stopReason toolUse); the caller must
+ *   defer as live, exactly as the full isSessionTailClosed path would.
+ * - null  → inconclusive (unreadable file, window without an assistant
+ *   message, or no fileable tail round in the window); fall through to the
+ *   full read+parse recovery path.
+ */
+export function tailRoundComplete(
+	sessionFile: string,
+	roundsDir: string,
+	fsImpl: TailReadFs & Pick<typeof fs, "existsSync"> = fs,
+): boolean | null {
+	const tail = readTailText(sessionFile, fsImpl);
+	if (tail === null) return null;
+	// A read that started mid-file opens on a partial line; drop it. The rest
+	// of the lines are complete (a UTF-8 continuation byte is never 0x0A).
+	const text = tail.truncated ? tail.text.slice(tail.text.indexOf("\n") + 1) : tail.text;
+	const closed = tailClosedFromText(text);
+	if (closed !== true) return closed; // null → inconclusive; false → defer as live
+	const parsed = parsePiSessionJsonl(text);
+	for (let i = parsed.length - 1; i >= 0; i--) {
+		const round = parsed[i];
+		if (!round.userPrompt) continue;
+		if (isPromptOnlyRound(round.responseSequence, round.toolCalls)) continue;
+		// Same derivation as the full-path early exit in collectMissingRounds,
+		// so a tail-window hit agrees byte-for-byte with the live write's name.
+		const lastFile = deriveRoundFile(round.userPrompt, round.responseSequence, round.toolCalls).fileName;
+		// Only TRUE short-circuits. A missing tail file is NOT "open tail" —
+		// the round may be recoverable, so the caller must run the full path.
+		return fsImpl.existsSync(path.join(roundsDir, lastFile)) ? true : null;
+	}
+	return null;
+}
+
+/**
  * Parse a session JSONL and return the round files missing from roundsDir.
  * Exported for testing / inspection without side effects.
  */
@@ -373,10 +490,8 @@ export function indexRecoveredRounds(
 export function backfillMissingRounds(
 	sessionFiles: string | string[],
 	roundsDir: string,
-	fsImpl: Pick<
-		typeof fs,
-		"existsSync" | "readdirSync" | "readFileSync" | "mkdirSync" | "writeFileSync" | "statSync"
-	> = fs,
+	fsImpl: Pick<typeof fs, "existsSync" | "readdirSync" | "readFileSync" | "mkdirSync" | "writeFileSync" | "statSync"> &
+		TailReadFs = fs,
 	opts: { liveWindowMs?: number; nowMs?: number } = {},
 ): BackfillOutcome {
 	const files = Array.isArray(sessionFiles) ? sessionFiles : [sessionFiles];
@@ -398,6 +513,18 @@ export function backfillMissingRounds(
 		// F2: defer before paying for the parse at all — a live file's tail is
 		// incomplete by definition, so parsing it is wasted startup work.
 		if (live) {
+			deferredLive++;
+			continue;
+		}
+		// Unit-001: try the bounded tail read first. A complete tail skips the
+		// full read+parse entirely; an open tail defers exactly as the full
+		// closedness path would; anything inconclusive falls through below.
+		const tail = tailRoundComplete(sessionFile, roundsDir, fsImpl);
+		if (tail === true) {
+			skippedComplete = true;
+			continue;
+		}
+		if (tail === false) {
 			deferredLive++;
 			continue;
 		}

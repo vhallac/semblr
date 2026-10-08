@@ -25,6 +25,8 @@ import {
 	planStartupEmbedding,
 	type RecoveredRoundLike,
 	startupEmbedStatusMessage,
+	TAIL_PEEK_BYTES,
+	tailRoundComplete,
 } from "./session-backfill.ts";
 
 function writeSessionFile(dir: string, lines: object[]): string {
@@ -1087,5 +1089,112 @@ describe("prompt-only round skip (PR !131 F1)", () => {
 		expect(skippedComplete).toBe(true);
 		expect(missing).toEqual([]);
 		expect(scanned).toBe(0);
+	});
+});
+
+describe("tailRoundComplete / tail-only backfill (unit-001)", () => {
+	let tmp: string;
+	beforeEach(() => {
+		tmp = fs.mkdtempSync(path.join(os.tmpdir(), "backfill-tail-"));
+	});
+	afterEach(() => {
+		fs.rmSync(tmp, { recursive: true, force: true });
+	});
+
+	/** fsImpl whose readFileSync is forbidden — proves the tail path never does a full read. */
+	function noFullReadFsImpl() {
+		return {
+			...fs,
+			readFileSync: (f: fs.PathOrFileDescriptor) => {
+				throw new Error(`full read must not happen: ${String(f)}`);
+			},
+		} as unknown as typeof fs;
+	}
+
+	it("returns null for an unreadable session file", () => {
+		expect(tailRoundComplete(path.join(tmp, "nope.jsonl"), tmp)).toBeNull();
+	});
+
+	it("skips a complete session with ONLY the bounded tail read (readFileSync forbidden)", () => {
+		const sessionFile = writeSessionFile(tmp, [userMsg("q"), assistantMsg("done")]);
+		const roundsDir = path.join(tmp, "rounds");
+		// First run writes the round file through the normal path.
+		const first = backfillMissingRounds(sessionFile, roundsDir, undefined, { liveWindowMs: 0 });
+		expect(first.recoveredFiles).toEqual([createRoundFilePath("q", "done", [])]);
+		fs.utimesSync(sessionFile, new Date(0), new Date(0));
+		// Second run: readFileSync must never fire — the tail read alone suffices.
+		const outcome = backfillMissingRounds(sessionFile, roundsDir, noFullReadFsImpl(), { liveWindowMs: 0 });
+		expect(outcome).toEqual({ recoveredFiles: [], scanned: 0, skippedComplete: true });
+	});
+
+	it("skips a complete session larger than the tail window via the tail read alone", () => {
+		const roundsDir = path.join(tmp, "rounds");
+		const sessionFile = writeSessionFile(tmp, [userMsg("q"), assistantMsg("done")]);
+		const first = backfillMissingRounds(sessionFile, roundsDir, undefined, { liveWindowMs: 0 });
+		expect(first.recoveredFiles).toHaveLength(1);
+		// Pad the head with garbage beyond the tail window — only the tail matters.
+		const padding = `{"type":"padding","blob":"${"x".repeat(TAIL_PEEK_BYTES)}"}\n`;
+		fs.writeFileSync(sessionFile, padding + fs.readFileSync(sessionFile, "utf-8"));
+		fs.utimesSync(sessionFile, new Date(0), new Date(0));
+		const outcome = backfillMissingRounds(sessionFile, roundsDir, noFullReadFsImpl(), { liveWindowMs: 0 });
+		expect(outcome.skippedComplete).toBe(true);
+		expect(outcome.recoveredFiles).toEqual([]);
+	});
+
+	it("falls through to the full recovery path when the tail round is missing", () => {
+		const sessionFile = writeSessionFile(tmp, [userMsg("q"), assistantMsg("done")]);
+		const roundsDir = path.join(tmp, "rounds");
+		fs.utimesSync(sessionFile, new Date(0), new Date(0));
+		const outcome = backfillMissingRounds(sessionFile, roundsDir, noFullReadFsImpl(), { liveWindowMs: 0 });
+		expect(outcome.recoveredFiles).toEqual([createRoundFilePath("q", "done", [])]);
+		expect(outcome.skippedComplete).toBeUndefined();
+	});
+
+	it("defers an open tail (toolUse) via the tail read alone", () => {
+		const sessionFile = writeSessionFile(tmp, [
+			userMsg("q"),
+			{
+				type: "message",
+				message: { role: "assistant", content: [{ type: "text", text: "partial" }], stopReason: "toolUse" },
+			},
+		]);
+		const roundsDir = path.join(tmp, "rounds");
+		fs.utimesSync(sessionFile, new Date(0), new Date(0));
+		const outcome = backfillMissingRounds(sessionFile, roundsDir, noFullReadFsImpl(), { liveWindowMs: 0 });
+		expect(outcome.deferredLive).toBe(1);
+		expect(outcome.recoveredFiles).toEqual([]);
+		expect(fs.existsSync(roundsDir)).toBe(false);
+	});
+
+	it("returns null (full read) when the tail window holds no assistant message", () => {
+		const big = "x".repeat(TAIL_PEEK_BYTES + 10);
+		const sessionFile = writeSessionFile(tmp, [
+			userMsg("q"),
+			assistantMsg(`a ${big}`), // pushes every assistant message out of the window
+			userMsg("trailing", "u2"),
+		]);
+		const roundsDir = path.join(tmp, "rounds");
+		expect(tailRoundComplete(sessionFile, roundsDir)).toBeNull();
+	});
+
+	it("returns null when the tail window's only round is prompt-only", () => {
+		const sessionFile = writeSessionFile(tmp, [userMsg("tail q", "u2")]);
+		expect(tailRoundComplete(sessionFile, path.join(tmp, "rounds"))).toBeNull();
+	});
+
+	it("recovers normally from a tail round whose file is missing while earlier rounds exist (partial-window round)", () => {
+		const roundsDir = path.join(tmp, "rounds");
+		const sessionFile = writeSessionFile(tmp, [
+			userMsg("q1"),
+			assistantMsg("a1"),
+			userMsg("q2", "u2"),
+			assistantMsg("a2"),
+		]);
+		fs.utimesSync(sessionFile, new Date(0), new Date(0));
+		const outcome = backfillMissingRounds(sessionFile, roundsDir, undefined, { liveWindowMs: 0 });
+		expect(outcome.recoveredFiles).toEqual([
+			createRoundFilePath("q1", "a1", []),
+			createRoundFilePath("q2", "a2", []),
+		]);
 	});
 });
