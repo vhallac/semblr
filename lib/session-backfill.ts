@@ -409,6 +409,14 @@ export interface StartupEmbedPlan {
 }
 
 /**
+ * Issue #133: the status message shown when startup defers the embedding
+ * burst. Extracted so the exact wording is pinned by a test.
+ */
+export function startupEmbedStatusMessage(plan: StartupEmbedPlan): string {
+	return `🧠 ${plan.pendingCount} rounds pending embedding backfill — run just index`;
+}
+
+/**
  * Issue #133: decide how startup should handle embedding for recovered
  * rounds. A round is "pending" when its round file is missing/unreadable or
  * carries no `promptEmbedding`. Pure — no I/O beyond the injected reader.

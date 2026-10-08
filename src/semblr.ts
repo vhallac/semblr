@@ -98,6 +98,7 @@ import {
 	indexRecoveredRounds,
 	isBackfillStartReason,
 	planStartupEmbedding,
+	startupEmbedStatusMessage,
 } from "../lib/session-backfill.ts";
 import type { CheckpointSummary, ToolCallDetail } from "../lib/state.ts";
 import { contextCacheStore, contextCacheValid, createRound, createSession } from "../lib/state.ts";
@@ -1216,10 +1217,7 @@ export default function (pi: ExtensionAPI) {
 							(fileName) => readRoundJson(ROUNDS_DIR, fileName) as { promptEmbedding?: unknown } | null,
 						);
 						if (embedPlan.mode === "defer") {
-							ctx.ui.setStatus(
-								"semblr",
-								`\u{1f9e0} ${embedPlan.pendingCount} rounds pending embedding backfill — run just index`,
-							);
+							ctx.ui.setStatus("semblr", startupEmbedStatusMessage(embedPlan));
 						} else
 							try {
 								const embedKey = await getApiKey(ctx, { config: SEMBLR_CONFIG });

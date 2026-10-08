@@ -23,6 +23,7 @@ import {
 	listBackfillCandidates,
 	planStartupEmbedding,
 	type RecoveredRoundLike,
+	startupEmbedStatusMessage,
 } from "./session-backfill.ts";
 
 function writeSessionFile(dir: string, lines: object[]): string {
@@ -587,10 +588,28 @@ describe("planStartupEmbedding (issue #133)", () => {
 	const embedded = (n: number): [string, Round][] =>
 		Array.from({ length: n }, (_, i) => [`r${i}.json`, { promptEmbedding: [0.1] }]);
 
-	it("keeps embedding inline when the unembedded count is at or below the threshold", () => {
-		const files = new Map<string, Round>([...embedded(10), ["rX.json", { promptEmbedding: [0.2] }]]);
+	it("keeps embedding inline when the unembedded count is exactly at the threshold (boundary: 10)", () => {
+		const files = new Map<string, Round>([
+			...embedded(2),
+			...Array.from({ length: 10 }, (_, i) => [`p${i}.json`, {}] as const),
+		]);
 		const plan = planStartupEmbedding([...files.keys()], (f) => files.get(f) ?? null);
-		expect(plan).toEqual({ mode: "inline", pendingCount: 0 });
+		expect(plan).toEqual({ mode: "inline", pendingCount: 10 });
+	});
+
+	it("defers when the unembedded count is just above the threshold (boundary: 11)", () => {
+		const files = new Map<string, Round>([
+			...embedded(2),
+			...Array.from({ length: 11 }, (_, i) => [`p${i}.json`, {}] as const),
+		]);
+		const plan = planStartupEmbedding([...files.keys()], (f) => files.get(f) ?? null);
+		expect(plan).toEqual({ mode: "defer", pendingCount: 11 });
+	});
+
+	it("builds the defer status message with exact wording", () => {
+		expect(startupEmbedStatusMessage({ mode: "defer", pendingCount: 10 })).toBe(
+			"🧠 10 rounds pending embedding backfill — run just index",
+		);
 	});
 
 	it("defers when the unembedded count exceeds the threshold, reporting the pending count", () => {
