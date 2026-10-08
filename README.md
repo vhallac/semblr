@@ -282,7 +282,7 @@ If pi exits before the final round of a session is persisted (crash, hard kill),
 
 - **Backfill scan:** for each recent session file, reconstructed rounds that have no round file on disk are written. Rounds recovered this way are marked `"recovered": true` in the round JSON, distinguishing second-class (recovered) provenance from live-saved rounds.
 - **Defer semantics:** if a session's tail round is already on disk, that session is fully backed up and skipped. If the tail is missing and the session file looks live (modified recently), the backfill defers instead of racing the live process — the live process will write those rounds itself.
-- **Startup embedding cost:** recovered rounds are indexed (BM25 + tool index) and queued for embedding at startup, so they reach every retrieval surface. This costs embedding API calls for recovered rounds only — never for already-persisted round files, which are skipped by content hash.
+- **Startup embedding cost:** recovered rounds are indexed (BM25 + tool index) and — when at most 10 rounds are pending embedding — embedded inline at startup, so they reach every retrieval surface. Above the threshold, the embedding burst is deferred: startup prints `🧠 N rounds pending embedding backfill — run just index` and never pays the API cost inline. Running `just index` redrives the pending rounds. Either way, already-persisted round files with a `promptEmbedding` marker are skipped; only unembedded rounds cost embedding API calls.
 
 ### Configuration
 
@@ -351,7 +351,7 @@ Three scripts parse historical conversation data into semblr rounds:
 
 | Script | What it does |
 |---|---|
-| `scripts/digest-all.ts` | Iterates all pi session files, deduplicates against already-indexed rounds, embeds new ones in parallel (concurrency: 5) |
+| `scripts/digest-all.ts` | Iterates all pi session files, sweeps the rounds dir for round files not yet indexed, deduplicates against already-indexed rounds, and embeds new ones in parallel (concurrency: 5) |
 | `scripts/digest-session.ts` | Parses a single session file, embeds each round, appends to the vector index |
 | `scripts/import-claude-code.ts` | Imports Claude Code JSONL history from `~/.claude/projects` into the shared index |
 
@@ -369,9 +369,10 @@ When `digest-all.ts` runs:
 2. Computes the expected file path for each parsed round via content hash
 3. Skips rounds already indexed with the current embedding model
 4. Re-embeds rounds whose index rows have an explicit different embedding model
-5. Only new or model-stale rounds are sent to the embedding API
+5. Sweeps `semblr.roundsDir` for round files not covered by the session scan (e.g. previously live-saved rounds) and enqueues them through the same embedding path — unreadable or incomplete files are skipped with a named warning
+6. Only new or model-stale rounds are sent to the embedding API
 
-This makes it safe to run repeatedly — only unindexed or model-stale session data gets embedded. Legacy two-column rows without a model column are treated as current-model rows; run `just migrate` to stamp them with the configured model.
+This makes it safe to run repeatedly — only unindexed or model-stale session data gets embedded. The run prints a summary line like `📊 New rounds to embed: N (X already indexed, Y swept from rounds dir)`. Legacy two-column rows without a model column are treated as current-model rows; run `just migrate` to stamp them with the configured model.
 
 ### Session file format
 
