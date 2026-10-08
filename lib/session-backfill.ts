@@ -25,6 +25,7 @@ import {
 	type RoundData,
 	type ToolCallDetail,
 } from "./round-data.ts";
+import { loadScanCutoff } from "./scan-register.ts";
 
 /**
  * F7 (PR !131): recover a checkpoint summary from the round's parsed tool
@@ -132,8 +133,28 @@ export function buildBackfillCandidates(
 	currentSessionFile: string,
 	previousSessionFile?: string,
 	fsImpl: Pick<typeof fs, "readdirSync" | "statSync"> = fs,
+	opts: { stateDir?: string; cutoffMs?: number } = {},
 ): string[] {
-	const candidates = listBackfillCandidates(sessionDir, currentSessionFile, fsImpl);
+	let candidates = listBackfillCandidates(sessionDir, currentSessionFile, fsImpl);
+	// Unit-002 scan register: files at-or-below the last-full-scan mtime were
+	// already covered by a complete scan, so opening them again is wasted work.
+	// The tail-completeness check downstream stays authoritative — the cutoff
+	// only prunes which files are OPENED, it cannot mask a missing round because
+	// the register is only advanced after zero-recovery full scans (unit-003).
+	// Corrupt/missing register → null → no filtering (full-scan fallback).
+	if (opts.cutoffMs === undefined && opts.stateDir !== undefined) {
+		opts = { ...opts, cutoffMs: loadScanCutoff(opts.stateDir, sessionDir) ?? undefined };
+	}
+	if (opts.cutoffMs !== undefined) {
+		const cutoff = opts.cutoffMs;
+		candidates = candidates.filter((file) => {
+			try {
+				return fsImpl.statSync(file).mtimeMs > cutoff;
+			} catch {
+				return true; // unreadable mtime: keep the candidate, stay safe
+			}
+		});
+	}
 	if (
 		previousSessionFile &&
 		path.resolve(previousSessionFile) !== path.resolve(currentSessionFile) &&

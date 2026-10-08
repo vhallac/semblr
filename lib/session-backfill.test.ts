@@ -11,6 +11,7 @@ import {
 	embeddingMaxTokensToResponseBytes,
 } from "./round-capture.ts";
 import type { ToolCallDetail } from "./round-data.ts";
+import { saveScanCutoff } from "./scan-register.ts";
 import {
 	backfillMissingRounds,
 	buildBackfillCandidates,
@@ -783,6 +784,68 @@ describe("buildBackfillCandidates (F5)", () => {
 		const current = path.join(tmp, "cur.jsonl");
 		fs.writeFileSync(current, "{}");
 		expect(buildBackfillCandidates(tmp, current, current)).toEqual([]);
+	});
+});
+
+describe("buildBackfillCandidates cutoff gating (unit-002)", () => {
+	let tmp: string;
+	let stateDir: string;
+	beforeEach(() => {
+		tmp = fs.mkdtempSync(path.join(os.tmpdir(), "backfill-cutoff-"));
+		stateDir = path.join(tmp, "state");
+	});
+	afterEach(() => {
+		fs.rmSync(tmp, { recursive: true, force: true });
+	});
+
+	function makeFile(name: string, mtimeMs: number): string {
+		const file = path.join(tmp, name);
+		fs.writeFileSync(file, "{}");
+		fs.utimesSync(file, new Date(mtimeMs), new Date(mtimeMs));
+		return file;
+	}
+
+	it("drops files at-or-below the cutoff and keeps newer ones", () => {
+		const old_ = makeFile("old.jsonl", 1000);
+		const at = makeFile("at.jsonl", 2000);
+		const newer = makeFile("newer.jsonl", 3000);
+		const current = makeFile("cur.jsonl", 10_000);
+		expect(buildBackfillCandidates(tmp, current, undefined, fs, { cutoffMs: 2000 })).toEqual([newer]);
+	});
+
+	it("pins previousSessionFile regardless of cutoff", () => {
+		const prev = makeFile("prev.jsonl", 500);
+		const current = makeFile("cur.jsonl", 10_000);
+		expect(buildBackfillCandidates(tmp, current, prev, fs, { cutoffMs: 9000 })).toEqual([prev]);
+	});
+
+	it("falls back to a full scan when the register is corrupt/missing", () => {
+		const a = makeFile("a.jsonl", 1000);
+		const current = makeFile("cur.jsonl", 10_000);
+		// No register written for this session dir.
+		expect(buildBackfillCandidates(tmp, current, undefined, fs, { stateDir })).toEqual([a]);
+	});
+
+	it("applies the register cutoff via stateDir", () => {
+		const a = makeFile("a.jsonl", 1000);
+		const b = makeFile("b.jsonl", 5000);
+		const current = makeFile("cur.jsonl", 10_000);
+		saveScanCutoff(stateDir, tmp, 2000);
+		expect(buildBackfillCandidates(tmp, current, undefined, fs, { stateDir })).toEqual([b]);
+	});
+
+	it("keeps a file whose statSync throws only in the cutoff filter (defensive branch)", () => {
+		const file = path.join(tmp, "a.jsonl");
+		fs.writeFileSync(file, "{}");
+		const current = path.join(tmp, "cur.jsonl");
+		fs.writeFileSync(current, "{}");
+		let statCalls = 0;
+		const statSync = (p: fs.PathLike): fs.Stats => {
+			if (path.resolve(String(p)) === path.resolve(file) && ++statCalls > 1) throw new Error("boom");
+			return fs.statSync(p) as fs.Stats;
+		};
+		const flaky = { readdirSync: fs.readdirSync, statSync } as Pick<typeof fs, "readdirSync" | "statSync">;
+		expect(buildBackfillCandidates(tmp, current, undefined, flaky, { cutoffMs: 5000 })).toEqual([file]);
 	});
 });
 
