@@ -54,6 +54,7 @@ import {
 	loadIndexFromPath as loadIndexFromPathCore,
 	loadSessionStartIndex as loadSessionStartIndexCore,
 } from "../lib/index-storage.ts";
+import { createRecoveryIndexDeps } from "../lib/recovery-index-deps.ts";
 import {
 	applyMessageEndToState,
 	buildAgentEndChainEntry,
@@ -1187,18 +1188,17 @@ export default function (pi: ExtensionAPI) {
 						// post-write — bm25 upsert AND tool-index rows — so a recovered round
 						// is reachable from every search surface, not just bm25. Each round is
 						// guarded independently (best-effort, never the round files).
-						const indexReport = indexRecoveredRounds(backfill.recoveredFiles, {
-							readRoundData: (fileName) => readRoundJson(ROUNDS_DIR, fileName),
+						const indexReport = indexRecoveredRounds(
+							backfill.recoveredFiles,
 							// Memory-only upsert; the whole batch commits with a single index
 							// write (issue #137: per-round rewrites dominated startup recovery).
-							upsertBm25: (fileName, roundData) => {
-								const index = loadSearchBm25Index();
-								upsertBm25Round(index, fileName, roundTextForBm25(roundData as unknown as RoundData));
-							},
-							flushBm25: () => writeBm25Index(BM25_INDEX_PATH, loadSearchBm25Index()),
-							appendToolRows: (fileName, toolCalls) =>
-								appendToolIndexRows(TOOLS_INDEX_PATH, ROUNDS_DIR, buildToolIndexRows(fileName, toolCalls)),
-						});
+							createRecoveryIndexDeps({
+								roundsDir: ROUNDS_DIR,
+								bm25IndexPath: BM25_INDEX_PATH,
+								toolIndexPath: TOOLS_INDEX_PATH,
+								loadBm25Index: loadSearchBm25Index,
+							}),
+						);
 						for (const message of indexReport.errors) {
 							ctx.ui.setStatus("semblr", `\u{1f9e0} backfill index error: ${message}`);
 						}

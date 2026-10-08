@@ -98,7 +98,7 @@ describe("bm25 index", () => {
 				documents: { "broken.json": { length: "one", termFrequencies: null } },
 			}),
 		],
-	])("backfills a %s sidecar from existing rounds", (_case, sidecarContents) => {
+	])("rebuilds an in-memory index from existing rounds without touching a %s sidecar", (_case, sidecarContents) => {
 		const roundsDir = tmpDir();
 		const indexPath = bm25IndexPathForRoundsDir(roundsDir);
 		fs.writeFileSync(

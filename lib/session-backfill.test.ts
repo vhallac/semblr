@@ -720,7 +720,7 @@ describe("indexRecoveredRounds", () => {
 		expect(report.errors).toEqual(["fail.json: bm25 boom"]);
 	});
 
-	it("writes the bm25 index file exactly once for an N-round batch (issue #137)", () => {
+	it("calls the flush dep exactly once for an N-round batch (issue #137)", () => {
 		const bm25Upserts: string[] = [];
 		const writes: string[] = [];
 		const report = indexRecoveredRounds(["a.json", "b.json", "c.json"], {
