@@ -273,8 +273,10 @@ export interface RecoveredRoundLike {
 export interface IndexRecoveredRoundsDeps {
 	/** Read a recovered round file; null/throwing means the file is unusable. */
 	readRoundData: (fileName: string) => RecoveredRoundLike | null;
-	/** Upsert the round into the bm25 index. */
+	/** Memory-only upsert of the round into the cached bm25 index (no file write). */
 	upsertBm25: (fileName: string, roundData: RecoveredRoundLike) => void;
+	/** Commit the batch: write the bm25 index file exactly once after the loop. */
+	flushBm25: () => void;
 	/** Append tool-index rows for the round's tool calls. */
 	appendToolRows: (fileName: string, toolCalls: readonly ToolCallDetail[]) => void;
 }
@@ -314,6 +316,13 @@ export function indexRecoveredRounds(
 			}
 		} catch (err) {
 			report.errors.push(`${fileName}: ${(err as Error).message}`);
+		}
+	}
+	if (report.bm25Indexed > 0) {
+		try {
+			deps.flushBm25();
+		} catch (err) {
+			report.errors.push(`bm25 flush: ${(err as Error).message}`);
 		}
 	}
 	return report;

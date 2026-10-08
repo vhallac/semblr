@@ -416,6 +416,8 @@ Legacy two-column rows without the model column are still readable and are assum
 
 Semblr also maintains `index.bm25.json` beside `index.csv`. It stores a local BM25 keyword index over each round's prompt, response, and tool text. Retrieval fuses semantic cosine score with normalized BM25 score using `SEMBLR_HYBRID_SEMANTIC_WEIGHT` / `hybridSemanticWeight` (default `0.7`). Run `just rebuild-bm25` to recreate it from existing round files without calling the embedding API.
 
+Load and persistence semantics: at startup the sidecar is loaded if it exists and is consistent with the round files, otherwise the index is rebuilt in memory from the round files — the load path itself never writes. The sidecar is rewritten only by an explicit flush (the per-round `agent_end` upsert, or the single commit after a startup recovery batch), so a stale or corrupt sidecar heals in memory on the next start and on disk at the next flush. Queries are always served from the in-memory index, which matches the round files either way.
+
 ## Known Problems
 
 ### Most-recent-round context loss (addressed by Recency List)

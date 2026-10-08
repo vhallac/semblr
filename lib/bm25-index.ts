@@ -184,9 +184,12 @@ export function loadOrRebuildBm25Index(
 		}
 	}
 
-	const index = buildBm25Index(rounds);
-	writeBm25Index(indexPath, index, fsImpl);
-	return index;
+	// Deliberately NOT persisted here (issue #137 / PR !138 F1): the write is
+	// left to the caller's explicit flush so a recovery batch commits the
+	// index file exactly once, even when the load itself rebuilt it. Callers
+	// that never flush keep the rebuilt index in memory only — queries are
+	// still consistent because the in-memory index matches the round files.
+	return buildBm25Index(rounds);
 }
 
 export function writeBm25Index(

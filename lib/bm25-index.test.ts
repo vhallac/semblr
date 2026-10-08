@@ -98,7 +98,7 @@ describe("bm25 index", () => {
 				documents: { "broken.json": { length: "one", termFrequencies: null } },
 			}),
 		],
-	])("backfills a %s sidecar from existing rounds", (_case, sidecarContents) => {
+	])("rebuilds an in-memory index from existing rounds without touching a %s sidecar", (_case, sidecarContents) => {
 		const roundsDir = tmpDir();
 		const indexPath = bm25IndexPathForRoundsDir(roundsDir);
 		fs.writeFileSync(
@@ -112,8 +112,10 @@ describe("bm25 index", () => {
 
 		const index = loadOrRebuildBm25Index(indexPath, roundsDir);
 
+		// The load path is non-writing (PR !138 F1): persistence is the
+		// caller's explicit flush, so the sidecar is untouched here.
 		expect(scoreBm25Query(index, "exact_identifier").get("existing.json")).toBeGreaterThan(0);
-		expect(loadBm25Index(indexPath).documentCount).toBe(1);
+		expect(fs.existsSync(indexPath)).toBe(Boolean(sidecarContents));
 	});
 
 	it("rebuilds a valid sidecar that omits saved rounds", () => {
@@ -129,6 +131,39 @@ describe("bm25 index", () => {
 
 		expect(scoreBm25Query(index, "exact_identifier").get("existing.json")).toBeGreaterThan(0);
 		expect(index.documentCount).toBe(1);
+	});
+
+	it("persists the index exactly once on the stale-sidecar recovery path (PR !138 F1)", () => {
+		const roundsDir = tmpDir();
+		const indexPath = bm25IndexPathForRoundsDir(roundsDir);
+		const writtenFiles: string[] = [];
+		const fsImpl: Pick<typeof fs, "existsSync" | "mkdirSync" | "readFileSync" | "readdirSync" | "writeFileSync"> = {
+			existsSync: fs.existsSync,
+			mkdirSync: fs.mkdirSync,
+			readFileSync: fs.readFileSync,
+			readdirSync: fs.readdirSync,
+			writeFileSync: (p, data) => {
+				writtenFiles.push(String(p));
+				fs.writeFileSync(p, data);
+			},
+		};
+		fs.mkdirSync(roundsDir, { recursive: true });
+		fs.writeFileSync(
+			path.join(roundsDir, "old.json"),
+			JSON.stringify({ userPrompt: "old token_a", responseSequence: "old" }),
+		);
+		// Stale sidecar: exists but does not cover the round files.
+		fs.writeFileSync(indexPath, JSON.stringify({ version: 1, documents: {} }));
+
+		// Production wiring (src/semblr.ts): load-or-rebuild, in-memory upserts
+		// for each recovered round, then one flush for the batch.
+		const index = loadOrRebuildBm25Index(indexPath, roundsDir, fsImpl);
+		upsertBm25Round(index, "new.json", "new token_b round");
+		upsertBm25Round(index, "newer.json", "newer token_c round");
+		writeBm25Index(indexPath, index, fsImpl);
+
+		expect(writtenFiles).toEqual([indexPath]);
+		expect(loadBm25Index(indexPath).documents["newer.json"]).toBeDefined();
 	});
 });
 
