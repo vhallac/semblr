@@ -30,6 +30,27 @@ function logger() {
 	};
 }
 
+/**
+ * Real filesystem with `writeFileSync`/`renameSync` recorded, so a test can
+ * assert write ordering/atomicity while every other call passes through.
+ */
+function spyFs(): { fsImpl: typeof fs; writes: string[]; renames: Array<[string, string]> } {
+	const writes: string[] = [];
+	const renames: Array<[string, string]> = [];
+	const fsImpl = {
+		...fs,
+		writeFileSync: ((p: fs.PathLike, data: unknown, opts?: unknown) => {
+			writes.push(String(p));
+			return (fs.writeFileSync as (...a: unknown[]) => void)(p, data, opts);
+		}) as typeof fs.writeFileSync,
+		renameSync: ((from: fs.PathLike, to: fs.PathLike) => {
+			renames.push([String(from), String(to)]);
+			return fs.renameSync(from, to);
+		}) as typeof fs.renameSync,
+	} as typeof fs;
+	return { fsImpl, writes, renames };
+}
+
 function line(value: unknown): string {
 	return JSON.stringify(value);
 }
@@ -955,6 +976,57 @@ describe("digest-all script", () => {
 		expect(logs.stderr.join("\n")).toContain("Skipping invalid round file: null-tool.json");
 		expect(logs.stdout.join("\n")).toContain("1 swept from rounds dir");
 		expect(logs.stdout.join("\n")).toContain("1 rounds embedded, 0 errors");
+	});
+
+	it("writes round files and markers atomically via tmp+rename, leaving no tmp residue", async () => {
+		const root = tmpDir();
+		const sessionsDir = tmpDir();
+		const roundsDir = path.join(root, "rounds");
+		fs.mkdirSync(roundsDir, { recursive: true });
+		const indexPath = path.join(roundsDir, "index.csv");
+
+		// Recovered round (no session JSONL) forces the sweep -> processRound path,
+		// which performs both writes under test: the round file, then the
+		// promptEmbedding marker through writeRoundEmbedding.
+		const userPrompt = "Are the digest round-file writes atomic yet?";
+		const responseSequence = "They should stage to a pid-suffixed temp file and rename over the target.";
+		const roundFile = `${computeContentHash(userPrompt, responseSequence, [])}.json`;
+		const roundPath = path.join(roundsDir, roundFile);
+		fs.writeFileSync(roundPath, JSON.stringify({ userPrompt, responseSequence, toolCalls: [], recovered: true }));
+
+		const { fsImpl, writes, renames } = spyFs();
+		const logs = logger();
+		await expect(
+			runDigestAll({
+				sessionsDir,
+				roundsDir,
+				indexPath,
+				apiKey: "key",
+				fetchImpl: embeddingFetch([
+					[1, 0],
+					[0, 1],
+					[2, 3],
+				]),
+				fsImpl,
+				stdout: logs.out,
+				stderr: logs.err,
+			}),
+		).resolves.toBe(0);
+
+		const tmpSuffix = `.tmp.${process.pid}`;
+		const roundWrites = writes.filter((w) => w.endsWith(".json") || w.endsWith(tmpSuffix));
+		// The round file is never written in place; every durable write is staged.
+		expect(roundWrites).not.toContain(roundPath);
+		const stagedWrites = roundWrites.filter((w) => w === `${roundPath}${tmpSuffix}`);
+		expect(stagedWrites.length).toBeGreaterThanOrEqual(2); // round file, then marker
+		// Each staged write is committed with a rename onto the target.
+		for (const staged of stagedWrites) {
+			expect(renames).toContainEqual([staged, roundPath]);
+		}
+		// No temp residue survives the successful run.
+		expect(fs.readdirSync(roundsDir).some((name) => name.includes(".tmp."))).toBe(false);
+		// The atomic path really ran: the marker landed on the durable file.
+		expect(JSON.parse(fs.readFileSync(roundPath, "utf-8")).promptEmbedding).toEqual([2, 3]);
 	});
 
 	it("short prompts follow the shared drop policy: no :prompt row, response vector stored as promptEmbedding", async () => {

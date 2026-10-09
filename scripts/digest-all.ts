@@ -347,8 +347,15 @@ export async function runDigestAll(options: DigestAllOptions = {}): Promise<numb
 			migrateIndexEntriesFile(indexPath, staleFile, roundFile);
 		}
 
-		// Write round file before deleting stale copies.
-		f.writeFileSync(path.resolve(roundsDir, roundFile), JSON.stringify(round, null, 2));
+		// Write round file before deleting stale copies. Atomic tmp+rename (F4, PR
+		// #134 review), matching the extension's round-file write (src/semblr.ts
+		// writeRoundEmbedding): round files are the durable store, so an interrupt
+		// mid-write must not truncate a file that has no session JSONL left to
+		// recover from.
+		const roundPath = path.resolve(roundsDir, roundFile);
+		const roundTmpPath = `${roundPath}.tmp.${process.pid}`;
+		f.writeFileSync(roundTmpPath, JSON.stringify(round, null, 2));
+		f.renameSync(roundTmpPath, roundPath);
 		const bm25Index = loadBm25Index(bm25IndexPath, f);
 		upsertBm25Round(bm25Index, roundFile, roundTextForBm25(round));
 		for (const staleFile of staleFiles) {
@@ -423,7 +430,12 @@ export async function runDigestAll(options: DigestAllOptions = {}): Promise<numb
 					},
 					writeRoundEmbedding: (fileName, vec) => {
 						round.promptEmbedding = vec;
-						f.writeFileSync(path.resolve(roundsDir, fileName), JSON.stringify(round, null, 2));
+						// Atomic tmp+rename (F4, PR #134 review): an interrupt during the
+						// marker write must not truncate the durable round file.
+						const target = path.resolve(roundsDir, fileName);
+						const tmp = `${target}.tmp.${process.pid}`;
+						f.writeFileSync(tmp, JSON.stringify(round, null, 2));
+						f.renameSync(tmp, target);
 					},
 				},
 			);
