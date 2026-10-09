@@ -23,7 +23,7 @@ import {
 	writeBm25Index,
 } from "../lib/bm25-index.ts";
 import { type EmbeddingModelRegistry, embedText } from "../lib/embed.ts";
-import { embedRound } from "../lib/embed-round.ts";
+import { embedRound, reproducedIndexSuffixes } from "../lib/embed-round.ts";
 import {
 	appendVectorIndexEntry,
 	buildStaleContentMatchMap,
@@ -35,7 +35,7 @@ import {
 } from "../lib/index-io.ts";
 import { type ParsedPiRound, parsePiSessionJsonl } from "../lib/pi-session.ts";
 import { deriveRoundFile, embeddingMaxTokensToResponseBytes } from "../lib/round-capture.ts";
-import { buildCheckpointSummaryText, type CheckpointSummary } from "../lib/round-data.ts";
+import { buildCheckpointSummaryText, type CheckpointSummary, type RoundData } from "../lib/round-data.ts";
 import {
 	resolveScriptApiKey,
 	resolveScriptConfig,
@@ -182,13 +182,18 @@ function indexRowSuffix(filePath: string): string {
 }
 
 /**
- * Suffixes whose staleness forces a model-change reindex. `:prompt`/`:response`
- * are the retrieval workhorses and the rows `embedRound` always produces; only
- * they demand a reindex. `:summary` is deliberately excluded: it is auxiliary
- * and content-dependent, so a stale `:summary` row whose summary can no longer
- * be derived would re-flag the round forever — the #140 D4 non-convergence this
- * fix removes. A reindex triggered by `:prompt`/`:response` still refreshes a
- * reproducible `:summary` row (it is in the fresh `entries`). A row with any
+ * Fallback reproducible-suffix set for a round whose round file is
+ * missing/unreadable. `:prompt`/`:response` are the retrieval workhorses; the
+ * conservative fallback keeps such a round flagged (the sweep then reports it
+ * non-convergent, issue #140 D4) rather than silently converging it on a file
+ * we could not inspect. For a readable round the set is derived per round by
+ * `reproducedIndexSuffixes` (lib/embed-round.ts) — `:prompt` is reproducible
+ * only when the prompt survives the short-prompt drop (F1, PR !141 review).
+ * `:summary` is always excluded from *forcing* a reindex: it is auxiliary and
+ * content-dependent, so a stale `:summary` row whose summary can no longer be
+ * derived would re-flag the round forever — the #140 D4 non-convergence this
+ * fix removes. A reindex triggered by a reproducible row still refreshes a
+ * reproduced `:summary` row (it is in the fresh `entries`). A row with any
  * other suffix (a legacy `:round` or bare row) is never rewritten by a reindex
  * and never forces one; it is preserved with its own model, because re-stamping
  * it to the current model would relabel a vector computed by another model and
@@ -307,25 +312,52 @@ export async function runDigestAll(options: DigestAllOptions = {}): Promise<numb
 	// A per-file scan would make the sweep O(n²); the response vector is the only
 	// index row a healed marker can reuse without an embedding call.
 	const responseVectorByRoundFile = new Map<string, number[]>();
+	// F1 (PR !141 review): which suffixes `embedRound` reproduces depends on the
+	// round, not on a static set — a short prompt yields no `:prompt` row, so a
+	// stale `:prompt` row on such a round can never be replaced and must be
+	// treated as an orphan (see reproducedIndexSuffixes). Derive the set per
+	// round from its round file. A missing/unreadable file keeps the conservative
+	// `:prompt`/`:response` set so the round stays flagged and the sweep can
+	// report it non-convergent (issue #140 D4) instead of silently converging.
+	const reproducibleSuffixesByRoundFile = new Map<string, Set<string>>();
+	const readReproducibleSuffixes = (roundFile: string): Set<string> => {
+		const cached = reproducibleSuffixesByRoundFile.get(roundFile);
+		if (cached) return cached;
+		let suffixes = REINDEXABLE_INDEX_SUFFIXES;
+		try {
+			const data = JSON.parse(f.readFileSync(path.join(roundsDir, roundFile), "utf-8")) as RoundData;
+			suffixes = reproducedIndexSuffixes(data.userPrompt ?? "", Boolean(data.summary));
+		} catch {
+			// Unreadable: keep the conservative default.
+		}
+		reproducibleSuffixesByRoundFile.set(roundFile, suffixes);
+		return suffixes;
+	};
+	const entriesByRoundFile = new Map<string, VectorIndexEntry[]>();
 	for (const entry of indexEntries) {
 		// indexRoundFileFromPath strips the :prompt/:response/:round/:summary suffix.
 		const roundFile = path.basename(indexRoundFileFromPath(entry.filePath));
 		existingRounds.add(roundFile);
-		if (REINDEXABLE_INDEX_SUFFIXES.has(indexRowSuffix(entry.filePath))) {
-			roundsWithReproducibleRow.add(roundFile);
-			// Legacy two-column rows have no model and are treated as current (#62).
-			if (entry.model !== undefined && entry.model !== config.embeddingModel) {
-				roundsWithStaleReproducibleRow.add(roundFile);
-			}
-		}
+		const list = entriesByRoundFile.get(roundFile);
+		if (list) list.push(entry);
+		else entriesByRoundFile.set(roundFile, [entry]);
 		if (entry.filePath.endsWith(":response") && !responseVectorByRoundFile.has(roundFile)) {
 			responseVectorByRoundFile.set(roundFile, entry.vector);
 		}
 	}
 	for (const roundFile of existingRounds) {
-		if (!roundsWithReproducibleRow.has(roundFile) || roundsWithStaleReproducibleRow.has(roundFile)) {
-			modelMismatchedRounds.add(roundFile);
+		const suffixes = readReproducibleSuffixes(roundFile);
+		let hasReproducibleRow = false;
+		let hasStaleReproducibleRow = false;
+		for (const entry of entriesByRoundFile.get(roundFile) ?? []) {
+			if (!suffixes.has(indexRowSuffix(entry.filePath))) continue;
+			hasReproducibleRow = true;
+			// Legacy two-column rows have no model and are treated as current (#62).
+			if (entry.model !== undefined && entry.model !== config.embeddingModel) hasStaleReproducibleRow = true;
 		}
+		if (hasReproducibleRow) roundsWithReproducibleRow.add(roundFile);
+		if (hasStaleReproducibleRow) roundsWithStaleReproducibleRow.add(roundFile);
+		if (!hasReproducibleRow || hasStaleReproducibleRow) modelMismatchedRounds.add(roundFile);
 	}
 	out.log(`📊 Already indexed: ${existingRounds.size} rounds`);
 	out.log(`📊 Model-mismatched rounds to re-index: ${modelMismatchedRounds.size}\n`);

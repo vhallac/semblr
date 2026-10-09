@@ -1,6 +1,32 @@
 import { describe, expect, it } from "vitest";
-import { type EmbedRoundDeps, embedRound } from "./embed-round.ts";
+import { type EmbedRoundDeps, embedRound, reproducedIndexSuffixes } from "./embed-round.ts";
 import { buildPromptEmbeddingInput } from "./round-capture.ts";
+
+describe("reproducedIndexSuffixes", () => {
+	it("reports :prompt only when the prompt survives the short-prompt drop", () => {
+		const prev = process.env.RELEVANCE_LIST_MIN_WORDS;
+		process.env.RELEVANCE_LIST_MIN_WORDS = "20";
+		try {
+			const short = reproducedIndexSuffixes("only three words", false);
+			expect([...short].sort()).toEqual([":response"]);
+			const long = reproducedIndexSuffixes(
+				"a prompt with well over twenty ordinary words so the shared policy will certainly not drop it from the index",
+				false,
+			);
+			expect([...long].sort()).toEqual([":prompt", ":response"]);
+		} finally {
+			if (prev === undefined) delete process.env.RELEVANCE_LIST_MIN_WORDS;
+			else process.env.RELEVANCE_LIST_MIN_WORDS = prev;
+		}
+	});
+
+	it("adds :summary only when a summary is present", () => {
+		const withSummary = reproducedIndexSuffixes("short one", true);
+		expect(withSummary.has(":summary")).toBe(true);
+		expect(withSummary.has(":response")).toBe(true);
+		expect(withSummary.has(":prompt")).toBe(false);
+	});
+});
 
 function makeDeps(overrides: Partial<EmbedRoundDeps> = {}) {
 	const embeddedTexts: string[] = [];

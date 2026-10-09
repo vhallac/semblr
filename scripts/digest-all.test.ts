@@ -772,6 +772,78 @@ describe("digest-all script", () => {
 		expect(secondLogs.stderr.join("\n")).not.toContain("Model-mismatched rounds to re-index: 1");
 	});
 
+	it("a stale :prompt row on a short-prompt round is an orphan and converges", async () => {
+		// F1 (PR !141 review): a short prompt reproduces no `:prompt` row
+		// (lib/embed-round.ts short-prompt drop), so an old-model `:prompt` row on
+		// such a round can never be replaced by a reindex. It must be treated as a
+		// non-reproducible orphan: the round is reindexed once for its stale
+		// `:response` row, the preserved `:prompt` orphan keeps its own model, and a
+		// second run must resolve and spend zero embedding calls.
+		const prevMinWords = process.env.RELEVANCE_LIST_MIN_WORDS;
+		process.env.RELEVANCE_LIST_MIN_WORDS = "20"; // the documented default threshold
+		try {
+			const root = tmpDir();
+			const sessionsDir = tmpDir(); // sweep-only
+			const roundsDir = path.join(root, "rounds");
+			fs.mkdirSync(roundsDir, { recursive: true });
+			const indexPath = path.join(roundsDir, "index.csv");
+			const userPrompt = "What was recovered?"; // 3 words — under the threshold
+			const responseSequence = "Short prompts never carry prompt-side embeddings on the live path.";
+			const roundFile = `${computeContentHash(userPrompt, responseSequence, [])}.json`;
+			fs.writeFileSync(
+				path.join(roundsDir, roundFile),
+				JSON.stringify({ userPrompt, responseSequence, toolCalls: [] }),
+			);
+			fs.writeFileSync(
+				indexPath,
+				`${[
+					encodeVectorIndexLine([1], `${roundFile}:prompt`, "old-model"),
+					encodeVectorIndexLine([2], `${roundFile}:response`, "old-model"),
+				].join("\n")}\n`,
+			);
+
+			const requests: unknown[] = [];
+			const logs = logger();
+			await expect(
+				runDigestAll({
+					sessionsDir,
+					roundsDir,
+					indexPath,
+					apiKey: "key",
+					fetchImpl: embeddingFetch([[9, 9]], requests),
+					stdout: logs.out,
+					stderr: logs.err,
+				}),
+			).resolves.toBe(0);
+
+			const rows = loadVectorIndex(indexPath);
+			// The stale `:response` is replaced; the unreproducible `:prompt` orphan is
+			// preserved with its own model (never re-stamped — cross-model cosine).
+			expect(rows.find((e) => e.filePath === `${roundFile}:response`)?.model).toBe(DEBUG_EMBEDDING_MODEL);
+			expect(rows.find((e) => e.filePath === `${roundFile}:prompt`)?.model).toBe("old-model");
+
+			const firstRunCalls = requests.length;
+			const secondLogs = logger();
+			await expect(
+				runDigestAll({
+					sessionsDir,
+					roundsDir,
+					indexPath,
+					apiKey: "key",
+					fetchImpl: embeddingFetch([], requests),
+					stdout: secondLogs.out,
+					stderr: secondLogs.err,
+				}),
+			).resolves.toBe(0);
+			expect(requests.length).toBe(firstRunCalls);
+			expect(secondLogs.stderr.join("\n")).not.toContain("Model-mismatched rounds to re-index: 1");
+			expect(secondLogs.stdout.join("\n")).toContain("Model-mismatched rounds to re-index: 0");
+		} finally {
+			if (prevMinWords === undefined) delete process.env.RELEVANCE_LIST_MIN_WORDS;
+			else process.env.RELEVANCE_LIST_MIN_WORDS = prevMinWords;
+		}
+	});
+
 	it("a stale :summary orphan does not re-flag a round that has current prompt/response rows", async () => {
 		// F1 (PR #141 review), case 3: `:summary` is auxiliary and content-dependent.
 		// A round whose `:prompt`/`:response` rows are current but whose `:summary`

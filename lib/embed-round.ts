@@ -56,6 +56,26 @@ export interface EmbedRoundResult {
 }
 
 /**
+ * The index-row suffixes `embedRound` reproduces for a round with this prompt
+ * and summary. A reindex replaces exactly these rows; any other suffix on disk
+ * (a legacy `:round`/bare row, or a `:summary` whose source is gone) is an
+ * orphan that must be preserved, not traded away.
+ *
+ * `:prompt` is reproduced only when the prompt survives the short-prompt drop
+ * (F1, PR !141 review): a short prompt yields a `:response` row and no
+ * `:prompt` row, so a stale `:prompt` row on such a round is an orphan —
+ * treating it as reproducible would re-flag the round on every run forever,
+ * because no reindex can ever replace it. `:response` is always reproduced;
+ * `:summary` only when a summary text is present.
+ */
+export function reproducedIndexSuffixes(userPrompt: string, hasSummary: boolean): Set<string> {
+	const suffixes = new Set<string>([":response"]);
+	if (!shouldDropEmbedding(countWordsInMessageContent(userPrompt))) suffixes.add(":prompt");
+	if (hasSummary) suffixes.add(":summary");
+	return suffixes;
+}
+
+/**
  * Embed one round under the single shared policy.
  *
  * Short-prompt drop (shouldDropEmbedding over the raw prompt's word count):
