@@ -318,7 +318,10 @@ describe("digest-all script", () => {
 			path.join(roundsDir, roundFile),
 			JSON.stringify({ userPrompt, responseSequence, toolCalls: [] }),
 		);
-		fs.writeFileSync(indexPath, `${encodeVectorIndexLine([1], `${roundFile}:prompt`)}\n`);
+		fs.writeFileSync(
+			indexPath,
+			`${encodeVectorIndexLine([1], `${roundFile}:prompt`)}\n${encodeVectorIndexLine([2], `${roundFile}:response`)}\n`,
+		);
 
 		const logs = logger();
 		const fetchImpl = vi.fn(async () => new Response("should not be called")) as typeof fetch;
@@ -335,12 +338,14 @@ describe("digest-all script", () => {
 			}),
 		).resolves.toBe(0);
 
+		// Legacy rows count as current-model, so the round is healed from its
+		// `:response` row (no API call) and its rows are untouched.
 		expect(fetchImpl).not.toHaveBeenCalled();
-		expect(readIndexLines(indexPath)).toEqual([encodeVectorIndexLine([1], `${roundFile}:prompt`)]);
+		expect(readIndexLines(indexPath)).toEqual([
+			encodeVectorIndexLine([1], `${roundFile}:prompt`),
+			encodeVectorIndexLine([2], `${roundFile}:response`),
+		]);
 		expect(logs.stdout.join("\n")).toContain("📊 Model-mismatched rounds to re-index: 0");
-		expect(logs.stdout.join("\n")).toContain(
-			"📊 New rounds to embed: 0 (1 already indexed, 0 swept from rounds dir)",
-		);
 	});
 
 	it("re-indexes rounds whose index rows were generated with a different explicit model", async () => {
@@ -821,7 +826,7 @@ describe("digest-all script", () => {
 		expect(logs.stdout.join("\n")).toContain("1 markers healed");
 	});
 
-	it("sweep leaves a marker-less round without a :response row unhealed", async () => {
+	it("sweep re-embeds a marker-less round with no :response row, replacing rows and writing the marker", async () => {
 		const root = tmpDir();
 		const sessionsDir = tmpDir();
 		const roundsDir = path.join(root, "rounds");
@@ -829,7 +834,7 @@ describe("digest-all script", () => {
 		const indexPath = path.join(roundsDir, "index.csv");
 
 		const userPrompt = "A round with a prompt row but no response row.";
-		const responseSequence = "Left marker-less because no truthful vector is available.";
+		const responseSequence = "Re-embedded because no truthful vector was available to heal from.";
 		const roundFile = `${computeContentHash(userPrompt, responseSequence, [])}.json`;
 		fs.writeFileSync(
 			path.join(roundsDir, roundFile),
@@ -840,7 +845,18 @@ describe("digest-all script", () => {
 			`${encodeVectorIndexLine([0.25, 0.5], `${roundFile}:prompt`, "openai/text-embedding-3-small")}\n`,
 		);
 
-		const fetchImpl = vi.fn(async () => new Response("should not be called")) as typeof fetch;
+		// F1 (issue #140, D1/D2): rows are the retrieval truth, so a round with
+		// current-model rows but no :response row to heal from is a retrieval gap
+		// and is re-embedded from its round file. The sweep spends the call and the
+		// full replace reproduces prompt+response rows and the marker together.
+		const requests: unknown[] = [];
+		const fetchImpl = embeddingFetch(
+			[
+				[1, 0],
+				[0, 1],
+			],
+			requests,
+		) as typeof fetch;
 		const logs = logger();
 		await expect(
 			runDigestAll({
@@ -854,10 +870,28 @@ describe("digest-all script", () => {
 			}),
 		).resolves.toBe(0);
 
-		expect(fetchImpl).not.toHaveBeenCalled();
+		expect(fetchImpl).toHaveBeenCalledTimes(3);
+		const rows = loadVectorIndex(indexPath);
+		expect(rows.map((e) => e.filePath).sort()).toEqual([`${roundFile}:prompt`, `${roundFile}:response`].sort());
 		const written = JSON.parse(fs.readFileSync(path.join(roundsDir, roundFile), "utf-8"));
-		expect(written.promptEmbedding).toBeUndefined();
+		expect(written.promptEmbedding).toBeDefined();
 		expect(logs.stdout.join("\n")).not.toContain("markers healed");
+
+		// Idempotence (D4): a second run sees current-model rows and embeds nothing.
+		const secondFetch = vi.fn(async () => new Response("should not be called")) as typeof fetch;
+		const secondLogs = logger();
+		await expect(
+			runDigestAll({
+				sessionsDir,
+				roundsDir,
+				indexPath,
+				apiKey: "key",
+				fetchImpl: secondFetch,
+				stdout: secondLogs.out,
+				stderr: secondLogs.err,
+			}),
+		).resolves.toBe(0);
+		expect(secondFetch).not.toHaveBeenCalled();
 	});
 
 	it("sweep skips unreadable round files and files without a user prompt", async () => {

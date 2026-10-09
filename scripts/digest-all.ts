@@ -123,37 +123,50 @@ function gatherSessionFiles(
 // ─────────────────────────────────────────────
 
 /**
- * Write the `promptEmbedding` marker onto a round file that already has index
- * rows but no marker, without re-embedding. The value is the round's
- * `:response` index-row vector (see the call site for why the combined vector
- * is unavailable and why grouping is therefore unsupported for healed rounds).
+ * Outcome of trying to heal a `promptEmbedding` marker onto a round file that
+ * already has current-model index rows.
+ *
+ * - `healed`: a marker was written from the round's `:response` row (no call).
+ * - `already-marked`: the round already carries a marker — genuinely done.
+ * - `unhealable`: no `:response` row to reuse (or the file is unreadable), so
+ *   the marker cannot be synthesized without an API call. The sweep treats
+ *   this as a retrieval gap and re-embeds the round when a source exists
+ *   (F1, issue #140 decision D1/D2).
+ */
+type HealOutcome = "healed" | "already-marked" | "unhealable";
+
+/**
+ * Heal a marker-less round that already has current-model index rows, without
+ * re-embedding. The marker value is the round's `:response` index-row vector
+ * (see the call site for why the combined vector is unavailable and why
+ * grouping is therefore unsupported for healed rounds).
  *
  * Atomic tmp+rename, matching the extension's round-file write
  * (src/semblr.ts writeRoundEmbedding). Round files are the durable store; a
  * truncating write here could destroy a round that has no session JSONL left
- * to recover from. Returns true when a marker was written.
+ * to recover from.
  */
 function healMissingPromptEmbedding(
 	fileName: string,
 	roundsDir: string,
 	responseVectorByRoundFile: Map<string, number[]>,
 	f: typeof fs,
-): boolean {
+): HealOutcome {
 	const roundPath = path.join(roundsDir, fileName);
 	let round: Round;
 	try {
 		round = JSON.parse(f.readFileSync(roundPath, "utf-8")) as Round;
 	} catch {
-		return false;
+		return "unhealable";
 	}
-	if (round.promptEmbedding) return false;
+	if (round.promptEmbedding) return "already-marked";
 	const responseVec = responseVectorByRoundFile.get(fileName);
-	if (!responseVec) return false;
+	if (!responseVec) return "unhealable";
 	round.promptEmbedding = responseVec;
 	const tmpPath = `${roundPath}.tmp.${process.pid}`;
 	f.writeFileSync(tmpPath, JSON.stringify(round, null, 2));
 	f.renameSync(tmpPath, roundPath);
-	return true;
+	return "healed";
 }
 
 // ─────────────────────────────────────────────
@@ -277,6 +290,16 @@ export async function runDigestAll(options: DigestAllOptions = {}): Promise<numb
 	// round-dir listing the sweep below walks; corrupt files are skipped exactly
 	// as in the per-call helper, which stays for direct callers.
 	const staleMatchesByTarget = buildStaleContentMatchMap(roundsDir, f);
+	// Issue #140 F1: when the sweep re-embeds a marker-less round with no
+	// `:response` row, a legacy file reachable only through a queued session
+	// round must not also be swept under its own (stale) name — the queued
+	// round's processRound migrates and deletes it, and a second enqueue would
+	// unlink an already-removed file. Skip any file listed as a stale match for
+	// a queued target; the target's migration is the single owner of that file.
+	const staleFilesForQueued = new Set<string>();
+	for (const target of queuedFiles) {
+		for (const stale of staleMatchesByTarget.get(target) ?? []) staleFilesForQueued.add(stale);
+	}
 	// Issue #139: hoist the derived-index state the per-round path used to reload.
 	// BM25 is loaded once here, upserted in memory inside processRound, and
 	// flushed exactly once after the batch (mirroring indexRecoveredRounds'
@@ -296,12 +319,11 @@ export async function runDigestAll(options: DigestAllOptions = {}): Promise<numb
 		for (const fileName of f.readdirSync(roundsDir)) {
 			if (!fileName.endsWith(".json") || fileName.startsWith("index")) continue;
 			if (queuedFiles.has(fileName)) continue;
+			if (staleFilesForQueued.has(fileName)) continue;
 			if (existingRounds.has(fileName) && !modelMismatchedRounds.has(fileName)) {
 				// F2 (PR #134 review, option b): a round that already has current-model
 				// index rows may still lack the `promptEmbedding` marker (e.g. rows
-				// survive while the round file was rewritten). The startup pending
-				// counter keys on the marker, so `just index` must heal it here — or the
-				// count names work this run cannot do. Healing reuses the round's
+				// survive while the round file was rewritten). Healing reuses the round's
 				// `:response` index-row vector instead of re-embedding: the live
 				// combined `concat(prompt, response)` vector is not stored in the index
 				// and cannot be reconstructed without an API call. The response-side
@@ -311,10 +333,27 @@ export async function runDigestAll(options: DigestAllOptions = {}): Promise<numb
 				// cannot support topic grouping (src/semblr.ts keys grouping on
 				// promptEmbedding), because grouping needs the combined vector. This is
 				// accepted for historical rounds — a migration can restore the combined
-				// vector if grouping is ever built. Rounds with no `:response` row are
-				// left marker-less (still truthfully pending).
-				healMissingPromptEmbedding(fileName, roundsDir, responseVectorByRoundFile, f) && healedTotal++;
-				continue;
+				// vector if grouping is ever built.
+				//
+				// F1 (issue #140, decision D1/D2): a round with current-model rows but no
+				// `:response` row cannot be healed without an API call. Because rows are
+				// the retrieval truth (D1), such a round is a genuine retrieval gap and
+				// the sweep re-embeds it from the round file (the source is in hand)
+				// rather than leaving it silently marker-less. The round is forced into
+				// the reindex path below — removed from the current-model set and added
+				// to the mismatched set — so processRound performs a full row replace
+				// and writes rows+marker together, restoring convergence.
+				const healOutcome = healMissingPromptEmbedding(fileName, roundsDir, responseVectorByRoundFile, f);
+				if (healOutcome === "healed") {
+					healedTotal++;
+					continue;
+				}
+				if (healOutcome === "already-marked") {
+					// Marker present and rows current — genuinely done, no work.
+					continue;
+				}
+				indexedRounds.delete(fileName);
+				modelMismatched.add(fileName);
 			}
 			let round: Round;
 			try {
