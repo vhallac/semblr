@@ -352,7 +352,7 @@ Three scripts parse historical conversation data into semblr rounds:
 
 | Script | What it does |
 |---|---|
-| `scripts/digest-all.ts` | Iterates all pi session files, sweeps the rounds dir for round files not yet indexed, deduplicates against already-indexed rounds, and embeds new ones in parallel (concurrency: 5) |
+| `scripts/digest-all.ts` | Iterates all pi session files, sweeps the rounds dir for round files not yet indexed, deduplicates against already-indexed rounds, and embeds new ones (concurrency: 1) |
 | `scripts/digest-session.ts` | Parses a single session file, embeds each round, appends to the vector index |
 | `scripts/import-claude-code.ts` | Imports Claude Code JSONL history from `~/.claude/projects` into the shared index |
 
@@ -449,7 +449,7 @@ Check that the status bar shows `🧠 semblr loaded — N rounds indexed`.
 just index
 ```
 
-This parses every JSONL session file in `~/.pi/agent/sessions/`, deduplicates against already-indexed rounds, and embeds new ones in parallel (concurrency: 5).
+This parses every JSONL session file in `~/.pi/agent/sessions/`, deduplicates against already-indexed rounds, and embeds new ones (concurrency: 1).
 
 ### Query the index
 
