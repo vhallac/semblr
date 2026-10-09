@@ -633,11 +633,13 @@ describe("digest-all script", () => {
 		expect(rows.find((e) => e.filePath === `${roundFile}:round`)?.vector).toEqual([7, 7]);
 		expect(logs.stderr.join("\n")).toContain(`Preserving non-reproduced index row: ${roundFile}:round`);
 
-		// F1 (PR #141 review): the preserved orphan must be re-stamped to the
-		// current model, otherwise the model-mismatch predicate re-flags this
-		// round forever. A second run must converge: resolved exit and zero
-		// embedding calls.
-		expect(rows.find((e) => e.filePath === `${roundFile}:round`)?.model).toBe(DEBUG_EMBEDDING_MODEL);
+		// F1 (PR #141 review): the preserved orphan keeps its own model — its vector
+		// was computed by another model, and re-stamping it to the current model
+		// would score a foreign-space vector against the current-model query vector
+		// (a cross-model cosine). Convergence instead comes from the mismatch
+		// predicate ignoring the non-reproducible `:round` suffix: a second run must
+		// resolve and spend zero embedding calls without relabelling the row.
+		expect(rows.find((e) => e.filePath === `${roundFile}:round`)?.model).toBe("old-model");
 		const firstRunCalls = requests.length;
 		const secondLogs = logger();
 		await expect(
@@ -652,11 +654,168 @@ describe("digest-all script", () => {
 			}),
 		).resolves.toBe(0);
 		expect(requests.length).toBe(firstRunCalls);
+		expect(secondLogs.stderr.join("\n")).not.toContain("Model-mismatched rounds to re-index: 1");
 		const rowsAfterSecondRun = loadVectorIndex(indexPath);
 		expect(rowsAfterSecondRun.map((e) => e.filePath)).toEqual(rows.map((e) => e.filePath));
-		for (const row of rowsAfterSecondRun) {
+		for (const row of rowsAfterSecondRun.filter((e) => !e.filePath.endsWith(":round"))) {
 			expect(row.model).toBe(DEBUG_EMBEDDING_MODEL);
 		}
+		expect(rowsAfterSecondRun.find((e) => e.filePath.endsWith(":round"))?.model).toBe("old-model");
+	});
+
+	it("a model-change reindex still rewrites a mismatched reproducible row", async () => {
+		// Guard for the F1 fix: excluding non-reproducible suffixes from the mismatch
+		// predicate must not exclude reproducible ones. A stale `:prompt` row is
+		// reproducible, so its round is re-embedded and the row replaced.
+		const root = tmpDir();
+		const sessionsDir = path.join(root, "sessions");
+		const sDir = path.join(sessionsDir, "--test");
+		fs.mkdirSync(sDir, { recursive: true });
+		const roundsDir = path.join(root, "rounds");
+		fs.mkdirSync(roundsDir, { recursive: true });
+		const indexPath = path.join(roundsDir, "index.csv");
+		const userPrompt = "Does a stale reproducible row still converge?";
+		const responseSequence = "It must be re-embedded under the current model.";
+		const roundFile = `${computeContentHash(userPrompt, responseSequence, [])}.json`;
+
+		writeSession(path.join(sDir, "session.jsonl"), [{ userPrompt, responseSequence }]);
+		fs.writeFileSync(indexPath, `${[encodeVectorIndexLine([1], `${roundFile}:prompt`, "old-model")].join("\n")}\n`);
+
+		const logs = logger();
+		const requests: unknown[] = [];
+		await expect(
+			runDigestAll({
+				sessionsDir,
+				roundsDir,
+				indexPath,
+				apiKey: "key",
+				fetchImpl: embeddingFetch(
+					[
+						[3, 4],
+						[0, 5],
+					],
+					requests,
+				),
+				stdout: logs.out,
+				stderr: logs.err,
+			}),
+		).resolves.toBe(0);
+
+		const rows = loadVectorIndex(indexPath);
+		expect(rows.find((e) => e.filePath === `${roundFile}:prompt`)?.model).toBe(DEBUG_EMBEDDING_MODEL);
+		for (const row of rows) {
+			expect(row.model).toBe(DEBUG_EMBEDDING_MODEL);
+		}
+	});
+
+	it("a legacy :round-only round is reindexed once and then converges", async () => {
+		// F1 (PR #141 review), case 2: a round whose only row is a non-reproducible
+		// legacy `:round` row has no current-model reproducible row, so it must be
+		// reindexed once to gain `:prompt`/`:response`. The preserved `:round` orphan
+		// then keeps its own model, and the round must not be reindexed again.
+		const root = tmpDir();
+		const sessionsDir = path.join(root, "sessions");
+		const sDir = path.join(sessionsDir, "--test");
+		fs.mkdirSync(sDir, { recursive: true });
+		const roundsDir = path.join(root, "rounds");
+		fs.mkdirSync(roundsDir, { recursive: true });
+		const indexPath = path.join(roundsDir, "index.csv");
+		const userPrompt = "Only a legacy combined row exists for this round, with plenty of words to keep the prompt.";
+		const responseSequence = "It must gain current-model rows and then stop being reindexed.";
+		const roundFile = `${computeContentHash(userPrompt, responseSequence, [])}.json`;
+
+		writeSession(path.join(sDir, "session.jsonl"), [{ userPrompt, responseSequence }]);
+		fs.writeFileSync(indexPath, `${[encodeVectorIndexLine([7, 7], `${roundFile}:round`, "old-model")].join("\n")}\n`);
+
+		const logs = logger();
+		const requests: unknown[] = [];
+		await expect(
+			runDigestAll({
+				sessionsDir,
+				roundsDir,
+				indexPath,
+				apiKey: "key",
+				fetchImpl: embeddingFetch(
+					[
+						[3, 4],
+						[0, 5],
+						[6, 8],
+					],
+					requests,
+				),
+				stdout: logs.out,
+				stderr: logs.err,
+			}),
+		).resolves.toBe(0);
+
+		const rows = loadVectorIndex(indexPath);
+		expect(rows.map((e) => e.filePath).sort()).toEqual(
+			[`${roundFile}:prompt`, `${roundFile}:response`, `${roundFile}:round`].sort(),
+		);
+		expect(rows.find((e) => e.filePath === `${roundFile}:round`)?.model).toBe("old-model");
+		expect(rows.find((e) => e.filePath === `${roundFile}:prompt`)?.model).toBe(DEBUG_EMBEDDING_MODEL);
+
+		const firstRunCalls = requests.length;
+		const secondLogs = logger();
+		await expect(
+			runDigestAll({
+				sessionsDir,
+				roundsDir,
+				indexPath,
+				apiKey: "key",
+				fetchImpl: embeddingFetch([], requests),
+				stdout: secondLogs.out,
+				stderr: secondLogs.err,
+			}),
+		).resolves.toBe(0);
+		expect(requests.length).toBe(firstRunCalls);
+		expect(secondLogs.stderr.join("\n")).not.toContain("Model-mismatched rounds to re-index: 1");
+	});
+
+	it("a stale :summary orphan does not re-flag a round that has current prompt/response rows", async () => {
+		// F1 (PR #141 review), case 3: `:summary` is auxiliary and content-dependent.
+		// A round whose `:prompt`/`:response` rows are current but whose `:summary`
+		// row is stale must converge — `:summary` staleness alone must not force a
+		// reindex, or an unreproducible `:summary` orphan would loop forever.
+		const root = tmpDir();
+		const sessionsDir = path.join(root, "sessions");
+		const sDir = path.join(sessionsDir, "--test");
+		fs.mkdirSync(sDir, { recursive: true });
+		const roundsDir = path.join(root, "rounds");
+		fs.mkdirSync(roundsDir, { recursive: true });
+		const indexPath = path.join(roundsDir, "index.csv");
+		const userPrompt = "A round with current retrieval rows and a stale summary row, long enough to keep the prompt.";
+		const responseSequence = "The summary staleness must not force a reindex.";
+		const roundFile = `${computeContentHash(userPrompt, responseSequence, [])}.json`;
+
+		writeSession(path.join(sDir, "session.jsonl"), [{ userPrompt, responseSequence }]);
+		fs.writeFileSync(
+			indexPath,
+			`${[
+				encodeVectorIndexLine([1], `${roundFile}:prompt`, DEBUG_EMBEDDING_MODEL),
+				encodeVectorIndexLine([2], `${roundFile}:response`, DEBUG_EMBEDDING_MODEL),
+				encodeVectorIndexLine([3], `${roundFile}:summary`, "old-model"),
+			].join("\n")}\n`,
+		);
+
+		const logs = logger();
+		const requests: unknown[] = [];
+		await expect(
+			runDigestAll({
+				sessionsDir,
+				roundsDir,
+				indexPath,
+				apiKey: "key",
+				fetchImpl: embeddingFetch([], requests),
+				stdout: logs.out,
+				stderr: logs.err,
+			}),
+		).resolves.toBe(0);
+
+		expect(requests.length).toBe(0);
+		expect(logs.stderr.join("\n")).not.toContain("Model-mismatched rounds to re-index: 1");
+		const rows = loadVectorIndex(indexPath);
+		expect(rows.find((e) => e.filePath === `${roundFile}:summary`)?.model).toBe("old-model");
 	});
 
 	it("migrates stale round filenames before deciding a round is already indexed", async () => {

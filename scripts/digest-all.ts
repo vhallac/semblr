@@ -182,6 +182,22 @@ function indexRowSuffix(filePath: string): string {
 }
 
 /**
+ * Suffixes whose staleness forces a model-change reindex. `:prompt`/`:response`
+ * are the retrieval workhorses and the rows `embedRound` always produces; only
+ * they demand a reindex. `:summary` is deliberately excluded: it is auxiliary
+ * and content-dependent, so a stale `:summary` row whose summary can no longer
+ * be derived would re-flag the round forever — the #140 D4 non-convergence this
+ * fix removes. A reindex triggered by `:prompt`/`:response` still refreshes a
+ * reproducible `:summary` row (it is in the fresh `entries`). A row with any
+ * other suffix (a legacy `:round` or bare row) is never rewritten by a reindex
+ * and never forces one; it is preserved with its own model, because re-stamping
+ * it to the current model would relabel a vector computed by another model and
+ * the read path would score it against the current-model query vector — a
+ * cross-model cosine (zettel 7.3 forbids it).
+ */
+const REINDEXABLE_INDEX_SUFFIXES = new Set([":prompt", ":response"]);
+
+/**
  * Existing index rows for `roundFile` whose suffix is not reproduced by
  * `entries`. A model-change reindex replaces every row for the round, so any
  * suffix it does not reproduce (e.g. a `:summary` row whose source is gone)
@@ -274,6 +290,20 @@ export async function runDigestAll(options: DigestAllOptions = {}): Promise<numb
 	const indexEntries = loadVectorIndex(indexPath, f);
 	const existingRounds = new Set<string>();
 	const modelMismatchedRounds = new Set<string>();
+	// F1 (PR #141 review): a round needs a reindex only when its *reproducible*
+	// rows (`:prompt`/`:response`) are stale or absent; `:summary` staleness alone
+	// does not force one (see REINDEXABLE_INDEX_SUFFIXES). A mismatched
+	// non-reproducible row (a legacy `:round` or bare row) is never rewritten by a
+	// reindex, so it must not force one — otherwise the round is re-embedded on
+	// every run forever. Such a row is preserved with its own model instead of
+	// being re-stamped to the current model, because re-stamping would relabel a
+	// foreign-model vector and the read path would then score it against the
+	// current-model query vector (a cross-model cosine; zettel 7.3 forbids it). A
+	// round with no reproducible row at all (legacy `:round`-only) is still
+	// queued: it has no usable current-model row yet, so one reindex adds them and
+	// then converges.
+	const roundsWithReproducibleRow = new Set<string>();
+	const roundsWithStaleReproducibleRow = new Set<string>();
 	// A per-file scan would make the sweep O(n²); the response vector is the only
 	// index row a healed marker can reuse without an embedding call.
 	const responseVectorByRoundFile = new Map<string, number[]>();
@@ -281,9 +311,20 @@ export async function runDigestAll(options: DigestAllOptions = {}): Promise<numb
 		// indexRoundFileFromPath strips the :prompt/:response/:round/:summary suffix.
 		const roundFile = path.basename(indexRoundFileFromPath(entry.filePath));
 		existingRounds.add(roundFile);
-		if (entry.model !== undefined && entry.model !== config.embeddingModel) modelMismatchedRounds.add(roundFile);
+		if (REINDEXABLE_INDEX_SUFFIXES.has(indexRowSuffix(entry.filePath))) {
+			roundsWithReproducibleRow.add(roundFile);
+			// Legacy two-column rows have no model and are treated as current (#62).
+			if (entry.model !== undefined && entry.model !== config.embeddingModel) {
+				roundsWithStaleReproducibleRow.add(roundFile);
+			}
+		}
 		if (entry.filePath.endsWith(":response") && !responseVectorByRoundFile.has(roundFile)) {
 			responseVectorByRoundFile.set(roundFile, entry.vector);
+		}
+	}
+	for (const roundFile of existingRounds) {
+		if (!roundsWithReproducibleRow.has(roundFile) || roundsWithStaleReproducibleRow.has(roundFile)) {
+			modelMismatchedRounds.add(roundFile);
 		}
 	}
 	out.log(`📊 Already indexed: ${existingRounds.size} rounds`);
@@ -585,15 +626,14 @@ export async function runDigestAll(options: DigestAllOptions = {}): Promise<numb
 				// (`:prompt`/`:response`/`:summary` when derived) are still replaced by
 				// their fresh rows; only orphan suffixes are kept.
 				//
-				// F1 (PR #141 review): a preserved orphan must carry the current model
-				// stamp. Its vector is retained for continuity, but leaving the stale
-				// model on the row makes the model-mismatch predicate re-flag this round
-				// on every subsequent run — the store never converges. Re-stamping makes
-				// a second reindex reproduce the same rows and spend no embedding call.
-				const orphanEntries = findOrphanIndexEntries(indexPath, roundFile, entries, f).map((orphan) => ({
-					...orphan,
-					model: config.embeddingModel,
-				}));
+				// F1 (PR #141 review): a preserved orphan keeps its own `model` (and its
+				// `embeddingInputHash`, if any). Its vector was computed by another model,
+				// so re-stamping the row to the current model would make the read path
+				// score it against the current-model query vector — a cross-model cosine
+				// (zettel 7.3). Convergence comes from the mismatch predicate ignoring
+				// non-reproducible suffixes (REINDEXABLE_INDEX_SUFFIXES), not from
+				// relabelling a foreign vector.
+				const orphanEntries = findOrphanIndexEntries(indexPath, roundFile, entries, f);
 				for (const orphan of orphanEntries) {
 					err.error(`  ⚠️  Preserving non-reproduced index row: ${orphan.filePath}`);
 				}
