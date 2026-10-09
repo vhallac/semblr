@@ -740,6 +740,93 @@ describe("digest-all script", () => {
 		expect(logs.stdout.join("\n")).toContain("0 swept from rounds dir");
 	});
 
+	it("sweep heals a marker-less round that already has rows, reusing the :response vector without embedding", async () => {
+		const root = tmpDir();
+		const sessionsDir = tmpDir();
+		const roundsDir = path.join(root, "rounds");
+		fs.mkdirSync(roundsDir, { recursive: true });
+		const indexPath = path.join(roundsDir, "index.csv");
+
+		const userPrompt = "A recovered round whose rows survived but whose marker did not.";
+		const responseSequence = "The startup pending counter must agree with what just index can do.";
+		const roundFile = `${computeContentHash(userPrompt, responseSequence, [])}.json`;
+		// Round file has rows in the index but no promptEmbedding marker.
+		fs.writeFileSync(
+			path.join(roundsDir, roundFile),
+			JSON.stringify({ userPrompt, responseSequence, toolCalls: [], recovered: true }),
+		);
+		fs.writeFileSync(
+			indexPath,
+			[
+				encodeVectorIndexLine([0.25, 0.5], `${roundFile}:prompt`, "openai/text-embedding-3-small"),
+				encodeVectorIndexLine([0.75, 0.125], `${roundFile}:response`, "openai/text-embedding-3-small"),
+			].join("\n") + "\n",
+		);
+		const linesBefore = readIndexLines(indexPath);
+
+		const fetchImpl = vi.fn(async () => new Response("should not be called")) as typeof fetch;
+		const logs = logger();
+		await expect(
+			runDigestAll({
+				sessionsDir,
+				roundsDir,
+				indexPath,
+				apiKey: "key",
+				fetchImpl,
+				stdout: logs.out,
+				stderr: logs.err,
+			}),
+		).resolves.toBe(0);
+
+		// No embed call — healing reuses the existing :response row vector.
+		expect(fetchImpl).not.toHaveBeenCalled();
+		// Index rows are untouched.
+		expect(readIndexLines(indexPath)).toEqual(linesBefore);
+		const written = JSON.parse(fs.readFileSync(path.join(roundsDir, roundFile), "utf-8"));
+		expect(written.promptEmbedding).toEqual([0.75, 0.125]);
+		expect(written.recovered).toBe(true);
+		expect(logs.stdout.join("\n")).toContain("1 markers healed");
+	});
+
+	it("sweep leaves a marker-less round without a :response row unhealed", async () => {
+		const root = tmpDir();
+		const sessionsDir = tmpDir();
+		const roundsDir = path.join(root, "rounds");
+		fs.mkdirSync(roundsDir, { recursive: true });
+		const indexPath = path.join(roundsDir, "index.csv");
+
+		const userPrompt = "A round with a prompt row but no response row.";
+		const responseSequence = "Left marker-less because no truthful vector is available.";
+		const roundFile = `${computeContentHash(userPrompt, responseSequence, [])}.json`;
+		fs.writeFileSync(
+			path.join(roundsDir, roundFile),
+			JSON.stringify({ userPrompt, responseSequence, toolCalls: [], recovered: true }),
+		);
+		fs.writeFileSync(
+			indexPath,
+			`${encodeVectorIndexLine([0.25, 0.5], `${roundFile}:prompt`, "openai/text-embedding-3-small")}\n`,
+		);
+
+		const fetchImpl = vi.fn(async () => new Response("should not be called")) as typeof fetch;
+		const logs = logger();
+		await expect(
+			runDigestAll({
+				sessionsDir,
+				roundsDir,
+				indexPath,
+				apiKey: "key",
+				fetchImpl,
+				stdout: logs.out,
+				stderr: logs.err,
+			}),
+		).resolves.toBe(0);
+
+		expect(fetchImpl).not.toHaveBeenCalled();
+		const written = JSON.parse(fs.readFileSync(path.join(roundsDir, roundFile), "utf-8"));
+		expect(written.promptEmbedding).toBeUndefined();
+		expect(logs.stdout.join("\n")).not.toContain("markers healed");
+	});
+
 	it("sweep skips unreadable round files and files without a user prompt", async () => {
 		const root = tmpDir();
 		const sessionsDir = tmpDir();
