@@ -1,5 +1,11 @@
 import * as fs from "node:fs";
-import { indexRoundFileFromPath, splitVectorIndexMetadata } from "./index-io.ts";
+import {
+	forEachIndexLine,
+	INDEX_CHUNK_BYTES,
+	type IndexReadFs,
+	indexRoundFileFromPath,
+	splitVectorIndexMetadata,
+} from "./index-io.ts";
 
 export interface IndexEntry {
 	filePath: string;
@@ -9,25 +15,66 @@ export interface IndexEntry {
 	embeddingInputHash?: string;
 }
 
+export { forEachIndexLine, INDEX_CHUNK_BYTES, type IndexReadFs } from "./index-io.ts";
+
+/** Parse one index CSV line; returns null for blank/whitespace-only lines. */
+function parseIndexLine(line: string): IndexEntry | null {
+	const trimmed = line.trim();
+	if (!trimmed) return null;
+	const firstComma = trimmed.indexOf(",");
+	const b64 = trimmed.slice(0, firstComma);
+	const decoded = JSON.parse(Buffer.from(b64, "base64url").toString("utf-8"));
+	// Metadata parsed right-to-left so the optional 4th column (embeddingInputHash)
+	// does not corrupt the model field (search groups entries by model).
+	const { filePath, model, embeddingInputHash } = splitVectorIndexMetadata(trimmed.slice(firstComma + 1));
+	const entry: IndexEntry = { filePath, vector: Array.isArray(decoded) ? decoded : [] };
+	if (model !== undefined) entry.model = model;
+	if (embeddingInputHash !== undefined) entry.embeddingInputHash = embeddingInputHash;
+	return entry;
+}
+
+/**
+ * Load the vector index via the chunked line iterator in index-io —
+ * the file can exceed Node's ~512MB max string length, which made
+ * wholesale readFileSync loading fail with ERR_STRING_TOO_LONG.
+ */
 export function loadIndexFromPath(
 	indexPath: string,
-	fsImpl: Pick<typeof fs, "existsSync" | "readFileSync"> = fs,
+	fsImpl: IndexReadFs = fs,
+	chunkSize: number = INDEX_CHUNK_BYTES,
 ): IndexEntry[] {
-	if (!fsImpl.existsSync(indexPath)) return [];
-	const raw = fsImpl.readFileSync(indexPath, "utf-8").trim();
-	if (!raw) return [];
-	return raw.split("\n").map((line) => {
-		const firstComma = line.indexOf(",");
-		const b64 = line.slice(0, firstComma);
-		const decoded = JSON.parse(Buffer.from(b64, "base64url").toString("utf-8"));
-		// Metadata parsed right-to-left so the optional 4th column (embeddingInputHash)
-		// does not corrupt the model field (search groups entries by model).
-		const { filePath, model, embeddingInputHash } = splitVectorIndexMetadata(line.slice(firstComma + 1));
-		const entry: IndexEntry = { filePath, vector: Array.isArray(decoded) ? decoded : [] };
-		if (model !== undefined) entry.model = model;
-		if (embeddingInputHash !== undefined) entry.embeddingInputHash = embeddingInputHash;
-		return entry;
-	});
+	const entries: IndexEntry[] = [];
+	forEachIndexLine(
+		indexPath,
+		fsImpl,
+		(line) => {
+			const entry = parseIndexLine(line);
+			if (entry !== null) entries.push(entry);
+		},
+		chunkSize,
+	);
+	return entries;
+}
+
+/**
+ * Count non-empty index lines with the same chunked-read strategy as
+ * {@link loadIndexFromPath} — without parsing the vectors.
+ */
+export function countIndexLines(
+	indexPath: string,
+	fsImpl: IndexReadFs = fs,
+	chunkSize: number = INDEX_CHUNK_BYTES,
+): number {
+	let count = 0;
+	forEachIndexLine(
+		indexPath,
+		fsImpl,
+		() => {
+			count++;
+		},
+		chunkSize,
+	);
+	return count;
 }
 
 export function loadSessionStartIndex(
@@ -54,7 +101,7 @@ export type IndexStorageFs = Pick<
 	| "existsSync"
 	| "mkdirSync"
 	| "openSync"
-	| "readFileSync"
+	| "readSync"
 	| "renameSync"
 	| "statSync"
 	| "unlinkSync"
@@ -134,14 +181,15 @@ export interface LockedAppendDeps extends AcquireIndexLockDeps {
 }
 
 /**
- * Append `line` to `targetPath` using a lockfile-based read-modify-write so
- * concurrent writers (multiple pi sessions) don't clobber each other. Falls
- * back to a plain (unsynchronized) append if the lock can't be acquired
- * after all retries.
+ * Append `line` to `targetPath` under the index-writer lockfile so concurrent
+ * writers (multiple pi sessions) serialize. Appending is used instead of a
+ * read-modify-write rewrite: the index can exceed Node's max string length,
+ * and rewriting the whole file on every append would be O(index size).
+ * Falls back to an unsynchronized single-line append if the lock can't be
+ * acquired after all retries.
  */
 export function appendLineWithLock(targetPath: string, dir: string, line: string, deps: LockedAppendDeps = {}): void {
 	const fsImpl = deps.fsImpl ?? fs;
-	const processId = deps.processId ?? process.pid;
 	fsImpl.mkdirSync(dir, { recursive: true });
 
 	const lock = acquireIndexLock(targetPath, deps);
@@ -155,11 +203,7 @@ export function appendLineWithLock(targetPath: string, dir: string, line: string
 	}
 
 	try {
-		const existing = fsImpl.existsSync(targetPath) ? fsImpl.readFileSync(targetPath, "utf-8") : "";
-		const newContent = existing + line;
-		const tmp = `${targetPath}.tmp.${processId}`;
-		fsImpl.writeFileSync(tmp, newContent);
-		fsImpl.renameSync(tmp, targetPath);
+		fsImpl.appendFileSync(targetPath, line);
 	} finally {
 		lock.release();
 	}

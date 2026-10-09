@@ -51,6 +51,7 @@ import {
 	appendToIndexPath,
 	buildSessionStartStatus,
 	type IndexEntry,
+	type IndexReadFs,
 	loadIndexFromPath as loadIndexFromPathCore,
 	loadSessionStartIndex as loadSessionStartIndexCore,
 } from "../lib/index-storage.ts";
@@ -307,10 +308,7 @@ function buildFollowUpContext(fileName: string): string | null {
 //   filePath includes :prompt, :response, or :round suffix
 // ─────────────────────────────────────────────
 
-export function loadIndexFromPath(
-	indexPath: string = INDEX_PATH,
-	fsImpl: Pick<typeof fs, "existsSync" | "readFileSync"> = fs,
-): IndexEntry[] {
+export function loadIndexFromPath(indexPath: string = INDEX_PATH, fsImpl: IndexReadFs = fs): IndexEntry[] {
 	return loadIndexFromPathCore(indexPath, fsImpl);
 }
 

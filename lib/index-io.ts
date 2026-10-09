@@ -101,12 +101,65 @@ function parseVectorIndexLine(line: string): VectorIndexEntry {
 	return entry;
 }
 
-export function readIndexLines(
+export function readIndexLines(indexPath: string, fsImpl: IndexReadFs = fs): string[] {
+	const lines: string[] = [];
+	forEachIndexLine(indexPath, fsImpl, (line) => {
+		lines.push(line);
+	});
+	return lines;
+}
+
+/** fs surface needed for chunked reading of the vector index. */
+export interface IndexReadFs {
+	existsSync(filePath: string): boolean;
+	openSync(filePath: string, flags: string): number;
+	readSync(fd: number, buffer: Buffer, offset: number, length: number, position: number | null): number;
+	closeSync(fd: number): void;
+}
+
+/** Default chunk size for index reads: large enough to be fast, well under the string-length limit. */
+export const INDEX_CHUNK_BYTES = 8 * 1024 * 1024;
+
+/**
+ * Invoke `onLine` for every non-blank line of the vector index using
+ * fixed-size chunked reads instead of a single readFileSync: the file can
+ * exceed Node's ~512MB max string length, which made wholesale loading fail
+ * with ERR_STRING_TOO_LONG.
+ */
+export function forEachIndexLine(
 	indexPath: string,
-	fsImpl: Pick<typeof fs, "existsSync" | "readFileSync"> = fs,
-): string[] {
-	if (!fsImpl.existsSync(indexPath)) return [];
-	return fsImpl.readFileSync(indexPath, "utf-8").trim().split("\n").filter(Boolean);
+	fsImpl: IndexReadFs,
+	onLine: (line: string) => void,
+	chunkSize: number = INDEX_CHUNK_BYTES,
+): void {
+	if (!fsImpl.existsSync(indexPath)) return;
+	const chunk = Buffer.allocUnsafe(chunkSize);
+	let carry: Buffer = Buffer.alloc(0);
+	const fd = fsImpl.openSync(indexPath, "r");
+	try {
+		for (;;) {
+			const bytesRead = fsImpl.readSync(fd, chunk, 0, chunk.length, null);
+			if (bytesRead <= 0) break;
+			const data = bytesRead === chunk.length ? Buffer.from(chunk) : Buffer.from(chunk.subarray(0, bytesRead));
+			const buf = carry.length > 0 ? Buffer.concat([carry, data]) : data;
+			const lastNewline = buf.lastIndexOf(0x0a);
+			if (lastNewline === -1) {
+				carry = buf;
+				continue;
+			}
+			carry = buf.subarray(lastNewline + 1);
+			for (const line of buf.subarray(0, lastNewline).toString("utf-8").split("\n")) {
+				const trimmed = line.trim();
+				if (trimmed) onLine(trimmed);
+			}
+		}
+		if (carry.length > 0) {
+			const trimmed = carry.toString("utf-8").trim();
+			if (trimmed) onLine(trimmed);
+		}
+	} finally {
+		fsImpl.closeSync(fd);
+	}
 }
 
 export function writeIndexLines(indexPath: string, entries: string[]): void {
@@ -123,11 +176,12 @@ export function appendVectorIndexEntry(
 	fs.appendFileSync(indexPath, `${encodeVectorIndexLine(vector, filePath, model, embeddingInputHash)}\n`);
 }
 
-export function loadVectorIndex(
-	indexPath: string,
-	fsImpl: Pick<typeof fs, "existsSync" | "readFileSync"> = fs,
-): VectorIndexEntry[] {
-	return readIndexLines(indexPath, fsImpl).map(parseVectorIndexLine);
+export function loadVectorIndex(indexPath: string, fsImpl: IndexReadFs = fs): VectorIndexEntry[] {
+	const entries: VectorIndexEntry[] = [];
+	forEachIndexLine(indexPath, fsImpl, (line) => {
+		entries.push(parseVectorIndexLine(line));
+	});
+	return entries;
 }
 
 export function indexRoundFileFromPath(filePath: string): string {
@@ -145,10 +199,7 @@ export function indexRowSuffix(filePath: string): string {
 	return path.basename(filePath).slice(roundFile.length);
 }
 
-export function loadIndexedRoundFiles(
-	indexPath: string,
-	fsImpl: Pick<typeof fs, "existsSync" | "readFileSync"> = fs,
-): Set<string> {
+export function loadIndexedRoundFiles(indexPath: string, fsImpl: IndexReadFs = fs): Set<string> {
 	return new Set(
 		loadVectorIndex(indexPath, fsImpl).map((entry) => path.basename(indexRoundFileFromPath(entry.filePath))),
 	);
@@ -157,7 +208,7 @@ export function loadIndexedRoundFiles(
 export function loadRoundFilesWithDifferentModel(
 	indexPath: string,
 	currentModel: string,
-	fsImpl: Pick<typeof fs, "existsSync" | "readFileSync"> = fs,
+	fsImpl: IndexReadFs = fs,
 ): Set<string> {
 	const mismatched = loadVectorIndex(indexPath, fsImpl)
 		.filter((entry) => entry.model !== undefined && entry.model !== currentModel)

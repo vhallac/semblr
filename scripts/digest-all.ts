@@ -39,6 +39,7 @@ import {
 	replaceIndexEntriesForRoundFile,
 	type VectorIndexEntry,
 } from "../lib/index-io.ts";
+import { countIndexLines } from "../lib/index-storage.ts";
 import { type ParsedPiRound, parsePiSessionJsonl } from "../lib/pi-session.ts";
 import { deriveRoundFile, embeddingMaxTokensToResponseBytes } from "../lib/round-capture.ts";
 import { buildCheckpointSummaryText, type CheckpointSummary, type RoundData } from "../lib/round-data.ts";
@@ -713,9 +714,7 @@ export async function runDigestAll(options: DigestAllOptions = {}): Promise<numb
 	// non-writing (PR #138) and round files are the source of truth.
 	writeBm25Index(bm25IndexPath, bm25Index, f);
 
-	const finalCount = f.existsSync(indexPath)
-		? f.readFileSync(indexPath, "utf-8").trim().split("\n").filter(Boolean).length
-		: 0;
+	const finalCount = countIndexLines(indexPath, f);
 
 	out.log(`\n✅ Done in ${elapsed}s. ${completed} rounds embedded, ${errors} errors.`);
 	out.log(`   Index: ${finalCount} vectors at ${indexPath}`);

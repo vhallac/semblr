@@ -1774,11 +1774,12 @@ describe("digest-all script", () => {
 		// O(1) evidence: doubling the round count must not change any whole-store count.
 		expect(large).toEqual(small);
 		// The bm25 index is written exactly once for the whole batch (flushBm25 seam)
-		// and loaded exactly once. The tool index is loaded once at start plus a
-		// single lockfile read for the one appending round — both O(1) in N.
+		// and loaded exactly once. The tool index is loaded once at start; appends
+		// take the lock and append directly (no read-modify-write), so no further
+		// reads — both O(1) in N.
 		expect(small.bm25Writes).toBe(1);
 		expect(small.bm25Reads).toBe(1);
-		expect(small.toolIndexReads).toBe(2);
+		expect(small.toolIndexReads).toBe(1);
 	});
 
 	it("short prompts follow the shared drop policy: no :prompt row, response vector stored as promptEmbedding", async () => {
