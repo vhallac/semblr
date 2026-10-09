@@ -10,6 +10,9 @@ docs/eval/golden-labels.json
 # Dependencies
 node_modules/
 
+# Python bytecode caches
+__pycache__/
+
 # Local environment files and per-project direnv / Nix dev shell files
 .env
 .envrc

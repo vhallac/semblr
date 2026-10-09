@@ -101,9 +101,12 @@ function parseVectorIndexLine(line: string): VectorIndexEntry {
 	return entry;
 }
 
-export function readIndexLines(indexPath: string): string[] {
-	if (!fs.existsSync(indexPath)) return [];
-	return fs.readFileSync(indexPath, "utf-8").trim().split("\n").filter(Boolean);
+export function readIndexLines(
+	indexPath: string,
+	fsImpl: Pick<typeof fs, "existsSync" | "readFileSync"> = fs,
+): string[] {
+	if (!fsImpl.existsSync(indexPath)) return [];
+	return fsImpl.readFileSync(indexPath, "utf-8").trim().split("\n").filter(Boolean);
 }
 
 export function writeIndexLines(indexPath: string, entries: string[]): void {
@@ -120,20 +123,43 @@ export function appendVectorIndexEntry(
 	fs.appendFileSync(indexPath, `${encodeVectorIndexLine(vector, filePath, model, embeddingInputHash)}\n`);
 }
 
-export function loadVectorIndex(indexPath: string): VectorIndexEntry[] {
-	return readIndexLines(indexPath).map(parseVectorIndexLine);
+export function loadVectorIndex(
+	indexPath: string,
+	fsImpl: Pick<typeof fs, "existsSync" | "readFileSync"> = fs,
+): VectorIndexEntry[] {
+	return readIndexLines(indexPath, fsImpl).map(parseVectorIndexLine);
 }
 
 export function indexRoundFileFromPath(filePath: string): string {
 	return filePath.replace(/(:prompt|:response|:round|:summary)$/, "");
 }
 
-export function loadIndexedRoundFiles(indexPath: string): Set<string> {
-	return new Set(loadVectorIndex(indexPath).map((entry) => path.basename(indexRoundFileFromPath(entry.filePath))));
+/**
+ * The index label suffix of a round's row (`:prompt`, `:response`, `:round`,
+ * `:summary`), or `""` for a bare round-file row. Shared by the `just index`
+ * sweep and the startup coverage predicate so both classify a row by the same
+ * suffix (issue #140 D1 / F2, PR !141 review).
+ */
+export function indexRowSuffix(filePath: string): string {
+	const roundFile = path.basename(indexRoundFileFromPath(filePath));
+	return path.basename(filePath).slice(roundFile.length);
 }
 
-export function loadRoundFilesWithDifferentModel(indexPath: string, currentModel: string): Set<string> {
-	const mismatched = loadVectorIndex(indexPath)
+export function loadIndexedRoundFiles(
+	indexPath: string,
+	fsImpl: Pick<typeof fs, "existsSync" | "readFileSync"> = fs,
+): Set<string> {
+	return new Set(
+		loadVectorIndex(indexPath, fsImpl).map((entry) => path.basename(indexRoundFileFromPath(entry.filePath))),
+	);
+}
+
+export function loadRoundFilesWithDifferentModel(
+	indexPath: string,
+	currentModel: string,
+	fsImpl: Pick<typeof fs, "existsSync" | "readFileSync"> = fs,
+): Set<string> {
+	const mismatched = loadVectorIndex(indexPath, fsImpl)
 		.filter((entry) => entry.model !== undefined && entry.model !== currentModel)
 		.map((entry) => path.basename(indexRoundFileFromPath(entry.filePath)));
 	return new Set(mismatched);
@@ -218,6 +244,40 @@ export function findStaleContentMatches(roundsDir: string, roundFile: string): s
 			const data = JSON.parse(fs.readFileSync(path.join(roundsDir, file), "utf-8")) as RoundHashContent;
 			const hash = `${computeContentHash(data.userPrompt ?? "", data.responseSequence ?? "", data.toolCalls)}.json`;
 			if (hash === roundFile) matches.push(file);
+		} catch {
+			// Corrupt round files are ignored during stale-content discovery.
+		}
+	}
+	return matches;
+}
+
+/**
+ * Materialize the findStaleContentMatches result for every round file in one
+ * pass as a map keyed by the *target* (content-hash) filename. Callers that
+ * process many rounds in a loop — digest-all's sweep — would otherwise scan and
+ * JSON-parse the whole store once per round (issue #139: O(n²)). The per-call
+ * `findStaleContentMatches` is unchanged for direct callers.
+ *
+ * A file whose content hashes to its own name contributes no stale entry; a
+ * legacy file whose stored name differs from its content hash is recorded under
+ * the hash filename its content belongs to. Corrupt/unreadable files are skipped
+ * exactly as in the per-call scan.
+ */
+export function buildStaleContentMatchMap(
+	roundsDir: string,
+	fsImpl: Pick<typeof fs, "existsSync" | "readdirSync" | "readFileSync"> = fs,
+): Map<string, string[]> {
+	const matches = new Map<string, string[]>();
+	if (!fsImpl.existsSync(roundsDir)) return matches;
+	const files = fsImpl.readdirSync(roundsDir).filter((f) => f.endsWith(".json") && !f.startsWith("index"));
+	for (const file of files) {
+		try {
+			const data = JSON.parse(fsImpl.readFileSync(path.join(roundsDir, file), "utf-8")) as RoundHashContent;
+			const hash = `${computeContentHash(data.userPrompt ?? "", data.responseSequence ?? "", data.toolCalls)}.json`;
+			if (hash === file) continue;
+			const list = matches.get(hash);
+			if (list) list.push(file);
+			else matches.set(hash, [file]);
 		} catch {
 			// Corrupt round files are ignored during stale-content discovery.
 		}

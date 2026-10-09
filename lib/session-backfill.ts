@@ -14,8 +14,9 @@
 
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { type EmbedRoundDeps, embedRound } from "./embed-round.ts";
+import { classifyRoundCoverage, type EmbedRoundDeps, embedRound, FORCING_INDEX_SUFFIXES } from "./embed-round.ts";
 import { canonicalDuplicateKey, type DuplicateKeyRound } from "./hash.ts";
+import { indexRoundFileFromPath, indexRowSuffix, type VectorIndexEntry } from "./index-io.ts";
 import { parsePiSessionJsonl, reconstructPiSessionRounds } from "./pi-session.ts";
 import type { PromptNoiseOptions } from "./round-capture.ts";
 import { buildAgentEndRoundData, deriveRoundFile, isPromptOnlyRound } from "./round-capture.ts";
@@ -602,6 +603,55 @@ export interface StartupEmbedPlan {
 }
 
 /**
+ * Issue #140 (D1): is this round covered by vector-index rows under the
+ * current embedding model? A round is covered when it has at least one
+ * *forcing* row (`:prompt`/`:response`) under the current model and no forcing
+ * row under a different one. A stale `:summary` row, a `:round`/bare row, or a
+ * short-prompt round's stale `:prompt` row is an orphan that never forces a
+ * reindex, so it does not make the round pending. Legacy rows without a model
+ * column are treated as current (issue #62).
+ *
+ * Issue #140 (D1) / F2 (PR !141 review): this is the exact negation of the
+ * `just index` sweep's enqueue condition, and both call sites now build it from
+ * the shared `classifyRoundCoverage` rule. When
+ * `forcingSuffixesFor` is supplied (the sweep derives it per round from the
+ * round file's prompt length and summary presence), the two agree on rounds
+ * the sweep treats as converged; with it omitted the static
+ * `:prompt`/`:response` set is used, preserving behaviour for callers with no
+ * round data.
+ *
+ * Keyed by round-file basename so the start-up counter and the sweep agree on
+ * what "this round is indexed" means: index rows, not the promptEmbedding
+ * marker.
+ */
+export function buildCurrentModelRowPredicate(
+	entries: readonly VectorIndexEntry[],
+	currentModel: string,
+	forcingSuffixesFor?: (fileName: string) => ReadonlySet<string>,
+): (fileName: string) => boolean {
+	const entriesByRound = new Map<string, VectorIndexEntry[]>();
+	for (const entry of entries) {
+		const roundFile = path.basename(indexRoundFileFromPath(entry.filePath));
+		const list = entriesByRound.get(roundFile);
+		if (list) list.push(entry);
+		else entriesByRound.set(roundFile, [entry]);
+	}
+	const coverage = new Map<string, boolean>();
+	for (const [roundFile, roundEntries] of entriesByRound) {
+		coverage.set(
+			roundFile,
+			classifyRoundCoverage(
+				roundEntries,
+				currentModel,
+				forcingSuffixesFor?.(roundFile) ?? FORCING_INDEX_SUFFIXES,
+				indexRowSuffix,
+			).covered,
+		);
+	}
+	return (fileName: string) => coverage.get(fileName) === true;
+}
+
+/**
  * Issue #133: the status message shown when startup defers the embedding
  * burst. Extracted so the exact wording is pinned by a test.
  */
@@ -612,14 +662,26 @@ export function startupEmbedStatusMessage(plan: StartupEmbedPlan): string {
 /**
  * Issue #133: decide how startup should handle embedding for recovered
  * rounds. A round is "pending" when its round file is missing/unreadable or
- * carries no `promptEmbedding`. Pure — no I/O beyond the injected reader.
+ * is not covered by current-model vector-index rows. Pure — no I/O beyond the
+ * injected reader/predicate.
+ *
+ * Issue #140 (D1): the pending count keys on index rows, not the
+ * `promptEmbedding` marker. A recovered round may already have current-model
+ * rows but no marker (rows written by `just index`/recovery without the
+ * marker, e.g. after a crash); counting it pending inflated the startup count
+ * and made startup and the `just index` sweep disagree. When
+ * `hasCurrentModelRows` is omitted the marker is the only evidence available
+ * (a missing/unreadable round is always pending), preserving the previous
+ * behaviour for callers with no index loaded.
  */
 export function planStartupEmbedding(
 	fileNames: readonly string[],
 	readRoundData: (fileName: string) => { promptEmbedding?: unknown } | null,
+	hasCurrentModelRows?: (fileName: string) => boolean,
 ): StartupEmbedPlan {
 	let pendingCount = 0;
 	for (const fileName of fileNames) {
+		if (hasCurrentModelRows?.(fileName)) continue;
 		const round = readRoundData(fileName);
 		if (!round?.promptEmbedding) pendingCount++;
 	}
@@ -633,12 +695,25 @@ export async function embedRecoveredRounds(
 	fileNames: string[],
 	roundsDir: string,
 	deps: RecoveredEmbedDeps,
-	opts: { maxResponseBytes?: number; promptNoiseOptions?: PromptNoiseOptions; promptMaxTokens?: number } = {},
+	opts: {
+		maxResponseBytes?: number;
+		promptNoiseOptions?: PromptNoiseOptions;
+		promptMaxTokens?: number;
+		hasCurrentModelRows?: (fileName: string) => boolean;
+	} = {},
 ): Promise<{ embedded: string[]; errors: string[] }> {
 	const embedded: string[] = [];
 	const errors: string[] = [];
 	for (const fileName of fileNames) {
 		try {
+			// Issue #140 (D1): a round covered by current-model index rows is not
+			// re-embedded, even when its promptEmbedding marker is missing — the
+			// same predicate the start-up count uses (planStartupEmbedding), so the
+			// count and the pass cannot disagree. A row written without a marker
+			// (e.g. a crash between appends and the marker write) must not spend an
+			// embedding call. Omitted by callers with no index loaded, preserving
+			// marker-only behaviour.
+			if (opts.hasCurrentModelRows?.(fileName)) continue;
 			const round = JSON.parse(fs.readFileSync(path.join(roundsDir, fileName), "utf-8")) as RoundData;
 			if (round.promptEmbedding) continue;
 			await embedRound(

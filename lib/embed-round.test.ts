@@ -1,6 +1,99 @@
 import { describe, expect, it } from "vitest";
-import { type EmbedRoundDeps, embedRound } from "./embed-round.ts";
+import {
+	classifyRoundCoverage,
+	type EmbedRoundDeps,
+	embedRound,
+	forcingReproducibleSuffixes,
+	reproducedIndexSuffixes,
+} from "./embed-round.ts";
+import { indexRowSuffix } from "./index-io.ts";
 import { buildPromptEmbeddingInput } from "./round-capture.ts";
+
+describe("reproducedIndexSuffixes", () => {
+	it("reports :prompt only when the prompt survives the short-prompt drop", () => {
+		const prev = process.env.RELEVANCE_LIST_MIN_WORDS;
+		process.env.RELEVANCE_LIST_MIN_WORDS = "20";
+		try {
+			const short = reproducedIndexSuffixes("only three words", false);
+			expect([...short].sort()).toEqual([":response"]);
+			const long = reproducedIndexSuffixes(
+				"a prompt with well over twenty ordinary words so the shared policy will certainly not drop it from the index",
+				false,
+			);
+			expect([...long].sort()).toEqual([":prompt", ":response"]);
+		} finally {
+			if (prev === undefined) delete process.env.RELEVANCE_LIST_MIN_WORDS;
+			else process.env.RELEVANCE_LIST_MIN_WORDS = prev;
+		}
+	});
+
+	it("adds :summary only when a summary is present", () => {
+		const withSummary = reproducedIndexSuffixes("short one", true);
+		expect(withSummary.has(":summary")).toBe(true);
+		expect(withSummary.has(":response")).toBe(true);
+		expect(withSummary.has(":prompt")).toBe(false);
+	});
+});
+
+describe("forcingReproducibleSuffixes", () => {
+	it("restricts a long prompt + summary to :prompt/:response, never :summary", () => {
+		const prev = process.env.RELEVANCE_LIST_MIN_WORDS;
+		process.env.RELEVANCE_LIST_MIN_WORDS = "20";
+		try {
+			const long = forcingReproducibleSuffixes(
+				"a prompt with well over twenty ordinary words so the shared policy will certainly not drop it from the index",
+				true,
+			);
+			expect([...long].sort()).toEqual([":prompt", ":response"]);
+		} finally {
+			if (prev === undefined) delete process.env.RELEVANCE_LIST_MIN_WORDS;
+			else process.env.RELEVANCE_LIST_MIN_WORDS = prev;
+		}
+	});
+
+	it("drops :prompt for a short prompt", () => {
+		expect([...forcingReproducibleSuffixes("only three words", true)].sort()).toEqual([":response"]);
+	});
+});
+
+describe("classifyRoundCoverage", () => {
+	const forcing = new Set([":prompt", ":response"]);
+	const classify = (entries: Array<{ filePath: string; model?: string }>, current: string) =>
+		classifyRoundCoverage(entries, current, forcing, indexRowSuffix);
+
+	it("is not covered when no forcing row exists (summary/round only)", () => {
+		expect(classify([{ filePath: "r.json:summary", model: "m" }], "m").covered).toBe(false);
+		expect(classify([{ filePath: "r.json:round", model: "m" }], "m").covered).toBe(false);
+	});
+
+	it("is covered when a forcing row is current, ignoring a foreign non-forcing row", () => {
+		const c = classify(
+			[
+				{ filePath: "r.json:prompt", model: "m" },
+				{ filePath: "r.json:summary", model: "old" },
+			],
+			"m",
+		);
+		expect(c.covered).toBe(true);
+		expect(c.hasStaleReproducibleRow).toBe(false);
+	});
+
+	it("is not covered when a forcing row is stale", () => {
+		const c = classify(
+			[
+				{ filePath: "r.json:prompt", model: "old" },
+				{ filePath: "r.json:response", model: "m" },
+			],
+			"m",
+		);
+		expect(c.covered).toBe(false);
+		expect(c.hasStaleReproducibleRow).toBe(true);
+	});
+
+	it("treats a legacy model-less row as current (issue #62)", () => {
+		expect(classify([{ filePath: "r.json:response" }], "m").covered).toBe(true);
+	});
+});
 
 function makeDeps(overrides: Partial<EmbedRoundDeps> = {}) {
 	const embeddedTexts: string[] = [];

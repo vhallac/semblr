@@ -43,7 +43,7 @@ import {
 	shouldDropRelevanceList,
 	stripEnvPreamble,
 } from "../lib/context-messages.ts";
-import { embedRound } from "../lib/embed-round.ts";
+import { embedRound, FORCING_INDEX_SUFFIXES, forcingReproducibleSuffixes } from "../lib/embed-round.ts";
 import { embedText, getApiKey } from "../lib/embedding-client.ts";
 import { assignToGroup, formatGroupStats } from "../lib/grouping.ts";
 import { indexRoundFileFromPath, loadVectorIndex } from "../lib/index-io.ts";
@@ -95,6 +95,7 @@ import { loadSemblrConfig, type SemblrConfig } from "../lib/semblr-config.ts";
 import {
 	backfillMissingRounds,
 	buildBackfillCandidates,
+	buildCurrentModelRowPredicate,
 	embedRecoveredRounds,
 	indexRecoveredRounds,
 	isBackfillStartReason,
@@ -1225,9 +1226,35 @@ export default function (pi: ExtensionAPI) {
 						// recovered rounds is unembedded — inline startup embedding beyond
 						// the threshold can block startup for minutes; `just index` sweeps
 						// it instead. BM25 + tool indexing above stays synchronous.
+						// Issue #140 (D1): the pending count keys on current-model index
+						// rows, not the promptEmbedding marker. A recovered round with
+						// current-model rows but no marker (rows written without one, e.g.
+						// after a crash) is not pending — counting it inflated the startup
+						// count and made startup disagree with the `just index` sweep. Load
+						// the index once here and reuse the same entries for the label
+						// guard below.
+						const indexEntries = loadVectorIndex(INDEX_PATH);
+						// F2 (PR !141 review): the pending count and the `just index` sweep must
+						// classify a recovered round alike. The sweep derives the *forcing*
+						// suffix set per round from the round file (a short prompt's `:prompt`
+						// row is non-reproducible; `:summary` never forces a reindex). Derive it
+						// the same way here, memoized per file so the round file is read once.
+						const forcingSuffixesByFile = new Map<string, ReadonlySet<string>>();
+						const forcingSuffixesFor = (fileName: string): ReadonlySet<string> => {
+							const cached = forcingSuffixesByFile.get(fileName);
+							if (cached) return cached;
+							const round = readRoundJson(ROUNDS_DIR, fileName);
+							const suffixes =
+								round === null
+									? FORCING_INDEX_SUFFIXES
+									: forcingReproducibleSuffixes(String(round.userPrompt ?? ""), Boolean(round.summary));
+							forcingSuffixesByFile.set(fileName, suffixes);
+							return suffixes;
+						};
 						const embedPlan = planStartupEmbedding(
 							backfill.recoveredFiles,
 							(fileName) => readRoundJson(ROUNDS_DIR, fileName) as { promptEmbedding?: unknown } | null,
+							buildCurrentModelRowPredicate(indexEntries, SEMBLR_CONFIG.embeddingModel, forcingSuffixesFor),
 						);
 						if (embedPlan.mode === "defer") {
 							ctx.ui.setStatus("semblr", startupEmbedStatusMessage(embedPlan));
@@ -1240,7 +1267,7 @@ export default function (pi: ExtensionAPI) {
 									// every append. Previously hasIndexRow re-read the full index
 									// file per recovered round (O(n × index size) — minutes of
 									// blocking startup work with a large index).
-									const indexedLabels = new Set(loadVectorIndex(INDEX_PATH).map((entry) => entry.filePath));
+									const indexedLabels = new Set(indexEntries.map((entry) => entry.filePath));
 									const embedResult = await embedRecoveredRounds(
 										backfill.recoveredFiles,
 										ROUNDS_DIR,
@@ -1270,6 +1297,14 @@ export default function (pi: ExtensionAPI) {
 											maxResponseBytes: EMBEDDING_RESPONSE_MAX_BYTES,
 											promptNoiseOptions: PROMPT_NOISE_CLEANUP,
 											promptMaxTokens: SEMBLR_CONFIG.embeddingMaxTokens,
+											// Issue #140 (D1): reuse the same current-model rows predicate as
+											// planStartupEmbedding above, so a round counted non-pending is not
+											// re-embedded by this pass (rows authoritative, marker derived).
+											hasCurrentModelRows: buildCurrentModelRowPredicate(
+												indexEntries,
+												SEMBLR_CONFIG.embeddingModel,
+												forcingSuffixesFor,
+											),
 										},
 									);
 									if (embedResult.embedded.length > 0) {

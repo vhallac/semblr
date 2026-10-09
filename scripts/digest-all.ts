@@ -23,12 +23,17 @@ import {
 	writeBm25Index,
 } from "../lib/bm25-index.ts";
 import { type EmbeddingModelRegistry, embedText } from "../lib/embed.ts";
-import { embedRound } from "../lib/embed-round.ts";
+import {
+	classifyRoundCoverage,
+	embedRound,
+	FORCING_INDEX_SUFFIXES,
+	forcingReproducibleSuffixes,
+} from "../lib/embed-round.ts";
 import {
 	appendVectorIndexEntry,
-	findStaleContentMatches as findStaleContentMatchesInDir,
-	loadIndexedRoundFiles,
-	loadRoundFilesWithDifferentModel,
+	buildStaleContentMatchMap,
+	indexRoundFileFromPath,
+	indexRowSuffix,
 	loadVectorIndex,
 	migrateIndexEntries as migrateIndexEntriesFile,
 	replaceIndexEntriesForRoundFile,
@@ -36,7 +41,7 @@ import {
 } from "../lib/index-io.ts";
 import { type ParsedPiRound, parsePiSessionJsonl } from "../lib/pi-session.ts";
 import { deriveRoundFile, embeddingMaxTokensToResponseBytes } from "../lib/round-capture.ts";
-import { buildCheckpointSummaryText, type CheckpointSummary } from "../lib/round-data.ts";
+import { buildCheckpointSummaryText, type CheckpointSummary, type RoundData } from "../lib/round-data.ts";
 import {
 	resolveScriptApiKey,
 	resolveScriptConfig,
@@ -53,6 +58,7 @@ import {
 	toolIndexPathForRoundsDir,
 	writeToolIndexRows,
 } from "../lib/search-tools.ts";
+import { extractCheckpointSummary } from "../lib/session-backfill.ts";
 
 // ─────────────────────────────────────────────
 // Config (matches digest-session.ts)
@@ -124,37 +130,98 @@ function gatherSessionFiles(
 // ─────────────────────────────────────────────
 
 /**
- * Write the `promptEmbedding` marker onto a round file that already has index
- * rows but no marker, without re-embedding. The value is the round's
- * `:response` index-row vector (see the call site for why the combined vector
- * is unavailable and why grouping is therefore unsupported for healed rounds).
+ * Outcome of trying to heal a `promptEmbedding` marker onto a round file that
+ * already has current-model index rows.
+ *
+ * - `healed`: a marker was written from the round's `:response` row (no call).
+ * - `already-marked`: the round already carries a marker — genuinely done.
+ * - `unhealable`: no `:response` row to reuse (or the file is unreadable), so
+ *   the marker cannot be synthesized without an API call. The sweep treats
+ *   this as a retrieval gap and re-embeds the round when a source exists
+ *   (F1, issue #140 decision D1/D2).
+ */
+type HealOutcome = "healed" | "already-marked" | "unhealable";
+
+/**
+ * Heal a marker-less round that already has current-model index rows, without
+ * re-embedding. The marker value is the round's `:response` index-row vector
+ * (see the call site for why the combined vector is unavailable and why
+ * grouping is therefore unsupported for healed rounds).
  *
  * Atomic tmp+rename, matching the extension's round-file write
  * (src/semblr.ts writeRoundEmbedding). Round files are the durable store; a
  * truncating write here could destroy a round that has no session JSONL left
- * to recover from. Returns true when a marker was written.
+ * to recover from.
  */
 function healMissingPromptEmbedding(
 	fileName: string,
 	roundsDir: string,
 	responseVectorByRoundFile: Map<string, number[]>,
 	f: typeof fs,
-): boolean {
+): HealOutcome {
 	const roundPath = path.join(roundsDir, fileName);
 	let round: Round;
 	try {
 		round = JSON.parse(f.readFileSync(roundPath, "utf-8")) as Round;
 	} catch {
-		return false;
+		return "unhealable";
 	}
-	if (round.promptEmbedding) return false;
+	if (round.promptEmbedding) return "already-marked";
 	const responseVec = responseVectorByRoundFile.get(fileName);
-	if (!responseVec) return false;
+	if (!responseVec) return "unhealable";
 	round.promptEmbedding = responseVec;
 	const tmpPath = `${roundPath}.tmp.${process.pid}`;
 	f.writeFileSync(tmpPath, JSON.stringify(round, null, 2));
 	f.renameSync(tmpPath, roundPath);
-	return true;
+	return "healed";
+}
+
+// ─────────────────────────────────────────────
+// F3 replace guard (issue #140, decision D3)
+// ─────────────────────────────────────────────
+
+/**
+ * Fallback forcing-suffix set for a round whose round file is
+ * missing/unreadable. `:prompt`/`:response` are the retrieval workhorses; the
+ * conservative fallback keeps such a round flagged (the sweep then reports it
+ * non-convergent, issue #140 D4) rather than silently converging it on a file
+ * we could not inspect. For a readable round the set is derived per round by
+ * `forcingReproducibleSuffixes` (lib/embed-round.ts) — `:prompt` counts only
+ * when the prompt survives the short-prompt drop (F1, PR !141 review).
+ * `:summary` is excluded from *forcing* a reindex: it is auxiliary and
+ * content-dependent, so a stale `:summary` row whose summary can no longer be
+ * derived would re-flag the round forever — the #140 D4 non-convergence. A
+ * reindex triggered by a forcing row still refreshes a reproduced `:summary`
+ * row (it is in the fresh `entries`). A row with any other suffix (a legacy
+ * `:round` or bare row) is never rewritten by a reindex and never forces one;
+ * it is preserved with its own model, because re-stamping it to the current
+ * model would relabel a vector computed by another model and the read path
+ * would score it against the current-model query vector — a cross-model cosine
+ * (zettel 7.3 forbids it).
+ */
+const REINDEXABLE_INDEX_SUFFIXES = FORCING_INDEX_SUFFIXES;
+
+/**
+ * Existing index rows for `roundFile` whose suffix is not reproduced by
+ * `entries`. A model-change reindex replaces every row for the round, so any
+ * suffix it does not reproduce (e.g. a `:summary` row whose source is gone)
+ * would be silently dropped. These are returned so the caller can report and
+ * preserve them (issue #140, decision D3: reproduce it or report it, never
+ * trade it away). Comparison is by suffix, so the old copies of reproduced
+ * suffixes are still replaced by their fresh rows.
+ */
+function findOrphanIndexEntries(
+	indexPath: string,
+	roundFile: string,
+	entries: VectorIndexEntry[],
+	f: typeof fs,
+): VectorIndexEntry[] {
+	const reproduced = new Set(entries.map((entry) => indexRowSuffix(entry.filePath)));
+	return loadVectorIndex(indexPath, f).filter(
+		(entry) =>
+			path.basename(indexRoundFileFromPath(entry.filePath)) === roundFile &&
+			!reproduced.has(indexRowSuffix(entry.filePath)),
+	);
 }
 
 // ─────────────────────────────────────────────
@@ -218,18 +285,77 @@ export async function runDigestAll(options: DigestAllOptions = {}): Promise<numb
 	// Ensure rounds dir
 	f.mkdirSync(roundsDir, { recursive: true });
 
-	// Load existing index dedup set and explicit model mismatches.
+	// Issue #139: parse index.csv exactly once per run and derive every
+	// index-level structure from that single pass — the dedup set, the
+	// model-mismatch set, and the F2 sweep-heal response-vector map. processRound
+	// used to re-read and re-parse index.csv twice per round (O(n²)); the
+	// in-memory sets it now consumes are seeded from this one load.
 	// Legacy two-column rows have no model and are treated as current per #62.
-	const existingRounds = loadIndexedRoundFiles(indexPath);
-	const modelMismatchedRounds = loadRoundFilesWithDifferentModel(indexPath, config.embeddingModel);
-	// One pass over the index for the F2 sweep heal below. A per-file scan would
-	// make the sweep O(n²); the response vector is the only index row a healed
-	// marker can reuse without an embedding call.
+	const indexEntries = loadVectorIndex(indexPath, f);
+	const existingRounds = new Set<string>();
+	const modelMismatchedRounds = new Set<string>();
+	// F1 (PR #141 review): a round needs a reindex only when its *reproducible*
+	// rows (`:prompt`/`:response`) are stale or absent; `:summary` staleness alone
+	// does not force one (see REINDEXABLE_INDEX_SUFFIXES). A mismatched
+	// non-reproducible row (a legacy `:round` or bare row) is never rewritten by a
+	// reindex, so it must not force one — otherwise the round is re-embedded on
+	// every run forever. Such a row is preserved with its own model instead of
+	// being re-stamped to the current model, because re-stamping would relabel a
+	// foreign-model vector and the read path would then score it against the
+	// current-model query vector (a cross-model cosine; zettel 7.3 forbids it). A
+	// round with no reproducible row at all (legacy `:round`-only) is still
+	// queued: it has no usable current-model row yet, so one reindex adds them and
+	// then converges.
+	const roundsWithReproducibleRow = new Set<string>();
+	const roundsWithStaleReproducibleRow = new Set<string>();
+	// A per-file scan would make the sweep O(n²); the response vector is the only
+	// index row a healed marker can reuse without an embedding call.
 	const responseVectorByRoundFile = new Map<string, number[]>();
-	for (const entry of loadVectorIndex(indexPath)) {
-		if (!entry.filePath.endsWith(":response")) continue;
-		const roundFile = path.basename(entry.filePath.slice(0, -":response".length));
-		if (!responseVectorByRoundFile.has(roundFile)) responseVectorByRoundFile.set(roundFile, entry.vector);
+	// F1 (PR !141 review): which suffixes can force a reindex depends on the
+	// round, not on a static set — a short prompt yields no `:prompt` row, so a
+	// stale `:prompt` row on such a round can never be replaced and must be
+	// treated as an orphan (see forcingReproducibleSuffixes). Derive the set per
+	// round from its round file. A missing/unreadable file keeps the conservative
+	// `:prompt`/`:response` set so the round stays flagged and the sweep can
+	// report it non-convergent (issue #140 D4) instead of silently converging.
+	// F2 (PR !141 review): the same derivation feeds the start-up coverage
+	// predicate, so the pending count and this sweep classify a round alike.
+	const reproducibleSuffixesByRoundFile = new Map<string, Set<string>>();
+	const readReproducibleSuffixes = (roundFile: string): Set<string> => {
+		const cached = reproducibleSuffixesByRoundFile.get(roundFile);
+		if (cached) return cached;
+		let suffixes: Set<string> = FORCING_INDEX_SUFFIXES as Set<string>;
+		try {
+			const data = JSON.parse(f.readFileSync(path.join(roundsDir, roundFile), "utf-8")) as RoundData;
+			suffixes = forcingReproducibleSuffixes(data.userPrompt ?? "", Boolean(data.summary));
+		} catch {
+			// Unreadable: keep the conservative default.
+		}
+		reproducibleSuffixesByRoundFile.set(roundFile, suffixes);
+		return suffixes;
+	};
+	const entriesByRoundFile = new Map<string, VectorIndexEntry[]>();
+	for (const entry of indexEntries) {
+		// indexRoundFileFromPath strips the :prompt/:response/:round/:summary suffix.
+		const roundFile = path.basename(indexRoundFileFromPath(entry.filePath));
+		existingRounds.add(roundFile);
+		const list = entriesByRoundFile.get(roundFile);
+		if (list) list.push(entry);
+		else entriesByRoundFile.set(roundFile, [entry]);
+		if (entry.filePath.endsWith(":response") && !responseVectorByRoundFile.has(roundFile)) {
+			responseVectorByRoundFile.set(roundFile, entry.vector);
+		}
+	}
+	for (const roundFile of existingRounds) {
+		const { hasReproducibleRow, hasStaleReproducibleRow, covered } = classifyRoundCoverage(
+			entriesByRoundFile.get(roundFile) ?? [],
+			config.embeddingModel,
+			readReproducibleSuffixes(roundFile),
+			indexRowSuffix,
+		);
+		if (hasReproducibleRow) roundsWithReproducibleRow.add(roundFile);
+		if (hasStaleReproducibleRow) roundsWithStaleReproducibleRow.add(roundFile);
+		if (!covered) modelMismatchedRounds.add(roundFile);
 	}
 	out.log(`📊 Already indexed: ${existingRounds.size} rounds`);
 	out.log(`📊 Model-mismatched rounds to re-index: ${modelMismatchedRounds.size}\n`);
@@ -263,18 +389,54 @@ export async function runDigestAll(options: DigestAllOptions = {}): Promise<numb
 	const queuedFiles = new Set(
 		allRounds.map((r) => deriveRoundFile(r.userPrompt, r.responseSequence, r.toolCalls).fileName),
 	);
+	// Issue #139: materialize stale-content matches once for the whole run.
+	// processRound used to call findStaleContentMatchesInDir per round, which
+	// re-scanned and JSON-parsed every round file on every iteration (O(store)
+	// per round → O(n²)). The map is built from a single pass over the same
+	// round-dir listing the sweep below walks; corrupt files are skipped exactly
+	// as in the per-call helper, which stays for direct callers.
+	const staleMatchesByTarget = buildStaleContentMatchMap(roundsDir, f);
+	// Issue #140 F1: when the sweep re-embeds a marker-less round with no
+	// `:response` row, a legacy file reachable only through a queued session
+	// round must not also be swept under its own (stale) name — the queued
+	// round's processRound migrates and deletes it, and a second enqueue would
+	// unlink an already-removed file. Skip any file listed as a stale match for
+	// a queued target; the target's migration is the single owner of that file.
+	const staleFilesForQueued = new Set<string>();
+	for (const target of queuedFiles) {
+		for (const stale of staleMatchesByTarget.get(target) ?? []) staleFilesForQueued.add(stale);
+	}
+	// Issue #139: hoist the derived-index state the per-round path used to reload.
+	// BM25 is loaded once here, upserted in memory inside processRound, and
+	// flushed exactly once after the batch (mirroring indexRecoveredRounds'
+	// flushBm25 seam, lib/session-backfill.ts). The tool-index and vector-index
+	// sets are seeded once and updated in memory as rows are appended/replaced,
+	// so processRound never re-parses index.csv or the tool index per round.
+	const bm25Index = loadBm25Index(bm25IndexPath, f);
+	const toolIndexPath = toolIndexPathForRoundsDir(roundsDir);
+	const toolIndexedRounds = loadToolIndexedRoundFiles(toolIndexPath, f);
+	// Seed the in-memory indexed/mismatched sets from the one index load and
+	// keep them current as rows are appended or replaced.
+	const indexedRounds = new Set(existingRounds);
+	const modelMismatched = new Set(modelMismatchedRounds);
 	let sweptTotal = 0;
 	let healedTotal = 0;
+	// Issue #140 (D4): rounds the sweep reaches but can never resolve into a
+	// round (unreadable JSON, or parseable-but-invalid fields). They are named
+	// here and reported as non-convergent in the run summary, so an unresolvable
+	// round is visible to the operator instead of silently dropped from the
+	// count — the observable proof of convergence is that a second run names
+	// nothing and spends no embedding call.
+	const nonConvergent: string[] = [];
 	if (f.existsSync(roundsDir)) {
 		for (const fileName of f.readdirSync(roundsDir)) {
 			if (!fileName.endsWith(".json") || fileName.startsWith("index")) continue;
 			if (queuedFiles.has(fileName)) continue;
+			if (staleFilesForQueued.has(fileName)) continue;
 			if (existingRounds.has(fileName) && !modelMismatchedRounds.has(fileName)) {
 				// F2 (PR #134 review, option b): a round that already has current-model
 				// index rows may still lack the `promptEmbedding` marker (e.g. rows
-				// survive while the round file was rewritten). The startup pending
-				// counter keys on the marker, so `just index` must heal it here — or the
-				// count names work this run cannot do. Healing reuses the round's
+				// survive while the round file was rewritten). Healing reuses the round's
 				// `:response` index-row vector instead of re-embedding: the live
 				// combined `concat(prompt, response)` vector is not stored in the index
 				// and cannot be reconstructed without an API call. The response-side
@@ -284,16 +446,34 @@ export async function runDigestAll(options: DigestAllOptions = {}): Promise<numb
 				// cannot support topic grouping (src/semblr.ts keys grouping on
 				// promptEmbedding), because grouping needs the combined vector. This is
 				// accepted for historical rounds — a migration can restore the combined
-				// vector if grouping is ever built. Rounds with no `:response` row are
-				// left marker-less (still truthfully pending).
-				healMissingPromptEmbedding(fileName, roundsDir, responseVectorByRoundFile, f) && healedTotal++;
-				continue;
+				// vector if grouping is ever built.
+				//
+				// F1 (issue #140, decision D1/D2): a round with current-model rows but no
+				// `:response` row cannot be healed without an API call. Because rows are
+				// the retrieval truth (D1), such a round is a genuine retrieval gap and
+				// the sweep re-embeds it from the round file (the source is in hand)
+				// rather than leaving it silently marker-less. The round is forced into
+				// the reindex path below — removed from the current-model set and added
+				// to the mismatched set — so processRound performs a full row replace
+				// and writes rows+marker together, restoring convergence.
+				const healOutcome = healMissingPromptEmbedding(fileName, roundsDir, responseVectorByRoundFile, f);
+				if (healOutcome === "healed") {
+					healedTotal++;
+					continue;
+				}
+				if (healOutcome === "already-marked") {
+					// Marker present and rows current — genuinely done, no work.
+					continue;
+				}
+				indexedRounds.delete(fileName);
+				modelMismatched.add(fileName);
 			}
 			let round: Round;
 			try {
 				round = JSON.parse(f.readFileSync(path.join(roundsDir, fileName), "utf-8")) as Round;
 			} catch {
 				err.error(`  ⚠️  Skipping unreadable round file: ${fileName}`);
+				nonConvergent.push(fileName);
 				continue;
 			}
 			// F5 (PR #134 review): parseable-but-incomplete rounds would throw in
@@ -314,6 +494,7 @@ export async function runDigestAll(options: DigestAllOptions = {}): Promise<numb
 				!round.toolCalls.every((tc) => tc !== null && typeof tc === "object")
 			) {
 				err.error(`  ⚠️  Skipping invalid round file: ${fileName}`);
+				nonConvergent.push(fileName);
 				continue;
 			}
 			allRounds.push({ ...round, sessionLabel: "<rounds-dir>" });
@@ -325,6 +506,18 @@ export async function runDigestAll(options: DigestAllOptions = {}): Promise<numb
 	out.log(
 		`📊 New rounds to embed: ${totalNew} (${skippedTotal} already indexed, ${sweptTotal} swept from rounds dir${healedTotal > 0 ? `, ${healedTotal} markers healed` : ""})\n`,
 	);
+
+	// Issue #140 (D4): name every round the sweep could not resolve. A round is
+	// non-convergent when no run can turn it into an embedded round (unreadable
+	// or invalid round file) — the operator must see it rather than infer it from
+	// a count that never reaches zero. Silent when the store converges.
+	if (nonConvergent.length > 0) {
+		out.log(
+			`⚠️  ${nonConvergent.length} non-convergent round${nonConvergent.length === 1 ? "" : "s"} — cannot be embedded:\n`,
+		);
+		for (const fileName of nonConvergent) out.log(`   • ${fileName}`);
+		out.log("");
+	}
 
 	if (totalNew === 0) {
 		out.log("✨ Nothing to do — all sessions already indexed!");
@@ -340,11 +533,18 @@ export async function runDigestAll(options: DigestAllOptions = {}): Promise<numb
 		const roundId = `${round.sessionLabel}/${roundFile}`;
 
 		// Check for stale files whose stored full hash material belongs under this
-		// content-hash filename. If found, migrate old index entries before deleting
-		// old files so the round remains retrievable even if embedding is unavailable.
-		const staleFiles = findStaleContentMatchesInDir(roundsDir, roundFile);
+		// content-hash filename. Issue #139: the stale-match map is built once for
+		// the whole run (buildStaleContentMatchMap above), so this is a map lookup
+		// instead of a per-round full-store scan. If found, migrate old index
+		// entries before deleting old files so the round remains retrievable even
+		// if embedding is unavailable.
+		const staleFiles = staleMatchesByTarget.get(roundFile) ?? [];
 		for (const staleFile of staleFiles) {
 			migrateIndexEntriesFile(indexPath, staleFile, roundFile);
+			// Mirror the on-disk migration in the in-memory dedup sets: the stale
+			// filename's rows now belong to roundFile.
+			if (indexedRounds.delete(staleFile)) indexedRounds.add(roundFile);
+			if (modelMismatched.delete(staleFile)) modelMismatched.add(roundFile);
 		}
 
 		// Write round file before deleting stale copies. Atomic tmp+rename (F4, PR
@@ -356,35 +556,34 @@ export async function runDigestAll(options: DigestAllOptions = {}): Promise<numb
 		const roundTmpPath = `${roundPath}.tmp.${process.pid}`;
 		f.writeFileSync(roundTmpPath, JSON.stringify(round, null, 2));
 		f.renameSync(roundTmpPath, roundPath);
-		const bm25Index = loadBm25Index(bm25IndexPath, f);
+		// Issue #139: BM25 is loaded once at run start and mutated in memory here;
+		// the file is flushed exactly once after the batch (below), mirroring the
+		// flushBm25 seam of indexRecoveredRounds (lib/session-backfill.ts).
 		upsertBm25Round(bm25Index, roundFile, roundTextForBm25(round));
 		for (const staleFile of staleFiles) {
 			deleteBm25Round(bm25Index, staleFile);
 		}
-		writeBm25Index(bm25IndexPath, bm25Index, f);
 		for (const staleFile of staleFiles) {
 			f.unlinkSync(path.join(roundsDir, staleFile));
 			err.error(`  ♻️  Migrated stale: ${staleFile} → ${roundFile}`);
 		}
 
 		// Tool-call fulltext index — independent of embedding, so re-run it even if
-		// this round only needs re-embedding due to a model change.
-		if (round.toolCalls.length > 0) {
-			const toolIndexPath = toolIndexPathForRoundsDir(roundsDir);
-			const alreadyToolIndexed = loadToolIndexedRoundFiles(toolIndexPath, f);
-			if (!alreadyToolIndexed.has(roundFile)) {
-				appendToolIndexRows(toolIndexPath, roundsDir, buildToolIndexRows(roundFile, round.toolCalls), {
-					fsImpl: f,
-				});
-			}
+		// this round only needs re-embedding due to a model change. Issue #139: the
+		// indexed set is loaded once at run start and updated in memory here.
+		if (round.toolCalls.length > 0 && !toolIndexedRounds.has(roundFile)) {
+			appendToolIndexRows(toolIndexPath, roundsDir, buildToolIndexRows(roundFile, round.toolCalls), {
+				fsImpl: f,
+			});
+			toolIndexedRounds.add(roundFile);
 		}
 
-		// Skip embedding if already indexed under the correct hash and current model
-		// (must reload after potential migrations above).
-		const indexedAfterCleanup = loadIndexedRoundFiles(indexPath);
-		const modelMismatchedAfterCleanup = loadRoundFilesWithDifferentModel(indexPath, config.embeddingModel);
-		const needsModelReindex = modelMismatchedAfterCleanup.has(roundFile);
-		if (indexedAfterCleanup.has(roundFile) && !needsModelReindex) {
+		// Skip embedding if already indexed under the correct hash and current model.
+		// Issue #139: indexedRounds/modelMismatched are kept current in memory (seeded
+		// from the one index load, updated on migration above and on row writes below),
+		// so this no longer re-parses index.csv per round.
+		const needsModelReindex = modelMismatched.has(roundFile);
+		if (indexedRounds.has(roundFile) && !needsModelReindex) {
 			completed++;
 			err.error(`  ⏭  [${completed}/${totalNew}] ${roundId} (already indexed)`);
 			return;
@@ -398,13 +597,22 @@ export async function runDigestAll(options: DigestAllOptions = {}): Promise<numb
 			// and the promptEmbedding write are parity by construction. Index rows are
 			// buffered here and flushed once the embed resolves (below): full replace on
 			// model re-index, append otherwise.
+			//
+			// F3 (issue #140, decision D3): a session-scanned round carries no `summary`
+			// field (ParsedPiRound has none), so before this fix a model-change reindex
+			// of a checkpointed round reproduced prompt+response but not `:summary`,
+			// silently dropping a row the live/offline-embed path writes. Recover the
+			// summary from the round's semblr_checkpoint tool call exactly as the
+			// startup recovery path does (lib/session-backfill.ts
+			// extractCheckpointSummary), so reindex reproduces the same rows.
+			const summary = round.summary ?? extractCheckpointSummary(round.toolCalls) ?? undefined;
 			const entries: VectorIndexEntry[] = [];
 			await embedRound(
 				{
 					fileName: roundFile,
 					userPrompt: round.userPrompt,
 					responseText: round.responseSequence,
-					checkpointSummaryText: round.summary ? buildCheckpointSummaryText(round.summary) : null,
+					checkpointSummaryText: summary ? buildCheckpointSummaryText(summary) : null,
 					maxResponseBytes: embeddingMaxTokensToResponseBytes(config.embeddingMaxTokens),
 					promptNoiseOptions: {
 						fenceMaxChars: config.promptNoiseFenceMaxChars,
@@ -441,12 +649,34 @@ export async function runDigestAll(options: DigestAllOptions = {}): Promise<numb
 			);
 
 			if (needsModelReindex) {
-				replaceIndexEntriesForRoundFile(indexPath, roundFile, entries);
+				// F3 (issue #140, decision D3): the full replace must never silently
+				// drop a row this reindex did not reproduce. A suffix present on disk
+				// but absent from `entries` (e.g. a `:summary` row whose source is gone)
+				// is reported and preserved rather than traded away. Reproduced suffixes
+				// (`:prompt`/`:response`/`:summary` when derived) are still replaced by
+				// their fresh rows; only orphan suffixes are kept.
+				//
+				// F1 (PR #141 review): a preserved orphan keeps its own `model` (and its
+				// `embeddingInputHash`, if any). Its vector was computed by another model,
+				// so re-stamping the row to the current model would make the read path
+				// score it against the current-model query vector — a cross-model cosine
+				// (zettel 7.3). Convergence comes from the mismatch predicate ignoring
+				// non-reproducible suffixes (REINDEXABLE_INDEX_SUFFIXES), not from
+				// relabelling a foreign vector.
+				const orphanEntries = findOrphanIndexEntries(indexPath, roundFile, entries, f);
+				for (const orphan of orphanEntries) {
+					err.error(`  ⚠️  Preserving non-reproduced index row: ${orphan.filePath}`);
+				}
+				replaceIndexEntriesForRoundFile(indexPath, roundFile, [...entries, ...orphanEntries]);
+				modelMismatched.delete(roundFile);
 			} else {
 				for (const entry of entries) {
 					appendVectorIndexEntry(indexPath, entry.vector, entry.filePath, entry.model, entry.embeddingInputHash);
 				}
 			}
+			// The round now has current-model rows; keep the in-memory dedup sets
+			// consistent with the on-disk write above.
+			indexedRounds.add(roundFile);
 
 			completed++;
 			const pct = ((completed / totalNew) * 100).toFixed(1);
@@ -476,6 +706,12 @@ export async function runDigestAll(options: DigestAllOptions = {}): Promise<numb
 	const startTime = Date.now();
 	await Promise.all(workers);
 	const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
+
+	// Issue #139: flush the in-memory BM25 index once for the whole batch,
+	// mirroring the flushBm25 seam of indexRecoveredRounds (lib/session-backfill.ts).
+	// A crash before this write self-heals on the next run: the load path is
+	// non-writing (PR #138) and round files are the source of truth.
+	writeBm25Index(bm25IndexPath, bm25Index, f);
 
 	const finalCount = f.existsSync(indexPath)
 		? f.readFileSync(indexPath, "utf-8").trim().split("\n").filter(Boolean).length

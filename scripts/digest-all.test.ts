@@ -2,10 +2,12 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { describe, expect, it, vi } from "vitest";
+import { bm25IndexPathForRoundsDir } from "../lib/bm25-index.ts";
 import { computeContentHash } from "../lib/hash.ts";
 import { encodeVectorIndexLine, loadVectorIndex, readIndexLines } from "../lib/index-io.ts";
 import { hashEmbeddingInput } from "../lib/round-capture.ts";
 import { loadToolIndex, toolIndexPathForRoundsDir } from "../lib/search-tools.ts";
+import { SEMBLR_CONFIG_DEFAULTS } from "../lib/semblr-config.ts";
 import { embedRecoveredRounds } from "../lib/session-backfill.ts";
 import { isMainModule, runDigestAll } from "./digest-all.ts";
 
@@ -14,6 +16,10 @@ import { isMainModule, runDigestAll } from "./digest-all.ts";
 // below target clip, row, and marker mechanics, so keep fixture prompts
 // embeddable unless a test opts into the documented default threshold.
 process.env.RELEVANCE_LIST_MIN_WORDS = "1";
+
+// The model a reindex stamps onto fresh rows (and, after the F1 fix, onto a
+// preserved orphan row) when no explicit model is configured.
+const DEBUG_EMBEDDING_MODEL = SEMBLR_CONFIG_DEFAULTS.embeddingModel;
 
 function tmpDir(): string {
 	return fs.mkdtempSync(path.join(os.tmpdir(), "semblr-digest-all-test-"));
@@ -31,12 +37,19 @@ function logger() {
 }
 
 /**
- * Real filesystem with `writeFileSync`/`renameSync` recorded, so a test can
- * assert write ordering/atomicity while every other call passes through.
+ * Real filesystem with `writeFileSync`/`renameSync`/`readFileSync` recorded, so
+ * a test can assert write ordering/atomicity and whole-store read counts while
+ * every other call passes through.
  */
-function spyFs(): { fsImpl: typeof fs; writes: string[]; renames: Array<[string, string]> } {
+function spyFs(): {
+	fsImpl: typeof fs;
+	writes: string[];
+	renames: Array<[string, string]>;
+	reads: string[];
+} {
 	const writes: string[] = [];
 	const renames: Array<[string, string]> = [];
+	const reads: string[] = [];
 	const fsImpl = {
 		...fs,
 		writeFileSync: ((p: fs.PathLike, data: unknown, opts?: unknown) => {
@@ -47,8 +60,12 @@ function spyFs(): { fsImpl: typeof fs; writes: string[]; renames: Array<[string,
 			renames.push([String(from), String(to)]);
 			return fs.renameSync(from, to);
 		}) as typeof fs.renameSync,
+		readFileSync: ((p: fs.PathLike, opts?: unknown) => {
+			reads.push(String(p));
+			return (fs.readFileSync as (...a: unknown[]) => unknown)(p, opts);
+		}) as typeof fs.readFileSync,
 	} as typeof fs;
-	return { fsImpl, writes, renames };
+	return { fsImpl, writes, renames, reads };
 }
 
 function line(value: unknown): string {
@@ -76,6 +93,52 @@ function writeSession(filePath: string, pairs: Array<{ userPrompt: string; respo
 			},
 		});
 	}
+	fs.writeFileSync(filePath, entries.map(line).join("\n"));
+}
+
+/**
+ * Write a pi-style session JSONL whose single round ends with a
+ * `semblr_checkpoint` tool call carrying `summary` and the accepted-result
+ * text the extractor keys on. Mirrors the live capture shape
+ * (src/semblr.ts) so `extractCheckpointSummary` recovers it.
+ */
+function writeSessionWithCheckpoint(
+	filePath: string,
+	userPrompt: string,
+	responseSequence: string,
+	summary: Record<string, unknown>,
+): void {
+	const entries: unknown[] = [
+		{ type: "message", id: "u0", message: { role: "user", content: [{ type: "text", text: userPrompt }] } },
+		{
+			type: "message",
+			id: "a0",
+			message: {
+				role: "assistant",
+				content: [{ type: "toolCall", id: "t1", name: "semblr_checkpoint", arguments: summary }],
+			},
+		},
+		{
+			type: "message",
+			id: "r0",
+			message: {
+				role: "toolResult",
+				toolName: "semblr_checkpoint",
+				toolCallId: "t1",
+				content: [
+					{
+						type: "text",
+						text: "Checkpoint recorded. Your progress summary has been saved. You may now stop — do not start new work.",
+					},
+				],
+			},
+		},
+		{
+			type: "message",
+			id: "a1",
+			message: { role: "assistant", content: [{ type: "text", text: responseSequence }] },
+		},
+	];
 	fs.writeFileSync(filePath, entries.map(line).join("\n"));
 }
 
@@ -306,7 +369,10 @@ describe("digest-all script", () => {
 			path.join(roundsDir, roundFile),
 			JSON.stringify({ userPrompt, responseSequence, toolCalls: [] }),
 		);
-		fs.writeFileSync(indexPath, `${encodeVectorIndexLine([1], `${roundFile}:prompt`)}\n`);
+		fs.writeFileSync(
+			indexPath,
+			`${encodeVectorIndexLine([1], `${roundFile}:prompt`)}\n${encodeVectorIndexLine([2], `${roundFile}:response`)}\n`,
+		);
 
 		const logs = logger();
 		const fetchImpl = vi.fn(async () => new Response("should not be called")) as typeof fetch;
@@ -323,12 +389,14 @@ describe("digest-all script", () => {
 			}),
 		).resolves.toBe(0);
 
+		// Legacy rows count as current-model, so the round is healed from its
+		// `:response` row (no API call) and its rows are untouched.
 		expect(fetchImpl).not.toHaveBeenCalled();
-		expect(readIndexLines(indexPath)).toEqual([encodeVectorIndexLine([1], `${roundFile}:prompt`)]);
+		expect(readIndexLines(indexPath)).toEqual([
+			encodeVectorIndexLine([1], `${roundFile}:prompt`),
+			encodeVectorIndexLine([2], `${roundFile}:response`),
+		]);
 		expect(logs.stdout.join("\n")).toContain("📊 Model-mismatched rounds to re-index: 0");
-		expect(logs.stdout.join("\n")).toContain(
-			"📊 New rounds to embed: 0 (1 already indexed, 0 swept from rounds dir)",
-		);
 	});
 
 	it("re-indexes rounds whose index rows were generated with a different explicit model", async () => {
@@ -397,6 +465,486 @@ describe("digest-all script", () => {
 			},
 			{ vector: [0, 1], filePath: `${roundFile}:response`, model: "openai/text-embedding-3-small" },
 		]);
+	});
+
+	it("a model-change reindex reproduces the :summary row derived from a session checkpoint call (F3)", async () => {
+		const root = tmpDir();
+		const sessionsDir = path.join(root, "sessions");
+		const sDir = path.join(sessionsDir, "--test");
+		fs.mkdirSync(sDir, { recursive: true });
+		const roundsDir = path.join(root, "rounds");
+		fs.mkdirSync(roundsDir, { recursive: true });
+		const indexPath = path.join(roundsDir, "index.csv");
+		const userPrompt = "What is the checkpoint state right now?";
+		const responseSequence = "Checkpoint saved with the mid-task state.";
+		const summary = {
+			currentTask: "F3 parity",
+			progressMade: ["derived summary"],
+			currentState: ["mid"],
+			nextSteps: ["guard"],
+			keyFindings: ["rows matter"],
+		};
+		const roundFile = `${computeContentHash(userPrompt, responseSequence, [
+			{
+				arguments: JSON.stringify(summary),
+				result_summary:
+					"Checkpoint recorded. Your progress summary has been saved. You may now stop — do not start new work.",
+			},
+		])}.json`;
+
+		writeSessionWithCheckpoint(path.join(sDir, "session.jsonl"), userPrompt, responseSequence, summary);
+		// Old-model rows for prompt+response+summary: the reindex must reproduce all
+		// three from the session, not just prompt+response.
+		fs.writeFileSync(
+			indexPath,
+			`${[
+				encodeVectorIndexLine([1], `${roundFile}:prompt`, "old-model"),
+				encodeVectorIndexLine([2], `${roundFile}:response`, "old-model"),
+				encodeVectorIndexLine([3], `${roundFile}:summary`, "old-model"),
+			].join("\n")}\n`,
+		);
+
+		const requests: unknown[] = [];
+		await expect(
+			runDigestAll({
+				sessionsDir,
+				roundsDir,
+				indexPath,
+				apiKey: "key",
+				fetchImpl: embeddingFetch(
+					[
+						[3, 4],
+						[0, 5],
+						[6, 7],
+						[8, 9],
+					],
+					requests,
+				),
+				stdout: logger().out,
+			}),
+		).resolves.toBe(0);
+
+		// The summary row is present and carries the derived checkpoint text.
+		const rows = loadVectorIndex(indexPath);
+		expect(rows.map((e) => e.filePath)).toEqual([
+			`${roundFile}:prompt`,
+			`${roundFile}:response`,
+			`${roundFile}:summary`,
+		]);
+		const summaryRequest = (requests as Array<{ body: { input: string } }>).find((r) =>
+			r.body.input.includes("F3 parity"),
+		);
+		expect(summaryRequest).toBeDefined();
+	});
+
+	it("a model-change reindex of a session round with no checkpoint call emits no :summary row (F3)", async () => {
+		const root = tmpDir();
+		const sessionsDir = path.join(root, "sessions");
+		const sDir = path.join(sessionsDir, "--test");
+		fs.mkdirSync(sDir, { recursive: true });
+		const roundsDir = path.join(root, "rounds");
+		fs.mkdirSync(roundsDir, { recursive: true });
+		const indexPath = path.join(roundsDir, "index.csv");
+		const userPrompt = "No checkpoint here, just a plain round?";
+		const responseSequence = "A plain answer without any checkpoint call.";
+		const roundFile = `${computeContentHash(userPrompt, responseSequence, [])}.json`;
+
+		writeSession(path.join(sDir, "session.jsonl"), [{ userPrompt, responseSequence }]);
+		fs.writeFileSync(
+			indexPath,
+			`${[
+				encodeVectorIndexLine([1], `${roundFile}:prompt`, "old-model"),
+				encodeVectorIndexLine([2], `${roundFile}:response`, "old-model"),
+			].join("\n")}\n`,
+		);
+
+		await expect(
+			runDigestAll({
+				sessionsDir,
+				roundsDir,
+				indexPath,
+				apiKey: "key",
+				fetchImpl: embeddingFetch([
+					[3, 4],
+					[0, 5],
+					[6, 7],
+				]),
+				stdout: logger().out,
+			}),
+		).resolves.toBe(0);
+
+		const rows = loadVectorIndex(indexPath);
+		expect(rows.map((e) => e.filePath)).toEqual([`${roundFile}:prompt`, `${roundFile}:response`]);
+	});
+
+	it("a model-change reindex preserves an index row it did not reproduce (F3 guard)", async () => {
+		const root = tmpDir();
+		const sessionsDir = path.join(root, "sessions");
+		const sDir = path.join(sessionsDir, "--test");
+		fs.mkdirSync(sDir, { recursive: true });
+		const roundsDir = path.join(root, "rounds");
+		fs.mkdirSync(roundsDir, { recursive: true });
+		const indexPath = path.join(roundsDir, "index.csv");
+		const userPrompt = "Does the reindex silently drop my orphan row?";
+		const responseSequence = "It must be reported and preserved.";
+		const roundFile = `${computeContentHash(userPrompt, responseSequence, [])}.json`;
+
+		writeSession(path.join(sDir, "session.jsonl"), [{ userPrompt, responseSequence }]);
+		// A `:round` row exists on disk with no source to reproduce it from (the
+		// round file carries no such field and there is no checkpoint call).
+		fs.writeFileSync(
+			indexPath,
+			`${[
+				encodeVectorIndexLine([1], `${roundFile}:prompt`, "old-model"),
+				encodeVectorIndexLine([2], `${roundFile}:response`, "old-model"),
+				encodeVectorIndexLine([7, 7], `${roundFile}:round`, "old-model"),
+			].join("\n")}\n`,
+		);
+
+		const logs = logger();
+		const requests: unknown[] = [];
+		await expect(
+			runDigestAll({
+				sessionsDir,
+				roundsDir,
+				indexPath,
+				apiKey: "key",
+				fetchImpl: embeddingFetch(
+					[
+						[3, 4],
+						[0, 5],
+						[6, 7],
+					],
+					requests,
+				),
+				stdout: logs.out,
+				stderr: logs.err,
+			}),
+		).resolves.toBe(0);
+
+		const rows = loadVectorIndex(indexPath);
+		// prompt+response are replaced with current-model rows; the orphan `:round`
+		// row survives.
+		expect(rows.map((e) => e.filePath)).toEqual([
+			`${roundFile}:prompt`,
+			`${roundFile}:response`,
+			`${roundFile}:round`,
+		]);
+		expect(rows.find((e) => e.filePath === `${roundFile}:round`)?.vector).toEqual([7, 7]);
+		expect(logs.stderr.join("\n")).toContain(`Preserving non-reproduced index row: ${roundFile}:round`);
+
+		// F1 (PR #141 review): the preserved orphan keeps its own model — its vector
+		// was computed by another model, and re-stamping it to the current model
+		// would score a foreign-space vector against the current-model query vector
+		// (a cross-model cosine). Convergence instead comes from the mismatch
+		// predicate ignoring the non-reproducible `:round` suffix: a second run must
+		// resolve and spend zero embedding calls without relabelling the row.
+		expect(rows.find((e) => e.filePath === `${roundFile}:round`)?.model).toBe("old-model");
+		const firstRunCalls = requests.length;
+		const secondLogs = logger();
+		await expect(
+			runDigestAll({
+				sessionsDir,
+				roundsDir,
+				indexPath,
+				apiKey: "key",
+				fetchImpl: embeddingFetch([], requests),
+				stdout: secondLogs.out,
+				stderr: secondLogs.err,
+			}),
+		).resolves.toBe(0);
+		expect(requests.length).toBe(firstRunCalls);
+		expect(secondLogs.stderr.join("\n")).not.toContain("Model-mismatched rounds to re-index: 1");
+		const rowsAfterSecondRun = loadVectorIndex(indexPath);
+		expect(rowsAfterSecondRun.map((e) => e.filePath)).toEqual(rows.map((e) => e.filePath));
+		for (const row of rowsAfterSecondRun.filter((e) => !e.filePath.endsWith(":round"))) {
+			expect(row.model).toBe(DEBUG_EMBEDDING_MODEL);
+		}
+		expect(rowsAfterSecondRun.find((e) => e.filePath.endsWith(":round"))?.model).toBe("old-model");
+	});
+
+	it("a model-change reindex still rewrites a mismatched reproducible row", async () => {
+		// Guard for the F1 fix: excluding non-reproducible suffixes from the mismatch
+		// predicate must not exclude reproducible ones. A stale `:prompt` row is
+		// reproducible, so its round is re-embedded and the row replaced.
+		const root = tmpDir();
+		const sessionsDir = path.join(root, "sessions");
+		const sDir = path.join(sessionsDir, "--test");
+		fs.mkdirSync(sDir, { recursive: true });
+		const roundsDir = path.join(root, "rounds");
+		fs.mkdirSync(roundsDir, { recursive: true });
+		const indexPath = path.join(roundsDir, "index.csv");
+		const userPrompt = "Does a stale reproducible row still converge?";
+		const responseSequence = "It must be re-embedded under the current model.";
+		const roundFile = `${computeContentHash(userPrompt, responseSequence, [])}.json`;
+
+		writeSession(path.join(sDir, "session.jsonl"), [{ userPrompt, responseSequence }]);
+		fs.writeFileSync(indexPath, `${[encodeVectorIndexLine([1], `${roundFile}:prompt`, "old-model")].join("\n")}\n`);
+
+		const logs = logger();
+		const requests: unknown[] = [];
+		await expect(
+			runDigestAll({
+				sessionsDir,
+				roundsDir,
+				indexPath,
+				apiKey: "key",
+				fetchImpl: embeddingFetch(
+					[
+						[3, 4],
+						[0, 5],
+					],
+					requests,
+				),
+				stdout: logs.out,
+				stderr: logs.err,
+			}),
+		).resolves.toBe(0);
+
+		const rows = loadVectorIndex(indexPath);
+		expect(rows.find((e) => e.filePath === `${roundFile}:prompt`)?.model).toBe(DEBUG_EMBEDDING_MODEL);
+		for (const row of rows) {
+			expect(row.model).toBe(DEBUG_EMBEDDING_MODEL);
+		}
+	});
+
+	it("a legacy :round-only round is reindexed once and then converges", async () => {
+		// F1 (PR #141 review), case 2: a round whose only row is a non-reproducible
+		// legacy `:round` row has no current-model reproducible row, so it must be
+		// reindexed once to gain `:prompt`/`:response`. The preserved `:round` orphan
+		// then keeps its own model, and the round must not be reindexed again.
+		const root = tmpDir();
+		const sessionsDir = path.join(root, "sessions");
+		const sDir = path.join(sessionsDir, "--test");
+		fs.mkdirSync(sDir, { recursive: true });
+		const roundsDir = path.join(root, "rounds");
+		fs.mkdirSync(roundsDir, { recursive: true });
+		const indexPath = path.join(roundsDir, "index.csv");
+		const userPrompt = "Only a legacy combined row exists for this round, with plenty of words to keep the prompt.";
+		const responseSequence = "It must gain current-model rows and then stop being reindexed.";
+		const roundFile = `${computeContentHash(userPrompt, responseSequence, [])}.json`;
+
+		writeSession(path.join(sDir, "session.jsonl"), [{ userPrompt, responseSequence }]);
+		fs.writeFileSync(indexPath, `${[encodeVectorIndexLine([7, 7], `${roundFile}:round`, "old-model")].join("\n")}\n`);
+
+		const logs = logger();
+		const requests: unknown[] = [];
+		await expect(
+			runDigestAll({
+				sessionsDir,
+				roundsDir,
+				indexPath,
+				apiKey: "key",
+				fetchImpl: embeddingFetch(
+					[
+						[3, 4],
+						[0, 5],
+						[6, 8],
+					],
+					requests,
+				),
+				stdout: logs.out,
+				stderr: logs.err,
+			}),
+		).resolves.toBe(0);
+
+		const rows = loadVectorIndex(indexPath);
+		expect(rows.map((e) => e.filePath).sort()).toEqual(
+			[`${roundFile}:prompt`, `${roundFile}:response`, `${roundFile}:round`].sort(),
+		);
+		expect(rows.find((e) => e.filePath === `${roundFile}:round`)?.model).toBe("old-model");
+		expect(rows.find((e) => e.filePath === `${roundFile}:prompt`)?.model).toBe(DEBUG_EMBEDDING_MODEL);
+
+		const firstRunCalls = requests.length;
+		const secondLogs = logger();
+		await expect(
+			runDigestAll({
+				sessionsDir,
+				roundsDir,
+				indexPath,
+				apiKey: "key",
+				fetchImpl: embeddingFetch([], requests),
+				stdout: secondLogs.out,
+				stderr: secondLogs.err,
+			}),
+		).resolves.toBe(0);
+		expect(requests.length).toBe(firstRunCalls);
+		expect(secondLogs.stderr.join("\n")).not.toContain("Model-mismatched rounds to re-index: 1");
+	});
+
+	it("a stale :prompt row on a short-prompt round is an orphan and converges", async () => {
+		// F1 (PR !141 review): a short prompt reproduces no `:prompt` row
+		// (lib/embed-round.ts short-prompt drop), so an old-model `:prompt` row on
+		// such a round can never be replaced by a reindex. It must be treated as a
+		// non-reproducible orphan: the round is reindexed once for its stale
+		// `:response` row, the preserved `:prompt` orphan keeps its own model, and a
+		// second run must resolve and spend zero embedding calls.
+		const prevMinWords = process.env.RELEVANCE_LIST_MIN_WORDS;
+		process.env.RELEVANCE_LIST_MIN_WORDS = "20"; // the documented default threshold
+		try {
+			const root = tmpDir();
+			const sessionsDir = tmpDir(); // sweep-only
+			const roundsDir = path.join(root, "rounds");
+			fs.mkdirSync(roundsDir, { recursive: true });
+			const indexPath = path.join(roundsDir, "index.csv");
+			const userPrompt = "What was recovered?"; // 3 words — under the threshold
+			const responseSequence = "Short prompts never carry prompt-side embeddings on the live path.";
+			const roundFile = `${computeContentHash(userPrompt, responseSequence, [])}.json`;
+			fs.writeFileSync(
+				path.join(roundsDir, roundFile),
+				JSON.stringify({ userPrompt, responseSequence, toolCalls: [] }),
+			);
+			fs.writeFileSync(
+				indexPath,
+				`${[
+					encodeVectorIndexLine([1], `${roundFile}:prompt`, "old-model"),
+					encodeVectorIndexLine([2], `${roundFile}:response`, "old-model"),
+				].join("\n")}\n`,
+			);
+
+			const requests: unknown[] = [];
+			const logs = logger();
+			await expect(
+				runDigestAll({
+					sessionsDir,
+					roundsDir,
+					indexPath,
+					apiKey: "key",
+					fetchImpl: embeddingFetch([[9, 9]], requests),
+					stdout: logs.out,
+					stderr: logs.err,
+				}),
+			).resolves.toBe(0);
+
+			const rows = loadVectorIndex(indexPath);
+			// The stale `:response` is replaced; the unreproducible `:prompt` orphan is
+			// preserved with its own model (never re-stamped — cross-model cosine).
+			expect(rows.find((e) => e.filePath === `${roundFile}:response`)?.model).toBe(DEBUG_EMBEDDING_MODEL);
+			expect(rows.find((e) => e.filePath === `${roundFile}:prompt`)?.model).toBe("old-model");
+
+			const firstRunCalls = requests.length;
+			const secondLogs = logger();
+			await expect(
+				runDigestAll({
+					sessionsDir,
+					roundsDir,
+					indexPath,
+					apiKey: "key",
+					fetchImpl: embeddingFetch([], requests),
+					stdout: secondLogs.out,
+					stderr: secondLogs.err,
+				}),
+			).resolves.toBe(0);
+			expect(requests.length).toBe(firstRunCalls);
+			expect(secondLogs.stderr.join("\n")).not.toContain("Model-mismatched rounds to re-index: 1");
+			expect(secondLogs.stdout.join("\n")).toContain("Model-mismatched rounds to re-index: 0");
+		} finally {
+			if (prevMinWords === undefined) delete process.env.RELEVANCE_LIST_MIN_WORDS;
+			else process.env.RELEVANCE_LIST_MIN_WORDS = prevMinWords;
+		}
+	});
+
+	it("a stale :summary orphan does not re-flag a round that has current prompt/response rows", async () => {
+		// F1 (PR #141 review), case 3: `:summary` is auxiliary and content-dependent.
+		// A round whose `:prompt`/`:response` rows are current but whose `:summary`
+		// row is stale must converge — `:summary` staleness alone must not force a
+		// reindex, or an unreproducible `:summary` orphan would loop forever.
+		const root = tmpDir();
+		const sessionsDir = path.join(root, "sessions");
+		const sDir = path.join(sessionsDir, "--test");
+		fs.mkdirSync(sDir, { recursive: true });
+		const roundsDir = path.join(root, "rounds");
+		fs.mkdirSync(roundsDir, { recursive: true });
+		const indexPath = path.join(roundsDir, "index.csv");
+		const userPrompt = "A round with current retrieval rows and a stale summary row, long enough to keep the prompt.";
+		const responseSequence = "The summary staleness must not force a reindex.";
+		const roundFile = `${computeContentHash(userPrompt, responseSequence, [])}.json`;
+
+		writeSession(path.join(sDir, "session.jsonl"), [{ userPrompt, responseSequence }]);
+		fs.writeFileSync(
+			indexPath,
+			`${[
+				encodeVectorIndexLine([1], `${roundFile}:prompt`, DEBUG_EMBEDDING_MODEL),
+				encodeVectorIndexLine([2], `${roundFile}:response`, DEBUG_EMBEDDING_MODEL),
+				encodeVectorIndexLine([3], `${roundFile}:summary`, "old-model"),
+			].join("\n")}\n`,
+		);
+
+		const logs = logger();
+		const requests: unknown[] = [];
+		await expect(
+			runDigestAll({
+				sessionsDir,
+				roundsDir,
+				indexPath,
+				apiKey: "key",
+				fetchImpl: embeddingFetch([], requests),
+				stdout: logs.out,
+				stderr: logs.err,
+			}),
+		).resolves.toBe(0);
+
+		expect(requests.length).toBe(0);
+		expect(logs.stderr.join("\n")).not.toContain("Model-mismatched rounds to re-index: 1");
+		const rows = loadVectorIndex(indexPath);
+		expect(rows.find((e) => e.filePath === `${roundFile}:summary`)?.model).toBe("old-model");
+	});
+
+	it("a stale :summary on a readable checkpoint round does not force a reindex (F2)", async () => {
+		// F2 (PR !141 review): the forcing set must exclude `:summary` even when the
+		// round file carries a summary (so a reindex *would* reproduce it). The
+		// earlier short-prompt orphan test passed only because its round file had no
+		// `summary`, which excluded `:summary` by absence — not by rule. With a
+		// readable checkpoint round (summary present) and current :prompt/:response
+		// rows the round must still converge, or the sweep and the start-up pending
+		// count disagree and README:286 is false.
+		const root = tmpDir();
+		const sessionsDir = path.join(root, "sessions");
+		const sDir = path.join(sessionsDir, "--test");
+		fs.mkdirSync(sDir, { recursive: true });
+		const roundsDir = path.join(root, "rounds");
+		fs.mkdirSync(roundsDir, { recursive: true });
+		const indexPath = path.join(roundsDir, "index.csv");
+		const userPrompt =
+			"A checkpoint round whose prompt is long enough to survive the short-prompt drop under the default threshold.";
+		const responseSequence = "Its summary row is stale but must not force a reindex.";
+		const roundFile = `${computeContentHash(userPrompt, responseSequence, [])}.json`;
+		fs.writeFileSync(
+			path.join(roundsDir, roundFile),
+			JSON.stringify({
+				userPrompt,
+				responseSequence,
+				toolCalls: [],
+				summary: { currentTask: "t", progressMade: [], currentState: [], nextSteps: [], keyFindings: [] },
+			}),
+		);
+		fs.writeFileSync(
+			indexPath,
+			`${[
+				encodeVectorIndexLine([1], `${roundFile}:prompt`, DEBUG_EMBEDDING_MODEL),
+				encodeVectorIndexLine([2], `${roundFile}:response`, DEBUG_EMBEDDING_MODEL),
+				encodeVectorIndexLine([3], `${roundFile}:summary`, "old-model"),
+			].join("\n")}\n`,
+		);
+
+		const logs = logger();
+		const requests: unknown[] = [];
+		await expect(
+			runDigestAll({
+				sessionsDir,
+				roundsDir,
+				indexPath,
+				apiKey: "key",
+				fetchImpl: embeddingFetch([], requests),
+				stdout: logs.out,
+				stderr: logs.err,
+			}),
+		).resolves.toBe(0);
+
+		expect(requests.length).toBe(0);
+		expect(logs.stderr.join("\n")).not.toContain("Model-mismatched rounds to re-index: 1");
+		const rows = loadVectorIndex(indexPath);
+		expect(rows.find((e) => e.filePath === `${roundFile}:summary`)?.model).toBe("old-model");
 	});
 
 	it("migrates stale round filenames before deciding a round is already indexed", async () => {
@@ -809,7 +1357,7 @@ describe("digest-all script", () => {
 		expect(logs.stdout.join("\n")).toContain("1 markers healed");
 	});
 
-	it("sweep leaves a marker-less round without a :response row unhealed", async () => {
+	it("sweep re-embeds a marker-less round with no :response row, replacing rows and writing the marker", async () => {
 		const root = tmpDir();
 		const sessionsDir = tmpDir();
 		const roundsDir = path.join(root, "rounds");
@@ -817,7 +1365,7 @@ describe("digest-all script", () => {
 		const indexPath = path.join(roundsDir, "index.csv");
 
 		const userPrompt = "A round with a prompt row but no response row.";
-		const responseSequence = "Left marker-less because no truthful vector is available.";
+		const responseSequence = "Re-embedded because no truthful vector was available to heal from.";
 		const roundFile = `${computeContentHash(userPrompt, responseSequence, [])}.json`;
 		fs.writeFileSync(
 			path.join(roundsDir, roundFile),
@@ -828,7 +1376,18 @@ describe("digest-all script", () => {
 			`${encodeVectorIndexLine([0.25, 0.5], `${roundFile}:prompt`, "openai/text-embedding-3-small")}\n`,
 		);
 
-		const fetchImpl = vi.fn(async () => new Response("should not be called")) as typeof fetch;
+		// F1 (issue #140, D1/D2): rows are the retrieval truth, so a round with
+		// current-model rows but no :response row to heal from is a retrieval gap
+		// and is re-embedded from its round file. The sweep spends the call and the
+		// full replace reproduces prompt+response rows and the marker together.
+		const requests: unknown[] = [];
+		const fetchImpl = embeddingFetch(
+			[
+				[1, 0],
+				[0, 1],
+			],
+			requests,
+		) as typeof fetch;
 		const logs = logger();
 		await expect(
 			runDigestAll({
@@ -842,10 +1401,28 @@ describe("digest-all script", () => {
 			}),
 		).resolves.toBe(0);
 
-		expect(fetchImpl).not.toHaveBeenCalled();
+		expect(fetchImpl).toHaveBeenCalledTimes(3);
+		const rows = loadVectorIndex(indexPath);
+		expect(rows.map((e) => e.filePath).sort()).toEqual([`${roundFile}:prompt`, `${roundFile}:response`].sort());
 		const written = JSON.parse(fs.readFileSync(path.join(roundsDir, roundFile), "utf-8"));
-		expect(written.promptEmbedding).toBeUndefined();
+		expect(written.promptEmbedding).toBeDefined();
 		expect(logs.stdout.join("\n")).not.toContain("markers healed");
+
+		// Idempotence (D4): a second run sees current-model rows and embeds nothing.
+		const secondFetch = vi.fn(async () => new Response("should not be called")) as typeof fetch;
+		const secondLogs = logger();
+		await expect(
+			runDigestAll({
+				sessionsDir,
+				roundsDir,
+				indexPath,
+				apiKey: "key",
+				fetchImpl: secondFetch,
+				stdout: secondLogs.out,
+				stderr: secondLogs.err,
+			}),
+		).resolves.toBe(0);
+		expect(secondFetch).not.toHaveBeenCalled();
 	});
 
 	it("sweep skips unreadable round files and files without a user prompt", async () => {
@@ -877,6 +1454,81 @@ describe("digest-all script", () => {
 		expect(logs.stderr.join("\n")).toContain("Skipping unreadable round file: corrupt.json");
 		expect(logs.stderr.join("\n")).toContain("Skipping invalid round file: no-prompt.json");
 		expect(logs.stdout.join("\n")).toContain("0 swept from rounds dir");
+		// D4: the unresolvable files are named as a set, not just warned about one
+		// at a time, so the operator sees the store will not converge.
+		expect(logs.stdout.join("\n")).toContain("2 non-convergent rounds");
+		expect(logs.stdout.join("\n")).toContain("• corrupt.json");
+		expect(logs.stdout.join("\n")).toContain("• no-prompt.json");
+	});
+
+	it("a resolvable round still embeds and converges; a second run embeds nothing (D4)", async () => {
+		const root = tmpDir();
+		const sessionsDir = tmpDir();
+		const roundsDir = path.join(root, "rounds");
+		fs.mkdirSync(roundsDir, { recursive: true });
+		const indexPath = path.join(roundsDir, "index.csv");
+
+		// One round the sweep cannot resolve, one it can.
+		fs.writeFileSync(path.join(roundsDir, "broken.json"), "{not json");
+		const userPrompt = "A resolvable swept round sitting next to an unresolvable one.";
+		const responseSequence = "It still embeds, and a second run spends nothing.";
+		const roundFile = `${computeContentHash(userPrompt, responseSequence, [])}.json`;
+		fs.writeFileSync(
+			path.join(roundsDir, roundFile),
+			JSON.stringify({ userPrompt, responseSequence, toolCalls: [], recovered: true }),
+		);
+
+		const requests: unknown[] = [];
+		const fetchImpl = embeddingFetch(
+			[
+				[1, 0],
+				[0, 1],
+			],
+			requests,
+		) as typeof fetch;
+		const logs = logger();
+		await expect(
+			runDigestAll({
+				sessionsDir,
+				roundsDir,
+				indexPath,
+				apiKey: "key",
+				fetchImpl,
+				stdout: logs.out,
+				stderr: logs.err,
+			}),
+		).resolves.toBe(0);
+
+		// The resolvable round embeds; the unresolvable one is named rather than
+		// silently dropped from the count.
+		expect(fetchImpl).toHaveBeenCalledTimes(3);
+		expect(logs.stdout.join("\n")).toContain("1 non-convergent round");
+		expect(logs.stdout.join("\n")).toContain("• broken.json");
+		expect(
+			loadVectorIndex(indexPath)
+				.map((e) => e.filePath)
+				.sort(),
+		).toEqual([`${roundFile}:prompt`, `${roundFile}:response`].sort());
+
+		// D4 convergence proof: a second run reaches no embeddable round and spends
+		// no embedding call — the only rounds left are the non-convergent one.
+		const secondFetch = vi.fn(async () => new Response("should not be called")) as typeof fetch;
+		const secondLogs = logger();
+		await expect(
+			runDigestAll({
+				sessionsDir,
+				roundsDir,
+				indexPath,
+				apiKey: "key",
+				fetchImpl: secondFetch,
+				stdout: secondLogs.out,
+				stderr: secondLogs.err,
+			}),
+		).resolves.toBe(0);
+		expect(secondFetch).not.toHaveBeenCalled();
+		expect(secondLogs.stdout.join("\n")).toContain("📊 New rounds to embed: 0");
+		expect(secondLogs.stdout.join("\n")).toContain("✨ Nothing to do — all sessions already indexed!");
+		expect(secondLogs.stdout.join("\n")).toContain("• broken.json");
 	});
 
 	it("sweep skips parseable-but-incomplete round files by name instead of failing the whole run", async () => {
@@ -1027,6 +1679,106 @@ describe("digest-all script", () => {
 		expect(fs.readdirSync(roundsDir).some((name) => name.includes(".tmp."))).toBe(false);
 		// The atomic path really ran: the marker landed on the durable file.
 		expect(JSON.parse(fs.readFileSync(roundPath, "utf-8")).promptEmbedding).toEqual([2, 3]);
+	});
+
+	// Issue #139 regression anchor: the whole-store work per run must not scale
+	// with the round count. Runs the sweep over two fixture sizes and asserts the
+	// index.csv read count and the index.bm25.json write count are identical —
+	// before the fix each round added a full-store scan, two index.csv parses, a
+	// bm25 load, and a bm25 write. Uses the sweep path (no session files) so every
+	// round goes through processRound.
+	async function runSweepFixture(roundCount: number): Promise<{
+		bm25Writes: number;
+		indexReads: number;
+		bm25Reads: number;
+		toolIndexReads: number;
+	}> {
+		const root = tmpDir();
+		const sessionsDir = tmpDir(); // no session files: force the rounds-dir sweep
+		const roundsDir = path.join(root, "rounds");
+		fs.mkdirSync(roundsDir, { recursive: true });
+		const indexPath = path.join(roundsDir, "index.csv");
+
+		// Seed an existing index.csv so the run genuinely reads it (a missing file
+		// read would also count, but a populated index exercises the dedup path).
+		fs.writeFileSync(
+			indexPath,
+			encodeVectorIndexLine(
+				[0.1, 0.2],
+				"00000000000000000000000000000000.json:prompt",
+				"openai/text-embedding-3-small",
+			) + "\n",
+		);
+		// Seed a valid bm25 sidecar so the run's single load actually reads it
+		// (loadBm25Index skips a missing file without a read).
+		fs.writeFileSync(
+			bm25IndexPathForRoundsDir(roundsDir),
+			JSON.stringify({ version: 1, documentCount: 0, averageDocumentLength: 0, documents: {} }),
+		);
+		// Seed the tool index too, so its once-per-run load is exercised.
+		fs.writeFileSync(toolIndexPathForRoundsDir(roundsDir), "00000000000000000000000000000000,0,bash,placeholder\n");
+
+		const vectors: number[][] = [];
+		for (let i = 0; i < roundCount; i++) {
+			const userPrompt = `Recovered round number ${i} with a distinct prompt body.`;
+			const responseSequence = `Recovered response number ${i} with a distinct response body.`;
+			const roundFile = `${computeContentHash(userPrompt, responseSequence, [])}.json`;
+			// A sweep round with tool calls exercises the tool-index load path.
+			if (i === 0) {
+				fs.writeFileSync(
+					path.join(roundsDir, roundFile),
+					JSON.stringify({
+						userPrompt,
+						responseSequence,
+						toolCalls: [{ index: 0, name: "bash", arguments: '{"command":"ls"}', result_summary: "ok" }],
+						recovered: true,
+					}),
+				);
+			} else {
+				fs.writeFileSync(
+					path.join(roundsDir, roundFile),
+					JSON.stringify({ userPrompt, responseSequence, toolCalls: [], recovered: true }),
+				);
+			}
+			// prompt + response rows per round; the combined embed call consumes a
+			// vector but writes no row.
+			vectors.push([i + 1, 0], [0, i + 1], [i + 1, i + 1]);
+		}
+
+		const { fsImpl, writes, reads } = spyFs();
+		await expect(
+			runDigestAll({
+				sessionsDir,
+				roundsDir,
+				indexPath,
+				apiKey: "key",
+				fetchImpl: embeddingFetch(vectors),
+				fsImpl,
+				stdout: logger().out,
+				stderr: logger().err,
+			}),
+		).resolves.toBe(0);
+
+		return {
+			bm25Writes: writes.filter((w) => w === bm25IndexPathForRoundsDir(roundsDir)).length,
+			indexReads: reads.filter((r) => r === indexPath).length,
+			bm25Reads: reads.filter((r) => r === bm25IndexPathForRoundsDir(roundsDir)).length,
+			toolIndexReads: reads.filter((r) => r === toolIndexPathForRoundsDir(roundsDir)).length,
+		};
+	}
+
+	it("loads whole-store structures once per run, not once per round", async () => {
+		const small = await runSweepFixture(3);
+		const large = await runSweepFixture(6);
+
+		// O(1) evidence: doubling the round count must not change any whole-store count.
+		expect(large).toEqual(small);
+		// The bm25 index is written exactly once for the whole batch (flushBm25 seam)
+		// and loaded exactly once. The tool index is loaded once at start plus a
+		// single lockfile read for the one appending round — both O(1) in N.
+		expect(small.bm25Writes).toBe(1);
+		expect(small.bm25Reads).toBe(1);
+		expect(small.toolIndexReads).toBe(2);
 	});
 
 	it("short prompts follow the shared drop policy: no :prompt row, response vector stored as promptEmbedding", async () => {

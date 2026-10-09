@@ -2,7 +2,9 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { forcingReproducibleSuffixes } from "./embed-round.ts";
 import { createRoundFilePath } from "./hash.ts";
+import type { VectorIndexEntry } from "./index-io.ts";
 import { parsePiSessionJsonl } from "./pi-session.ts";
 import {
 	buildAgentEndEmbeddingTexts,
@@ -15,6 +17,7 @@ import { saveScanCutoff } from "./scan-register.ts";
 import {
 	backfillMissingRounds,
 	buildBackfillCandidates,
+	buildCurrentModelRowPredicate,
 	embedRecoveredRounds,
 	extractCheckpointSummary,
 	findMissingRounds,
@@ -408,6 +411,81 @@ describe("session-backfill", () => {
 			expect(second.embedded).toEqual([]);
 		});
 
+		// F2 (PR !141 review): a round covered by current-model index rows is not
+		// re-embedded when its promptEmbedding marker is missing. The start-up
+		// count (planStartupEmbedding) already treats it as non-pending via the
+		// shared rows predicate; the embedding pass must apply the same predicate,
+		// or a rows-present/marker-missing round is counted 0 pending yet spends
+		// an embedding call — contradicting the README claim that such a round is
+		// not re-embedded. Anchored on buildCurrentModelRowPredicate, the predicate
+		// the `just index` sweep also uses.
+		it("does not re-embed a rows-covered round when the promptEmbedding marker is missing (F2)", async () => {
+			const sessionFile = writeSessionFile(tmp, [userMsg("q", "u-f2"), assistantMsg("a-f2")]);
+			const roundsDir = path.join(tmp, "rounds");
+			const outcome = backfillMissingRounds(sessionFile, roundsDir, undefined, { liveWindowMs: 0 });
+			const fileName = outcome.recoveredFiles[0];
+			// Marker is absent (nothing pre-embedded); the round is covered by a
+			// current-model row only.
+			const hasCurrentModelRows = buildCurrentModelRowPredicate(
+				[{ vector: [0.1], filePath: `${fileName}:prompt`, model: "text-embedding-3-small" }],
+				"text-embedding-3-small",
+			);
+			const plan = planStartupEmbedding(
+				outcome.recoveredFiles,
+				(name) => JSON.parse(fs.readFileSync(path.join(roundsDir, name), "utf-8")),
+				hasCurrentModelRows,
+			);
+			expect(plan).toEqual({ mode: "inline", pendingCount: 0 });
+			const embedCalls: string[] = [];
+			const result = await embedRecoveredRounds(
+				outcome.recoveredFiles,
+				roundsDir,
+				{
+					embed: (text) => {
+						embedCalls.push(text);
+						return Promise.resolve([text.length, 1]);
+					},
+					appendIndexRow: () => {},
+					writeRoundEmbedding: () => {},
+				},
+				{ hasCurrentModelRows },
+			);
+			// Count and pass agree: no embedding call is spent, no row appended,
+			// and no error is reported for the skipped round.
+			expect(embedCalls).toEqual([]);
+			expect(result).toEqual({ embedded: [], errors: [] });
+		});
+
+		// The rows predicate must not override the marker-based skip's intent: a
+		// round with a mismatched-model row remains pending and IS embedded (the
+		// predicate returns false), so the fallback path is preserved.
+		it("still re-embeds a round whose only rows were written by a different model (F2)", async () => {
+			const sessionFile = writeSessionFile(tmp, [userMsg("q", "u-f2b"), assistantMsg("a-f2b")]);
+			const roundsDir = path.join(tmp, "rounds");
+			const outcome = backfillMissingRounds(sessionFile, roundsDir, undefined, { liveWindowMs: 0 });
+			const fileName = outcome.recoveredFiles[0];
+			const hasCurrentModelRows = buildCurrentModelRowPredicate(
+				[{ vector: [0.1], filePath: `${fileName}:prompt`, model: "text-embedding-ada-002" }],
+				"text-embedding-3-small",
+			);
+			const embedCalls: string[] = [];
+			const result = await embedRecoveredRounds(
+				outcome.recoveredFiles,
+				roundsDir,
+				{
+					embed: (text) => {
+						embedCalls.push(text);
+						return Promise.resolve([text.length, 1]);
+					},
+					appendIndexRow: () => {},
+					writeRoundEmbedding: () => {},
+				},
+				{ hasCurrentModelRows },
+			);
+			expect(embedCalls.length).toBeGreaterThan(0);
+			expect(result.embedded).toEqual([fileName]);
+		});
+
 		it("F4 parity: prompt goes through buildPromptEmbeddingInput cleanup and the :prompt row carries the hash stamp", async () => {
 			const sessionFile = writeSessionFile(tmp, [
 				userMsg("explain this\n```python\n" + "x = 1\n".repeat(200) + "```"),
@@ -697,6 +775,126 @@ describe("planStartupEmbedding (issue #133)", () => {
 		const files = new Map<string, { promptEmbedding: number[] }>([["a.json", { promptEmbedding: [1] }]]);
 		const plan = planStartupEmbedding(["a.json", "missing.json"], (f) => files.get(f) ?? null);
 		expect(plan).toEqual({ mode: "inline", pendingCount: 1 });
+	});
+
+	// Issue #140 (D1): a recovered round that already has current-model index
+	// rows is not pending even when the promptEmbedding marker is missing —
+	// rows, not the marker, decide. Anchored on the `just index` sweep
+	// predicate (lib/session-backfill.ts buildCurrentModelRowPredicate).
+	it("does not count a round pending when it has current-model rows but no promptEmbedding marker", () => {
+		const files = new Map<string, Round>([["rows-only.json", {}]]);
+		const hasRows = buildCurrentModelRowPredicate(
+			[{ vector: [0.1], filePath: "rows-only.json:prompt", model: "text-embedding-3-small" }],
+			"text-embedding-3-small",
+		);
+		const plan = planStartupEmbedding([...files.keys()], (f) => files.get(f) ?? null, hasRows);
+		expect(plan).toEqual({ mode: "inline", pendingCount: 0 });
+	});
+
+	it("counts a round pending when its only rows were written by a different model", () => {
+		const files = new Map<string, Round>([["stale-model.json", {}]]);
+		const hasRows = buildCurrentModelRowPredicate(
+			[{ vector: [0.1], filePath: "stale-model.json:prompt", model: "text-embedding-ada-002" }],
+			"text-embedding-3-small",
+		);
+		const plan = planStartupEmbedding([...files.keys()], (f) => files.get(f) ?? null, hasRows);
+		expect(plan).toEqual({ mode: "inline", pendingCount: 1 });
+	});
+
+	it("treats a legacy model-less row as current so a marked round stays non-pending (issue #62)", () => {
+		const files = new Map<string, Round>([["legacy.json", { promptEmbedding: [0.1] }]]);
+		const hasRows = buildCurrentModelRowPredicate(
+			[{ vector: [0.1], filePath: "legacy.json:prompt" }],
+			"text-embedding-3-small",
+		);
+		const plan = planStartupEmbedding([...files.keys()], (f) => files.get(f) ?? null, hasRows);
+		expect(plan).toEqual({ mode: "inline", pendingCount: 0 });
+	});
+
+	it("still counts a missing round file as pending even when a rows predicate is supplied", () => {
+		const files = new Map<string, Round>([["a.json", { promptEmbedding: [1] }]]);
+		const hasRows = buildCurrentModelRowPredicate([{ vector: [0.1], filePath: "a.json:prompt", model: "m" }], "m");
+		const plan = planStartupEmbedding(["a.json", "missing.json"], (f) => files.get(f) ?? null, hasRows);
+		expect(plan).toEqual({ mode: "inline", pendingCount: 1 });
+	});
+
+	// Matches the `just index` sweep, which reindexes a round that has ANY
+	// model-mismatched forcing row even if some forcing rows are current.
+	it("counts a round pending when it has mixed current and mismatched rows", () => {
+		const hasRows = buildCurrentModelRowPredicate(
+			[
+				{ vector: [0.1], filePath: "mixed.json:prompt", model: "text-embedding-3-small" },
+				{ vector: [0.2], filePath: "mixed.json:response", model: "text-embedding-ada-002" },
+			],
+			"text-embedding-3-small",
+		);
+		expect(hasRows("mixed.json")).toBe(false);
+	});
+
+	// F2 (PR !141 review): the start-up predicate must classify a round exactly
+	// as the `just index` sweep does, including the non-forcing rows the sweep
+	// ignores. Each case pins one previously divergent configuration; the sweep
+	// side of the same rule is pinned in scripts/digest-all.test.ts.
+	describe("forcing-suffix coverage agrees with the sweep (F2)", () => {
+		// A long prompt reproduces :prompt and :response; a summary present in the
+		// round reproduces :summary. Only the first two may force a reindex.
+		const forcingSuffixesFor = () =>
+			forcingReproducibleSuffixes(
+				"a long enough prompt that certainly survives the short-prompt drop with comfortably more than twenty words in total added right here",
+				true,
+			);
+		const covered = (entries: VectorIndexEntry[], file: string) =>
+			buildCurrentModelRowPredicate(entries, "text-embedding-3-small", forcingSuffixesFor)(file);
+
+		it("treats current :prompt/:response with a foreign :summary as covered (:summary never forces)", () => {
+			expect(
+				covered(
+					[
+						{ vector: [0.1], filePath: "r.json:prompt", model: "text-embedding-3-small" },
+						{ vector: [0.2], filePath: "r.json:response", model: "text-embedding-3-small" },
+						{ vector: [0.3], filePath: "r.json:summary", model: "text-embedding-ada-002" },
+					],
+					"r.json",
+				),
+			).toBe(true);
+		});
+
+		it("treats a :summary-only round as not covered (the sweep queues it to add forcing rows)", () => {
+			expect(
+				covered([{ vector: [0.1], filePath: "r.json:summary", model: "text-embedding-3-small" }], "r.json"),
+			).toBe(false);
+		});
+
+		it("treats a legacy :round-only round as not covered", () => {
+			expect(covered([{ vector: [0.1], filePath: "r.json:round", model: "text-embedding-3-small" }], "r.json")).toBe(
+				false,
+			);
+		});
+
+		it("still treats a stale forcing row as not covered", () => {
+			expect(
+				covered(
+					[
+						{ vector: [0.1], filePath: "r.json:prompt", model: "text-embedding-ada-002" },
+						{ vector: [0.2], filePath: "r.json:response", model: "text-embedding-3-small" },
+					],
+					"r.json",
+				),
+			).toBe(false);
+		});
+
+		it("treats a short-prompt round's stale :prompt as a non-forcing orphan", () => {
+			const shortPrompt = () => forcingReproducibleSuffixes("short prompt", false);
+			const hasRows = buildCurrentModelRowPredicate(
+				[
+					{ vector: [0.1], filePath: "r.json:prompt", model: "text-embedding-ada-002" },
+					{ vector: [0.2], filePath: "r.json:response", model: "text-embedding-3-small" },
+				],
+				"text-embedding-3-small",
+				shortPrompt,
+			);
+			expect(hasRows("r.json")).toBe(true);
+		});
 	});
 });
 
