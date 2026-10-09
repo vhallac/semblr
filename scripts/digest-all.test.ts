@@ -890,6 +890,63 @@ describe("digest-all script", () => {
 		expect(rows.find((e) => e.filePath === `${roundFile}:summary`)?.model).toBe("old-model");
 	});
 
+	it("a stale :summary on a readable checkpoint round does not force a reindex (F2)", async () => {
+		// F2 (PR !141 review): the forcing set must exclude `:summary` even when the
+		// round file carries a summary (so a reindex *would* reproduce it). The
+		// earlier short-prompt orphan test passed only because its round file had no
+		// `summary`, which excluded `:summary` by absence — not by rule. With a
+		// readable checkpoint round (summary present) and current :prompt/:response
+		// rows the round must still converge, or the sweep and the start-up pending
+		// count disagree and README:286 is false.
+		const root = tmpDir();
+		const sessionsDir = path.join(root, "sessions");
+		const sDir = path.join(sessionsDir, "--test");
+		fs.mkdirSync(sDir, { recursive: true });
+		const roundsDir = path.join(root, "rounds");
+		fs.mkdirSync(roundsDir, { recursive: true });
+		const indexPath = path.join(roundsDir, "index.csv");
+		const userPrompt =
+			"A checkpoint round whose prompt is long enough to survive the short-prompt drop under the default threshold.";
+		const responseSequence = "Its summary row is stale but must not force a reindex.";
+		const roundFile = `${computeContentHash(userPrompt, responseSequence, [])}.json`;
+		fs.writeFileSync(
+			path.join(roundsDir, roundFile),
+			JSON.stringify({
+				userPrompt,
+				responseSequence,
+				toolCalls: [],
+				summary: { currentTask: "t", progressMade: [], currentState: [], nextSteps: [], keyFindings: [] },
+			}),
+		);
+		fs.writeFileSync(
+			indexPath,
+			`${[
+				encodeVectorIndexLine([1], `${roundFile}:prompt`, DEBUG_EMBEDDING_MODEL),
+				encodeVectorIndexLine([2], `${roundFile}:response`, DEBUG_EMBEDDING_MODEL),
+				encodeVectorIndexLine([3], `${roundFile}:summary`, "old-model"),
+			].join("\n")}\n`,
+		);
+
+		const logs = logger();
+		const requests: unknown[] = [];
+		await expect(
+			runDigestAll({
+				sessionsDir,
+				roundsDir,
+				indexPath,
+				apiKey: "key",
+				fetchImpl: embeddingFetch([], requests),
+				stdout: logs.out,
+				stderr: logs.err,
+			}),
+		).resolves.toBe(0);
+
+		expect(requests.length).toBe(0);
+		expect(logs.stderr.join("\n")).not.toContain("Model-mismatched rounds to re-index: 1");
+		const rows = loadVectorIndex(indexPath);
+		expect(rows.find((e) => e.filePath === `${roundFile}:summary`)?.model).toBe("old-model");
+	});
+
 	it("migrates stale round filenames before deciding a round is already indexed", async () => {
 		const root = tmpDir();
 		const sessionsDir = path.join(root, "sessions");

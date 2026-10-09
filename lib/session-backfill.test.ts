@@ -2,7 +2,9 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { forcingReproducibleSuffixes } from "./embed-round.ts";
 import { createRoundFilePath } from "./hash.ts";
+import type { VectorIndexEntry } from "./index-io.ts";
 import { parsePiSessionJsonl } from "./pi-session.ts";
 import {
 	buildAgentEndEmbeddingTexts,
@@ -817,7 +819,7 @@ describe("planStartupEmbedding (issue #133)", () => {
 	});
 
 	// Matches the `just index` sweep, which reindexes a round that has ANY
-	// model-mismatched row even if some rows are current.
+	// model-mismatched forcing row even if some forcing rows are current.
 	it("counts a round pending when it has mixed current and mismatched rows", () => {
 		const hasRows = buildCurrentModelRowPredicate(
 			[
@@ -827,6 +829,72 @@ describe("planStartupEmbedding (issue #133)", () => {
 			"text-embedding-3-small",
 		);
 		expect(hasRows("mixed.json")).toBe(false);
+	});
+
+	// F2 (PR !141 review): the start-up predicate must classify a round exactly
+	// as the `just index` sweep does, including the non-forcing rows the sweep
+	// ignores. Each case pins one previously divergent configuration; the sweep
+	// side of the same rule is pinned in scripts/digest-all.test.ts.
+	describe("forcing-suffix coverage agrees with the sweep (F2)", () => {
+		// A long prompt reproduces :prompt and :response; a summary present in the
+		// round reproduces :summary. Only the first two may force a reindex.
+		const forcingSuffixesFor = () =>
+			forcingReproducibleSuffixes(
+				"a long enough prompt that certainly survives the short-prompt drop with comfortably more than twenty words in total added right here",
+				true,
+			);
+		const covered = (entries: VectorIndexEntry[], file: string) =>
+			buildCurrentModelRowPredicate(entries, "text-embedding-3-small", forcingSuffixesFor)(file);
+
+		it("treats current :prompt/:response with a foreign :summary as covered (:summary never forces)", () => {
+			expect(
+				covered(
+					[
+						{ vector: [0.1], filePath: "r.json:prompt", model: "text-embedding-3-small" },
+						{ vector: [0.2], filePath: "r.json:response", model: "text-embedding-3-small" },
+						{ vector: [0.3], filePath: "r.json:summary", model: "text-embedding-ada-002" },
+					],
+					"r.json",
+				),
+			).toBe(true);
+		});
+
+		it("treats a :summary-only round as not covered (the sweep queues it to add forcing rows)", () => {
+			expect(
+				covered([{ vector: [0.1], filePath: "r.json:summary", model: "text-embedding-3-small" }], "r.json"),
+			).toBe(false);
+		});
+
+		it("treats a legacy :round-only round as not covered", () => {
+			expect(covered([{ vector: [0.1], filePath: "r.json:round", model: "text-embedding-3-small" }], "r.json")).toBe(
+				false,
+			);
+		});
+
+		it("still treats a stale forcing row as not covered", () => {
+			expect(
+				covered(
+					[
+						{ vector: [0.1], filePath: "r.json:prompt", model: "text-embedding-ada-002" },
+						{ vector: [0.2], filePath: "r.json:response", model: "text-embedding-3-small" },
+					],
+					"r.json",
+				),
+			).toBe(false);
+		});
+
+		it("treats a short-prompt round's stale :prompt as a non-forcing orphan", () => {
+			const shortPrompt = () => forcingReproducibleSuffixes("short prompt", false);
+			const hasRows = buildCurrentModelRowPredicate(
+				[
+					{ vector: [0.1], filePath: "r.json:prompt", model: "text-embedding-ada-002" },
+					{ vector: [0.2], filePath: "r.json:response", model: "text-embedding-3-small" },
+				],
+				"text-embedding-3-small",
+				shortPrompt,
+			);
+			expect(hasRows("r.json")).toBe(true);
+		});
 	});
 });
 

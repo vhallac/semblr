@@ -14,9 +14,9 @@
 
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { type EmbedRoundDeps, embedRound } from "./embed-round.ts";
+import { classifyRoundCoverage, type EmbedRoundDeps, embedRound, FORCING_INDEX_SUFFIXES } from "./embed-round.ts";
 import { canonicalDuplicateKey, type DuplicateKeyRound } from "./hash.ts";
-import { indexRoundFileFromPath, type VectorIndexEntry } from "./index-io.ts";
+import { indexRoundFileFromPath, indexRowSuffix, type VectorIndexEntry } from "./index-io.ts";
 import { parsePiSessionJsonl, reconstructPiSessionRounds } from "./pi-session.ts";
 import type { PromptNoiseOptions } from "./round-capture.ts";
 import { buildAgentEndRoundData, deriveRoundFile, isPromptOnlyRound } from "./round-capture.ts";
@@ -604,11 +604,21 @@ export interface StartupEmbedPlan {
 
 /**
  * Issue #140 (D1): is this round covered by vector-index rows under the
- * current embedding model? A round is covered when it has at least one index
- * row and none of its rows were written by a different model. Legacy rows
- * without a model column are treated as current (issue #62), matching the
- * `just index` sweep predicate (`existingRounds.has(key) &&
- * !modelMismatchedRounds.has(key)`).
+ * current embedding model? A round is covered when it has at least one
+ * *forcing* row (`:prompt`/`:response`) under the current model and no forcing
+ * row under a different one. A stale `:summary` row, a `:round`/bare row, or a
+ * short-prompt round's stale `:prompt` row is an orphan that never forces a
+ * reindex, so it does not make the round pending. Legacy rows without a model
+ * column are treated as current (issue #62).
+ *
+ * Issue #140 (D1) / F2 (PR !141 review): this is the exact negation of the
+ * `just index` sweep's enqueue condition, and both call sites now build it from
+ * the shared `classifyRoundCoverage` rule. When
+ * `forcingSuffixesFor` is supplied (the sweep derives it per round from the
+ * round file's prompt length and summary presence), the two agree on rounds
+ * the sweep treats as converged; with it omitted the static
+ * `:prompt`/`:response` set is used, preserving behaviour for callers with no
+ * round data.
  *
  * Keyed by round-file basename so the start-up counter and the sweep agree on
  * what "this round is indexed" means: index rows, not the promptEmbedding
@@ -617,15 +627,28 @@ export interface StartupEmbedPlan {
 export function buildCurrentModelRowPredicate(
 	entries: readonly VectorIndexEntry[],
 	currentModel: string,
+	forcingSuffixesFor?: (fileName: string) => ReadonlySet<string>,
 ): (fileName: string) => boolean {
-	const covered = new Set<string>();
-	const mismatched = new Set<string>();
+	const entriesByRound = new Map<string, VectorIndexEntry[]>();
 	for (const entry of entries) {
 		const roundFile = path.basename(indexRoundFileFromPath(entry.filePath));
-		if (entry.model !== undefined && entry.model !== currentModel) mismatched.add(roundFile);
-		else covered.add(roundFile);
+		const list = entriesByRound.get(roundFile);
+		if (list) list.push(entry);
+		else entriesByRound.set(roundFile, [entry]);
 	}
-	return (fileName: string) => covered.has(fileName) && !mismatched.has(fileName);
+	const coverage = new Map<string, boolean>();
+	for (const [roundFile, roundEntries] of entriesByRound) {
+		coverage.set(
+			roundFile,
+			classifyRoundCoverage(
+				roundEntries,
+				currentModel,
+				forcingSuffixesFor?.(roundFile) ?? FORCING_INDEX_SUFFIXES,
+				indexRowSuffix,
+			).covered,
+		);
+	}
+	return (fileName: string) => coverage.get(fileName) === true;
 }
 
 /**

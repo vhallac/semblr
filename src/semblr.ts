@@ -43,7 +43,7 @@ import {
 	shouldDropRelevanceList,
 	stripEnvPreamble,
 } from "../lib/context-messages.ts";
-import { embedRound } from "../lib/embed-round.ts";
+import { embedRound, FORCING_INDEX_SUFFIXES, forcingReproducibleSuffixes } from "../lib/embed-round.ts";
 import { embedText, getApiKey } from "../lib/embedding-client.ts";
 import { assignToGroup, formatGroupStats } from "../lib/grouping.ts";
 import { indexRoundFileFromPath, loadVectorIndex } from "../lib/index-io.ts";
@@ -1234,10 +1234,27 @@ export default function (pi: ExtensionAPI) {
 						// the index once here and reuse the same entries for the label
 						// guard below.
 						const indexEntries = loadVectorIndex(INDEX_PATH);
+						// F2 (PR !141 review): the pending count and the `just index` sweep must
+						// classify a recovered round alike. The sweep derives the *forcing*
+						// suffix set per round from the round file (a short prompt's `:prompt`
+						// row is non-reproducible; `:summary` never forces a reindex). Derive it
+						// the same way here, memoized per file so the round file is read once.
+						const forcingSuffixesByFile = new Map<string, ReadonlySet<string>>();
+						const forcingSuffixesFor = (fileName: string): ReadonlySet<string> => {
+							const cached = forcingSuffixesByFile.get(fileName);
+							if (cached) return cached;
+							const round = readRoundJson(ROUNDS_DIR, fileName);
+							const suffixes =
+								round === null
+									? FORCING_INDEX_SUFFIXES
+									: forcingReproducibleSuffixes(String(round.userPrompt ?? ""), Boolean(round.summary));
+							forcingSuffixesByFile.set(fileName, suffixes);
+							return suffixes;
+						};
 						const embedPlan = planStartupEmbedding(
 							backfill.recoveredFiles,
 							(fileName) => readRoundJson(ROUNDS_DIR, fileName) as { promptEmbedding?: unknown } | null,
-							buildCurrentModelRowPredicate(indexEntries, SEMBLR_CONFIG.embeddingModel),
+							buildCurrentModelRowPredicate(indexEntries, SEMBLR_CONFIG.embeddingModel, forcingSuffixesFor),
 						);
 						if (embedPlan.mode === "defer") {
 							ctx.ui.setStatus("semblr", startupEmbedStatusMessage(embedPlan));
@@ -1286,6 +1303,7 @@ export default function (pi: ExtensionAPI) {
 											hasCurrentModelRows: buildCurrentModelRowPredicate(
 												indexEntries,
 												SEMBLR_CONFIG.embeddingModel,
+												forcingSuffixesFor,
 											),
 										},
 									);

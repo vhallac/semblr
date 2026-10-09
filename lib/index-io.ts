@@ -134,6 +134,17 @@ export function indexRoundFileFromPath(filePath: string): string {
 	return filePath.replace(/(:prompt|:response|:round|:summary)$/, "");
 }
 
+/**
+ * The index label suffix of a round's row (`:prompt`, `:response`, `:round`,
+ * `:summary`), or `""` for a bare round-file row. Shared by the `just index`
+ * sweep and the startup coverage predicate so both classify a row by the same
+ * suffix (issue #140 D1 / F2, PR !141 review).
+ */
+export function indexRowSuffix(filePath: string): string {
+	const roundFile = path.basename(indexRoundFileFromPath(filePath));
+	return path.basename(filePath).slice(roundFile.length);
+}
+
 export function loadIndexedRoundFiles(
 	indexPath: string,
 	fsImpl: Pick<typeof fs, "existsSync" | "readFileSync"> = fs,

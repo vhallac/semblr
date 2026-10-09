@@ -23,11 +23,17 @@ import {
 	writeBm25Index,
 } from "../lib/bm25-index.ts";
 import { type EmbeddingModelRegistry, embedText } from "../lib/embed.ts";
-import { embedRound, reproducedIndexSuffixes } from "../lib/embed-round.ts";
+import {
+	classifyRoundCoverage,
+	embedRound,
+	FORCING_INDEX_SUFFIXES,
+	forcingReproducibleSuffixes,
+} from "../lib/embed-round.ts";
 import {
 	appendVectorIndexEntry,
 	buildStaleContentMatchMap,
 	indexRoundFileFromPath,
+	indexRowSuffix,
 	loadVectorIndex,
 	migrateIndexEntries as migrateIndexEntriesFile,
 	replaceIndexEntriesForRoundFile,
@@ -174,33 +180,26 @@ function healMissingPromptEmbedding(
 // F3 replace guard (issue #140, decision D3)
 // ─────────────────────────────────────────────
 
-/** The index label suffix of a round's row, or "" for a bare round-file row. */
-function indexRowSuffix(filePath: string): string {
-	const roundFile = path.basename(indexRoundFileFromPath(filePath));
-	const label = path.basename(filePath);
-	return label.slice(roundFile.length);
-}
-
 /**
- * Fallback reproducible-suffix set for a round whose round file is
+ * Fallback forcing-suffix set for a round whose round file is
  * missing/unreadable. `:prompt`/`:response` are the retrieval workhorses; the
  * conservative fallback keeps such a round flagged (the sweep then reports it
  * non-convergent, issue #140 D4) rather than silently converging it on a file
  * we could not inspect. For a readable round the set is derived per round by
- * `reproducedIndexSuffixes` (lib/embed-round.ts) — `:prompt` is reproducible
- * only when the prompt survives the short-prompt drop (F1, PR !141 review).
- * `:summary` is always excluded from *forcing* a reindex: it is auxiliary and
+ * `forcingReproducibleSuffixes` (lib/embed-round.ts) — `:prompt` counts only
+ * when the prompt survives the short-prompt drop (F1, PR !141 review).
+ * `:summary` is excluded from *forcing* a reindex: it is auxiliary and
  * content-dependent, so a stale `:summary` row whose summary can no longer be
- * derived would re-flag the round forever — the #140 D4 non-convergence this
- * fix removes. A reindex triggered by a reproducible row still refreshes a
- * reproduced `:summary` row (it is in the fresh `entries`). A row with any
- * other suffix (a legacy `:round` or bare row) is never rewritten by a reindex
- * and never forces one; it is preserved with its own model, because re-stamping
- * it to the current model would relabel a vector computed by another model and
- * the read path would score it against the current-model query vector — a
- * cross-model cosine (zettel 7.3 forbids it).
+ * derived would re-flag the round forever — the #140 D4 non-convergence. A
+ * reindex triggered by a forcing row still refreshes a reproduced `:summary`
+ * row (it is in the fresh `entries`). A row with any other suffix (a legacy
+ * `:round` or bare row) is never rewritten by a reindex and never forces one;
+ * it is preserved with its own model, because re-stamping it to the current
+ * model would relabel a vector computed by another model and the read path
+ * would score it against the current-model query vector — a cross-model cosine
+ * (zettel 7.3 forbids it).
  */
-const REINDEXABLE_INDEX_SUFFIXES = new Set([":prompt", ":response"]);
+const REINDEXABLE_INDEX_SUFFIXES = FORCING_INDEX_SUFFIXES;
 
 /**
  * Existing index rows for `roundFile` whose suffix is not reproduced by
@@ -312,21 +311,23 @@ export async function runDigestAll(options: DigestAllOptions = {}): Promise<numb
 	// A per-file scan would make the sweep O(n²); the response vector is the only
 	// index row a healed marker can reuse without an embedding call.
 	const responseVectorByRoundFile = new Map<string, number[]>();
-	// F1 (PR !141 review): which suffixes `embedRound` reproduces depends on the
+	// F1 (PR !141 review): which suffixes can force a reindex depends on the
 	// round, not on a static set — a short prompt yields no `:prompt` row, so a
 	// stale `:prompt` row on such a round can never be replaced and must be
-	// treated as an orphan (see reproducedIndexSuffixes). Derive the set per
+	// treated as an orphan (see forcingReproducibleSuffixes). Derive the set per
 	// round from its round file. A missing/unreadable file keeps the conservative
 	// `:prompt`/`:response` set so the round stays flagged and the sweep can
 	// report it non-convergent (issue #140 D4) instead of silently converging.
+	// F2 (PR !141 review): the same derivation feeds the start-up coverage
+	// predicate, so the pending count and this sweep classify a round alike.
 	const reproducibleSuffixesByRoundFile = new Map<string, Set<string>>();
 	const readReproducibleSuffixes = (roundFile: string): Set<string> => {
 		const cached = reproducibleSuffixesByRoundFile.get(roundFile);
 		if (cached) return cached;
-		let suffixes = REINDEXABLE_INDEX_SUFFIXES;
+		let suffixes: Set<string> = FORCING_INDEX_SUFFIXES as Set<string>;
 		try {
 			const data = JSON.parse(f.readFileSync(path.join(roundsDir, roundFile), "utf-8")) as RoundData;
-			suffixes = reproducedIndexSuffixes(data.userPrompt ?? "", Boolean(data.summary));
+			suffixes = forcingReproducibleSuffixes(data.userPrompt ?? "", Boolean(data.summary));
 		} catch {
 			// Unreadable: keep the conservative default.
 		}
@@ -346,18 +347,15 @@ export async function runDigestAll(options: DigestAllOptions = {}): Promise<numb
 		}
 	}
 	for (const roundFile of existingRounds) {
-		const suffixes = readReproducibleSuffixes(roundFile);
-		let hasReproducibleRow = false;
-		let hasStaleReproducibleRow = false;
-		for (const entry of entriesByRoundFile.get(roundFile) ?? []) {
-			if (!suffixes.has(indexRowSuffix(entry.filePath))) continue;
-			hasReproducibleRow = true;
-			// Legacy two-column rows have no model and are treated as current (#62).
-			if (entry.model !== undefined && entry.model !== config.embeddingModel) hasStaleReproducibleRow = true;
-		}
+		const { hasReproducibleRow, hasStaleReproducibleRow, covered } = classifyRoundCoverage(
+			entriesByRoundFile.get(roundFile) ?? [],
+			config.embeddingModel,
+			readReproducibleSuffixes(roundFile),
+			indexRowSuffix,
+		);
 		if (hasReproducibleRow) roundsWithReproducibleRow.add(roundFile);
 		if (hasStaleReproducibleRow) roundsWithStaleReproducibleRow.add(roundFile);
-		if (!hasReproducibleRow || hasStaleReproducibleRow) modelMismatchedRounds.add(roundFile);
+		if (!covered) modelMismatchedRounds.add(roundFile);
 	}
 	out.log(`📊 Already indexed: ${existingRounds.size} rounds`);
 	out.log(`📊 Model-mismatched rounds to re-index: ${modelMismatchedRounds.size}\n`);
