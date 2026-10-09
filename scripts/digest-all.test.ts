@@ -907,6 +907,56 @@ describe("digest-all script", () => {
 		expect(logs.stdout.join("\n")).toContain("1 rounds embedded, 0 errors");
 	});
 
+	it("sweep skips round files whose toolCalls hold non-object elements instead of failing the whole run", async () => {
+		const root = tmpDir();
+		const sessionsDir = tmpDir();
+		const roundsDir = path.join(root, "rounds");
+		fs.mkdirSync(roundsDir, { recursive: true });
+		const indexPath = path.join(roundsDir, "index.csv");
+		const requests: unknown[] = [];
+
+		// F3 shape: Array.isArray passes, but a null element throws in
+		// deriveRoundFile/computeContentHash before processRound's try/catch.
+		fs.writeFileSync(
+			path.join(roundsDir, "null-tool.json"),
+			JSON.stringify({ userPrompt: "hi", responseSequence: "there", toolCalls: [null] }),
+		);
+
+		const userPrompt = "Do non-object toolCalls elements abort the sweep?";
+		const responseSequence = "Well-formed rounds embed while malformed element arrays are skipped by name.";
+		const roundFile = `${computeContentHash(userPrompt, responseSequence, [])}.json`;
+		fs.writeFileSync(
+			path.join(roundsDir, roundFile),
+			JSON.stringify({ userPrompt, responseSequence, toolCalls: [], recovered: true }),
+		);
+
+		const logs = logger();
+		await expect(
+			runDigestAll({
+				sessionsDir,
+				roundsDir,
+				indexPath,
+				apiKey: "key",
+				fetchImpl: embeddingFetch(
+					[
+						[1, 0],
+						[0, 1],
+						[2, 3],
+					],
+					requests,
+				),
+				stdout: logs.out,
+				stderr: logs.err,
+			}),
+		).resolves.toBe(0); // a fatal abort would reject instead of resolving 0
+
+		expect(requests).toHaveLength(3);
+		expect(loadVectorIndex(indexPath)).toHaveLength(2);
+		expect(logs.stderr.join("\n")).toContain("Skipping invalid round file: null-tool.json");
+		expect(logs.stdout.join("\n")).toContain("1 swept from rounds dir");
+		expect(logs.stdout.join("\n")).toContain("1 rounds embedded, 0 errors");
+	});
+
 	it("short prompts follow the shared drop policy: no :prompt row, response vector stored as promptEmbedding", async () => {
 		const prevMinWords = process.env.RELEVANCE_LIST_MIN_WORDS;
 		process.env.RELEVANCE_LIST_MIN_WORDS = "20"; // the documented default threshold

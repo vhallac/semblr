@@ -301,11 +301,17 @@ export async function runDigestAll(options: DigestAllOptions = {}): Promise<numb
 			// outside its try/catch — and kill the whole run naming no file. Validate
 			// the fields the enqueue needs here; invalid files are skipped with a
 			// named warning, mirroring the unreadable-file skip above.
+			// F3 (PR #134 review): an array is not enough — a non-object element such
+			// as `[null]` passes Array.isArray, then throws in deriveRoundFile
+			// (computeContentHash) and in the tool-index row builders, outside any
+			// try/catch, aborting the run naming no file. Require every element to be
+			// a non-null object.
 			if (
 				typeof round.userPrompt !== "string" ||
 				round.userPrompt.length === 0 ||
 				typeof round.responseSequence !== "string" ||
-				!Array.isArray(round.toolCalls)
+				!Array.isArray(round.toolCalls) ||
+				!round.toolCalls.every((tc) => tc !== null && typeof tc === "object")
 			) {
 				err.error(`  ⚠️  Skipping invalid round file: ${fileName}`);
 				continue;
