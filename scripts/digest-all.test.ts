@@ -91,6 +91,52 @@ function writeSession(filePath: string, pairs: Array<{ userPrompt: string; respo
 	fs.writeFileSync(filePath, entries.map(line).join("\n"));
 }
 
+/**
+ * Write a pi-style session JSONL whose single round ends with a
+ * `semblr_checkpoint` tool call carrying `summary` and the accepted-result
+ * text the extractor keys on. Mirrors the live capture shape
+ * (src/semblr.ts) so `extractCheckpointSummary` recovers it.
+ */
+function writeSessionWithCheckpoint(
+	filePath: string,
+	userPrompt: string,
+	responseSequence: string,
+	summary: Record<string, unknown>,
+): void {
+	const entries: unknown[] = [
+		{ type: "message", id: "u0", message: { role: "user", content: [{ type: "text", text: userPrompt }] } },
+		{
+			type: "message",
+			id: "a0",
+			message: {
+				role: "assistant",
+				content: [{ type: "toolCall", id: "t1", name: "semblr_checkpoint", arguments: summary }],
+			},
+		},
+		{
+			type: "message",
+			id: "r0",
+			message: {
+				role: "toolResult",
+				toolName: "semblr_checkpoint",
+				toolCallId: "t1",
+				content: [
+					{
+						type: "text",
+						text: "Checkpoint recorded. Your progress summary has been saved. You may now stop — do not start new work.",
+					},
+				],
+			},
+		},
+		{
+			type: "message",
+			id: "a1",
+			message: { role: "assistant", content: [{ type: "text", text: responseSequence }] },
+		},
+	];
+	fs.writeFileSync(filePath, entries.map(line).join("\n"));
+}
+
 function embeddingFetch(vectors: number[][], requests: unknown[] = []): typeof fetch {
 	return vi.fn(async (input, init) => {
 		requests.push({
@@ -414,6 +460,169 @@ describe("digest-all script", () => {
 			},
 			{ vector: [0, 1], filePath: `${roundFile}:response`, model: "openai/text-embedding-3-small" },
 		]);
+	});
+
+	it("a model-change reindex reproduces the :summary row derived from a session checkpoint call (F3)", async () => {
+		const root = tmpDir();
+		const sessionsDir = path.join(root, "sessions");
+		const sDir = path.join(sessionsDir, "--test");
+		fs.mkdirSync(sDir, { recursive: true });
+		const roundsDir = path.join(root, "rounds");
+		fs.mkdirSync(roundsDir, { recursive: true });
+		const indexPath = path.join(roundsDir, "index.csv");
+		const userPrompt = "What is the checkpoint state right now?";
+		const responseSequence = "Checkpoint saved with the mid-task state.";
+		const summary = {
+			currentTask: "F3 parity",
+			progressMade: ["derived summary"],
+			currentState: ["mid"],
+			nextSteps: ["guard"],
+			keyFindings: ["rows matter"],
+		};
+		const roundFile = `${computeContentHash(userPrompt, responseSequence, [
+			{
+				arguments: JSON.stringify(summary),
+				result_summary:
+					"Checkpoint recorded. Your progress summary has been saved. You may now stop — do not start new work.",
+			},
+		])}.json`;
+
+		writeSessionWithCheckpoint(path.join(sDir, "session.jsonl"), userPrompt, responseSequence, summary);
+		// Old-model rows for prompt+response+summary: the reindex must reproduce all
+		// three from the session, not just prompt+response.
+		fs.writeFileSync(
+			indexPath,
+			`${[
+				encodeVectorIndexLine([1], `${roundFile}:prompt`, "old-model"),
+				encodeVectorIndexLine([2], `${roundFile}:response`, "old-model"),
+				encodeVectorIndexLine([3], `${roundFile}:summary`, "old-model"),
+			].join("\n")}\n`,
+		);
+
+		const requests: unknown[] = [];
+		await expect(
+			runDigestAll({
+				sessionsDir,
+				roundsDir,
+				indexPath,
+				apiKey: "key",
+				fetchImpl: embeddingFetch(
+					[
+						[3, 4],
+						[0, 5],
+						[6, 7],
+						[8, 9],
+					],
+					requests,
+				),
+				stdout: logger().out,
+			}),
+		).resolves.toBe(0);
+
+		// The summary row is present and carries the derived checkpoint text.
+		const rows = loadVectorIndex(indexPath);
+		expect(rows.map((e) => e.filePath)).toEqual([
+			`${roundFile}:prompt`,
+			`${roundFile}:response`,
+			`${roundFile}:summary`,
+		]);
+		const summaryRequest = (requests as Array<{ body: { input: string } }>).find((r) =>
+			r.body.input.includes("F3 parity"),
+		);
+		expect(summaryRequest).toBeDefined();
+	});
+
+	it("a model-change reindex of a session round with no checkpoint call emits no :summary row (F3)", async () => {
+		const root = tmpDir();
+		const sessionsDir = path.join(root, "sessions");
+		const sDir = path.join(sessionsDir, "--test");
+		fs.mkdirSync(sDir, { recursive: true });
+		const roundsDir = path.join(root, "rounds");
+		fs.mkdirSync(roundsDir, { recursive: true });
+		const indexPath = path.join(roundsDir, "index.csv");
+		const userPrompt = "No checkpoint here, just a plain round?";
+		const responseSequence = "A plain answer without any checkpoint call.";
+		const roundFile = `${computeContentHash(userPrompt, responseSequence, [])}.json`;
+
+		writeSession(path.join(sDir, "session.jsonl"), [{ userPrompt, responseSequence }]);
+		fs.writeFileSync(
+			indexPath,
+			`${[
+				encodeVectorIndexLine([1], `${roundFile}:prompt`, "old-model"),
+				encodeVectorIndexLine([2], `${roundFile}:response`, "old-model"),
+			].join("\n")}\n`,
+		);
+
+		await expect(
+			runDigestAll({
+				sessionsDir,
+				roundsDir,
+				indexPath,
+				apiKey: "key",
+				fetchImpl: embeddingFetch([
+					[3, 4],
+					[0, 5],
+					[6, 7],
+				]),
+				stdout: logger().out,
+			}),
+		).resolves.toBe(0);
+
+		const rows = loadVectorIndex(indexPath);
+		expect(rows.map((e) => e.filePath)).toEqual([`${roundFile}:prompt`, `${roundFile}:response`]);
+	});
+
+	it("a model-change reindex preserves an index row it did not reproduce (F3 guard)", async () => {
+		const root = tmpDir();
+		const sessionsDir = path.join(root, "sessions");
+		const sDir = path.join(sessionsDir, "--test");
+		fs.mkdirSync(sDir, { recursive: true });
+		const roundsDir = path.join(root, "rounds");
+		fs.mkdirSync(roundsDir, { recursive: true });
+		const indexPath = path.join(roundsDir, "index.csv");
+		const userPrompt = "Does the reindex silently drop my orphan row?";
+		const responseSequence = "It must be reported and preserved.";
+		const roundFile = `${computeContentHash(userPrompt, responseSequence, [])}.json`;
+
+		writeSession(path.join(sDir, "session.jsonl"), [{ userPrompt, responseSequence }]);
+		// A `:round` row exists on disk with no source to reproduce it from (the
+		// round file carries no such field and there is no checkpoint call).
+		fs.writeFileSync(
+			indexPath,
+			`${[
+				encodeVectorIndexLine([1], `${roundFile}:prompt`, "old-model"),
+				encodeVectorIndexLine([2], `${roundFile}:response`, "old-model"),
+				encodeVectorIndexLine([7, 7], `${roundFile}:round`, "old-model"),
+			].join("\n")}\n`,
+		);
+
+		const logs = logger();
+		await expect(
+			runDigestAll({
+				sessionsDir,
+				roundsDir,
+				indexPath,
+				apiKey: "key",
+				fetchImpl: embeddingFetch([
+					[3, 4],
+					[0, 5],
+					[6, 7],
+				]),
+				stdout: logs.out,
+				stderr: logs.err,
+			}),
+		).resolves.toBe(0);
+
+		const rows = loadVectorIndex(indexPath);
+		// prompt+response are replaced with current-model rows; the orphan `:round`
+		// row survives.
+		expect(rows.map((e) => e.filePath)).toEqual([
+			`${roundFile}:prompt`,
+			`${roundFile}:response`,
+			`${roundFile}:round`,
+		]);
+		expect(rows.find((e) => e.filePath === `${roundFile}:round`)?.vector).toEqual([7, 7]);
+		expect(logs.stderr.join("\n")).toContain(`Preserving non-reproduced index row: ${roundFile}:round`);
 	});
 
 	it("migrates stale round filenames before deciding a round is already indexed", async () => {

@@ -52,6 +52,7 @@ import {
 	toolIndexPathForRoundsDir,
 	writeToolIndexRows,
 } from "../lib/search-tools.ts";
+import { extractCheckpointSummary } from "../lib/session-backfill.ts";
 
 // ─────────────────────────────────────────────
 // Config (matches digest-session.ts)
@@ -167,6 +168,40 @@ function healMissingPromptEmbedding(
 	f.writeFileSync(tmpPath, JSON.stringify(round, null, 2));
 	f.renameSync(tmpPath, roundPath);
 	return "healed";
+}
+
+// ─────────────────────────────────────────────
+// F3 replace guard (issue #140, decision D3)
+// ─────────────────────────────────────────────
+
+/** The index label suffix of a round's row, or "" for a bare round-file row. */
+function indexRowSuffix(filePath: string): string {
+	const roundFile = path.basename(indexRoundFileFromPath(filePath));
+	const label = path.basename(filePath);
+	return label.slice(roundFile.length);
+}
+
+/**
+ * Existing index rows for `roundFile` whose suffix is not reproduced by
+ * `entries`. A model-change reindex replaces every row for the round, so any
+ * suffix it does not reproduce (e.g. a `:summary` row whose source is gone)
+ * would be silently dropped. These are returned so the caller can report and
+ * preserve them (issue #140, decision D3: reproduce it or report it, never
+ * trade it away). Comparison is by suffix, so the old copies of reproduced
+ * suffixes are still replaced by their fresh rows.
+ */
+function findOrphanIndexEntries(
+	indexPath: string,
+	roundFile: string,
+	entries: VectorIndexEntry[],
+	f: typeof fs,
+): VectorIndexEntry[] {
+	const reproduced = new Set(entries.map((entry) => indexRowSuffix(entry.filePath)));
+	return loadVectorIndex(indexPath, f).filter(
+		(entry) =>
+			path.basename(indexRoundFileFromPath(entry.filePath)) === roundFile &&
+			!reproduced.has(indexRowSuffix(entry.filePath)),
+	);
 }
 
 // ─────────────────────────────────────────────
@@ -470,13 +505,22 @@ export async function runDigestAll(options: DigestAllOptions = {}): Promise<numb
 			// and the promptEmbedding write are parity by construction. Index rows are
 			// buffered here and flushed once the embed resolves (below): full replace on
 			// model re-index, append otherwise.
+			//
+			// F3 (issue #140, decision D3): a session-scanned round carries no `summary`
+			// field (ParsedPiRound has none), so before this fix a model-change reindex
+			// of a checkpointed round reproduced prompt+response but not `:summary`,
+			// silently dropping a row the live/offline-embed path writes. Recover the
+			// summary from the round's semblr_checkpoint tool call exactly as the
+			// startup recovery path does (lib/session-backfill.ts
+			// extractCheckpointSummary), so reindex reproduces the same rows.
+			const summary = round.summary ?? extractCheckpointSummary(round.toolCalls) ?? undefined;
 			const entries: VectorIndexEntry[] = [];
 			await embedRound(
 				{
 					fileName: roundFile,
 					userPrompt: round.userPrompt,
 					responseText: round.responseSequence,
-					checkpointSummaryText: round.summary ? buildCheckpointSummaryText(round.summary) : null,
+					checkpointSummaryText: summary ? buildCheckpointSummaryText(summary) : null,
 					maxResponseBytes: embeddingMaxTokensToResponseBytes(config.embeddingMaxTokens),
 					promptNoiseOptions: {
 						fenceMaxChars: config.promptNoiseFenceMaxChars,
@@ -513,7 +557,17 @@ export async function runDigestAll(options: DigestAllOptions = {}): Promise<numb
 			);
 
 			if (needsModelReindex) {
-				replaceIndexEntriesForRoundFile(indexPath, roundFile, entries);
+				// F3 (issue #140, decision D3): the full replace must never silently
+				// drop a row this reindex did not reproduce. A suffix present on disk
+				// but absent from `entries` (e.g. a `:summary` row whose source is gone)
+				// is reported and preserved rather than traded away. Reproduced suffixes
+				// (`:prompt`/`:response`/`:summary` when derived) are still replaced by
+				// their fresh rows; only orphan suffixes are kept.
+				const orphanEntries = findOrphanIndexEntries(indexPath, roundFile, entries, f);
+				for (const orphan of orphanEntries) {
+					err.error(`  ⚠️  Preserving non-reproduced index row: ${orphan.filePath}`);
+				}
+				replaceIndexEntriesForRoundFile(indexPath, roundFile, [...entries, ...orphanEntries]);
 				modelMismatched.delete(roundFile);
 			} else {
 				for (const entry of entries) {
