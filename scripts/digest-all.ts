@@ -26,9 +26,8 @@ import { type EmbeddingModelRegistry, embedText } from "../lib/embed.ts";
 import { embedRound } from "../lib/embed-round.ts";
 import {
 	appendVectorIndexEntry,
-	findStaleContentMatches as findStaleContentMatchesInDir,
-	loadIndexedRoundFiles,
-	loadRoundFilesWithDifferentModel,
+	buildStaleContentMatchMap,
+	indexRoundFileFromPath,
 	loadVectorIndex,
 	migrateIndexEntries as migrateIndexEntriesFile,
 	replaceIndexEntriesForRoundFile,
@@ -218,18 +217,26 @@ export async function runDigestAll(options: DigestAllOptions = {}): Promise<numb
 	// Ensure rounds dir
 	f.mkdirSync(roundsDir, { recursive: true });
 
-	// Load existing index dedup set and explicit model mismatches.
+	// Issue #139: parse index.csv exactly once per run and derive every
+	// index-level structure from that single pass — the dedup set, the
+	// model-mismatch set, and the F2 sweep-heal response-vector map. processRound
+	// used to re-read and re-parse index.csv twice per round (O(n²)); the
+	// in-memory sets it now consumes are seeded from this one load.
 	// Legacy two-column rows have no model and are treated as current per #62.
-	const existingRounds = loadIndexedRoundFiles(indexPath);
-	const modelMismatchedRounds = loadRoundFilesWithDifferentModel(indexPath, config.embeddingModel);
-	// One pass over the index for the F2 sweep heal below. A per-file scan would
-	// make the sweep O(n²); the response vector is the only index row a healed
-	// marker can reuse without an embedding call.
+	const indexEntries = loadVectorIndex(indexPath, f);
+	const existingRounds = new Set<string>();
+	const modelMismatchedRounds = new Set<string>();
+	// A per-file scan would make the sweep O(n²); the response vector is the only
+	// index row a healed marker can reuse without an embedding call.
 	const responseVectorByRoundFile = new Map<string, number[]>();
-	for (const entry of loadVectorIndex(indexPath)) {
-		if (!entry.filePath.endsWith(":response")) continue;
-		const roundFile = path.basename(entry.filePath.slice(0, -":response".length));
-		if (!responseVectorByRoundFile.has(roundFile)) responseVectorByRoundFile.set(roundFile, entry.vector);
+	for (const entry of indexEntries) {
+		// indexRoundFileFromPath strips the :prompt/:response/:round/:summary suffix.
+		const roundFile = path.basename(indexRoundFileFromPath(entry.filePath));
+		existingRounds.add(roundFile);
+		if (entry.model !== undefined && entry.model !== config.embeddingModel) modelMismatchedRounds.add(roundFile);
+		if (entry.filePath.endsWith(":response") && !responseVectorByRoundFile.has(roundFile)) {
+			responseVectorByRoundFile.set(roundFile, entry.vector);
+		}
 	}
 	out.log(`📊 Already indexed: ${existingRounds.size} rounds`);
 	out.log(`📊 Model-mismatched rounds to re-index: ${modelMismatchedRounds.size}\n`);
@@ -263,6 +270,26 @@ export async function runDigestAll(options: DigestAllOptions = {}): Promise<numb
 	const queuedFiles = new Set(
 		allRounds.map((r) => deriveRoundFile(r.userPrompt, r.responseSequence, r.toolCalls).fileName),
 	);
+	// Issue #139: materialize stale-content matches once for the whole run.
+	// processRound used to call findStaleContentMatchesInDir per round, which
+	// re-scanned and JSON-parsed every round file on every iteration (O(store)
+	// per round → O(n²)). The map is built from a single pass over the same
+	// round-dir listing the sweep below walks; corrupt files are skipped exactly
+	// as in the per-call helper, which stays for direct callers.
+	const staleMatchesByTarget = buildStaleContentMatchMap(roundsDir, f);
+	// Issue #139: hoist the derived-index state the per-round path used to reload.
+	// BM25 is loaded once here, upserted in memory inside processRound, and
+	// flushed exactly once after the batch (mirroring indexRecoveredRounds'
+	// flushBm25 seam, lib/session-backfill.ts). The tool-index and vector-index
+	// sets are seeded once and updated in memory as rows are appended/replaced,
+	// so processRound never re-parses index.csv or the tool index per round.
+	const bm25Index = loadBm25Index(bm25IndexPath, f);
+	const toolIndexPath = toolIndexPathForRoundsDir(roundsDir);
+	const toolIndexedRounds = loadToolIndexedRoundFiles(toolIndexPath, f);
+	// Seed the in-memory indexed/mismatched sets from the one index load and
+	// keep them current as rows are appended or replaced.
+	const indexedRounds = new Set(existingRounds);
+	const modelMismatched = new Set(modelMismatchedRounds);
 	let sweptTotal = 0;
 	let healedTotal = 0;
 	if (f.existsSync(roundsDir)) {
@@ -340,11 +367,18 @@ export async function runDigestAll(options: DigestAllOptions = {}): Promise<numb
 		const roundId = `${round.sessionLabel}/${roundFile}`;
 
 		// Check for stale files whose stored full hash material belongs under this
-		// content-hash filename. If found, migrate old index entries before deleting
-		// old files so the round remains retrievable even if embedding is unavailable.
-		const staleFiles = findStaleContentMatchesInDir(roundsDir, roundFile);
+		// content-hash filename. Issue #139: the stale-match map is built once for
+		// the whole run (buildStaleContentMatchMap above), so this is a map lookup
+		// instead of a per-round full-store scan. If found, migrate old index
+		// entries before deleting old files so the round remains retrievable even
+		// if embedding is unavailable.
+		const staleFiles = staleMatchesByTarget.get(roundFile) ?? [];
 		for (const staleFile of staleFiles) {
 			migrateIndexEntriesFile(indexPath, staleFile, roundFile);
+			// Mirror the on-disk migration in the in-memory dedup sets: the stale
+			// filename's rows now belong to roundFile.
+			if (indexedRounds.delete(staleFile)) indexedRounds.add(roundFile);
+			if (modelMismatched.delete(staleFile)) modelMismatched.add(roundFile);
 		}
 
 		// Write round file before deleting stale copies. Atomic tmp+rename (F4, PR
@@ -356,35 +390,34 @@ export async function runDigestAll(options: DigestAllOptions = {}): Promise<numb
 		const roundTmpPath = `${roundPath}.tmp.${process.pid}`;
 		f.writeFileSync(roundTmpPath, JSON.stringify(round, null, 2));
 		f.renameSync(roundTmpPath, roundPath);
-		const bm25Index = loadBm25Index(bm25IndexPath, f);
+		// Issue #139: BM25 is loaded once at run start and mutated in memory here;
+		// the file is flushed exactly once after the batch (below), mirroring the
+		// flushBm25 seam of indexRecoveredRounds (lib/session-backfill.ts).
 		upsertBm25Round(bm25Index, roundFile, roundTextForBm25(round));
 		for (const staleFile of staleFiles) {
 			deleteBm25Round(bm25Index, staleFile);
 		}
-		writeBm25Index(bm25IndexPath, bm25Index, f);
 		for (const staleFile of staleFiles) {
 			f.unlinkSync(path.join(roundsDir, staleFile));
 			err.error(`  ♻️  Migrated stale: ${staleFile} → ${roundFile}`);
 		}
 
 		// Tool-call fulltext index — independent of embedding, so re-run it even if
-		// this round only needs re-embedding due to a model change.
-		if (round.toolCalls.length > 0) {
-			const toolIndexPath = toolIndexPathForRoundsDir(roundsDir);
-			const alreadyToolIndexed = loadToolIndexedRoundFiles(toolIndexPath, f);
-			if (!alreadyToolIndexed.has(roundFile)) {
-				appendToolIndexRows(toolIndexPath, roundsDir, buildToolIndexRows(roundFile, round.toolCalls), {
-					fsImpl: f,
-				});
-			}
+		// this round only needs re-embedding due to a model change. Issue #139: the
+		// indexed set is loaded once at run start and updated in memory here.
+		if (round.toolCalls.length > 0 && !toolIndexedRounds.has(roundFile)) {
+			appendToolIndexRows(toolIndexPath, roundsDir, buildToolIndexRows(roundFile, round.toolCalls), {
+				fsImpl: f,
+			});
+			toolIndexedRounds.add(roundFile);
 		}
 
-		// Skip embedding if already indexed under the correct hash and current model
-		// (must reload after potential migrations above).
-		const indexedAfterCleanup = loadIndexedRoundFiles(indexPath);
-		const modelMismatchedAfterCleanup = loadRoundFilesWithDifferentModel(indexPath, config.embeddingModel);
-		const needsModelReindex = modelMismatchedAfterCleanup.has(roundFile);
-		if (indexedAfterCleanup.has(roundFile) && !needsModelReindex) {
+		// Skip embedding if already indexed under the correct hash and current model.
+		// Issue #139: indexedRounds/modelMismatched are kept current in memory (seeded
+		// from the one index load, updated on migration above and on row writes below),
+		// so this no longer re-parses index.csv per round.
+		const needsModelReindex = modelMismatched.has(roundFile);
+		if (indexedRounds.has(roundFile) && !needsModelReindex) {
 			completed++;
 			err.error(`  ⏭  [${completed}/${totalNew}] ${roundId} (already indexed)`);
 			return;
@@ -442,11 +475,15 @@ export async function runDigestAll(options: DigestAllOptions = {}): Promise<numb
 
 			if (needsModelReindex) {
 				replaceIndexEntriesForRoundFile(indexPath, roundFile, entries);
+				modelMismatched.delete(roundFile);
 			} else {
 				for (const entry of entries) {
 					appendVectorIndexEntry(indexPath, entry.vector, entry.filePath, entry.model, entry.embeddingInputHash);
 				}
 			}
+			// The round now has current-model rows; keep the in-memory dedup sets
+			// consistent with the on-disk write above.
+			indexedRounds.add(roundFile);
 
 			completed++;
 			const pct = ((completed / totalNew) * 100).toFixed(1);
@@ -476,6 +513,12 @@ export async function runDigestAll(options: DigestAllOptions = {}): Promise<numb
 	const startTime = Date.now();
 	await Promise.all(workers);
 	const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
+
+	// Issue #139: flush the in-memory BM25 index once for the whole batch,
+	// mirroring the flushBm25 seam of indexRecoveredRounds (lib/session-backfill.ts).
+	// A crash before this write self-heals on the next run: the load path is
+	// non-writing (PR #138) and round files are the source of truth.
+	writeBm25Index(bm25IndexPath, bm25Index, f);
 
 	const finalCount = f.existsSync(indexPath)
 		? f.readFileSync(indexPath, "utf-8").trim().split("\n").filter(Boolean).length

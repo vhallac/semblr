@@ -2,6 +2,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { describe, expect, it, vi } from "vitest";
+import { bm25IndexPathForRoundsDir } from "../lib/bm25-index.ts";
 import { computeContentHash } from "../lib/hash.ts";
 import { encodeVectorIndexLine, loadVectorIndex, readIndexLines } from "../lib/index-io.ts";
 import { hashEmbeddingInput } from "../lib/round-capture.ts";
@@ -31,12 +32,19 @@ function logger() {
 }
 
 /**
- * Real filesystem with `writeFileSync`/`renameSync` recorded, so a test can
- * assert write ordering/atomicity while every other call passes through.
+ * Real filesystem with `writeFileSync`/`renameSync`/`readFileSync` recorded, so
+ * a test can assert write ordering/atomicity and whole-store read counts while
+ * every other call passes through.
  */
-function spyFs(): { fsImpl: typeof fs; writes: string[]; renames: Array<[string, string]> } {
+function spyFs(): {
+	fsImpl: typeof fs;
+	writes: string[];
+	renames: Array<[string, string]>;
+	reads: string[];
+} {
 	const writes: string[] = [];
 	const renames: Array<[string, string]> = [];
+	const reads: string[] = [];
 	const fsImpl = {
 		...fs,
 		writeFileSync: ((p: fs.PathLike, data: unknown, opts?: unknown) => {
@@ -47,8 +55,12 @@ function spyFs(): { fsImpl: typeof fs; writes: string[]; renames: Array<[string,
 			renames.push([String(from), String(to)]);
 			return fs.renameSync(from, to);
 		}) as typeof fs.renameSync,
+		readFileSync: ((p: fs.PathLike, opts?: unknown) => {
+			reads.push(String(p));
+			return (fs.readFileSync as (...a: unknown[]) => unknown)(p, opts);
+		}) as typeof fs.readFileSync,
 	} as typeof fs;
-	return { fsImpl, writes, renames };
+	return { fsImpl, writes, renames, reads };
 }
 
 function line(value: unknown): string {
@@ -1027,6 +1039,106 @@ describe("digest-all script", () => {
 		expect(fs.readdirSync(roundsDir).some((name) => name.includes(".tmp."))).toBe(false);
 		// The atomic path really ran: the marker landed on the durable file.
 		expect(JSON.parse(fs.readFileSync(roundPath, "utf-8")).promptEmbedding).toEqual([2, 3]);
+	});
+
+	// Issue #139 regression anchor: the whole-store work per run must not scale
+	// with the round count. Runs the sweep over two fixture sizes and asserts the
+	// index.csv read count and the index.bm25.json write count are identical —
+	// before the fix each round added a full-store scan, two index.csv parses, a
+	// bm25 load, and a bm25 write. Uses the sweep path (no session files) so every
+	// round goes through processRound.
+	async function runSweepFixture(roundCount: number): Promise<{
+		bm25Writes: number;
+		indexReads: number;
+		bm25Reads: number;
+		toolIndexReads: number;
+	}> {
+		const root = tmpDir();
+		const sessionsDir = tmpDir(); // no session files: force the rounds-dir sweep
+		const roundsDir = path.join(root, "rounds");
+		fs.mkdirSync(roundsDir, { recursive: true });
+		const indexPath = path.join(roundsDir, "index.csv");
+
+		// Seed an existing index.csv so the run genuinely reads it (a missing file
+		// read would also count, but a populated index exercises the dedup path).
+		fs.writeFileSync(
+			indexPath,
+			encodeVectorIndexLine(
+				[0.1, 0.2],
+				"00000000000000000000000000000000.json:prompt",
+				"openai/text-embedding-3-small",
+			) + "\n",
+		);
+		// Seed a valid bm25 sidecar so the run's single load actually reads it
+		// (loadBm25Index skips a missing file without a read).
+		fs.writeFileSync(
+			bm25IndexPathForRoundsDir(roundsDir),
+			JSON.stringify({ version: 1, documentCount: 0, averageDocumentLength: 0, documents: {} }),
+		);
+		// Seed the tool index too, so its once-per-run load is exercised.
+		fs.writeFileSync(toolIndexPathForRoundsDir(roundsDir), "00000000000000000000000000000000,0,bash,placeholder\n");
+
+		const vectors: number[][] = [];
+		for (let i = 0; i < roundCount; i++) {
+			const userPrompt = `Recovered round number ${i} with a distinct prompt body.`;
+			const responseSequence = `Recovered response number ${i} with a distinct response body.`;
+			const roundFile = `${computeContentHash(userPrompt, responseSequence, [])}.json`;
+			// A sweep round with tool calls exercises the tool-index load path.
+			if (i === 0) {
+				fs.writeFileSync(
+					path.join(roundsDir, roundFile),
+					JSON.stringify({
+						userPrompt,
+						responseSequence,
+						toolCalls: [{ index: 0, name: "bash", arguments: '{"command":"ls"}', result_summary: "ok" }],
+						recovered: true,
+					}),
+				);
+			} else {
+				fs.writeFileSync(
+					path.join(roundsDir, roundFile),
+					JSON.stringify({ userPrompt, responseSequence, toolCalls: [], recovered: true }),
+				);
+			}
+			// prompt + response rows per round; the combined embed call consumes a
+			// vector but writes no row.
+			vectors.push([i + 1, 0], [0, i + 1], [i + 1, i + 1]);
+		}
+
+		const { fsImpl, writes, reads } = spyFs();
+		await expect(
+			runDigestAll({
+				sessionsDir,
+				roundsDir,
+				indexPath,
+				apiKey: "key",
+				fetchImpl: embeddingFetch(vectors),
+				fsImpl,
+				stdout: logger().out,
+				stderr: logger().err,
+			}),
+		).resolves.toBe(0);
+
+		return {
+			bm25Writes: writes.filter((w) => w === bm25IndexPathForRoundsDir(roundsDir)).length,
+			indexReads: reads.filter((r) => r === indexPath).length,
+			bm25Reads: reads.filter((r) => r === bm25IndexPathForRoundsDir(roundsDir)).length,
+			toolIndexReads: reads.filter((r) => r === toolIndexPathForRoundsDir(roundsDir)).length,
+		};
+	}
+
+	it("loads whole-store structures once per run, not once per round", async () => {
+		const small = await runSweepFixture(3);
+		const large = await runSweepFixture(6);
+
+		// O(1) evidence: doubling the round count must not change any whole-store count.
+		expect(large).toEqual(small);
+		// The bm25 index is written exactly once for the whole batch (flushBm25 seam)
+		// and loaded exactly once. The tool index is loaded once at start plus a
+		// single lockfile read for the one appending round — both O(1) in N.
+		expect(small.bm25Writes).toBe(1);
+		expect(small.bm25Reads).toBe(1);
+		expect(small.toolIndexReads).toBe(2);
 	});
 
 	it("short prompts follow the shared drop policy: no :prompt row, response vector stored as promptEmbedding", async () => {
