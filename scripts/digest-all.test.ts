@@ -1132,6 +1132,81 @@ describe("digest-all script", () => {
 		expect(logs.stderr.join("\n")).toContain("Skipping unreadable round file: corrupt.json");
 		expect(logs.stderr.join("\n")).toContain("Skipping invalid round file: no-prompt.json");
 		expect(logs.stdout.join("\n")).toContain("0 swept from rounds dir");
+		// D4: the unresolvable files are named as a set, not just warned about one
+		// at a time, so the operator sees the store will not converge.
+		expect(logs.stdout.join("\n")).toContain("2 non-convergent rounds");
+		expect(logs.stdout.join("\n")).toContain("• corrupt.json");
+		expect(logs.stdout.join("\n")).toContain("• no-prompt.json");
+	});
+
+	it("a resolvable round still embeds and converges; a second run embeds nothing (D4)", async () => {
+		const root = tmpDir();
+		const sessionsDir = tmpDir();
+		const roundsDir = path.join(root, "rounds");
+		fs.mkdirSync(roundsDir, { recursive: true });
+		const indexPath = path.join(roundsDir, "index.csv");
+
+		// One round the sweep cannot resolve, one it can.
+		fs.writeFileSync(path.join(roundsDir, "broken.json"), "{not json");
+		const userPrompt = "A resolvable swept round sitting next to an unresolvable one.";
+		const responseSequence = "It still embeds, and a second run spends nothing.";
+		const roundFile = `${computeContentHash(userPrompt, responseSequence, [])}.json`;
+		fs.writeFileSync(
+			path.join(roundsDir, roundFile),
+			JSON.stringify({ userPrompt, responseSequence, toolCalls: [], recovered: true }),
+		);
+
+		const requests: unknown[] = [];
+		const fetchImpl = embeddingFetch(
+			[
+				[1, 0],
+				[0, 1],
+			],
+			requests,
+		) as typeof fetch;
+		const logs = logger();
+		await expect(
+			runDigestAll({
+				sessionsDir,
+				roundsDir,
+				indexPath,
+				apiKey: "key",
+				fetchImpl,
+				stdout: logs.out,
+				stderr: logs.err,
+			}),
+		).resolves.toBe(0);
+
+		// The resolvable round embeds; the unresolvable one is named rather than
+		// silently dropped from the count.
+		expect(fetchImpl).toHaveBeenCalledTimes(3);
+		expect(logs.stdout.join("\n")).toContain("1 non-convergent round");
+		expect(logs.stdout.join("\n")).toContain("• broken.json");
+		expect(
+			loadVectorIndex(indexPath)
+				.map((e) => e.filePath)
+				.sort(),
+		).toEqual([`${roundFile}:prompt`, `${roundFile}:response`].sort());
+
+		// D4 convergence proof: a second run reaches no embeddable round and spends
+		// no embedding call — the only rounds left are the non-convergent one.
+		const secondFetch = vi.fn(async () => new Response("should not be called")) as typeof fetch;
+		const secondLogs = logger();
+		await expect(
+			runDigestAll({
+				sessionsDir,
+				roundsDir,
+				indexPath,
+				apiKey: "key",
+				fetchImpl: secondFetch,
+				stdout: secondLogs.out,
+				stderr: secondLogs.err,
+			}),
+		).resolves.toBe(0);
+		expect(secondFetch).not.toHaveBeenCalled();
+		expect(secondLogs.stdout.join("\n")).toContain("📊 New rounds to embed: 0");
+		expect(secondLogs.stdout.join("\n")).toContain("✨ Nothing to do — all sessions already indexed!");
+		expect(secondLogs.stdout.join("\n")).toContain("• broken.json");
 	});
 
 	it("sweep skips parseable-but-incomplete round files by name instead of failing the whole run", async () => {

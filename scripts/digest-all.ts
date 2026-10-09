@@ -350,6 +350,13 @@ export async function runDigestAll(options: DigestAllOptions = {}): Promise<numb
 	const modelMismatched = new Set(modelMismatchedRounds);
 	let sweptTotal = 0;
 	let healedTotal = 0;
+	// Issue #140 (D4): rounds the sweep reaches but can never resolve into a
+	// round (unreadable JSON, or parseable-but-invalid fields). They are named
+	// here and reported as non-convergent in the run summary, so an unresolvable
+	// round is visible to the operator instead of silently dropped from the
+	// count — the observable proof of convergence is that a second run names
+	// nothing and spends no embedding call.
+	const nonConvergent: string[] = [];
 	if (f.existsSync(roundsDir)) {
 		for (const fileName of f.readdirSync(roundsDir)) {
 			if (!fileName.endsWith(".json") || fileName.startsWith("index")) continue;
@@ -395,6 +402,7 @@ export async function runDigestAll(options: DigestAllOptions = {}): Promise<numb
 				round = JSON.parse(f.readFileSync(path.join(roundsDir, fileName), "utf-8")) as Round;
 			} catch {
 				err.error(`  ⚠️  Skipping unreadable round file: ${fileName}`);
+				nonConvergent.push(fileName);
 				continue;
 			}
 			// F5 (PR #134 review): parseable-but-incomplete rounds would throw in
@@ -415,6 +423,7 @@ export async function runDigestAll(options: DigestAllOptions = {}): Promise<numb
 				!round.toolCalls.every((tc) => tc !== null && typeof tc === "object")
 			) {
 				err.error(`  ⚠️  Skipping invalid round file: ${fileName}`);
+				nonConvergent.push(fileName);
 				continue;
 			}
 			allRounds.push({ ...round, sessionLabel: "<rounds-dir>" });
@@ -426,6 +435,18 @@ export async function runDigestAll(options: DigestAllOptions = {}): Promise<numb
 	out.log(
 		`📊 New rounds to embed: ${totalNew} (${skippedTotal} already indexed, ${sweptTotal} swept from rounds dir${healedTotal > 0 ? `, ${healedTotal} markers healed` : ""})\n`,
 	);
+
+	// Issue #140 (D4): name every round the sweep could not resolve. A round is
+	// non-convergent when no run can turn it into an embedded round (unreadable
+	// or invalid round file) — the operator must see it rather than infer it from
+	// a count that never reaches zero. Silent when the store converges.
+	if (nonConvergent.length > 0) {
+		out.log(
+			`⚠️  ${nonConvergent.length} non-convergent round${nonConvergent.length === 1 ? "" : "s"} — cannot be embedded:\n`,
+		);
+		for (const fileName of nonConvergent) out.log(`   • ${fileName}`);
+		out.log("");
+	}
 
 	if (totalNew === 0) {
 		out.log("✨ Nothing to do — all sessions already indexed!");
