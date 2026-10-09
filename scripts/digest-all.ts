@@ -22,18 +22,21 @@ import {
 	upsertBm25Round,
 	writeBm25Index,
 } from "../lib/bm25-index.ts";
-import { type EmbeddingModelRegistry, embedText, normalize } from "../lib/embed.ts";
+import { type EmbeddingModelRegistry, embedText } from "../lib/embed.ts";
+import { embedRound } from "../lib/embed-round.ts";
 import {
 	appendVectorIndexEntry,
 	findStaleContentMatches as findStaleContentMatchesInDir,
 	loadIndexedRoundFiles,
 	loadRoundFilesWithDifferentModel,
+	loadVectorIndex,
 	migrateIndexEntries as migrateIndexEntriesFile,
 	replaceIndexEntriesForRoundFile,
 	type VectorIndexEntry,
 } from "../lib/index-io.ts";
 import { type ParsedPiRound, parsePiSessionJsonl } from "../lib/pi-session.ts";
-import { buildPromptEmbeddingInput, deriveRoundFile } from "../lib/round-capture.ts";
+import { deriveRoundFile, embeddingMaxTokensToResponseBytes } from "../lib/round-capture.ts";
+import { buildCheckpointSummaryText, type CheckpointSummary } from "../lib/round-data.ts";
 import {
 	resolveScriptApiKey,
 	resolveScriptConfig,
@@ -67,7 +70,13 @@ const CONCURRENCY = 1;
 // Types
 // ─────────────────────────────────────────────
 
-type Round = ParsedPiRound & { sessionLabel: string };
+type Round = ParsedPiRound & {
+	sessionLabel: string;
+	/** Checkpoint summary carried by recovered round files; embeds as a `:summary` row (F1 parity). */
+	summary?: CheckpointSummary;
+	/** Stored embedding marker (F2); written through embedRound's writeRoundEmbedding dep. */
+	promptEmbedding?: number[];
+};
 
 // ─────────────────────────────────────────────
 // Parse a single JSONL file into rounds
@@ -108,6 +117,44 @@ function gatherSessionFiles(
 
 	jsonlFiles.sort((a, b) => a.filePath.localeCompare(b.filePath));
 	return jsonlFiles;
+}
+
+// ─────────────────────────────────────────────
+// F2 sweep heal (PR #134 review, option b)
+// ─────────────────────────────────────────────
+
+/**
+ * Write the `promptEmbedding` marker onto a round file that already has index
+ * rows but no marker, without re-embedding. The value is the round's
+ * `:response` index-row vector (see the call site for why the combined vector
+ * is unavailable and why grouping is therefore unsupported for healed rounds).
+ *
+ * Atomic tmp+rename, matching the extension's round-file write
+ * (src/semblr.ts writeRoundEmbedding). Round files are the durable store; a
+ * truncating write here could destroy a round that has no session JSONL left
+ * to recover from. Returns true when a marker was written.
+ */
+function healMissingPromptEmbedding(
+	fileName: string,
+	roundsDir: string,
+	responseVectorByRoundFile: Map<string, number[]>,
+	f: typeof fs,
+): boolean {
+	const roundPath = path.join(roundsDir, fileName);
+	let round: Round;
+	try {
+		round = JSON.parse(f.readFileSync(roundPath, "utf-8")) as Round;
+	} catch {
+		return false;
+	}
+	if (round.promptEmbedding) return false;
+	const responseVec = responseVectorByRoundFile.get(fileName);
+	if (!responseVec) return false;
+	round.promptEmbedding = responseVec;
+	const tmpPath = `${roundPath}.tmp.${process.pid}`;
+	f.writeFileSync(tmpPath, JSON.stringify(round, null, 2));
+	f.renameSync(tmpPath, roundPath);
+	return true;
 }
 
 // ─────────────────────────────────────────────
@@ -175,6 +222,15 @@ export async function runDigestAll(options: DigestAllOptions = {}): Promise<numb
 	// Legacy two-column rows have no model and are treated as current per #62.
 	const existingRounds = loadIndexedRoundFiles(indexPath);
 	const modelMismatchedRounds = loadRoundFilesWithDifferentModel(indexPath, config.embeddingModel);
+	// One pass over the index for the F2 sweep heal below. A per-file scan would
+	// make the sweep O(n²); the response vector is the only index row a healed
+	// marker can reuse without an embedding call.
+	const responseVectorByRoundFile = new Map<string, number[]>();
+	for (const entry of loadVectorIndex(indexPath)) {
+		if (!entry.filePath.endsWith(":response")) continue;
+		const roundFile = path.basename(entry.filePath.slice(0, -":response".length));
+		if (!responseVectorByRoundFile.has(roundFile)) responseVectorByRoundFile.set(roundFile, entry.vector);
+	}
 	out.log(`📊 Already indexed: ${existingRounds.size} rounds`);
 	out.log(`📊 Model-mismatched rounds to re-index: ${modelMismatchedRounds.size}\n`);
 
@@ -192,8 +248,83 @@ export async function runDigestAll(options: DigestAllOptions = {}): Promise<numb
 		allRounds.push(...newRounds);
 	}
 
+	// Rounds-dir sweep (issue #133): recovered round files written by the
+	// startup backfill may have no session JSONL left to scan from — but they
+	// also have no vector-index rows yet (the backfill writes the round file
+	// without embedding). Sweep every round file that is not already covered
+	// by the session scan and is missing index rows under the current model,
+	// so `just index` backfills their embeddings too. Rounds already indexed
+	// under the current model are skipped — index presence, not the
+	// promptEmbedding field, is the idempotence guard. Since F2 (PR #134
+	// review) processRound embeds through embedRound (lib/embed-round.ts),
+	// which writes the index rows and the promptEmbedding field together —
+	// but the guard stays index presence, so a round whose rows are missing
+	// is swept again even if a promptEmbedding marker survived.
+	const queuedFiles = new Set(
+		allRounds.map((r) => deriveRoundFile(r.userPrompt, r.responseSequence, r.toolCalls).fileName),
+	);
+	let sweptTotal = 0;
+	let healedTotal = 0;
+	if (f.existsSync(roundsDir)) {
+		for (const fileName of f.readdirSync(roundsDir)) {
+			if (!fileName.endsWith(".json") || fileName.startsWith("index")) continue;
+			if (queuedFiles.has(fileName)) continue;
+			if (existingRounds.has(fileName) && !modelMismatchedRounds.has(fileName)) {
+				// F2 (PR #134 review, option b): a round that already has current-model
+				// index rows may still lack the `promptEmbedding` marker (e.g. rows
+				// survive while the round file was rewritten). The startup pending
+				// counter keys on the marker, so `just index` must heal it here — or the
+				// count names work this run cannot do. Healing reuses the round's
+				// `:response` index-row vector instead of re-embedding: the live
+				// combined `concat(prompt, response)` vector is not stored in the index
+				// and cannot be reconstructed without an API call. The response-side
+				// vector is already the accepted degraded marker on the shared-core
+				// short-prompt path (lib/embed-round.ts), and every consumer gates on
+				// truthiness and uses it as a real vector. Consequence: healed rounds
+				// cannot support topic grouping (src/semblr.ts keys grouping on
+				// promptEmbedding), because grouping needs the combined vector. This is
+				// accepted for historical rounds — a migration can restore the combined
+				// vector if grouping is ever built. Rounds with no `:response` row are
+				// left marker-less (still truthfully pending).
+				healMissingPromptEmbedding(fileName, roundsDir, responseVectorByRoundFile, f) && healedTotal++;
+				continue;
+			}
+			let round: Round;
+			try {
+				round = JSON.parse(f.readFileSync(path.join(roundsDir, fileName), "utf-8")) as Round;
+			} catch {
+				err.error(`  ⚠️  Skipping unreadable round file: ${fileName}`);
+				continue;
+			}
+			// F5 (PR #134 review): parseable-but-incomplete rounds would throw in
+			// deriveRoundFile or the toolCalls length check inside processRound —
+			// outside its try/catch — and kill the whole run naming no file. Validate
+			// the fields the enqueue needs here; invalid files are skipped with a
+			// named warning, mirroring the unreadable-file skip above.
+			// F3 (PR #134 review): an array is not enough — a non-object element such
+			// as `[null]` passes Array.isArray, then throws in deriveRoundFile
+			// (computeContentHash) and in the tool-index row builders, outside any
+			// try/catch, aborting the run naming no file. Require every element to be
+			// a non-null object.
+			if (
+				typeof round.userPrompt !== "string" ||
+				round.userPrompt.length === 0 ||
+				typeof round.responseSequence !== "string" ||
+				!Array.isArray(round.toolCalls) ||
+				!round.toolCalls.every((tc) => tc !== null && typeof tc === "object")
+			) {
+				err.error(`  ⚠️  Skipping invalid round file: ${fileName}`);
+				continue;
+			}
+			allRounds.push({ ...round, sessionLabel: "<rounds-dir>" });
+			sweptTotal++;
+		}
+	}
+
 	const totalNew = allRounds.length;
-	out.log(`📊 New rounds to embed: ${totalNew} (${skippedTotal} already indexed)\n`);
+	out.log(
+		`📊 New rounds to embed: ${totalNew} (${skippedTotal} already indexed, ${sweptTotal} swept from rounds dir${healedTotal > 0 ? `, ${healedTotal} markers healed` : ""})\n`,
+	);
 
 	if (totalNew === 0) {
 		out.log("✨ Nothing to do — all sessions already indexed!");
@@ -216,8 +347,15 @@ export async function runDigestAll(options: DigestAllOptions = {}): Promise<numb
 			migrateIndexEntriesFile(indexPath, staleFile, roundFile);
 		}
 
-		// Write round file before deleting stale copies.
-		f.writeFileSync(path.resolve(roundsDir, roundFile), JSON.stringify(round, null, 2));
+		// Write round file before deleting stale copies. Atomic tmp+rename (F4, PR
+		// #134 review), matching the extension's round-file write (src/semblr.ts
+		// writeRoundEmbedding): round files are the durable store, so an interrupt
+		// mid-write must not truncate a file that has no session JSONL left to
+		// recover from.
+		const roundPath = path.resolve(roundsDir, roundFile);
+		const roundTmpPath = `${roundPath}.tmp.${process.pid}`;
+		f.writeFileSync(roundTmpPath, JSON.stringify(round, null, 2));
+		f.renameSync(roundTmpPath, roundPath);
 		const bm25Index = loadBm25Index(bm25IndexPath, f);
 		upsertBm25Round(bm25Index, roundFile, roundTextForBm25(round));
 		for (const staleFile of staleFiles) {
@@ -253,44 +391,54 @@ export async function runDigestAll(options: DigestAllOptions = {}): Promise<numb
 		}
 
 		try {
+			// F1+F2 (PR #134 review): redrive embedding goes through the shared policy
+			// core embedRound (lib/embed-round.ts) — the same call the live agent_end
+			// path and embedRecoveredRounds make. Response clip budget (24,000 bytes,
+			// not 8,000 code units), checkpoint `:summary` rows, the short-prompt drop,
+			// and the promptEmbedding write are parity by construction. Index rows are
+			// buffered here and flushed once the embed resolves (below): full replace on
+			// model re-index, append otherwise.
 			const entries: VectorIndexEntry[] = [];
-			// Prompt input: noise-cleaned, budget-clipped prompt text + embedding-input hash
-			// stamp (issue #106; clip restored post-cleanup in #107 F4), matching the
-			// extension capture path so `just migrate` stays churn-free.
-			const { text: promptInput, hash: promptInputHash } = buildPromptEmbeddingInput(
-				round.userPrompt,
+			await embedRound(
 				{
-					fenceMaxChars: config.promptNoiseFenceMaxChars,
-					jsonMaxChars: config.promptNoiseJsonMaxChars,
-					repeatMaxChars: config.promptNoiseRepeatMaxChars,
+					fileName: roundFile,
+					userPrompt: round.userPrompt,
+					responseText: round.responseSequence,
+					checkpointSummaryText: round.summary ? buildCheckpointSummaryText(round.summary) : null,
+					maxResponseBytes: embeddingMaxTokensToResponseBytes(config.embeddingMaxTokens),
+					promptNoiseOptions: {
+						fenceMaxChars: config.promptNoiseFenceMaxChars,
+						jsonMaxChars: config.promptNoiseJsonMaxChars,
+						repeatMaxChars: config.promptNoiseRepeatMaxChars,
+					},
+					promptMaxTokens: config.embeddingMaxTokens,
 				},
-				config.embeddingMaxTokens,
+				{
+					embed: (text) =>
+						embedText(text, apiKey, {
+							fetchImpl: options.fetchImpl,
+							config: embeddingConfig,
+							modelRegistry,
+						}),
+					appendIndexRow: (label, vec, hash) => {
+						entries.push({
+							vector: vec,
+							filePath: label,
+							model: config.embeddingModel,
+							embeddingInputHash: hash,
+						});
+					},
+					writeRoundEmbedding: (fileName, vec) => {
+						round.promptEmbedding = vec;
+						// Atomic tmp+rename (F4, PR #134 review): an interrupt during the
+						// marker write must not truncate the durable round file.
+						const target = path.resolve(roundsDir, fileName);
+						const tmp = `${target}.tmp.${process.pid}`;
+						f.writeFileSync(tmp, JSON.stringify(round, null, 2));
+						f.renameSync(tmp, target);
+					},
+				},
 			);
-			const promptVector = await embedText(promptInput, apiKey, {
-				fetchImpl: options.fetchImpl,
-				config: embeddingConfig,
-				modelRegistry,
-			});
-			entries.push({
-				vector: normalize(promptVector),
-				filePath: `${roundFile}:prompt`,
-				model: config.embeddingModel,
-				embeddingInputHash: promptInputHash,
-			});
-
-			const respText = round.responseSequence.slice(0, config.embeddingMaxTokens);
-			if (respText) {
-				const respVector = await embedText(respText, apiKey, {
-					fetchImpl: options.fetchImpl,
-					config: embeddingConfig,
-					modelRegistry,
-				});
-				entries.push({
-					vector: normalize(respVector),
-					filePath: `${roundFile}:response`,
-					model: config.embeddingModel,
-				});
-			}
 
 			if (needsModelReindex) {
 				replaceIndexEntriesForRoundFile(indexPath, roundFile, entries);

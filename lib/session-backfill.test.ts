@@ -11,6 +11,7 @@ import {
 	embeddingMaxTokensToResponseBytes,
 } from "./round-capture.ts";
 import type { ToolCallDetail } from "./round-data.ts";
+import { saveScanCutoff } from "./scan-register.ts";
 import {
 	backfillMissingRounds,
 	buildBackfillCandidates,
@@ -21,7 +22,12 @@ import {
 	isBackfillStartReason,
 	isSessionTailClosed,
 	listBackfillCandidates,
+	loadDiskCanonicalKeys,
+	planStartupEmbedding,
 	type RecoveredRoundLike,
+	startupEmbedStatusMessage,
+	TAIL_PEEK_BYTES,
+	tailRoundComplete,
 } from "./session-backfill.ts";
 
 function writeSessionFile(dir: string, lines: object[]): string {
@@ -146,6 +152,71 @@ describe("session-backfill", () => {
 		expect(round.toolCalls[0].result_full).toBe("output line\n");
 	});
 
+	it("skips a round already on disk under a legacy filename with whitespace-drifted content (duplicate regeneration fix)", () => {
+		// A legacy live save stripped the trailing newline from the tool result
+		// and omitted tool-call ids, so its filename is a historical hash that
+		// today's parser cannot reproduce. The content-based existence check must
+		// still recognize the round and skip re-recovery.
+		const sessionFile = writeSessionFile(tmp, [
+			userMsg("q", "u1"),
+			{
+				type: "message",
+				message: {
+					role: "assistant",
+					content: [{ type: "toolCall", name: "bash", arguments: {}, id: "t1" }],
+				},
+			},
+			{
+				type: "message",
+				message: {
+					role: "toolResult",
+					toolName: "bash",
+					toolCallId: "t1",
+					content: [{ type: "text", text: "output line\n" }],
+				},
+			},
+			assistantMsg("a"),
+		]);
+		const roundsDir = path.join(tmp, "rounds");
+		const legacyRound = {
+			userPrompt: "q",
+			responseSequence: "a",
+			toolCalls: [{ name: "bash", arguments: "{}", result_full: "output line" }],
+		};
+		fs.mkdirSync(roundsDir, { recursive: true });
+		// Arbitrary legacy filename — unreproducible by today's hashing.
+		fs.writeFileSync(path.join(roundsDir, "00000000000000000000000000000000.json"), JSON.stringify(legacyRound));
+
+		const { missing, scanned } = findMissingRounds(sessionFile, roundsDir);
+		expect(scanned).toBe(1);
+		expect(missing).toHaveLength(0);
+	});
+
+	it("does not let the content check absorb genuinely different rounds", () => {
+		const sessionFile = writeSessionFile(tmp, [userMsg("q one"), assistantMsg("a one")]);
+		const roundsDir = path.join(tmp, "rounds");
+		fs.mkdirSync(roundsDir, { recursive: true });
+		fs.writeFileSync(
+			path.join(roundsDir, "11111111111111111111111111111111.json"),
+			JSON.stringify({ userPrompt: "q two", responseSequence: "a two" }),
+		);
+		const { missing } = findMissingRounds(sessionFile, roundsDir);
+		expect(missing).toHaveLength(1);
+	});
+
+	it("loadDiskCanonicalKeys tolerates unreadable/corrupt round files", () => {
+		const roundsDir = path.join(tmp, "rounds");
+		fs.mkdirSync(roundsDir, { recursive: true });
+		fs.writeFileSync(path.join(roundsDir, "bad.json"), "{not json");
+		fs.writeFileSync(path.join(roundsDir, "notes.txt"), "ignored");
+		fs.writeFileSync(
+			path.join(roundsDir, "22222222222222222222222222222222.json"),
+			JSON.stringify({ userPrompt: "p", responseSequence: "r" }),
+		);
+		const keys = loadDiskCanonicalKeys(roundsDir);
+		expect(keys.size).toBe(1);
+	});
+
 	it("rounds with empty user prompt are not counted as scanned", () => {
 		const sessionFile = writeSessionFile(tmp, [userMsg("   ", "u1"), assistantMsg("response")]);
 		const roundsDir = path.join(tmp, "rounds");
@@ -160,6 +231,8 @@ describe("session-backfill", () => {
 		// Pretend every file exists — nothing should be recovered.
 		const outcome = backfillMissingRounds(sessionFile, roundsDir, {
 			existsSync: () => true,
+			readdirSync: fs.readdirSync,
+			readFileSync: fs.readFileSync,
 			mkdirSync: fs.mkdirSync,
 			writeFileSync: fs.writeFileSync,
 			statSync: fs.statSync,
@@ -581,6 +654,52 @@ describe("session-backfill", () => {
 	});
 });
 
+describe("planStartupEmbedding (issue #133)", () => {
+	type Round = { promptEmbedding?: number[] };
+	const embedded = (n: number): [string, Round][] =>
+		Array.from({ length: n }, (_, i) => [`r${i}.json`, { promptEmbedding: [0.1] }]);
+
+	it("keeps embedding inline when the unembedded count is exactly at the threshold (boundary: 10)", () => {
+		const files = new Map<string, Round>([
+			...embedded(2),
+			...Array.from({ length: 10 }, (_, i) => [`p${i}.json`, {}] as const),
+		]);
+		const plan = planStartupEmbedding([...files.keys()], (f) => files.get(f) ?? null);
+		expect(plan).toEqual({ mode: "inline", pendingCount: 10 });
+	});
+
+	it("defers when the unembedded count is just above the threshold (boundary: 11)", () => {
+		const files = new Map<string, Round>([
+			...embedded(2),
+			...Array.from({ length: 11 }, (_, i) => [`p${i}.json`, {}] as const),
+		]);
+		const plan = planStartupEmbedding([...files.keys()], (f) => files.get(f) ?? null);
+		expect(plan).toEqual({ mode: "defer", pendingCount: 11 });
+	});
+
+	it("builds the defer status message with exact wording", () => {
+		expect(startupEmbedStatusMessage({ mode: "defer", pendingCount: 10 })).toBe(
+			"🧠 10 rounds pending embedding backfill — run just index",
+		);
+	});
+
+	it("defers when the unembedded count exceeds the threshold, reporting the pending count", () => {
+		const files = new Map<string, Round>([
+			...embedded(3),
+			...Array.from({ length: 11 }, (_, i) => [`p${i}.json`, {}] as const),
+		]);
+		const plan = planStartupEmbedding([...files.keys()], (f) => files.get(f) ?? null);
+		// Message built from this count: `🧠 11 rounds pending embedding backfill — run just index`
+		expect(plan).toEqual({ mode: "defer", pendingCount: 11 });
+	});
+
+	it("treats unreadable round files as pending", () => {
+		const files = new Map<string, { promptEmbedding: number[] }>([["a.json", { promptEmbedding: [1] }]]);
+		const plan = planStartupEmbedding(["a.json", "missing.json"], (f) => files.get(f) ?? null);
+		expect(plan).toEqual({ mode: "inline", pendingCount: 1 });
+	});
+});
+
 describe("listBackfillCandidates", () => {
 	let tmp: string;
 	beforeEach(() => {
@@ -665,6 +784,68 @@ describe("buildBackfillCandidates (F5)", () => {
 		const current = path.join(tmp, "cur.jsonl");
 		fs.writeFileSync(current, "{}");
 		expect(buildBackfillCandidates(tmp, current, current)).toEqual([]);
+	});
+});
+
+describe("buildBackfillCandidates cutoff gating (unit-002)", () => {
+	let tmp: string;
+	let stateDir: string;
+	beforeEach(() => {
+		tmp = fs.mkdtempSync(path.join(os.tmpdir(), "backfill-cutoff-"));
+		stateDir = path.join(tmp, "state");
+	});
+	afterEach(() => {
+		fs.rmSync(tmp, { recursive: true, force: true });
+	});
+
+	function makeFile(name: string, mtimeMs: number): string {
+		const file = path.join(tmp, name);
+		fs.writeFileSync(file, "{}");
+		fs.utimesSync(file, new Date(mtimeMs), new Date(mtimeMs));
+		return file;
+	}
+
+	it("drops files at-or-below the cutoff and keeps newer ones", () => {
+		const old_ = makeFile("old.jsonl", 1000);
+		const at = makeFile("at.jsonl", 2000);
+		const newer = makeFile("newer.jsonl", 3000);
+		const current = makeFile("cur.jsonl", 10_000);
+		expect(buildBackfillCandidates(tmp, current, undefined, fs, { cutoffMs: 2000 })).toEqual([newer]);
+	});
+
+	it("pins previousSessionFile regardless of cutoff", () => {
+		const prev = makeFile("prev.jsonl", 500);
+		const current = makeFile("cur.jsonl", 10_000);
+		expect(buildBackfillCandidates(tmp, current, prev, fs, { cutoffMs: 9000 })).toEqual([prev]);
+	});
+
+	it("falls back to a full scan when the register is corrupt/missing", () => {
+		const a = makeFile("a.jsonl", 1000);
+		const current = makeFile("cur.jsonl", 10_000);
+		// No register written for this session dir.
+		expect(buildBackfillCandidates(tmp, current, undefined, fs, { stateDir })).toEqual([a]);
+	});
+
+	it("applies the register cutoff via stateDir", () => {
+		const a = makeFile("a.jsonl", 1000);
+		const b = makeFile("b.jsonl", 5000);
+		const current = makeFile("cur.jsonl", 10_000);
+		saveScanCutoff(stateDir, tmp, 2000);
+		expect(buildBackfillCandidates(tmp, current, undefined, fs, { stateDir })).toEqual([b]);
+	});
+
+	it("keeps a file whose statSync throws only in the cutoff filter (defensive branch)", () => {
+		const file = path.join(tmp, "a.jsonl");
+		fs.writeFileSync(file, "{}");
+		const current = path.join(tmp, "cur.jsonl");
+		fs.writeFileSync(current, "{}");
+		let statCalls = 0;
+		const statSync = (p: fs.PathLike): fs.Stats => {
+			if (path.resolve(String(p)) === path.resolve(file) && ++statCalls > 1) throw new Error("boom");
+			return fs.statSync(p) as fs.Stats;
+		};
+		const flaky = { readdirSync: fs.readdirSync, statSync } as Pick<typeof fs, "readdirSync" | "statSync">;
+		expect(buildBackfillCandidates(tmp, current, undefined, flaky, { cutoffMs: 5000 })).toEqual([file]);
 	});
 });
 
@@ -757,6 +938,26 @@ describe("indexRecoveredRounds", () => {
 		});
 		expect(writes).toEqual([]);
 		expect(report.bm25Indexed).toBe(0);
+	});
+
+	it("is synchronous — all indexing effects have landed when it returns (issue #133: must-not-lose contract)", () => {
+		const bm25: string[] = [];
+		const toolAppends: string[] = [];
+		const report = indexRecoveredRounds(["a.json", "b.json"], {
+			readRoundData: () => ({ toolCalls: [toolCall] }),
+			upsertBm25: (f) => bm25.push(f),
+			flushBm25: () => {},
+			appendToolRows: (f) => toolAppends.push(f),
+		});
+		// Not a promise: the returned report is final the instant the call returns.
+		expect(report).not.toBeInstanceOf(Promise);
+		// Every effect is complete by return time — the caller's deferral of the
+		// embedding burst must never delay these indexes.
+		expect(bm25).toEqual(["a.json", "b.json"]);
+		expect(toolAppends).toEqual(["a.json", "b.json"]);
+		expect(report.bm25Indexed).toBe(2);
+		expect(report.toolIndexed).toBe(2);
+		expect(report.errors).toEqual([]);
 	});
 
 	it("propagates appendToolRows failures into errors without blocking later rounds", () => {
@@ -951,5 +1152,112 @@ describe("prompt-only round skip (PR !131 F1)", () => {
 		expect(skippedComplete).toBe(true);
 		expect(missing).toEqual([]);
 		expect(scanned).toBe(0);
+	});
+});
+
+describe("tailRoundComplete / tail-only backfill (unit-001)", () => {
+	let tmp: string;
+	beforeEach(() => {
+		tmp = fs.mkdtempSync(path.join(os.tmpdir(), "backfill-tail-"));
+	});
+	afterEach(() => {
+		fs.rmSync(tmp, { recursive: true, force: true });
+	});
+
+	/** fsImpl whose readFileSync is forbidden — proves the tail path never does a full read. */
+	function noFullReadFsImpl() {
+		return {
+			...fs,
+			readFileSync: (f: fs.PathOrFileDescriptor) => {
+				throw new Error(`full read must not happen: ${String(f)}`);
+			},
+		} as unknown as typeof fs;
+	}
+
+	it("returns null for an unreadable session file", () => {
+		expect(tailRoundComplete(path.join(tmp, "nope.jsonl"), tmp)).toBeNull();
+	});
+
+	it("skips a complete session with ONLY the bounded tail read (readFileSync forbidden)", () => {
+		const sessionFile = writeSessionFile(tmp, [userMsg("q"), assistantMsg("done")]);
+		const roundsDir = path.join(tmp, "rounds");
+		// First run writes the round file through the normal path.
+		const first = backfillMissingRounds(sessionFile, roundsDir, undefined, { liveWindowMs: 0 });
+		expect(first.recoveredFiles).toEqual([createRoundFilePath("q", "done", [])]);
+		fs.utimesSync(sessionFile, new Date(0), new Date(0));
+		// Second run: readFileSync must never fire — the tail read alone suffices.
+		const outcome = backfillMissingRounds(sessionFile, roundsDir, noFullReadFsImpl(), { liveWindowMs: 0 });
+		expect(outcome).toEqual({ recoveredFiles: [], scanned: 0, skippedComplete: true });
+	});
+
+	it("skips a complete session larger than the tail window via the tail read alone", () => {
+		const roundsDir = path.join(tmp, "rounds");
+		const sessionFile = writeSessionFile(tmp, [userMsg("q"), assistantMsg("done")]);
+		const first = backfillMissingRounds(sessionFile, roundsDir, undefined, { liveWindowMs: 0 });
+		expect(first.recoveredFiles).toHaveLength(1);
+		// Pad the head with garbage beyond the tail window — only the tail matters.
+		const padding = `{"type":"padding","blob":"${"x".repeat(TAIL_PEEK_BYTES)}"}\n`;
+		fs.writeFileSync(sessionFile, padding + fs.readFileSync(sessionFile, "utf-8"));
+		fs.utimesSync(sessionFile, new Date(0), new Date(0));
+		const outcome = backfillMissingRounds(sessionFile, roundsDir, noFullReadFsImpl(), { liveWindowMs: 0 });
+		expect(outcome.skippedComplete).toBe(true);
+		expect(outcome.recoveredFiles).toEqual([]);
+	});
+
+	it("falls through to the full recovery path when the tail round is missing", () => {
+		const sessionFile = writeSessionFile(tmp, [userMsg("q"), assistantMsg("done")]);
+		const roundsDir = path.join(tmp, "rounds");
+		fs.utimesSync(sessionFile, new Date(0), new Date(0));
+		const outcome = backfillMissingRounds(sessionFile, roundsDir, noFullReadFsImpl(), { liveWindowMs: 0 });
+		expect(outcome.recoveredFiles).toEqual([createRoundFilePath("q", "done", [])]);
+		expect(outcome.skippedComplete).toBeUndefined();
+	});
+
+	it("defers an open tail (toolUse) via the tail read alone", () => {
+		const sessionFile = writeSessionFile(tmp, [
+			userMsg("q"),
+			{
+				type: "message",
+				message: { role: "assistant", content: [{ type: "text", text: "partial" }], stopReason: "toolUse" },
+			},
+		]);
+		const roundsDir = path.join(tmp, "rounds");
+		fs.utimesSync(sessionFile, new Date(0), new Date(0));
+		const outcome = backfillMissingRounds(sessionFile, roundsDir, noFullReadFsImpl(), { liveWindowMs: 0 });
+		expect(outcome.deferredLive).toBe(1);
+		expect(outcome.recoveredFiles).toEqual([]);
+		expect(fs.existsSync(roundsDir)).toBe(false);
+	});
+
+	it("returns null (full read) when the tail window holds no assistant message", () => {
+		const big = "x".repeat(TAIL_PEEK_BYTES + 10);
+		const sessionFile = writeSessionFile(tmp, [
+			userMsg("q"),
+			assistantMsg(`a ${big}`), // pushes every assistant message out of the window
+			userMsg("trailing", "u2"),
+		]);
+		const roundsDir = path.join(tmp, "rounds");
+		expect(tailRoundComplete(sessionFile, roundsDir)).toBeNull();
+	});
+
+	it("returns null when the tail window's only round is prompt-only", () => {
+		const sessionFile = writeSessionFile(tmp, [userMsg("tail q", "u2")]);
+		expect(tailRoundComplete(sessionFile, path.join(tmp, "rounds"))).toBeNull();
+	});
+
+	it("recovers normally from a tail round whose file is missing while earlier rounds exist (partial-window round)", () => {
+		const roundsDir = path.join(tmp, "rounds");
+		const sessionFile = writeSessionFile(tmp, [
+			userMsg("q1"),
+			assistantMsg("a1"),
+			userMsg("q2", "u2"),
+			assistantMsg("a2"),
+		]);
+		fs.utimesSync(sessionFile, new Date(0), new Date(0));
+		const outcome = backfillMissingRounds(sessionFile, roundsDir, undefined, { liveWindowMs: 0 });
+		expect(outcome.recoveredFiles).toEqual([
+			createRoundFilePath("q1", "a1", []),
+			createRoundFilePath("q2", "a2", []),
+		]);
 	});
 });

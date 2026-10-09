@@ -28,9 +28,14 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { pathToFileURL } from "node:url";
 import { bm25IndexPathForRoundsDir, buildBm25Index, roundTextForBm25, writeBm25Index } from "../lib/bm25-index.ts";
+// Shared duplicate key lives in lib/hash.ts so the backfill existence check
+// uses the exact same canonicalization as this prune script.
+import { canonicalDuplicateKey } from "../lib/hash.ts";
 import { filterIndexLinesExcludingFilenames, readIndexLines, writeIndexLines } from "../lib/index-io.ts";
 import { resolveScriptConfig, resolveScriptIndexPath, type ScriptConfigOptions } from "../lib/script-config.ts";
 import { toolIndexPathForRoundsDir } from "../lib/search-tools.ts";
+
+export { canonicalDuplicateKey };
 
 interface ToolCallDetail {
 	name?: string;
@@ -56,13 +61,6 @@ export interface RoundRecord {
 export interface PrunePlan {
 	keeper: string;
 	prunes: string[];
-}
-
-export function canonicalDuplicateKey(round: RoundLike): string {
-	const tools = (round.toolCalls ?? []).map((tc) =>
-		[tc.name ?? "", tc.arguments ?? "", (tc.result_full ?? tc.result_summary ?? "").trimEnd()].join("\u0000"),
-	);
-	return JSON.stringify([(round.userPrompt ?? "").trim(), (round.responseSequence ?? "").trim(), tools]);
 }
 
 export function selectPrunes(records: RoundRecord[], cutoffMs: number): PrunePlan[] {

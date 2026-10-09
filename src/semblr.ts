@@ -71,6 +71,7 @@ import {
 	renderToolDetailsToolResult,
 	type ToolDetailsParams,
 } from "../lib/round-tool-results.ts";
+import { computeMaxMtime, saveScanCutoff } from "../lib/scan-register.ts";
 import {
 	collectMultiModelSearchRoundScores,
 	collectSearchRoundScores,
@@ -97,6 +98,8 @@ import {
 	embedRecoveredRounds,
 	indexRecoveredRounds,
 	isBackfillStartReason,
+	planStartupEmbedding,
+	startupEmbedStatusMessage,
 } from "../lib/session-backfill.ts";
 import type { CheckpointSummary, ToolCallDetail } from "../lib/state.ts";
 import { contextCacheStore, contextCacheValid, createRound, createSession } from "../lib/state.ts";
@@ -1175,8 +1178,20 @@ export default function (pi: ExtensionAPI) {
 						path.dirname(sessionFile),
 						sessionFile,
 						event.previousSessionFile,
+						fs,
+						{ stateDir: SEMBLR_DIR },
 					);
 					const backfill = backfillMissingRounds(candidates, ROUNDS_DIR);
+					// Issue #133 unit-003: advance the scan register only after a scan that
+					// recovered nothing — those scans found every round already on disk.
+					// Deferrals don't block the advance: a deferred file whose in-flight
+					// round completes later gets its mtime bumped above the cutoff and is
+					// re-examined; one that never completes has nothing to recover (F2
+					// defers it on every scan today as well).
+					if (backfill.recoveredFiles.length === 0) {
+						const maxMtime = computeMaxMtime([sessionFile, ...candidates]);
+						if (maxMtime !== null) saveScanCutoff(SEMBLR_DIR, path.dirname(sessionFile), maxMtime);
+					}
 					if (backfill.deferredLive) {
 						ctx.ui.setStatus(
 							"semblr",
@@ -1206,62 +1221,70 @@ export default function (pi: ExtensionAPI) {
 							"semblr",
 							`\u{1f9e0} backfill: recovered ${backfill.recoveredFiles.length} round(s) from previous session`,
 						);
-						// F4 (PR #131): queue recovered rounds for embedding so they reach
-						// semantic retrieval, not just bm25. Best-effort — a failure here
-						// costs embeddings, never the recovered round files.
-						try {
-							const embedKey = await getApiKey(ctx, { config: SEMBLR_CONFIG });
-							if (embedKey) {
-								// Label guard backed by a single index load: the index is read
-								// once before embedding, kept as an in-memory Set, and updated on
-								// every append. Previously hasIndexRow re-read the full index
-								// file per recovered round (O(n × index size) — minutes of
-								// blocking startup work with a large index).
-								const indexedLabels = new Set(loadVectorIndex(INDEX_PATH).map((entry) => entry.filePath));
-								const embedResult = await embedRecoveredRounds(
-									backfill.recoveredFiles,
-									ROUNDS_DIR,
-									{
-										embed: (text) => embedText(text, embedKey, embeddingClientDeps(ctx)),
-										appendIndexRow: (label, vec, hash) => {
-											appendToIndex(label, vec, SEMBLR_CONFIG.embeddingModel, hash);
-											indexedLabels.add(label);
+						// Issue #133: defer the embedding burst when a large backlog of
+						// recovered rounds is unembedded — inline startup embedding beyond
+						// the threshold can block startup for minutes; `just index` sweeps
+						// it instead. BM25 + tool indexing above stays synchronous.
+						const embedPlan = planStartupEmbedding(
+							backfill.recoveredFiles,
+							(fileName) => readRoundJson(ROUNDS_DIR, fileName) as { promptEmbedding?: unknown } | null,
+						);
+						if (embedPlan.mode === "defer") {
+							ctx.ui.setStatus("semblr", startupEmbedStatusMessage(embedPlan));
+						} else
+							try {
+								const embedKey = await getApiKey(ctx, { config: SEMBLR_CONFIG });
+								if (embedKey) {
+									// Label guard backed by a single index load: the index is read
+									// once before embedding, kept as an in-memory Set, and updated on
+									// every append. Previously hasIndexRow re-read the full index
+									// file per recovered round (O(n × index size) — minutes of
+									// blocking startup work with a large index).
+									const indexedLabels = new Set(loadVectorIndex(INDEX_PATH).map((entry) => entry.filePath));
+									const embedResult = await embedRecoveredRounds(
+										backfill.recoveredFiles,
+										ROUNDS_DIR,
+										{
+											embed: (text) => embedText(text, embedKey, embeddingClientDeps(ctx)),
+											appendIndexRow: (label, vec, hash) => {
+												appendToIndex(label, vec, SEMBLR_CONFIG.embeddingModel, hash);
+												indexedLabels.add(label);
+											},
+											// F4+F6 (PR !131): prompt derivation, clipping, and row labels now
+											// come from the shared core, so recovered rows are in the same domain
+											// as agent_end by construction; only the config is passed here.
+											// F5 (PR !131): label-guard so a re-run after a crash between the
+											// appends and the embedding write does not duplicate index rows.
+											hasIndexRow: (label) => indexedLabels.has(label),
+											writeRoundEmbedding: (fileName, vec) => {
+												const p = `${ROUNDS_DIR}/${fileName}`;
+												const existing = JSON.parse(fs.readFileSync(p, "utf-8"));
+												existing.promptEmbedding = vec;
+												fs.writeFileSync(p + ".tmp." + process.pid, JSON.stringify(existing, null, 2));
+												fs.renameSync(p + ".tmp." + process.pid, p);
+											},
 										},
-										// F4+F6 (PR !131): prompt derivation, clipping, and row labels now
-										// come from the shared core, so recovered rows are in the same domain
-										// as agent_end by construction; only the config is passed here.
-										// F5 (PR !131): label-guard so a re-run after a crash between the
-										// appends and the embedding write does not duplicate index rows.
-										hasIndexRow: (label) => indexedLabels.has(label),
-										writeRoundEmbedding: (fileName, vec) => {
-											const p = `${ROUNDS_DIR}/${fileName}`;
-											const existing = JSON.parse(fs.readFileSync(p, "utf-8"));
-											existing.promptEmbedding = vec;
-											fs.writeFileSync(p + ".tmp." + process.pid, JSON.stringify(existing, null, 2));
-											fs.renameSync(p + ".tmp." + process.pid, p);
+										// F3 (PR !131): live-parity response budget — recovered embeddings are
+										// clipped with the same configured budget as agent_end, not the default.
+										{
+											maxResponseBytes: EMBEDDING_RESPONSE_MAX_BYTES,
+											promptNoiseOptions: PROMPT_NOISE_CLEANUP,
+											promptMaxTokens: SEMBLR_CONFIG.embeddingMaxTokens,
 										},
-									},
-									// F3 (PR !131): live-parity response budget — recovered embeddings are
-									// clipped with the same configured budget as agent_end, not the default.
-									{
-										maxResponseBytes: EMBEDDING_RESPONSE_MAX_BYTES,
-										promptNoiseOptions: PROMPT_NOISE_CLEANUP,
-										promptMaxTokens: SEMBLR_CONFIG.embeddingMaxTokens,
-									},
-								);
-								if (embedResult.embedded.length > 0) {
-									ctx.ui.setStatus(
-										"semblr",
-										`\u{1f9e0} backfill: embedded ${embedResult.embedded.length} recovered round(s)`,
 									);
+									if (embedResult.embedded.length > 0) {
+										ctx.ui.setStatus(
+											"semblr",
+											`\u{1f9e0} backfill: embedded ${embedResult.embedded.length} recovered round(s)`,
+										);
+									}
+									for (const message of embedResult.errors) {
+										ctx.ui.setStatus("semblr", `\u{1f9e0} backfill embed error: ${message}`);
+									}
 								}
-								for (const message of embedResult.errors) {
-									ctx.ui.setStatus("semblr", `\u{1f9e0} backfill embed error: ${message}`);
-								}
+							} catch (err) {
+								ctx.ui.setStatus("semblr", `\u{1f9e0} backfill embed failed: ${(err as Error).message}`);
 							}
-						} catch (err) {
-							ctx.ui.setStatus("semblr", `\u{1f9e0} backfill embed failed: ${(err as Error).message}`);
-						}
 					}
 				} catch (err) {
 					ctx.ui.setStatus("semblr", `🧠 backfill failed: ${(err as Error).message}`);

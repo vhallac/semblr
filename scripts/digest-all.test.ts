@@ -6,7 +6,14 @@ import { computeContentHash } from "../lib/hash.ts";
 import { encodeVectorIndexLine, loadVectorIndex, readIndexLines } from "../lib/index-io.ts";
 import { hashEmbeddingInput } from "../lib/round-capture.ts";
 import { loadToolIndex, toolIndexPathForRoundsDir } from "../lib/search-tools.ts";
+import { embedRecoveredRounds } from "../lib/session-backfill.ts";
 import { isMainModule, runDigestAll } from "./digest-all.ts";
+
+// The short-prompt drop is shared-core policy (lib/embed-round.ts, covered in
+// lib/embed-round.test.ts and lib/session-backfill.test.ts). The redrive tests
+// below target clip, row, and marker mechanics, so keep fixture prompts
+// embeddable unless a test opts into the documented default threshold.
+process.env.RELEVANCE_LIST_MIN_WORDS = "1";
 
 function tmpDir(): string {
 	return fs.mkdtempSync(path.join(os.tmpdir(), "semblr-digest-all-test-"));
@@ -21,6 +28,27 @@ function logger() {
 		out: { log: (line: string) => stdout.push(line) },
 		err: { error: (line: string) => stderr.push(line) },
 	};
+}
+
+/**
+ * Real filesystem with `writeFileSync`/`renameSync` recorded, so a test can
+ * assert write ordering/atomicity while every other call passes through.
+ */
+function spyFs(): { fsImpl: typeof fs; writes: string[]; renames: Array<[string, string]> } {
+	const writes: string[] = [];
+	const renames: Array<[string, string]> = [];
+	const fsImpl = {
+		...fs,
+		writeFileSync: ((p: fs.PathLike, data: unknown, opts?: unknown) => {
+			writes.push(String(p));
+			return (fs.writeFileSync as (...a: unknown[]) => void)(p, data, opts);
+		}) as typeof fs.writeFileSync,
+		renameSync: ((from: fs.PathLike, to: fs.PathLike) => {
+			renames.push([String(from), String(to)]);
+			return fs.renameSync(from, to);
+		}) as typeof fs.renameSync,
+	} as typeof fs;
+	return { fsImpl, writes, renames };
 }
 
 function line(value: unknown): string {
@@ -127,8 +155,10 @@ describe("digest-all script", () => {
 			[
 				[3, 4], // prompt1
 				[0, 0], // resp1
+				[3, 0], // combined1 (stored raw as promptEmbedding)
 				[1, 1], // prompt2
 				[2, 2], // resp2
+				[1, 0], // combined2
 			],
 			requests,
 		);
@@ -155,7 +185,8 @@ describe("digest-all script", () => {
 		const index = loadVectorIndex(indexPath);
 		expect(index).toHaveLength(4); // 2 prompts + 2 responses
 
-		// Prompt text is noise-cleaned (full cleaned text, no slice); response stays sliced to 8000 chars
+		// Prompt text is noise-cleaned (full cleaned text, no slice); the response
+		// stays whole — 8,100 bytes fit the shared 24,000-byte response budget (F1).
 		expect(requests).toEqual([
 			{
 				input: "https://openrouter.ai/api/v1/embeddings",
@@ -167,7 +198,13 @@ describe("digest-all script", () => {
 				input: "https://openrouter.ai/api/v1/embeddings",
 				method: "POST",
 				headers: { Authorization: "Bearer key", "Content-Type": "application/json" },
-				body: { model: "openai/text-embedding-3-small", input: "r".repeat(8000) },
+				body: { model: "openai/text-embedding-3-small", input: "r".repeat(8100) },
+			},
+			{
+				input: "https://openrouter.ai/api/v1/embeddings",
+				method: "POST",
+				headers: { Authorization: "Bearer key", "Content-Type": "application/json" },
+				body: { model: "openai/text-embedding-3-small", input: `[REPEAT: 'p' × 8100]\n\n${"r".repeat(8100)}` },
 			},
 			{
 				input: "https://openrouter.ai/api/v1/embeddings",
@@ -180,6 +217,12 @@ describe("digest-all script", () => {
 				method: "POST",
 				headers: { Authorization: "Bearer key", "Content-Type": "application/json" },
 				body: { model: "openai/text-embedding-3-small", input: resp2 },
+			},
+			{
+				input: "https://openrouter.ai/api/v1/embeddings",
+				method: "POST",
+				headers: { Authorization: "Bearer key", "Content-Type": "application/json" },
+				body: { model: "openai/text-embedding-3-small", input: `${userPrompt2}\n\n${resp2}` },
 			},
 		]);
 
@@ -205,6 +248,7 @@ describe("digest-all script", () => {
 			[
 				[1, 0],
 				[0, 1],
+				[2, 3],
 			],
 			[],
 		);
@@ -220,7 +264,7 @@ describe("digest-all script", () => {
 			}),
 		).resolves.toBe(0);
 
-		expect(firstFetch).toHaveBeenCalledTimes(2);
+		expect(firstFetch).toHaveBeenCalledTimes(3);
 
 		// Second run — skip all
 		const secondLogs = logger();
@@ -239,7 +283,9 @@ describe("digest-all script", () => {
 		).resolves.toBe(0);
 
 		expect(secondFetch).not.toHaveBeenCalled();
-		expect(secondLogs.stdout.join("\n")).toContain("📊 New rounds to embed: 0 (1 already indexed)");
+		expect(secondLogs.stdout.join("\n")).toContain(
+			"📊 New rounds to embed: 0 (1 already indexed, 0 swept from rounds dir)",
+		);
 		expect(secondLogs.stdout.join("\n")).toContain("✨ Nothing to do — all sessions already indexed!");
 	});
 
@@ -280,7 +326,9 @@ describe("digest-all script", () => {
 		expect(fetchImpl).not.toHaveBeenCalled();
 		expect(readIndexLines(indexPath)).toEqual([encodeVectorIndexLine([1], `${roundFile}:prompt`)]);
 		expect(logs.stdout.join("\n")).toContain("📊 Model-mismatched rounds to re-index: 0");
-		expect(logs.stdout.join("\n")).toContain("📊 New rounds to embed: 0 (1 already indexed)");
+		expect(logs.stdout.join("\n")).toContain(
+			"📊 New rounds to embed: 0 (1 already indexed, 0 swept from rounds dir)",
+		);
 	});
 
 	it("re-indexes rounds whose index rows were generated with a different explicit model", async () => {
@@ -321,6 +369,7 @@ describe("digest-all script", () => {
 					[
 						[3, 4],
 						[0, 5],
+						[6, 7],
 					],
 					requests,
 				),
@@ -328,12 +377,16 @@ describe("digest-all script", () => {
 			}),
 		).resolves.toBe(0);
 
-		expect(requests).toHaveLength(2);
+		expect(requests).toHaveLength(3);
 		expect((requests[0] as any).body).toEqual({
 			model: "openai/text-embedding-3-small",
 			input: userPrompt,
 		});
 		expect((requests[1] as any).body).toEqual({ model: "openai/text-embedding-3-small", input: responseSequence });
+		expect((requests[2] as any).body).toEqual({
+			model: "openai/text-embedding-3-small",
+			input: `${userPrompt}\n\n${responseSequence}`,
+		});
 		expect(loadVectorIndex(indexPath)).toEqual([
 			{ vector: [9], filePath: "unrelated.json:prompt", model: "old-model" },
 			{
@@ -443,7 +496,7 @@ describe("digest-all script", () => {
 		expect(logs.stdout.join("\n")).toContain("1 rounds embedded, 1 errors");
 	});
 
-	it("noise-cleans long prompts and truncates long response text", async () => {
+	it("noise-cleans long prompts and keeps a 12k-char response whole (24,000-byte budget)", async () => {
 		const root = tmpDir();
 		const sessionsDir = path.join(root, "sessions");
 		const sDir = path.join(sessionsDir, "--test");
@@ -453,7 +506,7 @@ describe("digest-all script", () => {
 		const requests: unknown[] = [];
 
 		const longPrompt = `${"A".repeat(10000)}`;
-		const longResponse = `${"B".repeat(10000)}`;
+		const longResponse = `${"B".repeat(12000)}`;
 
 		writeSession(path.join(sDir, "session.jsonl"), [{ userPrompt: longPrompt, responseSequence: longResponse }]);
 
@@ -461,6 +514,7 @@ describe("digest-all script", () => {
 			[
 				[1, 0],
 				[0, 1],
+				[1, 1],
 			],
 			requests,
 		);
@@ -476,10 +530,53 @@ describe("digest-all script", () => {
 			}),
 		).resolves.toBe(0);
 
-		// Prompt input is the noise-cleaned full text (repetition collapsed); response stays sliced to 8000 chars
-		expect(requests).toHaveLength(2);
+		// Prompt input is the noise-cleaned full text (repetition collapsed). The
+		// response is NOT clipped at 8,000 code units (the old redrive behavior) —
+		// 12,000 ASCII chars fit the shared 24,000-byte response budget intact (F1).
+		expect(requests).toHaveLength(3);
 		expect((requests[0] as any).body.input).toBe("[REPEAT: 'A' × 10000]");
-		expect((requests[1] as any).body.input).toBe("B".repeat(8000));
+		expect((requests[1] as any).body.input).toBe("B".repeat(12000));
+		expect((requests[2] as any).body.input).toBe(`[REPEAT: 'A' × 10000]\n\n${"B".repeat(12000)}`);
+	});
+
+	it("clips a response longer than 24,000 bytes at the byte budget", async () => {
+		const root = tmpDir();
+		const sessionsDir = path.join(root, "sessions");
+		const sDir = path.join(sessionsDir, "--test");
+		fs.mkdirSync(sDir, { recursive: true });
+		const roundsDir = path.join(root, "rounds");
+		const indexPath = path.join(roundsDir, "index.csv");
+		const requests: unknown[] = [];
+
+		writeSession(path.join(sDir, "session.jsonl"), [
+			{ userPrompt: "Please clip the response at the byte budget", responseSequence: "C".repeat(30000) },
+		]);
+
+		const fetchImpl = embeddingFetch(
+			[
+				[1, 0],
+				[0, 1],
+				[1, 1],
+			],
+			requests,
+		);
+
+		await expect(
+			runDigestAll({
+				sessionsDir,
+				roundsDir,
+				indexPath,
+				apiKey: "key",
+				fetchImpl,
+				stdout: logger().out,
+			}),
+		).resolves.toBe(0);
+
+		expect(requests).toHaveLength(3);
+		expect((requests[1] as any).body.input).toBe("C".repeat(24000));
+		expect((requests[2] as any).body.input).toBe(
+			`Please clip the response at the byte budget\n\n${"C".repeat(24000)}`,
+		);
 	});
 
 	it("skips non-session (non-dash-dash) directories", async () => {
@@ -506,6 +603,7 @@ describe("digest-all script", () => {
 			[
 				[1, 0],
 				[0, 1],
+				[2, 3],
 			],
 			requests,
 		);
@@ -525,7 +623,7 @@ describe("digest-all script", () => {
 		// Only the real session was picked up
 		expect(logs.stdout.join("\n")).toContain("📂 Found 1 session files across 1 directories");
 		expect(logs.stdout.join("\n")).toContain("📊 New rounds to embed: 1");
-		expect(requests).toHaveLength(2);
+		expect(requests).toHaveLength(3);
 	});
 
 	it("uses environment and fetch defaults when options are not injected", async () => {
@@ -562,6 +660,551 @@ describe("digest-all script", () => {
 			else process.env.OPENROUTER_API_KEY = oldKey;
 			globalThis.fetch = oldFetch;
 		}
+	});
+
+	it("sweeps recovered rounds from the rounds dir even when no session file exists", async () => {
+		const root = tmpDir();
+		const sessionsDir = tmpDir(); // no session files at all
+		const roundsDir = path.join(root, "rounds");
+		fs.mkdirSync(roundsDir, { recursive: true });
+		const indexPath = path.join(roundsDir, "index.csv");
+		const requests: unknown[] = [];
+
+		const userPrompt = "What was recovered after the crash?";
+		const responseSequence = "This round was recovered by the startup backfill.";
+		const roundFile = `${computeContentHash(userPrompt, responseSequence, [])}.json`;
+		fs.writeFileSync(
+			path.join(roundsDir, roundFile),
+			JSON.stringify({ userPrompt, responseSequence, toolCalls: [], recovered: true }),
+		);
+
+		const logs = logger();
+		await expect(
+			runDigestAll({
+				sessionsDir,
+				roundsDir,
+				indexPath,
+				apiKey: "key",
+				fetchImpl: embeddingFetch(
+					[
+						[1, 0],
+						[0, 1],
+						[3, 4],
+					],
+					requests,
+				),
+				stdout: logs.out,
+				stderr: logs.err,
+			}),
+		).resolves.toBe(0);
+
+		// Prompt + response rows embedded; the combined embed call carries no row.
+		expect(requests).toHaveLength(3);
+		expect(loadVectorIndex(indexPath)).toHaveLength(2);
+		const written = JSON.parse(fs.readFileSync(path.join(roundsDir, roundFile), "utf-8"));
+		expect(written.recovered).toBe(true);
+		// F2: redriven rounds now carry promptEmbedding — the raw combined vector
+		// (unnormalized, live scale convention), not an index-row vector.
+		expect(written.promptEmbedding).toEqual([3, 4]);
+		expect(logs.stdout.join("\n")).toContain("1 swept from rounds dir");
+		expect(logs.stdout.join("\n")).toContain("1 rounds embedded, 0 errors");
+	});
+
+	it("rounds-dir sweep is idempotent — re-run adds no duplicate index rows", async () => {
+		const root = tmpDir();
+		const sessionsDir = tmpDir();
+		const roundsDir = path.join(root, "rounds");
+		fs.mkdirSync(roundsDir, { recursive: true });
+		const indexPath = path.join(roundsDir, "index.csv");
+
+		const userPrompt = "What is swept exactly once?";
+		const responseSequence = "The sweep must not duplicate index rows on re-run.";
+		const roundFile = `${computeContentHash(userPrompt, responseSequence, [])}.json`;
+		fs.writeFileSync(
+			path.join(roundsDir, roundFile),
+			JSON.stringify({ userPrompt, responseSequence, toolCalls: [], recovered: true }),
+		);
+
+		await expect(
+			runDigestAll({
+				sessionsDir,
+				roundsDir,
+				indexPath,
+				apiKey: "key",
+				fetchImpl: embeddingFetch([
+					[1, 0],
+					[0, 1],
+					[2, 3],
+				]),
+				stdout: logger().out,
+			}),
+		).resolves.toBe(0);
+		const linesAfterFirst = readIndexLines(indexPath);
+		expect(linesAfterFirst).toHaveLength(2);
+
+		const secondFetch = vi.fn(async () => new Response("should not be called")) as typeof fetch;
+		const logs = logger();
+		await expect(
+			runDigestAll({
+				sessionsDir,
+				roundsDir,
+				indexPath,
+				apiKey: "key",
+				fetchImpl: secondFetch,
+				stdout: logs.out,
+				stderr: logs.err,
+			}),
+		).resolves.toBe(0);
+
+		expect(secondFetch).not.toHaveBeenCalled();
+		expect(readIndexLines(indexPath)).toEqual(linesAfterFirst);
+		expect(logs.stdout.join("\n")).toContain("0 swept from rounds dir");
+	});
+
+	it("sweep heals a marker-less round that already has rows, reusing the :response vector without embedding", async () => {
+		const root = tmpDir();
+		const sessionsDir = tmpDir();
+		const roundsDir = path.join(root, "rounds");
+		fs.mkdirSync(roundsDir, { recursive: true });
+		const indexPath = path.join(roundsDir, "index.csv");
+
+		const userPrompt = "A recovered round whose rows survived but whose marker did not.";
+		const responseSequence = "The startup pending counter must agree with what just index can do.";
+		const roundFile = `${computeContentHash(userPrompt, responseSequence, [])}.json`;
+		// Round file has rows in the index but no promptEmbedding marker.
+		fs.writeFileSync(
+			path.join(roundsDir, roundFile),
+			JSON.stringify({ userPrompt, responseSequence, toolCalls: [], recovered: true }),
+		);
+		fs.writeFileSync(
+			indexPath,
+			[
+				encodeVectorIndexLine([0.25, 0.5], `${roundFile}:prompt`, "openai/text-embedding-3-small"),
+				encodeVectorIndexLine([0.75, 0.125], `${roundFile}:response`, "openai/text-embedding-3-small"),
+			].join("\n") + "\n",
+		);
+		const linesBefore = readIndexLines(indexPath);
+
+		const fetchImpl = vi.fn(async () => new Response("should not be called")) as typeof fetch;
+		const logs = logger();
+		await expect(
+			runDigestAll({
+				sessionsDir,
+				roundsDir,
+				indexPath,
+				apiKey: "key",
+				fetchImpl,
+				stdout: logs.out,
+				stderr: logs.err,
+			}),
+		).resolves.toBe(0);
+
+		// No embed call — healing reuses the existing :response row vector.
+		expect(fetchImpl).not.toHaveBeenCalled();
+		// Index rows are untouched.
+		expect(readIndexLines(indexPath)).toEqual(linesBefore);
+		const written = JSON.parse(fs.readFileSync(path.join(roundsDir, roundFile), "utf-8"));
+		expect(written.promptEmbedding).toEqual([0.75, 0.125]);
+		expect(written.recovered).toBe(true);
+		expect(logs.stdout.join("\n")).toContain("1 markers healed");
+	});
+
+	it("sweep leaves a marker-less round without a :response row unhealed", async () => {
+		const root = tmpDir();
+		const sessionsDir = tmpDir();
+		const roundsDir = path.join(root, "rounds");
+		fs.mkdirSync(roundsDir, { recursive: true });
+		const indexPath = path.join(roundsDir, "index.csv");
+
+		const userPrompt = "A round with a prompt row but no response row.";
+		const responseSequence = "Left marker-less because no truthful vector is available.";
+		const roundFile = `${computeContentHash(userPrompt, responseSequence, [])}.json`;
+		fs.writeFileSync(
+			path.join(roundsDir, roundFile),
+			JSON.stringify({ userPrompt, responseSequence, toolCalls: [], recovered: true }),
+		);
+		fs.writeFileSync(
+			indexPath,
+			`${encodeVectorIndexLine([0.25, 0.5], `${roundFile}:prompt`, "openai/text-embedding-3-small")}\n`,
+		);
+
+		const fetchImpl = vi.fn(async () => new Response("should not be called")) as typeof fetch;
+		const logs = logger();
+		await expect(
+			runDigestAll({
+				sessionsDir,
+				roundsDir,
+				indexPath,
+				apiKey: "key",
+				fetchImpl,
+				stdout: logs.out,
+				stderr: logs.err,
+			}),
+		).resolves.toBe(0);
+
+		expect(fetchImpl).not.toHaveBeenCalled();
+		const written = JSON.parse(fs.readFileSync(path.join(roundsDir, roundFile), "utf-8"));
+		expect(written.promptEmbedding).toBeUndefined();
+		expect(logs.stdout.join("\n")).not.toContain("markers healed");
+	});
+
+	it("sweep skips unreadable round files and files without a user prompt", async () => {
+		const root = tmpDir();
+		const sessionsDir = tmpDir();
+		const roundsDir = path.join(root, "rounds");
+		fs.mkdirSync(roundsDir, { recursive: true });
+		const indexPath = path.join(roundsDir, "index.csv");
+
+		fs.writeFileSync(path.join(roundsDir, "corrupt.json"), "{not json");
+		fs.writeFileSync(path.join(roundsDir, "no-prompt.json"), JSON.stringify({ responseSequence: "orphan" }));
+
+		const logs = logger();
+		const fetchImpl = vi.fn(async () => new Response("should not be called")) as typeof fetch;
+		await expect(
+			runDigestAll({
+				sessionsDir,
+				roundsDir,
+				indexPath,
+				apiKey: "key",
+				fetchImpl,
+				stdout: logs.out,
+				stderr: logs.err,
+			}),
+		).resolves.toBe(0);
+
+		expect(fetchImpl).not.toHaveBeenCalled();
+		expect(loadVectorIndex(indexPath)).toHaveLength(0);
+		expect(logs.stderr.join("\n")).toContain("Skipping unreadable round file: corrupt.json");
+		expect(logs.stderr.join("\n")).toContain("Skipping invalid round file: no-prompt.json");
+		expect(logs.stdout.join("\n")).toContain("0 swept from rounds dir");
+	});
+
+	it("sweep skips parseable-but-incomplete round files by name instead of failing the whole run", async () => {
+		const root = tmpDir();
+		const sessionsDir = tmpDir();
+		const roundsDir = path.join(root, "rounds");
+		fs.mkdirSync(roundsDir, { recursive: true });
+		const indexPath = path.join(roundsDir, "index.csv");
+		const requests: unknown[] = [];
+
+		// F5 shape: parseable JSON whose missing fields would throw inside
+		// processRound before its try/catch and abort the run.
+		fs.writeFileSync(path.join(roundsDir, "incomplete.json"), JSON.stringify({ userPrompt: "hi" }));
+
+		const userPrompt = "What survives an incomplete sibling round file?";
+		const responseSequence = "Well-formed rounds embed while invalid files are skipped by name.";
+		const roundFile = `${computeContentHash(userPrompt, responseSequence, [])}.json`;
+		fs.writeFileSync(
+			path.join(roundsDir, roundFile),
+			JSON.stringify({ userPrompt, responseSequence, toolCalls: [], recovered: true }),
+		);
+
+		const logs = logger();
+		await expect(
+			runDigestAll({
+				sessionsDir,
+				roundsDir,
+				indexPath,
+				apiKey: "key",
+				fetchImpl: embeddingFetch(
+					[
+						[1, 0],
+						[0, 1],
+						[2, 3],
+					],
+					requests,
+				),
+				stdout: logs.out,
+				stderr: logs.err,
+			}),
+		).resolves.toBe(0); // a fatal abort would reject instead of resolving 0
+
+		// The well-formed round is embedded (prompt + response rows, 3 embed calls
+		// including the combined vector); the bad file is named on stderr.
+		expect(requests).toHaveLength(3);
+		expect(loadVectorIndex(indexPath)).toHaveLength(2);
+		expect(logs.stderr.join("\n")).toContain("Skipping invalid round file: incomplete.json");
+		expect(logs.stdout.join("\n")).toContain("1 swept from rounds dir");
+		expect(logs.stdout.join("\n")).toContain("1 rounds embedded, 0 errors");
+	});
+
+	it("sweep skips round files whose toolCalls hold non-object elements instead of failing the whole run", async () => {
+		const root = tmpDir();
+		const sessionsDir = tmpDir();
+		const roundsDir = path.join(root, "rounds");
+		fs.mkdirSync(roundsDir, { recursive: true });
+		const indexPath = path.join(roundsDir, "index.csv");
+		const requests: unknown[] = [];
+
+		// F3 shape: Array.isArray passes, but a null element throws in
+		// deriveRoundFile/computeContentHash before processRound's try/catch.
+		fs.writeFileSync(
+			path.join(roundsDir, "null-tool.json"),
+			JSON.stringify({ userPrompt: "hi", responseSequence: "there", toolCalls: [null] }),
+		);
+
+		const userPrompt = "Do non-object toolCalls elements abort the sweep?";
+		const responseSequence = "Well-formed rounds embed while malformed element arrays are skipped by name.";
+		const roundFile = `${computeContentHash(userPrompt, responseSequence, [])}.json`;
+		fs.writeFileSync(
+			path.join(roundsDir, roundFile),
+			JSON.stringify({ userPrompt, responseSequence, toolCalls: [], recovered: true }),
+		);
+
+		const logs = logger();
+		await expect(
+			runDigestAll({
+				sessionsDir,
+				roundsDir,
+				indexPath,
+				apiKey: "key",
+				fetchImpl: embeddingFetch(
+					[
+						[1, 0],
+						[0, 1],
+						[2, 3],
+					],
+					requests,
+				),
+				stdout: logs.out,
+				stderr: logs.err,
+			}),
+		).resolves.toBe(0); // a fatal abort would reject instead of resolving 0
+
+		expect(requests).toHaveLength(3);
+		expect(loadVectorIndex(indexPath)).toHaveLength(2);
+		expect(logs.stderr.join("\n")).toContain("Skipping invalid round file: null-tool.json");
+		expect(logs.stdout.join("\n")).toContain("1 swept from rounds dir");
+		expect(logs.stdout.join("\n")).toContain("1 rounds embedded, 0 errors");
+	});
+
+	it("writes round files and markers atomically via tmp+rename, leaving no tmp residue", async () => {
+		const root = tmpDir();
+		const sessionsDir = tmpDir();
+		const roundsDir = path.join(root, "rounds");
+		fs.mkdirSync(roundsDir, { recursive: true });
+		const indexPath = path.join(roundsDir, "index.csv");
+
+		// Recovered round (no session JSONL) forces the sweep -> processRound path,
+		// which performs both writes under test: the round file, then the
+		// promptEmbedding marker through writeRoundEmbedding.
+		const userPrompt = "Are the digest round-file writes atomic yet?";
+		const responseSequence = "They should stage to a pid-suffixed temp file and rename over the target.";
+		const roundFile = `${computeContentHash(userPrompt, responseSequence, [])}.json`;
+		const roundPath = path.join(roundsDir, roundFile);
+		fs.writeFileSync(roundPath, JSON.stringify({ userPrompt, responseSequence, toolCalls: [], recovered: true }));
+
+		const { fsImpl, writes, renames } = spyFs();
+		const logs = logger();
+		await expect(
+			runDigestAll({
+				sessionsDir,
+				roundsDir,
+				indexPath,
+				apiKey: "key",
+				fetchImpl: embeddingFetch([
+					[1, 0],
+					[0, 1],
+					[2, 3],
+				]),
+				fsImpl,
+				stdout: logs.out,
+				stderr: logs.err,
+			}),
+		).resolves.toBe(0);
+
+		const tmpSuffix = `.tmp.${process.pid}`;
+		const roundWrites = writes.filter((w) => w.endsWith(".json") || w.endsWith(tmpSuffix));
+		// The round file is never written in place; every durable write is staged.
+		expect(roundWrites).not.toContain(roundPath);
+		const stagedWrites = roundWrites.filter((w) => w === `${roundPath}${tmpSuffix}`);
+		expect(stagedWrites.length).toBeGreaterThanOrEqual(2); // round file, then marker
+		// Each staged write is committed with a rename onto the target.
+		for (const staged of stagedWrites) {
+			expect(renames).toContainEqual([staged, roundPath]);
+		}
+		// No temp residue survives the successful run.
+		expect(fs.readdirSync(roundsDir).some((name) => name.includes(".tmp."))).toBe(false);
+		// The atomic path really ran: the marker landed on the durable file.
+		expect(JSON.parse(fs.readFileSync(roundPath, "utf-8")).promptEmbedding).toEqual([2, 3]);
+	});
+
+	it("short prompts follow the shared drop policy: no :prompt row, response vector stored as promptEmbedding", async () => {
+		const prevMinWords = process.env.RELEVANCE_LIST_MIN_WORDS;
+		process.env.RELEVANCE_LIST_MIN_WORDS = "20"; // the documented default threshold
+		try {
+			const root = tmpDir();
+			const sessionsDir = tmpDir(); // sweep-only
+			const roundsDir = path.join(root, "rounds");
+			fs.mkdirSync(roundsDir, { recursive: true });
+			const indexPath = path.join(roundsDir, "index.csv");
+			const requests: unknown[] = [];
+
+			const userPrompt = "What was recovered?"; // 3 words — under the threshold
+			const responseSequence = "Short prompts never carry prompt-side embeddings on the live path.";
+			const roundFile = `${computeContentHash(userPrompt, responseSequence, [])}.json`;
+			fs.writeFileSync(
+				path.join(roundsDir, roundFile),
+				JSON.stringify({ userPrompt, responseSequence, toolCalls: [] }),
+			);
+
+			await expect(
+				runDigestAll({
+					sessionsDir,
+					roundsDir,
+					indexPath,
+					apiKey: "key",
+					fetchImpl: embeddingFetch([[1, 0]], requests),
+					stdout: logger().out,
+				}),
+			).resolves.toBe(0);
+
+			const index = loadVectorIndex(indexPath);
+			expect(index.map((e) => e.filePath)).toEqual([`${roundFile}:response`]);
+			const written = JSON.parse(fs.readFileSync(path.join(roundsDir, roundFile), "utf-8"));
+			expect(written.promptEmbedding).toEqual([1, 0]); // normalized response vector
+			expect(requests).toHaveLength(1); // response only — no prompt, no combined
+		} finally {
+			if (prevMinWords === undefined) delete process.env.RELEVANCE_LIST_MIN_WORDS;
+			else process.env.RELEVANCE_LIST_MIN_WORDS = prevMinWords;
+		}
+	});
+
+	it("a swept checkpoint round with a summary embeds a :summary row", async () => {
+		const root = tmpDir();
+		const sessionsDir = tmpDir();
+		const roundsDir = path.join(root, "rounds");
+		fs.mkdirSync(roundsDir, { recursive: true });
+		const indexPath = path.join(roundsDir, "index.csv");
+		const requests: unknown[] = [];
+
+		const userPrompt = "Where did the checkpoint stand?";
+		const responseSequence = "The checkpoint captured the mid-task state.";
+		const summary = {
+			currentTask: "checkpoint parity",
+			progressMade: ["embedded the round"],
+			currentState: ["mid-task"],
+			nextSteps: ["continue"],
+			keyFindings: ["summary rows matter"],
+		};
+		const roundFile = `${computeContentHash(userPrompt, responseSequence, [])}.json`;
+		fs.writeFileSync(
+			path.join(roundsDir, roundFile),
+			JSON.stringify({ userPrompt, responseSequence, toolCalls: [], summary }),
+		);
+
+		await expect(
+			runDigestAll({
+				sessionsDir,
+				roundsDir,
+				indexPath,
+				apiKey: "key",
+				fetchImpl: embeddingFetch(
+					[
+						[1, 0],
+						[0, 1],
+						[3, 4],
+						[5, 6],
+					],
+					requests,
+				),
+				stdout: logger().out,
+			}),
+		).resolves.toBe(0);
+
+		const index = loadVectorIndex(indexPath);
+		expect(index.map((e) => e.filePath)).toEqual([
+			`${roundFile}:prompt`,
+			`${roundFile}:response`,
+			`${roundFile}:summary`,
+		]);
+		expect((requests[3] as any).body.input).toContain("checkpoint parity");
+	});
+
+	it("sweep and embedRecoveredRounds produce identical inputs, rows, and promptEmbedding (F1/F2 parity)", async () => {
+		const userPrompt = "What must the offline sweep have in common with the startup recovery path?";
+		const responseSequence = "Identical embed inputs, index labels, and promptEmbedding values.";
+		const summary = {
+			currentTask: "parity check",
+			progressMade: ["routed redrive through embedRound"],
+			currentState: ["tests green"],
+			nextSteps: ["commit"],
+			keyFindings: ["parity by construction"],
+		};
+		const roundFile = `${computeContentHash(userPrompt, responseSequence, [])}.json`;
+		const roundJson = JSON.stringify({ userPrompt, responseSequence, toolCalls: [], recovered: true, summary });
+
+		// Path A: rounds-dir sweep in digest-all (fetch-backed embeds).
+		const roundsDirA = path.join(tmpDir(), "rounds");
+		fs.mkdirSync(roundsDirA, { recursive: true });
+		fs.writeFileSync(path.join(roundsDirA, roundFile), roundJson);
+		const requestsA: unknown[] = [];
+		await expect(
+			runDigestAll({
+				sessionsDir: tmpDir(), // no session files — sweep only
+				roundsDir: roundsDirA,
+				indexPath: path.join(roundsDirA, "index.csv"),
+				apiKey: "key",
+				fetchImpl: embeddingFetch(
+					[
+						[1, 0],
+						[0, 1],
+						[3, 4],
+						[5, 6],
+					],
+					requestsA,
+				),
+				stdout: logger().out,
+			}),
+		).resolves.toBe(0);
+		const inputsA = requestsA.map((r) => (r as { body: { input: string } }).body.input);
+		const rowsA = loadVectorIndex(path.join(roundsDirA, "index.csv"));
+		const writtenA = JSON.parse(fs.readFileSync(path.join(roundsDirA, roundFile), "utf-8"));
+
+		// Path B: startup recovery embedding (injected embeds).
+		const roundsDirB = path.join(tmpDir(), "rounds");
+		fs.mkdirSync(roundsDirB, { recursive: true });
+		fs.writeFileSync(path.join(roundsDirB, roundFile), roundJson);
+		const inputsB: string[] = [];
+		const rowsB: Array<{ vector: number[]; filePath: string; model?: string; embeddingInputHash?: string }> = [];
+		const seq: number[][] = [
+			[1, 0],
+			[0, 1],
+			[3, 4],
+			[5, 6],
+		];
+		await embedRecoveredRounds([roundFile], roundsDirB, {
+			embed: (text) => {
+				inputsB.push(text);
+				return Promise.resolve(seq.shift()!);
+			},
+			appendIndexRow: (label, vec, hash) =>
+				rowsB.push({
+					vector: vec,
+					filePath: label,
+					model: "openai/text-embedding-3-small",
+					embeddingInputHash: hash,
+				}),
+			writeRoundEmbedding: (name, vec) => {
+				const p = path.join(roundsDirB, name);
+				const existing = JSON.parse(fs.readFileSync(p, "utf-8"));
+				existing.promptEmbedding = vec;
+				fs.writeFileSync(p, JSON.stringify(existing, null, 2));
+			},
+		});
+		const writtenB = JSON.parse(fs.readFileSync(path.join(roundsDirB, roundFile), "utf-8"));
+
+		expect(inputsB).toEqual(inputsA);
+		expect(rowsB).toEqual(rowsA);
+		expect(writtenB.promptEmbedding).toEqual(writtenA.promptEmbedding);
+		// Anchor the shared row policy: prompt + response + checkpoint summary.
+		expect(rowsA.map((e) => e.filePath)).toEqual([
+			`${roundFile}:prompt`,
+			`${roundFile}:response`,
+			`${roundFile}:summary`,
+		]);
+		// The summary embed input carries the checkpoint text on both paths.
+		expect(inputsA[3]).toContain("parity check");
 	});
 
 	it("detects direct CLI execution", () => {
@@ -631,6 +1274,7 @@ describe("digest-all script", () => {
 					fetchImpl: embeddingFetch([
 						[1, 0],
 						[0, 1],
+						[2, 3],
 					]),
 					stdout: logger().out,
 				}),
@@ -666,6 +1310,7 @@ describe("digest-all script", () => {
 				fetchImpl: embeddingFetch([
 					[1, 0],
 					[0, 1],
+					[2, 3],
 				]),
 				stdout: logger().out,
 			});
@@ -685,6 +1330,7 @@ describe("digest-all script", () => {
 				fetchImpl: embeddingFetch([
 					[1, 0],
 					[0, 1],
+					[2, 3],
 				]),
 				stdout: logger().out,
 			});

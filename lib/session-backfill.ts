@@ -15,6 +15,7 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { type EmbedRoundDeps, embedRound } from "./embed-round.ts";
+import { canonicalDuplicateKey, type DuplicateKeyRound } from "./hash.ts";
 import { parsePiSessionJsonl, reconstructPiSessionRounds } from "./pi-session.ts";
 import type { PromptNoiseOptions } from "./round-capture.ts";
 import { buildAgentEndRoundData, deriveRoundFile, isPromptOnlyRound } from "./round-capture.ts";
@@ -24,6 +25,7 @@ import {
 	type RoundData,
 	type ToolCallDetail,
 } from "./round-data.ts";
+import { loadScanCutoff } from "./scan-register.ts";
 
 /**
  * F7 (PR !131): recover a checkpoint summary from the round's parsed tool
@@ -131,8 +133,28 @@ export function buildBackfillCandidates(
 	currentSessionFile: string,
 	previousSessionFile?: string,
 	fsImpl: Pick<typeof fs, "readdirSync" | "statSync"> = fs,
+	opts: { stateDir?: string; cutoffMs?: number } = {},
 ): string[] {
-	const candidates = listBackfillCandidates(sessionDir, currentSessionFile, fsImpl);
+	let candidates = listBackfillCandidates(sessionDir, currentSessionFile, fsImpl);
+	// Unit-002 scan register: files at-or-below the last-full-scan mtime were
+	// already covered by a complete scan, so opening them again is wasted work.
+	// The tail-completeness check downstream stays authoritative — the cutoff
+	// only prunes which files are OPENED, it cannot mask a missing round because
+	// the register is only advanced after zero-recovery full scans (unit-003).
+	// Corrupt/missing register → null → no filtering (full-scan fallback).
+	if (opts.cutoffMs === undefined && opts.stateDir !== undefined) {
+		opts = { ...opts, cutoffMs: loadScanCutoff(opts.stateDir, sessionDir) ?? undefined };
+	}
+	if (opts.cutoffMs !== undefined) {
+		const cutoff = opts.cutoffMs;
+		candidates = candidates.filter((file) => {
+			try {
+				return fsImpl.statSync(file).mtimeMs > cutoff;
+			} catch {
+				return true; // unreadable mtime: keep the candidate, stay safe
+			}
+		});
+	}
 	if (
 		previousSessionFile &&
 		path.resolve(previousSessionFile) !== path.resolve(currentSessionFile) &&
@@ -172,13 +194,130 @@ export function isSessionTailClosed(rawJsonl: string): boolean {
 }
 
 /**
+ * Unit-001 tail-only completeness check: bytes read from the END of a session
+ * file to decide completeness without a full read+parse. A session's last
+ * round is at EOF, so a bounded tail window suffices; larger files fall back
+ * to the full read when the window is inconclusive.
+ */
+export const TAIL_PEEK_BYTES = 256 * 1024;
+
+/**
+ * The tail-read fs surface is Partial so pre-existing minimal fsImpl injections
+ * (e.g. existsSync-only stubs) keep type-checking; a missing method makes the
+ * tail read throw → null → full-read fall-through, preserving old behavior.
+ */
+export type TailReadFs = Partial<Pick<typeof fs, "statSync" | "openSync" | "readSync" | "closeSync">>;
+
+function tailFs(fsImpl: TailReadFs): Pick<typeof fs, "statSync" | "openSync" | "readSync" | "closeSync"> {
+	return {
+		statSync: fsImpl.statSync ?? fs.statSync,
+		openSync: fsImpl.openSync ?? fs.openSync,
+		readSync: fsImpl.readSync ?? fs.readSync,
+		closeSync: fsImpl.closeSync ?? fs.closeSync,
+	};
+}
+
+/**
+ * Read the last `maxBytes` of a file. Returns the text plus whether the read
+ * started mid-file (so the first returned chunk may be a partial line that
+ * must be dropped). Null when the file cannot be stat'd/opened/read.
+ */
+export function readTailText(
+	sessionFile: string,
+	fsImpl: TailReadFs = fs,
+	maxBytes = TAIL_PEEK_BYTES,
+): { text: string; truncated: boolean } | null {
+	const f = tailFs(fsImpl);
+	try {
+		const size = f.statSync(sessionFile).size;
+		const start = Math.max(0, size - maxBytes);
+		const fd = f.openSync(sessionFile, "r");
+		try {
+			const buf = Buffer.alloc(size - start);
+			let read = 0;
+			while (read < buf.length) {
+				const n = f.readSync(fd, buf, read, buf.length - read, start + read);
+				if (n <= 0) break;
+				read += n;
+			}
+			return { text: buf.toString("utf-8", 0, read), truncated: start > 0 };
+		} finally {
+			f.closeSync(fd);
+		}
+	} catch {
+		return null;
+	}
+}
+
+/**
+ * Tail closedness with an explicit "no evidence" answer: like
+ * isSessionTailClosed, but returns null when the text contains NO assistant
+ * message at all — a tail window truncated mid tool-loop proves nothing about
+ * the file's real tail, so the caller must fall back to the full read.
+ */
+function tailClosedFromText(text: string): boolean | null {
+	for (let i = text.split("\n").length - 1; i >= 0; i--) {
+		const line = text.split("\n")[i].trim();
+		if (!line) continue;
+		let entry: { type?: string; message?: { role?: string; stopReason?: string } };
+		try {
+			entry = JSON.parse(line);
+		} catch {
+			continue;
+		}
+		if (entry?.type !== "message") continue;
+		const msg = entry.message;
+		if (msg?.role !== "assistant") continue;
+		return msg.stopReason !== "toolUse";
+	}
+	return null;
+}
+
+/**
+ * Unit-001: decide completeness from a bounded tail read only — no full-file
+ * read or parse. Returns:
+ * - true  → the tail round's file is on disk; the session is fully backed up.
+ * - false → the tail turn is still open (stopReason toolUse); the caller must
+ *   defer as live, exactly as the full isSessionTailClosed path would.
+ * - null  → inconclusive (unreadable file, window without an assistant
+ *   message, or no fileable tail round in the window); fall through to the
+ *   full read+parse recovery path.
+ */
+export function tailRoundComplete(
+	sessionFile: string,
+	roundsDir: string,
+	fsImpl: TailReadFs & Pick<typeof fs, "existsSync"> = fs,
+): boolean | null {
+	const tail = readTailText(sessionFile, fsImpl);
+	if (tail === null) return null;
+	// A read that started mid-file opens on a partial line; drop it. The rest
+	// of the lines are complete (a UTF-8 continuation byte is never 0x0A).
+	const text = tail.truncated ? tail.text.slice(tail.text.indexOf("\n") + 1) : tail.text;
+	const closed = tailClosedFromText(text);
+	if (closed !== true) return closed; // null → inconclusive; false → defer as live
+	const parsed = parsePiSessionJsonl(text);
+	for (let i = parsed.length - 1; i >= 0; i--) {
+		const round = parsed[i];
+		if (!round.userPrompt) continue;
+		if (isPromptOnlyRound(round.responseSequence, round.toolCalls)) continue;
+		// Same derivation as the full-path early exit in collectMissingRounds,
+		// so a tail-window hit agrees byte-for-byte with the live write's name.
+		const lastFile = deriveRoundFile(round.userPrompt, round.responseSequence, round.toolCalls).fileName;
+		// Only TRUE short-circuits. A missing tail file is NOT "open tail" —
+		// the round may be recoverable, so the caller must run the full path.
+		return fsImpl.existsSync(path.join(roundsDir, lastFile)) ? true : null;
+	}
+	return null;
+}
+
+/**
  * Parse a session JSONL and return the round files missing from roundsDir.
  * Exported for testing / inspection without side effects.
  */
 export function findMissingRounds(
 	sessionFile: string,
 	roundsDir: string,
-	fsImpl: Pick<typeof fs, "existsSync"> = fs,
+	fsImpl: Pick<typeof fs, "existsSync" | "readdirSync" | "readFileSync"> = fs,
 ): { missing: BackfillWrite[]; scanned: number; skippedComplete?: boolean } {
 	const parsed = parsePiSessionJsonl(fs.readFileSync(sessionFile, "utf-8"));
 	return collectMissingRounds(parsed, roundsDir, fsImpl);
@@ -192,10 +331,36 @@ export function findMissingRounds(
  * skip per-round reconstruction and hashing entirely. Doubles as the F2
  * tail-completeness check.
  */
+/**
+ * Build the set of whitespace-insensitive content keys (canonicalDuplicateKey)
+ * for every round file currently on disk. Exported for testing. Unreadable or
+ * unparseable files are tolerated (skipped) — they cannot match a candidate.
+ */
+export function loadDiskCanonicalKeys(
+	roundsDir: string,
+	fsImpl: Pick<typeof fs, "readdirSync" | "readFileSync"> = fs,
+): Set<string> {
+	const keys = new Set<string>();
+	let names: string[];
+	try {
+		names = fsImpl.readdirSync(roundsDir);
+	} catch {
+		return keys;
+	}
+	for (const name of names) {
+		if (!name.endsWith(".json")) continue;
+		try {
+			const round = JSON.parse(fsImpl.readFileSync(path.join(roundsDir, name), "utf-8")) as DuplicateKeyRound;
+			keys.add(canonicalDuplicateKey(round));
+		} catch {}
+	}
+	return keys;
+}
+
 function collectMissingRounds(
 	parsed: ReturnType<typeof parsePiSessionJsonl>,
 	roundsDir: string,
-	fsImpl: Pick<typeof fs, "existsSync">,
+	fsImpl: Pick<typeof fs, "existsSync" | "readdirSync" | "readFileSync">,
 ): { missing: BackfillWrite[]; scanned: number; skippedComplete?: boolean } {
 	for (let i = parsed.length - 1; i >= 0; i--) {
 		if (!parsed[i].userPrompt) continue;
@@ -214,6 +379,9 @@ function collectMissingRounds(
 	const reconstructed = reconstructPiSessionRounds(parsed);
 	const missing: BackfillWrite[] = [];
 	let scanned = 0;
+	// Lazily built on the first exact-hash miss: content keys of every round
+	// file on disk (see the legacy-drift comment below).
+	let existingCanonicalKeys: Set<string> | null = null;
 	for (const { roundFile, round } of reconstructed) {
 		// Rounds without a user prompt cannot be filed (filename derives from it).
 		if (!round.userPrompt) continue;
@@ -223,6 +391,18 @@ function collectMissingRounds(
 		if (isPromptOnlyRound(round.responseSequence, round.toolCalls)) continue;
 		scanned++;
 		if (fsImpl.existsSync(path.join(roundsDir, roundFile))) continue;
+		// Legacy serialization drift: rounds stored by historical semblr code may
+		// hash differently from today's parser (trailing-newline handling in tool
+		// results, absent tool-call ids) even though the content is the same — and
+		// those historical filenames cannot be recomputed from today's parse. So
+		// on the first exact-hash miss, compare by whitespace-insensitive CONTENT
+		// (same canonicalization as scripts/prune-recovery-duplicates.ts) against
+		// every round file on disk; a content match means the round is already
+		// stored under a legacy name. Without this, every startup backfill
+		// re-recreates duplicates of legacy rounds, faster than pruning removes
+		// them. The disk scan is paid only when an exact miss occurs.
+		if (existingCanonicalKeys === null) existingCanonicalKeys = loadDiskCanonicalKeys(roundsDir, fsImpl);
+		if (existingCanonicalKeys.has(canonicalDuplicateKey(round))) continue;
 		const roundData = {
 			...buildAgentEndRoundData({
 				userPrompt: round.userPrompt,
@@ -331,7 +511,8 @@ export function indexRecoveredRounds(
 export function backfillMissingRounds(
 	sessionFiles: string | string[],
 	roundsDir: string,
-	fsImpl: Pick<typeof fs, "existsSync" | "mkdirSync" | "writeFileSync" | "statSync"> = fs,
+	fsImpl: Pick<typeof fs, "existsSync" | "readdirSync" | "readFileSync" | "mkdirSync" | "writeFileSync" | "statSync"> &
+		TailReadFs = fs,
 	opts: { liveWindowMs?: number; nowMs?: number } = {},
 ): BackfillOutcome {
 	const files = Array.isArray(sessionFiles) ? sessionFiles : [sessionFiles];
@@ -353,6 +534,18 @@ export function backfillMissingRounds(
 		// F2: defer before paying for the parse at all — a live file's tail is
 		// incomplete by definition, so parsing it is wasted startup work.
 		if (live) {
+			deferredLive++;
+			continue;
+		}
+		// Unit-001: try the bounded tail read first. A complete tail skips the
+		// full read+parse entirely; an open tail defers exactly as the full
+		// closedness path would; anything inconclusive falls through below.
+		const tail = tailRoundComplete(sessionFile, roundsDir, fsImpl);
+		if (tail === true) {
+			skippedComplete = true;
+			continue;
+		}
+		if (tail === false) {
 			deferredLive++;
 			continue;
 		}
@@ -394,6 +587,47 @@ export function backfillMissingRounds(
  * itself lives in `embedRound` (lib/embed-round.ts).
  */
 export interface RecoveredEmbedDeps extends EmbedRoundDeps {}
+
+/**
+ * Issue #133: at most this many unembedded recovered rounds are embedded
+ * inline during session_start; above the threshold the embedding burst is
+ * deferred to `just index` (scripts/digest-all.ts) so startup never pays a
+ * large OpenRouter embedding bill.
+ */
+export const STARTUP_EMBED_INLINE_MAX = 10;
+
+export interface StartupEmbedPlan {
+	mode: "inline" | "defer";
+	pendingCount: number;
+}
+
+/**
+ * Issue #133: the status message shown when startup defers the embedding
+ * burst. Extracted so the exact wording is pinned by a test.
+ */
+export function startupEmbedStatusMessage(plan: StartupEmbedPlan): string {
+	return `🧠 ${plan.pendingCount} rounds pending embedding backfill — run just index`;
+}
+
+/**
+ * Issue #133: decide how startup should handle embedding for recovered
+ * rounds. A round is "pending" when its round file is missing/unreadable or
+ * carries no `promptEmbedding`. Pure — no I/O beyond the injected reader.
+ */
+export function planStartupEmbedding(
+	fileNames: readonly string[],
+	readRoundData: (fileName: string) => { promptEmbedding?: unknown } | null,
+): StartupEmbedPlan {
+	let pendingCount = 0;
+	for (const fileName of fileNames) {
+		const round = readRoundData(fileName);
+		if (!round?.promptEmbedding) pendingCount++;
+	}
+	return {
+		mode: pendingCount > STARTUP_EMBED_INLINE_MAX ? "defer" : "inline",
+		pendingCount,
+	};
+}
 
 export async function embedRecoveredRounds(
 	fileNames: string[],
