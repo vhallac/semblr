@@ -95,6 +95,7 @@ import { loadSemblrConfig, type SemblrConfig } from "../lib/semblr-config.ts";
 import {
 	backfillMissingRounds,
 	buildBackfillCandidates,
+	buildCurrentModelRowPredicate,
 	embedRecoveredRounds,
 	indexRecoveredRounds,
 	isBackfillStartReason,
@@ -1225,9 +1226,18 @@ export default function (pi: ExtensionAPI) {
 						// recovered rounds is unembedded — inline startup embedding beyond
 						// the threshold can block startup for minutes; `just index` sweeps
 						// it instead. BM25 + tool indexing above stays synchronous.
+						// Issue #140 (D1): the pending count keys on current-model index
+						// rows, not the promptEmbedding marker. A recovered round with
+						// current-model rows but no marker (rows written without one, e.g.
+						// after a crash) is not pending — counting it inflated the startup
+						// count and made startup disagree with the `just index` sweep. Load
+						// the index once here and reuse the same entries for the label
+						// guard below.
+						const indexEntries = loadVectorIndex(INDEX_PATH);
 						const embedPlan = planStartupEmbedding(
 							backfill.recoveredFiles,
 							(fileName) => readRoundJson(ROUNDS_DIR, fileName) as { promptEmbedding?: unknown } | null,
+							buildCurrentModelRowPredicate(indexEntries, SEMBLR_CONFIG.embeddingModel),
 						);
 						if (embedPlan.mode === "defer") {
 							ctx.ui.setStatus("semblr", startupEmbedStatusMessage(embedPlan));
@@ -1240,7 +1250,7 @@ export default function (pi: ExtensionAPI) {
 									// every append. Previously hasIndexRow re-read the full index
 									// file per recovered round (O(n × index size) — minutes of
 									// blocking startup work with a large index).
-									const indexedLabels = new Set(loadVectorIndex(INDEX_PATH).map((entry) => entry.filePath));
+									const indexedLabels = new Set(indexEntries.map((entry) => entry.filePath));
 									const embedResult = await embedRecoveredRounds(
 										backfill.recoveredFiles,
 										ROUNDS_DIR,

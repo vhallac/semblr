@@ -15,6 +15,7 @@ import { saveScanCutoff } from "./scan-register.ts";
 import {
 	backfillMissingRounds,
 	buildBackfillCandidates,
+	buildCurrentModelRowPredicate,
 	embedRecoveredRounds,
 	extractCheckpointSummary,
 	findMissingRounds,
@@ -697,6 +698,60 @@ describe("planStartupEmbedding (issue #133)", () => {
 		const files = new Map<string, { promptEmbedding: number[] }>([["a.json", { promptEmbedding: [1] }]]);
 		const plan = planStartupEmbedding(["a.json", "missing.json"], (f) => files.get(f) ?? null);
 		expect(plan).toEqual({ mode: "inline", pendingCount: 1 });
+	});
+
+	// Issue #140 (D1): a recovered round that already has current-model index
+	// rows is not pending even when the promptEmbedding marker is missing —
+	// rows, not the marker, decide. Anchored on the `just index` sweep
+	// predicate (lib/session-backfill.ts buildCurrentModelRowPredicate).
+	it("does not count a round pending when it has current-model rows but no promptEmbedding marker", () => {
+		const files = new Map<string, Round>([["rows-only.json", {}]]);
+		const hasRows = buildCurrentModelRowPredicate(
+			[{ vector: [0.1], filePath: "rows-only.json:prompt", model: "text-embedding-3-small" }],
+			"text-embedding-3-small",
+		);
+		const plan = planStartupEmbedding([...files.keys()], (f) => files.get(f) ?? null, hasRows);
+		expect(plan).toEqual({ mode: "inline", pendingCount: 0 });
+	});
+
+	it("counts a round pending when its only rows were written by a different model", () => {
+		const files = new Map<string, Round>([["stale-model.json", {}]]);
+		const hasRows = buildCurrentModelRowPredicate(
+			[{ vector: [0.1], filePath: "stale-model.json:prompt", model: "text-embedding-ada-002" }],
+			"text-embedding-3-small",
+		);
+		const plan = planStartupEmbedding([...files.keys()], (f) => files.get(f) ?? null, hasRows);
+		expect(plan).toEqual({ mode: "inline", pendingCount: 1 });
+	});
+
+	it("treats a legacy model-less row as current so a marked round stays non-pending (issue #62)", () => {
+		const files = new Map<string, Round>([["legacy.json", { promptEmbedding: [0.1] }]]);
+		const hasRows = buildCurrentModelRowPredicate(
+			[{ vector: [0.1], filePath: "legacy.json:prompt" }],
+			"text-embedding-3-small",
+		);
+		const plan = planStartupEmbedding([...files.keys()], (f) => files.get(f) ?? null, hasRows);
+		expect(plan).toEqual({ mode: "inline", pendingCount: 0 });
+	});
+
+	it("still counts a missing round file as pending even when a rows predicate is supplied", () => {
+		const files = new Map<string, Round>([["a.json", { promptEmbedding: [1] }]]);
+		const hasRows = buildCurrentModelRowPredicate([{ vector: [0.1], filePath: "a.json:prompt", model: "m" }], "m");
+		const plan = planStartupEmbedding(["a.json", "missing.json"], (f) => files.get(f) ?? null, hasRows);
+		expect(plan).toEqual({ mode: "inline", pendingCount: 1 });
+	});
+
+	// Matches the `just index` sweep, which reindexes a round that has ANY
+	// model-mismatched row even if some rows are current.
+	it("counts a round pending when it has mixed current and mismatched rows", () => {
+		const hasRows = buildCurrentModelRowPredicate(
+			[
+				{ vector: [0.1], filePath: "mixed.json:prompt", model: "text-embedding-3-small" },
+				{ vector: [0.2], filePath: "mixed.json:response", model: "text-embedding-ada-002" },
+			],
+			"text-embedding-3-small",
+		);
+		expect(hasRows("mixed.json")).toBe(false);
 	});
 });
 

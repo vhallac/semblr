@@ -16,6 +16,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { type EmbedRoundDeps, embedRound } from "./embed-round.ts";
 import { canonicalDuplicateKey, type DuplicateKeyRound } from "./hash.ts";
+import { indexRoundFileFromPath, type VectorIndexEntry } from "./index-io.ts";
 import { parsePiSessionJsonl, reconstructPiSessionRounds } from "./pi-session.ts";
 import type { PromptNoiseOptions } from "./round-capture.ts";
 import { buildAgentEndRoundData, deriveRoundFile, isPromptOnlyRound } from "./round-capture.ts";
@@ -602,6 +603,32 @@ export interface StartupEmbedPlan {
 }
 
 /**
+ * Issue #140 (D1): is this round covered by vector-index rows under the
+ * current embedding model? A round is covered when it has at least one index
+ * row and none of its rows were written by a different model. Legacy rows
+ * without a model column are treated as current (issue #62), matching the
+ * `just index` sweep predicate (`existingRounds.has(key) &&
+ * !modelMismatchedRounds.has(key)`).
+ *
+ * Keyed by round-file basename so the start-up counter and the sweep agree on
+ * what "this round is indexed" means: index rows, not the promptEmbedding
+ * marker.
+ */
+export function buildCurrentModelRowPredicate(
+	entries: readonly VectorIndexEntry[],
+	currentModel: string,
+): (fileName: string) => boolean {
+	const covered = new Set<string>();
+	const mismatched = new Set<string>();
+	for (const entry of entries) {
+		const roundFile = path.basename(indexRoundFileFromPath(entry.filePath));
+		if (entry.model !== undefined && entry.model !== currentModel) mismatched.add(roundFile);
+		else covered.add(roundFile);
+	}
+	return (fileName: string) => covered.has(fileName) && !mismatched.has(fileName);
+}
+
+/**
  * Issue #133: the status message shown when startup defers the embedding
  * burst. Extracted so the exact wording is pinned by a test.
  */
@@ -612,14 +639,26 @@ export function startupEmbedStatusMessage(plan: StartupEmbedPlan): string {
 /**
  * Issue #133: decide how startup should handle embedding for recovered
  * rounds. A round is "pending" when its round file is missing/unreadable or
- * carries no `promptEmbedding`. Pure — no I/O beyond the injected reader.
+ * is not covered by current-model vector-index rows. Pure — no I/O beyond the
+ * injected reader/predicate.
+ *
+ * Issue #140 (D1): the pending count keys on index rows, not the
+ * `promptEmbedding` marker. A recovered round may already have current-model
+ * rows but no marker (rows written by `just index`/recovery without the
+ * marker, e.g. after a crash); counting it pending inflated the startup count
+ * and made startup and the `just index` sweep disagree. When
+ * `hasCurrentModelRows` is omitted the marker is the only evidence available
+ * (a missing/unreadable round is always pending), preserving the previous
+ * behaviour for callers with no index loaded.
  */
 export function planStartupEmbedding(
 	fileNames: readonly string[],
 	readRoundData: (fileName: string) => { promptEmbedding?: unknown } | null,
+	hasCurrentModelRows?: (fileName: string) => boolean,
 ): StartupEmbedPlan {
 	let pendingCount = 0;
 	for (const fileName of fileNames) {
+		if (hasCurrentModelRows?.(fileName)) continue;
 		const round = readRoundData(fileName);
 		if (!round?.promptEmbedding) pendingCount++;
 	}
