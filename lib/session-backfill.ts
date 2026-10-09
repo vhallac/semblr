@@ -672,12 +672,25 @@ export async function embedRecoveredRounds(
 	fileNames: string[],
 	roundsDir: string,
 	deps: RecoveredEmbedDeps,
-	opts: { maxResponseBytes?: number; promptNoiseOptions?: PromptNoiseOptions; promptMaxTokens?: number } = {},
+	opts: {
+		maxResponseBytes?: number;
+		promptNoiseOptions?: PromptNoiseOptions;
+		promptMaxTokens?: number;
+		hasCurrentModelRows?: (fileName: string) => boolean;
+	} = {},
 ): Promise<{ embedded: string[]; errors: string[] }> {
 	const embedded: string[] = [];
 	const errors: string[] = [];
 	for (const fileName of fileNames) {
 		try {
+			// Issue #140 (D1): a round covered by current-model index rows is not
+			// re-embedded, even when its promptEmbedding marker is missing — the
+			// same predicate the start-up count uses (planStartupEmbedding), so the
+			// count and the pass cannot disagree. A row written without a marker
+			// (e.g. a crash between appends and the marker write) must not spend an
+			// embedding call. Omitted by callers with no index loaded, preserving
+			// marker-only behaviour.
+			if (opts.hasCurrentModelRows?.(fileName)) continue;
 			const round = JSON.parse(fs.readFileSync(path.join(roundsDir, fileName), "utf-8")) as RoundData;
 			if (round.promptEmbedding) continue;
 			await embedRound(

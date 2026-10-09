@@ -1280,6 +1280,13 @@ export default function (pi: ExtensionAPI) {
 											maxResponseBytes: EMBEDDING_RESPONSE_MAX_BYTES,
 											promptNoiseOptions: PROMPT_NOISE_CLEANUP,
 											promptMaxTokens: SEMBLR_CONFIG.embeddingMaxTokens,
+											// Issue #140 (D1): reuse the same current-model rows predicate as
+											// planStartupEmbedding above, so a round counted non-pending is not
+											// re-embedded by this pass (rows authoritative, marker derived).
+											hasCurrentModelRows: buildCurrentModelRowPredicate(
+												indexEntries,
+												SEMBLR_CONFIG.embeddingModel,
+											),
 										},
 									);
 									if (embedResult.embedded.length > 0) {

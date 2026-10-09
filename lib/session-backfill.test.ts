@@ -409,6 +409,81 @@ describe("session-backfill", () => {
 			expect(second.embedded).toEqual([]);
 		});
 
+		// F2 (PR !141 review): a round covered by current-model index rows is not
+		// re-embedded when its promptEmbedding marker is missing. The start-up
+		// count (planStartupEmbedding) already treats it as non-pending via the
+		// shared rows predicate; the embedding pass must apply the same predicate,
+		// or a rows-present/marker-missing round is counted 0 pending yet spends
+		// an embedding call — contradicting the README claim that such a round is
+		// not re-embedded. Anchored on buildCurrentModelRowPredicate, the predicate
+		// the `just index` sweep also uses.
+		it("does not re-embed a rows-covered round when the promptEmbedding marker is missing (F2)", async () => {
+			const sessionFile = writeSessionFile(tmp, [userMsg("q", "u-f2"), assistantMsg("a-f2")]);
+			const roundsDir = path.join(tmp, "rounds");
+			const outcome = backfillMissingRounds(sessionFile, roundsDir, undefined, { liveWindowMs: 0 });
+			const fileName = outcome.recoveredFiles[0];
+			// Marker is absent (nothing pre-embedded); the round is covered by a
+			// current-model row only.
+			const hasCurrentModelRows = buildCurrentModelRowPredicate(
+				[{ vector: [0.1], filePath: `${fileName}:prompt`, model: "text-embedding-3-small" }],
+				"text-embedding-3-small",
+			);
+			const plan = planStartupEmbedding(
+				outcome.recoveredFiles,
+				(name) => JSON.parse(fs.readFileSync(path.join(roundsDir, name), "utf-8")),
+				hasCurrentModelRows,
+			);
+			expect(plan).toEqual({ mode: "inline", pendingCount: 0 });
+			const embedCalls: string[] = [];
+			const result = await embedRecoveredRounds(
+				outcome.recoveredFiles,
+				roundsDir,
+				{
+					embed: (text) => {
+						embedCalls.push(text);
+						return Promise.resolve([text.length, 1]);
+					},
+					appendIndexRow: () => {},
+					writeRoundEmbedding: () => {},
+				},
+				{ hasCurrentModelRows },
+			);
+			// Count and pass agree: no embedding call is spent, no row appended,
+			// and no error is reported for the skipped round.
+			expect(embedCalls).toEqual([]);
+			expect(result).toEqual({ embedded: [], errors: [] });
+		});
+
+		// The rows predicate must not override the marker-based skip's intent: a
+		// round with a mismatched-model row remains pending and IS embedded (the
+		// predicate returns false), so the fallback path is preserved.
+		it("still re-embeds a round whose only rows were written by a different model (F2)", async () => {
+			const sessionFile = writeSessionFile(tmp, [userMsg("q", "u-f2b"), assistantMsg("a-f2b")]);
+			const roundsDir = path.join(tmp, "rounds");
+			const outcome = backfillMissingRounds(sessionFile, roundsDir, undefined, { liveWindowMs: 0 });
+			const fileName = outcome.recoveredFiles[0];
+			const hasCurrentModelRows = buildCurrentModelRowPredicate(
+				[{ vector: [0.1], filePath: `${fileName}:prompt`, model: "text-embedding-ada-002" }],
+				"text-embedding-3-small",
+			);
+			const embedCalls: string[] = [];
+			const result = await embedRecoveredRounds(
+				outcome.recoveredFiles,
+				roundsDir,
+				{
+					embed: (text) => {
+						embedCalls.push(text);
+						return Promise.resolve([text.length, 1]);
+					},
+					appendIndexRow: () => {},
+					writeRoundEmbedding: () => {},
+				},
+				{ hasCurrentModelRows },
+			);
+			expect(embedCalls.length).toBeGreaterThan(0);
+			expect(result.embedded).toEqual([fileName]);
+		});
+
 		it("F4 parity: prompt goes through buildPromptEmbeddingInput cleanup and the :prompt row carries the hash stamp", async () => {
 			const sessionFile = writeSessionFile(tmp, [
 				userMsg("explain this\n```python\n" + "x = 1\n".repeat(200) + "```"),
