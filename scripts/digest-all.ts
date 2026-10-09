@@ -584,7 +584,16 @@ export async function runDigestAll(options: DigestAllOptions = {}): Promise<numb
 				// is reported and preserved rather than traded away. Reproduced suffixes
 				// (`:prompt`/`:response`/`:summary` when derived) are still replaced by
 				// their fresh rows; only orphan suffixes are kept.
-				const orphanEntries = findOrphanIndexEntries(indexPath, roundFile, entries, f);
+				//
+				// F1 (PR #141 review): a preserved orphan must carry the current model
+				// stamp. Its vector is retained for continuity, but leaving the stale
+				// model on the row makes the model-mismatch predicate re-flag this round
+				// on every subsequent run — the store never converges. Re-stamping makes
+				// a second reindex reproduce the same rows and spend no embedding call.
+				const orphanEntries = findOrphanIndexEntries(indexPath, roundFile, entries, f).map((orphan) => ({
+					...orphan,
+					model: config.embeddingModel,
+				}));
 				for (const orphan of orphanEntries) {
 					err.error(`  ⚠️  Preserving non-reproduced index row: ${orphan.filePath}`);
 				}

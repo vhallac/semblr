@@ -7,6 +7,7 @@ import { computeContentHash } from "../lib/hash.ts";
 import { encodeVectorIndexLine, loadVectorIndex, readIndexLines } from "../lib/index-io.ts";
 import { hashEmbeddingInput } from "../lib/round-capture.ts";
 import { loadToolIndex, toolIndexPathForRoundsDir } from "../lib/search-tools.ts";
+import { SEMBLR_CONFIG_DEFAULTS } from "../lib/semblr-config.ts";
 import { embedRecoveredRounds } from "../lib/session-backfill.ts";
 import { isMainModule, runDigestAll } from "./digest-all.ts";
 
@@ -15,6 +16,10 @@ import { isMainModule, runDigestAll } from "./digest-all.ts";
 // below target clip, row, and marker mechanics, so keep fixture prompts
 // embeddable unless a test opts into the documented default threshold.
 process.env.RELEVANCE_LIST_MIN_WORDS = "1";
+
+// The model a reindex stamps onto fresh rows (and, after the F1 fix, onto a
+// preserved orphan row) when no explicit model is configured.
+const DEBUG_EMBEDDING_MODEL = SEMBLR_CONFIG_DEFAULTS.embeddingModel;
 
 function tmpDir(): string {
 	return fs.mkdtempSync(path.join(os.tmpdir(), "semblr-digest-all-test-"));
@@ -597,17 +602,21 @@ describe("digest-all script", () => {
 		);
 
 		const logs = logger();
+		const requests: unknown[] = [];
 		await expect(
 			runDigestAll({
 				sessionsDir,
 				roundsDir,
 				indexPath,
 				apiKey: "key",
-				fetchImpl: embeddingFetch([
-					[3, 4],
-					[0, 5],
-					[6, 7],
-				]),
+				fetchImpl: embeddingFetch(
+					[
+						[3, 4],
+						[0, 5],
+						[6, 7],
+					],
+					requests,
+				),
 				stdout: logs.out,
 				stderr: logs.err,
 			}),
@@ -623,6 +632,31 @@ describe("digest-all script", () => {
 		]);
 		expect(rows.find((e) => e.filePath === `${roundFile}:round`)?.vector).toEqual([7, 7]);
 		expect(logs.stderr.join("\n")).toContain(`Preserving non-reproduced index row: ${roundFile}:round`);
+
+		// F1 (PR #141 review): the preserved orphan must be re-stamped to the
+		// current model, otherwise the model-mismatch predicate re-flags this
+		// round forever. A second run must converge: resolved exit and zero
+		// embedding calls.
+		expect(rows.find((e) => e.filePath === `${roundFile}:round`)?.model).toBe(DEBUG_EMBEDDING_MODEL);
+		const firstRunCalls = requests.length;
+		const secondLogs = logger();
+		await expect(
+			runDigestAll({
+				sessionsDir,
+				roundsDir,
+				indexPath,
+				apiKey: "key",
+				fetchImpl: embeddingFetch([], requests),
+				stdout: secondLogs.out,
+				stderr: secondLogs.err,
+			}),
+		).resolves.toBe(0);
+		expect(requests.length).toBe(firstRunCalls);
+		const rowsAfterSecondRun = loadVectorIndex(indexPath);
+		expect(rowsAfterSecondRun.map((e) => e.filePath)).toEqual(rows.map((e) => e.filePath));
+		for (const row of rowsAfterSecondRun) {
+			expect(row.model).toBe(DEBUG_EMBEDDING_MODEL);
+		}
 	});
 
 	it("migrates stale round filenames before deciding a round is already indexed", async () => {
