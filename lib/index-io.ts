@@ -166,6 +166,27 @@ export function writeIndexLines(indexPath: string, entries: string[]): void {
 	fs.writeFileSync(indexPath, entries.join("\n") + (entries.length > 0 ? "\n" : ""));
 }
 
+/**
+ * Write the full vector index atomically (tmp+rename, decision 015) from an
+ * in-memory entry list. digest-all's batch path (issue #142) buffers all row
+ * mutations in memory — appends and model-change replaces — and flushes once
+ * after the batch, so a run performs exactly one full index write regardless
+ * of the number of re-indexed rounds. The tmp file is pid-suffixed so
+ * concurrent runs cannot collide on it.
+ */
+export function flushVectorIndex(
+	indexPath: string,
+	entries: VectorIndexEntry[],
+	fsImpl: Pick<typeof fs, "writeFileSync" | "renameSync"> = fs,
+): void {
+	const lines = entries.map((entry) =>
+		encodeVectorIndexLine(entry.vector, entry.filePath, entry.model, entry.embeddingInputHash),
+	);
+	const tmp = `${indexPath}.tmp.${process.pid}`;
+	fsImpl.writeFileSync(tmp, lines.length > 0 ? `${lines.join("\n")}\n` : "");
+	fsImpl.renameSync(tmp, indexPath);
+}
+
 export function appendVectorIndexEntry(
 	indexPath: string,
 	vector: number[],

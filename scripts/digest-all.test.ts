@@ -46,10 +46,13 @@ function spyFs(): {
 	writes: string[];
 	renames: Array<[string, string]>;
 	reads: string[];
+	opens: string[];
 } {
 	const writes: string[] = [];
 	const renames: Array<[string, string]> = [];
 	const reads: string[] = [];
+	const opens: string[] = [];
+	const fdPaths = new Map<number, string>();
 	const fsImpl = {
 		...fs,
 		writeFileSync: ((p: fs.PathLike, data: unknown, opts?: unknown) => {
@@ -64,8 +67,22 @@ function spyFs(): {
 			reads.push(String(p));
 			return (fs.readFileSync as (...a: unknown[]) => unknown)(p, opts);
 		}) as typeof fs.readFileSync,
+		// forEachIndexLine reads the vector index with openSync/readSync, not
+		// readFileSync — map the fd back to its path so full-index reads are
+		// observable through the same `reads` list.
+		openSync: ((p: fs.PathLike, flags?: unknown, mode?: unknown) => {
+			const fd = (fs.openSync as (...a: unknown[]) => number)(p, flags, mode);
+			fdPaths.set(fd, String(p));
+			opens.push(String(p));
+			return fd;
+		}) as typeof fs.openSync,
+		readSync: ((fd: number, buffer: Buffer, offset: number, length: number, position: number | null) => {
+			const p = fdPaths.get(fd);
+			if (p !== undefined) reads.push(p);
+			return fs.readSync(fd, buffer, offset, length, position);
+		}) as typeof fs.readSync,
 	} as typeof fs;
-	return { fsImpl, writes, renames, reads };
+	return { fsImpl, writes, renames, reads, opens };
 }
 
 function line(value: unknown): string {
@@ -1745,7 +1762,7 @@ describe("digest-all script", () => {
 			vectors.push([i + 1, 0], [0, i + 1], [i + 1, i + 1]);
 		}
 
-		const { fsImpl, writes, reads } = spyFs();
+		const { fsImpl, opens, writes, reads } = spyFs();
 		await expect(
 			runDigestAll({
 				sessionsDir,
@@ -1761,7 +1778,9 @@ describe("digest-all script", () => {
 
 		return {
 			bm25Writes: writes.filter((w) => w === bm25IndexPathForRoundsDir(roundsDir)).length,
-			indexReads: reads.filter((r) => r === indexPath).length,
+			// One full-index load = one openSync; readSync fires per chunk, so it
+			// is not a load counter.
+			indexReads: opens.filter((r) => r === indexPath).length,
 			bm25Reads: reads.filter((r) => r === bm25IndexPathForRoundsDir(roundsDir)).length,
 			toolIndexReads: reads.filter((r) => r === toolIndexPathForRoundsDir(roundsDir)).length,
 		};
@@ -1780,6 +1799,133 @@ describe("digest-all script", () => {
 		expect(small.bm25Writes).toBe(1);
 		expect(small.bm25Reads).toBe(1);
 		expect(small.toolIndexReads).toBe(1);
+	});
+
+	/**
+	 * Issue #142 regression fixture: N round files whose index rows were written
+	 * with a stale embedding model, plus one orphan row whose round file does
+	 * not exist. digest-all must reindex every mismatched round with a constant
+	 * number of full-index reads and full-index writes, preserve the orphan
+	 * with its original model, and converge on a second run (no re-embedding,
+	 * no rewrite, byte-identical index).
+	 */
+	async function runModelChangeFixture(roundCount: number): Promise<{
+		indexPath: string;
+		indexReads: number;
+		indexWrites: number;
+		embeddingCalls: number;
+		indexBytes: string;
+		secondRun: { embeddingCalls: number; indexWrites: number; indexBytes: string };
+	}> {
+		const root = tmpDir();
+		const sessionsDir = tmpDir(); // no session files: force the rounds-dir sweep
+		const roundsDir = path.join(root, "rounds");
+		fs.mkdirSync(roundsDir, { recursive: true });
+		const indexPath = path.join(roundsDir, "index.csv");
+
+		const oldModel = "old-model";
+		const seedRows: string[] = [
+			// Orphan: points at a round file that never exists. Must survive the
+			// reindex with its original vector AND its original model (F1 guard).
+			encodeVectorIndexLine([7, 7], "unrelated.json:prompt", oldModel),
+		];
+		const vectors: number[][] = [];
+		for (let i = 0; i < roundCount; i++) {
+			const userPrompt = `Stale model round ${i} with a distinct prompt body.`;
+			const responseSequence = `Stale model round ${i} with a distinct response body.`;
+			const roundFile = `${computeContentHash(userPrompt, responseSequence, [])}.json`;
+			fs.writeFileSync(
+				path.join(roundsDir, roundFile),
+				JSON.stringify({ userPrompt, responseSequence, toolCalls: [], recovered: true }),
+			);
+			seedRows.push(
+				encodeVectorIndexLine([i, 0], `${roundFile}:prompt`, oldModel),
+				encodeVectorIndexLine([0, i], `${roundFile}:response`, oldModel),
+			);
+			// prompt, response, combined — one embedding fetch each per round.
+			vectors.push([i + 1, 0], [0, i + 1], [i + 1, i + 1]);
+		}
+		fs.writeFileSync(indexPath, `${seedRows.join("\n")}\n`);
+
+		const requests: unknown[] = [];
+		const { fsImpl, opens, renames, reads } = spyFs();
+		await expect(
+			runDigestAll({
+				sessionsDir,
+				roundsDir,
+				indexPath,
+				apiKey: "key",
+				fetchImpl: embeddingFetch(vectors, requests),
+				fsImpl,
+				stdout: logger().out,
+				stderr: logger().err,
+			}),
+		).resolves.toBe(0);
+		const indexBytes = fs.readFileSync(indexPath, "utf-8");
+
+		// Second run: everything is current-model, so nothing re-embeds and the
+		// batch must not dirty the index — bytes stay exactly as run 1 left them.
+		const secondRequests: unknown[] = [];
+		const second = spyFs();
+		await expect(
+			runDigestAll({
+				sessionsDir,
+				roundsDir,
+				indexPath,
+				apiKey: "key",
+				fetchImpl: embeddingFetch([], secondRequests),
+				fsImpl: second.fsImpl,
+				stdout: logger().out,
+				stderr: logger().err,
+			}),
+		).resolves.toBe(0);
+
+		return {
+			indexPath,
+			// One full-index load = one openSync; readSync fires per chunk, so it
+			// is not a load counter.
+			indexReads: opens.filter((r) => r === indexPath).length,
+			indexWrites: renames.filter(([, to]) => to === indexPath).length,
+			embeddingCalls: requests.length,
+			indexBytes,
+			secondRun: {
+				embeddingCalls: secondRequests.length,
+				indexWrites: second.renames.filter(([, to]) => to === indexPath).length,
+				indexBytes: fs.readFileSync(indexPath, "utf-8"),
+			},
+		};
+	}
+
+	it("model-change reindex keeps full index reads/writes flat in N, preserves orphans, and converges (#142)", async () => {
+		const small = await runModelChangeFixture(2);
+		const medium = await runModelChangeFixture(4);
+		const large = await runModelChangeFixture(8);
+
+		// O(1) evidence: full-index opens stay constant in N — one for the initial
+		// in-memory load (issue #139) and one for the trailing countIndexLines
+		// summary (per-chunk readSync granularity is why opens, not reads, count).
+		// The single full-index write is the one tmp+rename flush.
+		expect(small.indexReads).toBe(2);
+		expect(medium.indexReads).toBe(2);
+		expect(large.indexReads).toBe(2);
+		expect(small.indexWrites).toBe(1);
+		expect(medium.indexWrites).toBe(1);
+		expect(large.indexWrites).toBe(1);
+
+		// Every mismatched round is still re-embedded (3 vectors per round) — the
+		// I/O got cheaper, not the work.
+		expect(large.embeddingCalls).toBe(24);
+
+		// The orphan row survives the flush with its original vector AND its
+		// original (stale) model — a re-stamp would be a cross-model relabel (F1).
+		const orphan = loadVectorIndex(large.indexPath).find((e) => e.filePath === "unrelated.json:prompt");
+		expect(orphan).toEqual({ vector: [7, 7], filePath: "unrelated.json:prompt", model: "old-model" });
+
+		// Second run converges: zero embedding calls, no index rewrite, and the
+		// on-disk rows are byte-identical to what run 1 produced.
+		expect(large.secondRun.embeddingCalls).toBe(0);
+		expect(large.secondRun.indexWrites).toBe(0);
+		expect(large.secondRun.indexBytes).toBe(large.indexBytes);
 	});
 
 	it("short prompts follow the shared drop policy: no :prompt row, response vector stored as promptEmbedding", async () => {

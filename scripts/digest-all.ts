@@ -30,13 +30,11 @@ import {
 	forcingReproducibleSuffixes,
 } from "../lib/embed-round.ts";
 import {
-	appendVectorIndexEntry,
 	buildStaleContentMatchMap,
+	flushVectorIndex,
 	indexRoundFileFromPath,
 	indexRowSuffix,
 	loadVectorIndex,
-	migrateIndexEntries as migrateIndexEntriesFile,
-	replaceIndexEntriesForRoundFile,
 	type VectorIndexEntry,
 } from "../lib/index-io.ts";
 import { countIndexLines } from "../lib/index-storage.ts";
@@ -203,25 +201,31 @@ function healMissingPromptEmbedding(
 const REINDEXABLE_INDEX_SUFFIXES = FORCING_INDEX_SUFFIXES;
 
 /**
- * Existing index rows for `roundFile` whose suffix is not reproduced by
- * `entries`. A model-change reindex replaces every row for the round, so any
- * suffix it does not reproduce (e.g. a `:summary` row whose source is gone)
- * would be silently dropped. These are returned so the caller can report and
- * preserve them (issue #140, decision D3: reproduce it or report it, never
- * trade it away). Comparison is by suffix, so the old copies of reproduced
- * suffixes are still replaced by their fresh rows.
+ * True when an index row's filePath carries a label suffix (`:prompt`, ...).
+ * Suffix-less rows (`b64,abc.json`) have no `fileName:label` key, so a model
+ * reindex neither replaces nor orphans them — they stay in place, matching
+ * the `!filename` survivor rule of the per-round disk replace this in-memory
+ * path replaced (issue #142).
  */
-function findOrphanIndexEntries(
-	indexPath: string,
-	roundFile: string,
-	entries: VectorIndexEntry[],
-	f: typeof fs,
-): VectorIndexEntry[] {
+function isLabeledIndexEntry(entry: VectorIndexEntry): boolean {
+	return entry.filePath.includes(":");
+}
+
+/**
+ * Existing index rows for `roundFile` whose suffix is not reproduced by
+ * `entries` — answered from the in-memory entry list instead of re-loading
+ * the index (issue #142: the per-round full index read made the model-reindex
+ * path O(n²) in bytes). A model-change reindex replaces every labeled row for
+ * the round, so any suffix it does not reproduce (e.g. a `:summary` row whose
+ * source is gone) would be silently dropped. These are returned so the caller
+ * can report and preserve them (issue #140, decision D3: reproduce it or
+ * report it, never trade it away). Comparison is by suffix, so the old copies
+ * of reproduced suffixes are still replaced by their fresh rows.
+ */
+function findOrphanIndexEntries(existingEntries: VectorIndexEntry[], entries: VectorIndexEntry[]): VectorIndexEntry[] {
 	const reproduced = new Set(entries.map((entry) => indexRowSuffix(entry.filePath)));
-	return loadVectorIndex(indexPath, f).filter(
-		(entry) =>
-			path.basename(indexRoundFileFromPath(entry.filePath)) === roundFile &&
-			!reproduced.has(indexRowSuffix(entry.filePath)),
+	return existingEntries.filter(
+		(entry) => isLabeledIndexEntry(entry) && !reproduced.has(indexRowSuffix(entry.filePath)),
 	);
 }
 
@@ -419,6 +423,10 @@ export async function runDigestAll(options: DigestAllOptions = {}): Promise<numb
 	// Seed the in-memory indexed/mismatched sets from the one index load and
 	// keep them current as rows are appended or replaced.
 	const indexedRounds = new Set(existingRounds);
+	// Issue #142: set when any buffered row mutation happens (append, replace, or
+	// migration) — the single flush after the batch is skipped for no-op runs so
+	// an all-already-indexed run leaves the index bytes untouched.
+	let indexDirty = false;
 	const modelMismatched = new Set(modelMismatchedRounds);
 	let sweptTotal = 0;
 	let healedTotal = 0;
@@ -541,8 +549,23 @@ export async function runDigestAll(options: DigestAllOptions = {}): Promise<numb
 		// if embedding is unavailable.
 		const staleFiles = staleMatchesByTarget.get(roundFile) ?? [];
 		for (const staleFile of staleFiles) {
-			migrateIndexEntriesFile(indexPath, staleFile, roundFile);
-			// Mirror the on-disk migration in the in-memory dedup sets: the stale
+			// Issue #142: migrate the stale rows in memory — the same
+			// prefix-rename rule as migrateIndexEntries — instead of a full
+			// on-disk read+write per migration. The map holds the same entry
+			// objects as the ordered batch list below, so the rename is visible
+			// to both; the rows keep their loaded positions.
+			const staleRows = entriesByRoundFile.get(staleFile) ?? [];
+			for (const row of staleRows) {
+				if (row.filePath.startsWith(staleFile)) {
+					row.filePath = roundFile + row.filePath.slice(staleFile.length);
+				}
+			}
+			entriesByRoundFile.delete(staleFile);
+			const targetList = entriesByRoundFile.get(roundFile);
+			if (targetList) targetList.push(...staleRows);
+			else entriesByRoundFile.set(roundFile, staleRows);
+			indexDirty = true;
+			// Mirror the migration in the in-memory dedup sets: the stale
 			// filename's rows now belong to roundFile.
 			if (indexedRounds.delete(staleFile)) indexedRounds.add(roundFile);
 			if (modelMismatched.delete(staleFile)) modelMismatched.add(roundFile);
@@ -651,28 +674,54 @@ export async function runDigestAll(options: DigestAllOptions = {}): Promise<numb
 
 			if (needsModelReindex) {
 				// F3 (issue #140, decision D3): the full replace must never silently
-				// drop a row this reindex did not reproduce. A suffix present on disk
-				// but absent from `entries` (e.g. a `:summary` row whose source is gone)
-				// is reported and preserved rather than traded away. Reproduced suffixes
-				// (`:prompt`/`:response`/`:summary` when derived) are still replaced by
-				// their fresh rows; only orphan suffixes are kept.
+				// drop a row this reindex did not reproduce. A labeled row for this
+				// round whose suffix is absent from `entries` (e.g. a `:summary` row
+				// whose source is gone) is reported and preserved rather than traded
+				// away. Reproduced suffixes (`:prompt`/`:response`/`:summary` when
+				// derived) are still replaced by their fresh rows; only orphan suffixes
+				// are kept.
 				//
-				// F1 (PR #141 review): a preserved orphan keeps its own `model` (and its
-				// `embeddingInputHash`, if any). Its vector was computed by another model,
-				// so re-stamping the row to the current model would make the read path
-				// score it against the current-model query vector — a cross-model cosine
-				// (zettel 7.3). Convergence comes from the mismatch predicate ignoring
-				// non-reproducible suffixes (REINDEXABLE_INDEX_SUFFIXES), not from
-				// relabelling a foreign vector.
-				const orphanEntries = findOrphanIndexEntries(indexPath, roundFile, entries, f);
+				// F1 (PR #141 review): a preserved orphan keeps its own `model` (and
+				// its `embeddingInputHash`, if any). Its vector was computed by another
+				// model, so re-stamping the row to the current model would make the
+				// read path score it against the current-model query vector — a
+				// cross-model cosine (zettel 7.3). Convergence comes from the mismatch
+				// predicate ignoring non-reproducible suffixes
+				// (REINDEXABLE_INDEX_SUFFIXES), not from relabelling a foreign vector.
+				//
+				// Issue #142: the replace happens in memory — orphan discovery reads
+				// the round's entry list from the map seeded by the single index load,
+				// and the ordered batch list is rewritten with the disk-replace byte
+				// layout (survivors keep load order, replacement block appended at the
+				// end). One full flush of the batch list happens after the workers
+				// join, so the run does exactly one full index read and one full index
+				// write regardless of the mismatched-round count N.
+				const existingEntries = entriesByRoundFile.get(roundFile) ?? [];
+				const orphanEntries = findOrphanIndexEntries(existingEntries, entries);
 				for (const orphan of orphanEntries) {
 					err.error(`  ⚠️  Preserving non-reproduced index row: ${orphan.filePath}`);
 				}
-				replaceIndexEntriesForRoundFile(indexPath, roundFile, [...entries, ...orphanEntries]);
+				entriesByRoundFile.set(roundFile, [...entries, ...orphanEntries]);
+				indexDirty = true;
+				for (let i = indexEntries.length - 1; i >= 0; i--) {
+					const entry = indexEntries[i];
+					if (isLabeledIndexEntry(entry) && path.basename(indexRoundFileFromPath(entry.filePath)) === roundFile) {
+						indexEntries.splice(i, 1);
+					}
+				}
+				indexEntries.push(...entries, ...orphanEntries);
 				modelMismatched.delete(roundFile);
 			} else {
 				for (const entry of entries) {
-					appendVectorIndexEntry(indexPath, entry.vector, entry.filePath, entry.model, entry.embeddingInputHash);
+					// Issue #142: appended rows are buffered in the ordered batch list
+					// and flushed once after the batch (decision 006 idempotency is
+					// enforced in memory by the indexedRounds set, which gates this
+					// branch).
+					indexEntries.push(entry);
+					const list = entriesByRoundFile.get(roundFile);
+					if (list) list.push(entry);
+					else entriesByRoundFile.set(roundFile, [entry]);
+					indexDirty = true;
 				}
 			}
 			// The round now has current-model rows; keep the in-memory dedup sets
@@ -713,6 +762,13 @@ export async function runDigestAll(options: DigestAllOptions = {}): Promise<numb
 	// A crash before this write self-heals on the next run: the load path is
 	// non-writing (PR #138) and round files are the source of truth.
 	writeBm25Index(bm25IndexPath, bm25Index, f);
+
+	// Issue #142: flush the buffered vector-index rows once for the whole batch
+	// (tmp+rename, decision 015) — one full index write per run, mirroring the
+	// writeBm25Index seam. A crash before this point self-heals: round files are
+	// durable and the next run re-derives the rows. Skipped when the batch
+	// mutated nothing (no-op run) so the on-disk bytes are left untouched.
+	if (indexDirty) flushVectorIndex(indexPath, indexEntries, f);
 
 	const finalCount = countIndexLines(indexPath, f);
 
