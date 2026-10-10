@@ -768,7 +768,7 @@ export async function runDigestAll(options: DigestAllOptions = {}): Promise<numb
 	// writeBm25Index seam. A crash before this point self-heals: round files are
 	// durable and the next run re-derives the rows. Skipped when the batch
 	// mutated nothing (no-op run) so the on-disk bytes are left untouched.
-	if (indexDirty) flushVectorIndex(indexPath, indexEntries);
+	if (indexDirty) flushVectorIndex(indexPath, indexEntries, f);
 
 	const finalCount = countIndexLines(indexPath, f);
 

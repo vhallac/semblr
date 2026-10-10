@@ -174,13 +174,17 @@ export function writeIndexLines(indexPath: string, entries: string[]): void {
  * of the number of re-indexed rounds. The tmp file is pid-suffixed so
  * concurrent runs cannot collide on it.
  */
-export function flushVectorIndex(indexPath: string, entries: VectorIndexEntry[]): void {
+export function flushVectorIndex(
+	indexPath: string,
+	entries: VectorIndexEntry[],
+	fsImpl: Pick<typeof fs, "writeFileSync" | "renameSync"> = fs,
+): void {
 	const lines = entries.map((entry) =>
 		encodeVectorIndexLine(entry.vector, entry.filePath, entry.model, entry.embeddingInputHash),
 	);
 	const tmp = `${indexPath}.tmp.${process.pid}`;
-	fs.writeFileSync(tmp, lines.length > 0 ? `${lines.join("\n")}\n` : "");
-	fs.renameSync(tmp, indexPath);
+	fsImpl.writeFileSync(tmp, lines.length > 0 ? `${lines.join("\n")}\n` : "");
+	fsImpl.renameSync(tmp, indexPath);
 }
 
 export function appendVectorIndexEntry(
