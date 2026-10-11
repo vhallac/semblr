@@ -417,6 +417,56 @@ describe("import-claude-code script", () => {
 		expect(logs.stdout.join("\n")).toContain("📊 New rounds to import: 0");
 	});
 
+	it("keeps existing round file byte-identical when the atomic write fails", async () => {
+		const root = tmpDir();
+		const projectsDir = path.join(root, "projects");
+		fs.mkdirSync(projectsDir, { recursive: true });
+		const roundsDir = path.join(root, "rounds");
+		fs.mkdirSync(roundsDir, { recursive: true });
+		const logs = logger();
+
+		writeClaudeJsonl(path.join(projectsDir, "session.jsonl"), [validUserEntry(), validAssistantEntry()]);
+
+		const roundFile = claudeRoundFileName({ userPrompt: "User prompt", responseSequence: RESPONSE() });
+		const target = path.join(roundsDir, roundFile);
+		const sentinel = JSON.stringify({ existing: true });
+		fs.writeFileSync(target, sentinel);
+
+		// Proxy over real fs so the stub still satisfies typeof fs while
+		// failing every round-file write (disk full).
+		const failingFs = new Proxy(fs, {
+			get(t, prop, receiver) {
+				if (prop === "writeFileSync") {
+					return () => {
+						throw new Error("disk full");
+					};
+				}
+				return Reflect.get(t, prop, receiver);
+			},
+		});
+
+		// The write failure is thrown before the per-round try (which guards
+		// embedding/indexing), so the run rejects — matching digest-session's
+		// failure-injection behavior.
+		await expect(
+			runImportClaudeCode({
+				projectsDir,
+				roundsDir,
+				indexPath: path.join(roundsDir, "index.csv"),
+				apiKey: "key",
+				fetchImpl: embeddingFetch([[1]]),
+				concurrency: 1,
+				stdout: logs.out,
+				stderr: logs.err,
+				fsImpl: failingFs as typeof fs,
+			}),
+		).rejects.toThrow("disk full");
+
+		expect(fs.readFileSync(target, "utf-8")).toBe(sentinel);
+		expect(fs.readdirSync(roundsDir).filter((name) => name.includes(".tmp."))).toEqual([]);
+		expect(loadVectorIndex(path.join(roundsDir, "index.csv"))).toEqual([]);
+	});
+
 	it("detects direct CLI execution", () => {
 		expect(isMainModule("file:///tmp/import-claude-code.ts", "/tmp/import-claude-code.ts")).toBe(true);
 		expect(isMainModule("file:///tmp/import-claude-code.ts", "/tmp/other.ts")).toBe(false);
