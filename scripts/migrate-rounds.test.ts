@@ -114,6 +114,25 @@ describe("migrate-rounds script", () => {
 		expect(logs.stderr).toEqual([]);
 	});
 
+	it("leaves round files byte-identical when the atomic write fails", () => {
+		const roundsDir = tmpDir();
+		const logs = logger();
+		writeRound(roundsDir, "target.json", { userPrompt: "question", responseSequence: "answer" });
+		const before = fs.readFileSync(path.join(roundsDir, "target.json"), "utf8");
+		const fsImpl = {
+			writeFileSync: () => {
+				throw new Error("disk full");
+			},
+			renameSync: fs.renameSync,
+		};
+
+		expect(() => runResponseSegmentsMigration({ roundsDir, stdout: logs.out, stderr: logs.err, fsImpl })).toThrow(
+			"disk full",
+		);
+
+		expect(fs.readFileSync(path.join(roundsDir, "target.json"), "utf8")).toBe(before);
+	});
+
 	it("skips unparseable and empty rounds without rewriting them", () => {
 		const roundsDir = tmpDir();
 		const logs = logger();

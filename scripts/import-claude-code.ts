@@ -17,6 +17,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { pathToFileURL } from "node:url";
+import { atomicWriteFileSync } from "../lib/atomic-write.ts";
 import { type ClaudeRound, claudeRoundFileName, parseClaudeCodeJsonl } from "../lib/claude-code.ts";
 import { type EmbeddingModelRegistry, embedText, normalize } from "../lib/embed.ts";
 import { appendVectorIndexEntry, loadIndexedRoundFiles as loadIndexedRoundFilesFromIndex } from "../lib/index-io.ts";
@@ -149,7 +150,9 @@ export async function runImportClaudeCode(options: ImportClaudeCodeOptions = {})
 
 	async function processRound(round: Round) {
 		const file = claudeRoundFileName(round);
-		f.writeFileSync(path.resolve(roundsDir, file), JSON.stringify(round, null, 2));
+		// Atomic (decision-015): tmp write + rename, so a failure leaves the
+		// existing round file byte-identical.
+		atomicWriteFileSync(path.resolve(roundsDir, file), JSON.stringify(round, null, 2), f);
 		try {
 			const promptVec = await embedText(round.userPrompt.slice(0, config.embeddingMaxTokens), apiKey!, {
 				fetchImpl: options.fetchImpl,

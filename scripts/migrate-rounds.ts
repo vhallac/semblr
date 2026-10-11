@@ -22,6 +22,7 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { pathToFileURL } from "node:url";
+import { type AtomicWriteFs, atomicWriteFileSync } from "../lib/atomic-write.ts";
 import { resolveScriptConfig, type ScriptConfigOptions } from "../lib/script-config.ts";
 
 // ─────────────────────────────────────────────
@@ -61,6 +62,7 @@ export interface MigrateRoundsOptions extends ScriptConfigOptions {
 	roundsDir?: string;
 	stdout?: Pick<typeof console, "log">;
 	stderr?: Pick<typeof console, "error" | "warn">;
+	fsImpl?: AtomicWriteFs;
 }
 
 export function runResponseSegmentsMigration(options: MigrateRoundsOptions = {}): number {
@@ -120,8 +122,9 @@ export function runResponseSegmentsMigration(options: MigrateRoundsOptions = {})
 
 		data.responseSegments = segments;
 
-		// Write back with 2-space indent
-		fs.writeFileSync(filePath, JSON.stringify(data, null, 2));
+		// Write back with 2-space indent. Atomic (decision-015): tmp write +
+		// rename, so a failure leaves the round file byte-identical.
+		atomicWriteFileSync(filePath, JSON.stringify(data, null, 2), options.fsImpl);
 		migrated++;
 	}
 

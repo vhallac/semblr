@@ -225,6 +225,34 @@ describe("digest-session script", () => {
 		expect(fetchImpl).not.toHaveBeenCalled();
 	});
 
+	it("leaves round files byte-identical when the atomic write fails", async () => {
+		const root = tmpDir();
+		const sessionFile = path.join(root, "session.jsonl");
+		const roundsDir = path.join(root, "rounds");
+		fs.mkdirSync(roundsDir, { recursive: true });
+		writeSession(sessionFile, "same prompt", "same response");
+		const legacyPath = path.join(roundsDir, "legacy.json");
+		const legacyData = { userPrompt: "same prompt", responseSequence: "same response", toolCalls: [] };
+		fs.writeFileSync(legacyPath, JSON.stringify(legacyData));
+		const legacyContent = fs.readFileSync(legacyPath, "utf8");
+		const logs = logger();
+		const fetchImpl = vi.fn(async () => new Response("should not be called")) as typeof fetch;
+		const fsImpl = {
+			writeFileSync: () => {
+				throw new Error("disk full");
+			},
+			renameSync: fs.renameSync,
+		};
+
+		await expect(
+			runDigestSession({ sessionFile, roundsDir, apiKey: "key", fetchImpl, stdout: logs.out, fsImpl }),
+		).rejects.toThrow("disk full");
+
+		const roundFile = `${computeContentHash("same prompt", "same response", [])}.json`;
+		expect(fs.existsSync(path.join(roundsDir, roundFile))).toBe(false);
+		expect(fs.readFileSync(legacyPath, "utf8")).toBe(legacyContent);
+	});
+
 	it("surfaces embedding setup and API failures", async () => {
 		await expect(embed("text", { apiKey: "" })).rejects.toThrow("OPENROUTER_API_KEY");
 

@@ -16,6 +16,7 @@
 
 import * as fs from "node:fs";
 import { pathToFileURL } from "node:url";
+import { type AtomicWriteFs, atomicWriteFileSync } from "../lib/atomic-write.ts";
 import { computeContentHash } from "../lib/hash.ts";
 import {
 	filterIndexLinesExcludingFilenames,
@@ -62,6 +63,7 @@ export interface ContentHashMigrationOptions extends ScriptConfigOptions {
 	now?: () => number;
 	stdout?: Pick<typeof console, "log">;
 	stderr?: Pick<typeof console, "error">;
+	fsImpl?: AtomicWriteFs;
 }
 
 // ─────────────────────────────────────────────
@@ -135,7 +137,7 @@ export function runContentHashMigration(options: ContentHashMigrationOptions = {
 			if (data.id !== newHash) {
 				data.id = newHash;
 				if (!dryRun) {
-					fs.writeFileSync(filePath, JSON.stringify(data, null, 2));
+					atomicWriteFileSync(filePath, JSON.stringify(data, null, 2), options.fsImpl);
 					out.log(`  ✓ updated id field: ${filename}`);
 				} else {
 					out.log(`  ~ would update id field: ${filename}`);
@@ -160,7 +162,7 @@ export function runContentHashMigration(options: ContentHashMigrationOptions = {
 			if (!dryRun) {
 				// Add the new id field
 				data.id = newHash;
-				fs.writeFileSync(newPath, JSON.stringify(data, null, 2));
+				atomicWriteFileSync(newPath, JSON.stringify(data, null, 2), options.fsImpl);
 				fs.unlinkSync(filePath);
 			}
 		}

@@ -8,7 +8,7 @@ docs/eval/golden-labels.json
 .pi/agent/sessions/
 
 # Dependencies
-node_modules/
+node_modules
 
 # Python bytecode caches
 __pycache__/

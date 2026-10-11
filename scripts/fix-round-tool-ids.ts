@@ -14,6 +14,7 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { pathToFileURL } from "node:url";
+import { atomicWriteFileSync } from "../lib/atomic-write.ts";
 import { migrateIndexEntryLine, readIndexLines } from "../lib/index-io.ts";
 import { parsePiSessionJsonl } from "../lib/pi-session.ts";
 import { deriveRoundFile } from "../lib/round-capture.ts";
@@ -140,8 +141,8 @@ export async function runFixRoundToolIds(options: FixRoundToolIdsOptions = {}): 
 							f.writeFileSync(indexPath, migrated.join("\n") + (migrated.length > 0 ? "\n" : ""));
 						}
 
-						// Write corrected round file
-						f.writeFileSync(path.join(roundsDir, newHash), JSON.stringify(round, null, 2));
+						// Write corrected round file (atomic: tmp+rename, decision-015)
+						atomicWriteFileSync(path.join(roundsDir, newHash), JSON.stringify(round, null, 2), f);
 
 						// Delete old broken file
 						f.unlinkSync(path.join(roundsDir, brokenFile));
