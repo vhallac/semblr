@@ -270,6 +270,68 @@ describe("two-phase render walk", () => {
 		expect(result.outcomes.find((o) => o.identity === "semblr.nothing")?.status).toBe("empty");
 	});
 
+	it("renders a phase-2-on-phase-2 dependency in view (dep's section present)", () => {
+		const registry = populatedRegistry(
+			makeProvider({ identity: "semblr.c", render: () => "c-content" }),
+			makeProvider({
+				identity: "semblr.a",
+				dependsOn: ["semblr.c"],
+				budgetHints: { priority: 5, preferredTokens: 100, minimumViableTokens: 10 },
+				render: (ctx) => `A saw c=${ctx.sections["semblr.c"]}`,
+			}),
+			makeProvider({
+				identity: "semblr.b",
+				dependsOn: ["semblr.a"],
+				budgetHints: { priority: 0, preferredTokens: 100, minimumViableTokens: 10 },
+				render: (ctx) => `B saw a=${ctx.sections["semblr.a"]}`,
+			}),
+		);
+
+		const result = renderProviders(registry, base);
+
+		// Topological order: c → a → b, despite b's higher priority than a.
+		expect(result.outcomes.map((o) => o.identity)).toEqual(["semblr.c", "semblr.a", "semblr.b"]);
+		expect(result.sections.get("semblr.b")).toBe("B saw a=A saw c=c-content");
+	});
+
+	it("skips the whole phase-2 mid-chain when a middle provider throws", () => {
+		const registry = populatedRegistry(
+			makeProvider({ identity: "semblr.root", render: () => "root" }),
+			makeProvider({
+				identity: "semblr.mid",
+				dependsOn: ["semblr.root"],
+				render: () => {
+					throw new Error("mid kaboom");
+				},
+			}),
+			makeProvider({ identity: "semblr.leaf", dependsOn: ["semblr.mid"], render: () => "never" }),
+		);
+
+		const result = renderProviders(registry, base);
+
+		expect(result.outcomes.find((o) => o.identity === "semblr.mid")?.status).toBe("dropped");
+		expect(result.outcomes.find((o) => o.identity === "semblr.leaf")?.status).toBe("skipped-dependency");
+		expect(result.outcomes.find((o) => o.identity === "semblr.leaf")?.diagnostic).toMatch(/semblr.mid/);
+	});
+
+	it("renders a dependent whose declared dependency returned null, observing undefined", () => {
+		const registry = populatedRegistry(
+			makeProvider({ identity: "semblr.void", render: () => null }),
+			makeProvider({
+				identity: "semblr.dep",
+				dependsOn: ["semblr.void"],
+				render: (ctx) => `dep saw ${ctx.sections["semblr.void"]}`,
+			}),
+		);
+
+		const result = renderProviders(registry, base);
+
+		// null is "nothing to inject", not a failure: the dependent renders and
+		// observes undefined for the absent section (decision 021 semantics).
+		expect(result.outcomes.find((o) => o.identity === "semblr.dep")?.status).toBe("rendered");
+		expect(result.sections.get("semblr.dep")).toBe("dep saw undefined");
+	});
+
 	it("passes the provider's preferredTokens as the allocated ceiling", () => {
 		let seen: number | undefined;
 		const registry = populatedRegistry(

@@ -43,7 +43,8 @@ export interface ProviderBudgetHints {
 
 /**
  * Read-only view of the sections built so far in this context build,
- * keyed by provider identity. Present (empty) for phase-1 providers;
+ * keyed by provider identity. Empty for the first phase-1 provider;
+ * sections built so far thereafter (including earlier phase-1 sections);
  * progressively filled for phase-2 providers. Providers MUST NOT rely on
  * the presence of any particular section — fail-by-omission means a
  * dependency may be absent.
@@ -68,7 +69,7 @@ export interface BuildContext {
 	prompt: string;
 	/** Epoch milliseconds at the start of this context build. */
 	now: number;
-	/** Additive field: read-only sections built so far (empty for phase 1). */
+	/** Additive field: read-only sections built so far (empty for the first phase-1 provider). */
 	readonly sections: SectionsView;
 }
 
@@ -97,7 +98,7 @@ export interface ContextProvider {
 	render(buildContext: BuildContext, budget: ProviderBudget): string | null;
 }
 
-/** Ordered set of registered providers (registration order = render order). */
+/** Ordered set of registered providers (registration order; render order is priority-ordered two-phase). */
 export interface ProviderRegistry {
 	providers: Map<string, ContextProvider>;
 }
@@ -216,9 +217,16 @@ export interface RenderResult {
  * Two-phase render walk over the registry.
  *
  * Phase 1: providers without `dependsOn`, ordered by priority (lower first),
- * ties by registration order. Phase 2: providers with `dependsOn`, same
- * ordering, rendered after all independents with a read-only view of the
- * sections built so far.
+ * ties by registration order; each sees the sections built so far (empty for
+ * the first phase-1 provider). Phase 2: providers with `dependsOn`, ordered
+ * topologically over `dependsOn` edges (Kahn's algorithm, priority as tie-break
+ * among ready nodes), rendered after all independents with a read-only view of
+ * the sections built so far — so a dependent always renders after its declared
+ * dependencies, regardless of priority.
+ *
+ * A dependent whose declared dependency rendered `null` (status "empty")
+ * renders anyway and observes `undefined` for that section — `null` is not a
+ * failure; only thrown/dropped providers cascade-skip dependents (decision 021).
  *
  * Fail-by-omission (ext 2.a): a provider returning `null` yields no section;
  * a provider throwing has its section dropped with a diagnostic. Either way
@@ -229,7 +237,7 @@ export function renderProviders(registry: ProviderRegistry, base: Omit<BuildCont
 	const all = [...registry.providers.values()];
 	const byPriority = (a: ContextProvider, b: ContextProvider) => a.budgetHints.priority - b.budgetHints.priority;
 	const phase1 = all.filter((p) => !p.dependsOn || p.dependsOn.length === 0).sort(byPriority);
-	const phase2 = all.filter((p) => p.dependsOn && p.dependsOn.length > 0).sort(byPriority);
+	const phase2 = all.filter((p) => p.dependsOn && p.dependsOn.length > 0);
 
 	const sections = new Map<string, string>();
 	const dropped = new Set<string>();
@@ -258,7 +266,34 @@ export function renderProviders(registry: ProviderRegistry, base: Omit<BuildCont
 	};
 
 	for (const provider of phase1) renderOne(provider, snapshot(sections));
-	for (const provider of phase2) {
+
+	// Kahn's algorithm over phase-2 `dependsOn` edges (registration validated
+	// acyclicity, so `next` below always exists); priority breaks ties among
+	// ready nodes, stable sort keeps registration order. Edges to phase-1
+	// providers are already satisfied by the phase-1 walk.
+	const phase2Ids = new Set(phase2.map((p) => p.identity));
+	const indegree = new Map<string, number>();
+	const dependents = new Map<string, string[]>();
+	for (const p of phase2) {
+		const within = p.dependsOn!.filter((d) => phase2Ids.has(d));
+		indegree.set(p.identity, within.length);
+		for (const dep of within) dependents.set(dep, [...(dependents.get(dep) ?? []), p.identity]);
+	}
+	const remaining = new Set(phase2Ids);
+	const ordered: ContextProvider[] = [];
+	while (remaining.size > 0) {
+		const next = phase2
+			.filter((p) => remaining.has(p.identity) && indegree.get(p.identity) === 0)
+			.sort(byPriority)[0];
+		if (next === undefined) break; // unreachable: registration rejects cycles
+		ordered.push(next);
+		remaining.delete(next.identity);
+		for (const dependent of dependents.get(next.identity) ?? []) {
+			indegree.set(dependent, indegree.get(dependent)! - 1);
+		}
+	}
+
+	for (const provider of ordered) {
 		const failedDep = provider.dependsOn!.find((dep) => dropped.has(dep));
 		if (failedDep !== undefined) {
 			dropped.add(provider.identity);
