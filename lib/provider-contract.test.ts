@@ -80,23 +80,37 @@ describe("provider contract registration", () => {
 		},
 	);
 
-	it("rejects an unknown dependency at registration", () => {
+	it("accepts a required edge to an unregistered dependency (render-time resolution, decision 022)", () => {
 		const registry = createProviderRegistry();
 
 		const result = registerProvider(
 			registry,
-			makeProvider({ identity: "semblr.dep", dependsOn: ["semblr.missing"] }),
+			makeProvider({ identity: "semblr.dep", dependsOn: [{ name: "semblr.missing", required: true }] }),
 		);
 
-		expect(result.status).toBe("unknown-dependency");
-		expect(result.diagnostic).toMatch(/semblr\.missing/);
-		expect(registry.providers.size).toBe(0);
+		// Decision 022: existence is resolved at render time, not registration —
+		// an unregistered dependency name is accepted (required-absent disables
+		// the provider statically later).
+		expect(result.status).toBe("registered");
+		expect(registry.providers.get("semblr.dep")).toBeDefined();
+	});
+
+	it("registers a provider with an optional edge to an unregistered dependency", () => {
+		const registry = createProviderRegistry();
+
+		const result = registerProvider(
+			registry,
+			makeProvider({ identity: "semblr.opt", dependsOn: [{ name: "semblr.maybe", required: false }] }),
+		);
+
+		expect(result.status).toBe("registered");
+		expect(registry.providers.get("semblr.opt")).toBeDefined();
 	});
 
 	it("rejects self-dependency at registration", () => {
 		const registry = createProviderRegistry();
 
-		const result = registerProvider(registry, makeProvider({ identity: "semblr.self", dependsOn: ["semblr.self"] }));
+		const result = registerProvider(registry, makeProvider({ identity: "semblr.self", dependsOn: [{ name: "semblr.self", required: true }] }));
 
 		expect(result.status).toBe("circular-dependency");
 		expect(registry.providers.size).toBe(0);
@@ -108,15 +122,15 @@ describe("provider contract registration", () => {
 		// directly; registration still guards against it.
 		const registry = createProviderRegistry();
 		registerProvider(registry, makeProvider({ identity: "semblr.a" }));
-		registry.providers.set("semblr.x", makeProvider({ identity: "semblr.x", dependsOn: ["semblr.a"] }));
+		registry.providers.set("semblr.x", makeProvider({ identity: "semblr.x", dependsOn: [{ name: "semblr.a", required: true }] }));
 
-		const backEdge = registerProvider(registry, makeProvider({ identity: "semblr.z", dependsOn: ["semblr.x"] }));
+		const backEdge = registerProvider(registry, makeProvider({ identity: "semblr.z", dependsOn: [{ name: "semblr.x", required: true }] }));
 		expect(backEdge.status).toBe("registered"); // x→a, z→x: no cycle
 
 		// Mutate x to depend on the not-yet-registered w; registering w then
 		// would close w→x→w.
-		registry.providers.set("semblr.x", makeProvider({ identity: "semblr.x", dependsOn: ["semblr.w"] }));
-		const cycle = registerProvider(registry, makeProvider({ identity: "semblr.w", dependsOn: ["semblr.x"] }));
+		registry.providers.set("semblr.x", makeProvider({ identity: "semblr.x", dependsOn: [{ name: "semblr.w", required: true }] }));
+		const cycle = registerProvider(registry, makeProvider({ identity: "semblr.w", dependsOn: [{ name: "semblr.x", required: true }] }));
 		expect(cycle.status).toBe("circular-dependency");
 		expect(cycle.diagnostic).toMatch(/cycle/);
 		expect(registry.providers.size).toBe(3); // a, x, z — w not added
@@ -156,7 +170,7 @@ describe("two-phase render walk", () => {
 			}),
 			makeProvider({
 				identity: "semblr.second",
-				dependsOn: ["semblr.high"],
+				dependsOn: [{ name: "semblr.high", required: true }],
 				render: () => {
 					order.push("second");
 					return "second-content";
@@ -179,7 +193,7 @@ describe("two-phase render walk", () => {
 			makeProvider({ identity: "semblr.base", render: () => "base-content" }),
 			makeProvider({
 				identity: "semblr.reader",
-				dependsOn: ["semblr.base"],
+				dependsOn: [{ name: "semblr.base", required: true }],
 				render: (ctx) => `saw:${ctx.sections["semblr.base"]}`,
 			}),
 		);
@@ -247,7 +261,7 @@ describe("two-phase render walk", () => {
 					throw new Error("kaboom");
 				},
 			}),
-			makeProvider({ identity: "semblr.dep", dependsOn: ["semblr.boom"], render: () => "never" }),
+			makeProvider({ identity: "semblr.dep", dependsOn: [{ name: "semblr.boom", required: true }], render: () => "never" }),
 		);
 
 		const result = renderProviders(registry, base);
@@ -259,7 +273,7 @@ describe("two-phase render walk", () => {
 	it("treats a null render as empty — no section, no cascade", () => {
 		const registry = populatedRegistry(
 			makeProvider({ identity: "semblr.nothing", render: () => null }),
-			makeProvider({ identity: "semblr.dep", dependsOn: ["semblr.nothing"], render: () => "dep-content" }),
+			makeProvider({ identity: "semblr.dep", dependsOn: [{ name: "semblr.nothing", required: true }], render: () => "dep-content" }),
 		);
 
 		const result = renderProviders(registry, base);
@@ -275,13 +289,13 @@ describe("two-phase render walk", () => {
 			makeProvider({ identity: "semblr.c", render: () => "c-content" }),
 			makeProvider({
 				identity: "semblr.a",
-				dependsOn: ["semblr.c"],
+				dependsOn: [{ name: "semblr.c", required: true }],
 				budgetHints: { priority: 5, preferredTokens: 100, minimumViableTokens: 10 },
 				render: (ctx) => `A saw c=${ctx.sections["semblr.c"]}`,
 			}),
 			makeProvider({
 				identity: "semblr.b",
-				dependsOn: ["semblr.a"],
+				dependsOn: [{ name: "semblr.a", required: true }],
 				budgetHints: { priority: 0, preferredTokens: 100, minimumViableTokens: 10 },
 				render: (ctx) => `B saw a=${ctx.sections["semblr.a"]}`,
 			}),
@@ -299,12 +313,12 @@ describe("two-phase render walk", () => {
 			makeProvider({ identity: "semblr.root", render: () => "root" }),
 			makeProvider({
 				identity: "semblr.mid",
-				dependsOn: ["semblr.root"],
+				dependsOn: [{ name: "semblr.root", required: true }],
 				render: () => {
 					throw new Error("mid kaboom");
 				},
 			}),
-			makeProvider({ identity: "semblr.leaf", dependsOn: ["semblr.mid"], render: () => "never" }),
+			makeProvider({ identity: "semblr.leaf", dependsOn: [{ name: "semblr.mid", required: true }], render: () => "never" }),
 		);
 
 		const result = renderProviders(registry, base);
@@ -319,7 +333,7 @@ describe("two-phase render walk", () => {
 			makeProvider({ identity: "semblr.void", render: () => null }),
 			makeProvider({
 				identity: "semblr.dep",
-				dependsOn: ["semblr.void"],
+				dependsOn: [{ name: "semblr.void", required: true }],
 				render: (ctx) => `dep saw ${ctx.sections["semblr.void"]}`,
 			}),
 		);

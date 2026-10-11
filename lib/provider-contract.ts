@@ -73,6 +73,17 @@ export interface BuildContext {
 	readonly sections: SectionsView;
 }
 
+/** A declared dependency edge: identity of the provider depended on, and
+ * whether absence disables this provider (decision 022). */
+export interface ProviderDependency {
+	/** Identity of the depended-on provider. */
+	name: string;
+	/** When true, absence of the dependency at render time disables this
+	 * provider (with transitive cascade); when false, the edge is dropped
+	 * silently and the provider still renders. */
+	required: boolean;
+}
+
 /**
  * A context provider. The extension author implements this to participate
  * in every context build.
@@ -85,11 +96,11 @@ export interface ContextProvider {
 	/** Static budget hints (see {@link ProviderBudgetHints}). */
 	budgetHints: ProviderBudgetHints;
 	/**
-	 * Identities this provider's content depends on (phase-2 providers).
-	 * All dependencies must be registered providers; cycles are rejected
-	 * at registration.
+	 * Dependency edges this provider's content depends on (phase-2 providers).
+	 * Dependencies are resolved at render time over the fully-registered set
+	 * (decision 022); cycles are rejected at registration.
 	 */
-	dependsOn?: readonly string[];
+	dependsOn?: ReadonlyArray<ProviderDependency>;
 	/**
 	 * Produce this round's section content, or `null` for nothing to inject.
 	 * Ext 2.a: throwing here drops the section and the build continues
@@ -108,7 +119,6 @@ export type RegistrationStatus =
 	| "duplicate-identity"
 	| "unsupported-api-version"
 	| "invalid-identity"
-	| "unknown-dependency"
 	| "circular-dependency";
 
 export interface RegistrationResult {
@@ -152,20 +162,13 @@ export function registerProvider(registry: ProviderRegistry, provider: ContextPr
 			diagnostic: `provider identity "${provider.identity}" is already registered — original provider stands`,
 		};
 	}
-	if (provider.dependsOn?.includes(provider.identity)) {
+	if (provider.dependsOn?.some((dep) => dep.name === provider.identity)) {
 		return {
 			status: "circular-dependency",
 			diagnostic: `provider "${provider.identity}" depends on itself`,
 		};
 	}
-	const missing = provider.dependsOn?.filter((dep) => !registry.providers.has(dep)) ?? [];
-	if (missing.length > 0) {
-		return {
-			status: "unknown-dependency",
-			diagnostic: `provider "${provider.identity}" depends on unregistered provider(s): ${missing.join(", ")}`,
-		};
-	}
-	if (reaches(provider.identity, provider.dependsOn ?? [], registry)) {
+	if (reaches(provider.identity, provider.dependsOn?.map((dep) => dep.name) ?? [], registry)) {
 		return {
 			status: "circular-dependency",
 			diagnostic: `provider "${provider.identity}" would create a dependsOn cycle`,
@@ -190,7 +193,7 @@ function reaches(identity: string, deps: readonly string[], registry: ProviderRe
 		if (seen.has(current)) continue;
 		seen.add(current);
 		const provider = registry.providers.get(current);
-		if (provider?.dependsOn) stack.push(...provider.dependsOn);
+		if (provider?.dependsOn) stack.push(...provider.dependsOn.map((dep) => dep.name));
 	}
 	return false;
 }
@@ -238,6 +241,8 @@ export function renderProviders(registry: ProviderRegistry, base: Omit<BuildCont
 	const byPriority = (a: ContextProvider, b: ContextProvider) => a.budgetHints.priority - b.budgetHints.priority;
 	const phase1 = all.filter((p) => !p.dependsOn || p.dependsOn.length === 0).sort(byPriority);
 	const phase2 = all.filter((p) => p.dependsOn && p.dependsOn.length > 0);
+	// Render-time resolution of required/optional edges is decision 022
+	// (unit-003); until then every declared edge is treated as required.
 
 	const sections = new Map<string, string>();
 	const dropped = new Set<string>();
@@ -275,7 +280,8 @@ export function renderProviders(registry: ProviderRegistry, base: Omit<BuildCont
 	const indegree = new Map<string, number>();
 	const dependents = new Map<string, string[]>();
 	for (const p of phase2) {
-		const within = p.dependsOn!.filter((d) => phase2Ids.has(d));
+		const depNames = p.dependsOn!.map((dep) => dep.name);
+		const within = depNames.filter((d) => phase2Ids.has(d));
 		indegree.set(p.identity, within.length);
 		for (const dep of within) dependents.set(dep, [...(dependents.get(dep) ?? []), p.identity]);
 	}
@@ -294,7 +300,7 @@ export function renderProviders(registry: ProviderRegistry, base: Omit<BuildCont
 	}
 
 	for (const provider of ordered) {
-		const failedDep = provider.dependsOn!.find((dep) => dropped.has(dep));
+		const failedDep = provider.dependsOn!.map((dep) => dep.name).find((dep) => dropped.has(dep));
 		if (failedDep !== undefined) {
 			dropped.add(provider.identity);
 			outcomes.push({
