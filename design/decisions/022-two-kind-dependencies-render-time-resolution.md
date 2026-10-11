@@ -8,7 +8,7 @@
 ## Decision
 `dependsOn` becomes `ReadonlyArray<{ name: string; required: boolean }>` — two kinds of edges:
 
-1. **Required edges** (`required: true`): if the named provider is registered but did not render (dropped after throwing), the dependent is statically disabled with a TUI diagnostic (`provider X disabled: required provider Y not registered`) and its dependents are cascade-disabled transitively. If the named provider is not registered at all, the dependent is likewise statically disabled — resolution happens at render time over the fully-registered set, not at registration.
+1. **Required edges** (`required: true`): if the named provider is unregistered, statically disabled, or dropped (threw during render), the dependent is disabled with a TUI diagnostic (`provider X disabled: required provider Y not registered`) and its dependents are cascade-disabled transitively. A dependency that renders `null` is "nothing to inject", not absence-failure: the dependent still renders and observes `undefined` for that section. If the named provider is not registered at all, the dependent is likewise statically disabled — resolution happens at render time over the fully-registered set, not at registration.
 2. **Optional edges** (`required: false`): if the section is absent at render time, the edge is dropped silently and the dependent still renders; it observes `undefined` for that section.
 
 Resolution is deferred to render time:

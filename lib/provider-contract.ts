@@ -81,9 +81,12 @@ export interface BuildContext {
 export interface ProviderDependency {
 	/** Identity of the depended-on provider. */
 	name: string;
-	/** When true, absence of the dependency at render time disables this
-	 * provider (with transitive cascade); when false, the edge is dropped
-	 * silently and the provider still renders. */
+	/** When true, this provider is disabled (with transitive cascade) if the
+	 * dependency is unregistered, statically disabled, or dropped (threw
+	 * during render). A dependency that renders `null` is "nothing to
+	 * inject", not absence-failure: the dependent still renders and observes
+	 * `undefined` for that section. When false, the edge is dropped silently
+	 * and the provider still renders in every case. */
 	required: boolean;
 }
 
@@ -300,7 +303,10 @@ export function renderProviders(registry: ProviderRegistry, base: Omit<BuildCont
 	// edges to registered providers remain order constraints. Registration
 	// validated acyclicity, so `next` below always exists; priority breaks
 	// ties among ready nodes, stable sort keeps registration order. Edges to
-	// phase-1 providers are already satisfied by the phase-1 walk.
+	// phase-1 providers are already satisfied by the phase-1 walk. Registration
+	// rejects cycles (including mutation-guarded ones), but the registry map is
+	// a public surface: if a cycle still reaches render time, fail-by-omission
+	// requires diagnostics rather than a silent break.
 	const phase2Ids = new Set(phase2.map((p) => p.identity));
 	const indegree = new Map<string, number>();
 	const dependents = new Map<string, string[]>();
@@ -317,7 +323,20 @@ export function renderProviders(registry: ProviderRegistry, base: Omit<BuildCont
 		const next = phase2
 			.filter((p) => remaining.has(p.identity) && indegree.get(p.identity) === 0)
 			.sort(byPriority)[0];
-		if (next === undefined) break; // unreachable: registration rejects cycles
+		if (next === undefined) {
+			// Cycle among remaining phase-2 providers (injected via direct
+			// registry mutation): emit a diagnostic per remaining provider
+			// instead of silently dropping them.
+			for (const id of remaining) {
+				outcomes.push({
+					identity: id,
+					status: "skipped-dependency",
+					diagnostic: `provider "${id}" skipped: dependency cycle among phase-2 providers (${[...remaining].sort().join(", ")})`,
+				});
+			}
+			remaining.clear();
+			break;
+		}
 		ordered.push(next);
 		remaining.delete(next.identity);
 		for (const dependent of dependents.get(next.identity) ?? []) {

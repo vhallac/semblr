@@ -355,6 +355,30 @@ describe("two-phase render walk", () => {
 		expect(result.outcomes.find((o) => o.identity === "semblr.leaf")?.diagnostic).toMatch(/semblr.mid/);
 	});
 
+	it("emits cycle diagnostics instead of silently dropping providers when a render-time cycle is injected via registry mutation", () => {
+		// Registration rejects cycles, but `providers` is a public Map; a
+		// direct mutation can still inject a cycle. Fail-by-omission: the
+		// remaining providers must carry diagnostics, not vanish.
+		const registry = populatedRegistry(
+			makeProvider({ identity: "semblr.x", dependsOn: [{ name: "semblr.y", required: true }] }),
+			makeProvider({ identity: "semblr.y", render: () => "y" }),
+		);
+		// Inject cycle: y now depends back on x.
+		registry.providers.set(
+			"semblr.y",
+			makeProvider({ identity: "semblr.y", dependsOn: [{ name: "semblr.x", required: true }], render: () => "y" }),
+		);
+
+		const result = renderProviders(registry, base);
+
+		expect(result.sections.size).toBe(0);
+		for (const id of ["semblr.x", "semblr.y"]) {
+			const outcome = result.outcomes.find((o) => o.identity === id);
+			expect(outcome?.status).toBe("skipped-dependency");
+			expect(outcome?.diagnostic).toMatch(/cycle/);
+		}
+	});
+
 	it("renders a dependent whose declared dependency returned null, observing undefined", () => {
 		const registry = populatedRegistry(
 			makeProvider({ identity: "semblr.void", render: () => null }),
