@@ -134,6 +134,27 @@ export {
 } from "../lib/context-messages.ts";
 export { embedText, getApiKey } from "../lib/embedding-client.ts";
 export { appendToIndexPath, buildSessionStartStatus, countUniqueIndexedRounds } from "../lib/index-storage.ts";
+export type {
+	BuildContext,
+	ContextProvider,
+	ProviderBudget,
+	ProviderBudgetHints,
+	ProviderRegistry,
+	RegistrationResult,
+	RegistrationStatus,
+	RenderedSection,
+	RenderResult,
+	RenderStatus,
+	SectionsView,
+} from "../lib/provider-contract.ts";
+export {
+	API_VERSION,
+	createProviderRegistry,
+	isValidProviderIdentity,
+	registerProvider,
+	renderProviders,
+	SUPPORTED_API_VERSIONS,
+} from "../lib/provider-contract.ts";
 export type { MessageEndProcessingState } from "../lib/round-capture.ts";
 export {
 	applyMessageEndToState,
