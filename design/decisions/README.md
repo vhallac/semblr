@@ -4,6 +4,7 @@ One indexed line per decision. Newest at the top.
 
 ## Context-provider contract
 
+- 022 — Two-kind dependencies with render-time resolution — accepted
 - 021 — Two-phase provider render with a frozen SectionsView — accepted
 - 020 — Provider contract public surface: package-entry named exports — accepted
 - 019 — Provider contract: registration validation and fail-by-omission in the base contract — accepted

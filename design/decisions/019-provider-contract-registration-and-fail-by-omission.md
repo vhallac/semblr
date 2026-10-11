@@ -10,7 +10,7 @@ Registration validation and minimal fail-by-omission live in the contract module
 
 1. Registration rejects duplicate identities and invalid identities; providers declaring an unsupported `apiVersion` are skipped (not an error).
 2. Fail-by-omission: a provider returning `null` is not a failure — it simply renders nothing and its dependents still render. A provider that throws is dropped with a diagnostic, and its dependents are skipped (cascade), but the build continues.
-3. `dependsOn` is validated at registration: unknown deps, self-deps, and cycles are rejected; a defensive cycle guard (`reaches()`) covers direct registry-map mutation.
+3. `dependsOn` is validated at registration: self-deps and cycles are rejected; a defensive cycle guard (`reaches()`) covers direct registry-map mutation. (Existence validation of dependency names was later moved to render time by 022 — see that record.)
 
 ## Consequences
 - The contract is testable and safe in isolation; #112 only adds ceiling/timeout on top.
