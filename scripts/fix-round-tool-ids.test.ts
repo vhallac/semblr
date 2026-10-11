@@ -39,6 +39,15 @@ function makeFS(files: Record<string, string>) {
 		writeFileSync: (p: string, data: string) => {
 			files[p] = data;
 		},
+		renameSync: (from: string, to: string) => {
+			if (!(from in files)) {
+				const err = new Error(`ENOENT: ${from}`);
+				(err as NodeJS.ErrnoException).code = "ENOENT";
+				throw err;
+			}
+			files[to] = files[from];
+			delete files[from];
+		},
 		appendFileSync: (p: string, data: string) => {
 			files[p] = (files[p] ?? "") + data;
 		},
@@ -311,5 +320,98 @@ describe("fix-round-tool-ids", () => {
 		// Should log dry-run message
 		const joinedLogs = logs.join(" ");
 		expect(joinedLogs).toContain("Would fix");
+	});
+
+	it("failure-injection: tmp write throws → broken file byte-identical, no corrected file, run reports errors", async () => {
+		const sessionJSONL = [
+			line({ type: "session", version: 3, id: "s1", timestamp: "2026-01-01T00:00:00Z", cwd: "/test" }),
+			line({
+				type: "message",
+				id: "u1",
+				message: { role: "user", timestamp: 1000, content: [{ type: "text", text: "Use tools" }] },
+			}),
+			line({
+				type: "message",
+				message: {
+					role: "assistant",
+					content: [
+						{ type: "text", text: "Running tools for you now." },
+						{ type: "toolCall", id: "call_a", name: "alpha", arguments: { x: 1 } },
+					],
+				},
+			}),
+			line({
+				type: "message",
+				message: {
+					role: "toolResult",
+					toolCallId: "call_a",
+					toolName: "alpha",
+					content: [{ type: "text", text: "result of A" }],
+				},
+			}),
+		].join("\n");
+
+		const brokenRound = {
+			id: "u1",
+			userPrompt: "Use tools",
+			responseSequence: "Running tools for you now.",
+			responseEndTimestamp: 9999,
+			toolCalls: [
+				{
+					index: 0,
+					name: "alpha",
+					arguments: '{"x":1}',
+					result_summary: "wrong result",
+					result_full: "wrong result",
+					result_truncated: false,
+				},
+			],
+		};
+
+		const oldHash = "broken_fail.json";
+		const oldContent = JSON.stringify(brokenRound);
+		const files: Record<string, string> = {};
+		files[`/sessions/--test--/s1.jsonl`] = sessionJSONL;
+		files[`/rounds/${oldHash}`] = oldContent;
+		files["/rounds/index.csv"] = `base64vector,${oldHash}:prompt,test-model\n`;
+
+		const fsImpl = makeFS(files) as unknown as typeof fs;
+		// Fail only the atomic tmp write (the corrected round file), not the in-place index write.
+		const inner = fsImpl.writeFileSync.bind(fsImpl);
+		(fsImpl as { writeFileSync: (p: string, data: string) => void }).writeFileSync = (p, data) => {
+			if (p.includes(".tmp.")) throw new Error("disk full");
+			inner(p, data);
+		};
+		const stdout = { log: () => {} } as Pick<typeof console, "log">;
+		const stderr = { error: () => {} } as Pick<typeof console, "error">;
+
+		const exitCode = await runFixRoundToolIds({
+			config: testConfig({ roundsDir: "/rounds", agentDir: "/agent" }),
+			sessionsDir: "/sessions",
+			roundsDir: "/rounds",
+			indexPath: "/rounds/index.csv",
+			dryRun: false,
+			stdout,
+			stderr,
+			fsImpl,
+		});
+
+		// Run survived the per-file catch and reports the error
+		expect(exitCode).toBe(1);
+
+		// Broken file survives byte-identical (crash-safe ordering)
+		expect(files[`/rounds/${oldHash}`]).toBe(oldContent);
+
+		// No corrected file and no tmp leftovers
+		const newFiles = Object.keys(files).filter(
+			(k) => k.startsWith("/rounds/") && k.endsWith(".json") && !k.includes("index"),
+		);
+		expect(newFiles).toHaveLength(1); // only the broken file
+		expect(Object.keys(files).some((k) => k.includes(".tmp."))).toBe(false);
+
+		// Pre-existing ordering: index migration runs before the round-file write,
+		// so a failed tmp write leaves the index already migrated (unit scope is the
+		// atomic round write + write-new-then-delete-old, not index reordering).
+		expect(files["/rounds/index.csv"]).not.toContain(oldHash);
 	});
 });
