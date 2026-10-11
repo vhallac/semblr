@@ -64,6 +64,19 @@ describe("atomicWriteFileSync", () => {
 		expect(fs.readFileSync(target, "utf-8")).toBe(original);
 	});
 
+	it("unlinks the tmp file when the rename throws", () => {
+		const target = path.join(dir, "round.json");
+		const failing = {
+			writeFileSync: fs.writeFileSync.bind(fs),
+			renameSync() {
+				throw new Error("simulated rename failure");
+			},
+		};
+
+		expect(() => atomicWriteFileSync(target, "new", failing)).toThrow("simulated rename failure");
+		expect(fs.readdirSync(dir).some((f) => f.includes(".tmp."))).toBe(false);
+	});
+
 	it("never touches the target when it did not exist and the write throws", () => {
 		const target = path.join(dir, "round.json");
 		const failing = {

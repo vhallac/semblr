@@ -19,6 +19,15 @@ export interface AtomicWriteFs {
  */
 export function atomicWriteFileSync(targetPath: string, data: string, fsImpl: AtomicWriteFs = fs): void {
 	const tmpPath = `${targetPath}.tmp.${process.pid}`;
-	fsImpl.writeFileSync(tmpPath, data);
-	fsImpl.renameSync(tmpPath, targetPath);
+	try {
+		fsImpl.writeFileSync(tmpPath, data);
+		fsImpl.renameSync(tmpPath, targetPath);
+	} catch (err) {
+		try {
+			fs.unlinkSync(tmpPath);
+		} catch {
+			// tmp may never have been created; nothing to clean up
+		}
+		throw err;
+	}
 }
