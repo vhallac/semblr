@@ -346,6 +346,121 @@ describe("two-phase render walk", () => {
 		expect(result.sections.get("semblr.dep")).toBe("dep saw undefined");
 	});
 
+	it("statically disables a provider whose required dependency is not registered (decision 022)", () => {
+		const registry = populatedRegistry(
+			makeProvider({
+				identity: "semblr.dep",
+				dependsOn: [{ name: "semblr.missing", required: true }],
+				render: () => "never",
+			}),
+		);
+
+		const result = renderProviders(registry, base);
+
+		expect(result.sections.has("semblr.dep")).toBe(false);
+		const outcome = result.outcomes.find((o) => o.identity === "semblr.dep");
+		expect(outcome?.status).toBe("skipped-dependency");
+		expect(outcome?.diagnostic).toBe('provider "semblr.dep" disabled: required provider "semblr.missing" not registered');
+	});
+
+	it("cascades static disable transitively over required edges (decision 022)", () => {
+		const registry = populatedRegistry(
+			makeProvider({
+				identity: "semblr.a",
+				dependsOn: [{ name: "semblr.missing", required: true }],
+				render: () => "never-a",
+			}),
+			makeProvider({
+				identity: "semblr.b",
+				dependsOn: [{ name: "semblr.a", required: true }],
+				render: () => "never-b",
+			}),
+			makeProvider({
+				identity: "semblr.c",
+				dependsOn: [{ name: "semblr.b", required: false }],
+				render: (ctx) => `c saw ${ctx.sections["semblr.b"]}`,
+			}),
+		);
+
+		const result = renderProviders(registry, base);
+
+		// a disabled (required-absent); b disabled transitively; c's optional
+		// edge into the disabled b is dropped silently and c still renders.
+		expect(result.sections.has("semblr.a")).toBe(false);
+		expect(result.sections.has("semblr.b")).toBe(false);
+		expect(result.sections.get("semblr.c")).toBe("c saw undefined");
+		expect(result.outcomes.find((o) => o.identity === "semblr.b")?.status).toBe("skipped-dependency");
+		expect(result.outcomes.find((o) => o.identity === "semblr.b")?.diagnostic).toMatch(/required provider "semblr.a" is disabled/);
+	});
+
+	it("renders a dependent whose optional dependency is not registered (edge dropped silently)", () => {
+		const registry = populatedRegistry(
+			makeProvider({
+				identity: "semblr.opt",
+				dependsOn: [{ name: "semblr.maybe", required: false }],
+				render: (ctx) => `opt saw ${ctx.sections["semblr.maybe"]}`,
+			}),
+		);
+
+		const result = renderProviders(registry, base);
+
+		expect(result.outcomes.find((o) => o.identity === "semblr.opt")?.status).toBe("rendered");
+		expect(result.sections.get("semblr.opt")).toBe("opt saw undefined");
+	});
+
+	it("renders a dependent whose optional dependency threw (optional edges never cascade)", () => {
+		const registry = populatedRegistry(
+			makeProvider({
+				identity: "semblr.boom",
+				render: () => {
+					throw new Error("kaboom");
+				},
+			}),
+			makeProvider({
+				identity: "semblr.opt",
+				dependsOn: [{ name: "semblr.boom", required: false }],
+				render: (ctx) => `opt saw ${ctx.sections["semblr.boom"]}`,
+			}),
+		);
+
+		const result = renderProviders(registry, base);
+
+		expect(result.outcomes.find((o) => o.identity === "semblr.boom")?.status).toBe("dropped");
+		expect(result.sections.get("semblr.opt")).toBe("opt saw undefined");
+	});
+
+	it("orders phase-2 providers topologically over resolved edges, including optional ones", () => {
+		const order: string[] = [];
+		const registry = populatedRegistry(
+			makeProvider({
+				identity: "semblr.late",
+				budgetHints: { priority: 0, preferredTokens: 100, minimumViableTokens: 10 },
+				dependsOn: [{ name: "semblr.early", required: false }],
+				render: () => {
+					order.push("late");
+					return "late";
+				},
+			}),
+			makeProvider({
+				identity: "semblr.early",
+				budgetHints: { priority: 5, preferredTokens: 100, minimumViableTokens: 10 },
+				dependsOn: [{ name: "semblr.void", required: false }],
+				render: () => {
+					order.push("early");
+					return "early";
+				},
+			}),
+		);
+
+		const result = renderProviders(registry, base);
+
+		// Resolved edge late→early (optional, registered) forces early first
+		// despite late's higher priority; late's optional edge to the
+		// unregistered semblr.void is dropped and doesn't block ordering.
+		expect(order).toEqual(["early", "late"]);
+		expect(result.outcomes.map((o) => o.status)).toEqual(["rendered", "rendered"]);
+	});
+
 	it("passes the provider's preferredTokens as the allocated ceiling", () => {
 		let seen: number | undefined;
 		const registry = populatedRegistry(

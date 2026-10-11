@@ -222,27 +222,46 @@ export interface RenderResult {
  * Phase 1: providers without `dependsOn`, ordered by priority (lower first),
  * ties by registration order; each sees the sections built so far (empty for
  * the first phase-1 provider). Phase 2: providers with `dependsOn`, ordered
- * topologically over `dependsOn` edges (Kahn's algorithm, priority as tie-break
- * among ready nodes), rendered after all independents with a read-only view of
+ * topologically over the resolved edge set (decision 022 — edges to
+ * unregistered providers dropped, statically-disabled providers skipped with
+ * a diagnostic), rendered after all independents with a read-only view of
  * the sections built so far — so a dependent always renders after its declared
  * dependencies, regardless of priority.
  *
- * A dependent whose declared dependency rendered `null` (status "empty")
- * renders anyway and observes `undefined` for that section — `null` is not a
- * failure; only thrown/dropped providers cascade-skip dependents (decision 021).
- *
- * Fail-by-omission (ext 2.a): a provider returning `null` yields no section;
- * a provider throwing has its section dropped with a diagnostic. Either way
- * the build continues — but dependents of a dropped provider are skipped,
- * so the omission cascades.
+ * Failure semantics (decisions 021/022): a provider returning `null` yields no
+ * section but is not a failure — dependents render and observe `undefined`. A
+ * provider throwing has its section dropped with a diagnostic, and its
+ * *required* dependents are skipped (fail-by-omission cascades); a required
+ * edge to an unregistered provider statically disables the dependent with a
+ * TUI diagnostic, cascading transitively. Optional edges never cascade — they
+ * are dropped silently. Either way the build continues.
  */
 export function renderProviders(registry: ProviderRegistry, base: Omit<BuildContext, "sections">): RenderResult {
 	const all = [...registry.providers.values()];
 	const byPriority = (a: ContextProvider, b: ContextProvider) => a.budgetHints.priority - b.budgetHints.priority;
 	const phase1 = all.filter((p) => !p.dependsOn || p.dependsOn.length === 0).sort(byPriority);
 	const phase2 = all.filter((p) => p.dependsOn && p.dependsOn.length > 0);
-	// Render-time resolution of required/optional edges is decision 022
-	// (unit-003); until then every declared edge is treated as required.
+
+	// Static disable (decision 022): a required edge to an unregistered
+	// provider — directly or transitively — statically disables the dependent
+	// for this build. Computed once per build, not per render call.
+	const staticallyDisabled = new Map<string, string>();
+	let changed = true;
+	while (changed) {
+		changed = false;
+		for (const p of phase2) {
+			if (staticallyDisabled.has(p.identity)) continue;
+			const missing = (p.dependsOn ?? []).find(
+				(dep) => dep.required && (!registry.providers.has(dep.name) || staticallyDisabled.has(dep.name)),
+			);
+			if (missing === undefined) continue;
+			const reason = registry.providers.has(missing.name)
+				? `required provider "${missing.name}" is disabled`
+				: `required provider "${missing.name}" not registered`;
+			staticallyDisabled.set(p.identity, `provider "${p.identity}" disabled: ${reason}`);
+			changed = true;
+		}
+	}
 
 	const sections = new Map<string, string>();
 	const dropped = new Set<string>();
@@ -272,16 +291,20 @@ export function renderProviders(registry: ProviderRegistry, base: Omit<BuildCont
 
 	for (const provider of phase1) renderOne(provider, snapshot(sections));
 
-	// Kahn's algorithm over phase-2 `dependsOn` edges (registration validated
-	// acyclicity, so `next` below always exists); priority breaks ties among
-	// ready nodes, stable sort keeps registration order. Edges to phase-1
-	// providers are already satisfied by the phase-1 walk.
+	// Kahn's algorithm over phase-2 resolved edges (decision 022): edges to
+	// unregistered providers are dropped (required ones disable their
+	// dependent statically; optional ones are dropped silently); optional
+	// edges to registered providers remain order constraints. Registration
+	// validated acyclicity, so `next` below always exists; priority breaks
+	// ties among ready nodes, stable sort keeps registration order. Edges to
+	// phase-1 providers are already satisfied by the phase-1 walk.
 	const phase2Ids = new Set(phase2.map((p) => p.identity));
 	const indegree = new Map<string, number>();
 	const dependents = new Map<string, string[]>();
 	for (const p of phase2) {
-		const depNames = p.dependsOn!.map((dep) => dep.name);
-		const within = depNames.filter((d) => phase2Ids.has(d));
+		const within = (p.dependsOn ?? [])
+			.filter((dep) => phase2Ids.has(dep.name) && registry.providers.has(dep.name))
+			.map((dep) => dep.name);
 		indegree.set(p.identity, within.length);
 		for (const dep of within) dependents.set(dep, [...(dependents.get(dep) ?? []), p.identity]);
 	}
@@ -300,13 +323,26 @@ export function renderProviders(registry: ProviderRegistry, base: Omit<BuildCont
 	}
 
 	for (const provider of ordered) {
-		const failedDep = provider.dependsOn!.map((dep) => dep.name).find((dep) => dropped.has(dep));
-		if (failedDep !== undefined) {
+		// Static disable (required-absent, transitively) — decision 022.
+		const disableDiagnostic = staticallyDisabled.get(provider.identity);
+		if (disableDiagnostic !== undefined) {
+			outcomes.push({
+				identity: provider.identity,
+				status: "skipped-dependency",
+				diagnostic: disableDiagnostic,
+			});
+			continue;
+		}
+		// Dynamic cascade: only a required edge to a provider that threw
+		// (status "dropped") skips the dependent; optional edges are dropped
+		// silently and the dependent renders, observing undefined.
+		const failedRequiredDep = (provider.dependsOn ?? []).find((dep) => dep.required && dropped.has(dep.name));
+		if (failedRequiredDep !== undefined) {
 			dropped.add(provider.identity);
 			outcomes.push({
 				identity: provider.identity,
 				status: "skipped-dependency",
-				diagnostic: `provider "${provider.identity}" skipped: dependency "${failedDep}" produced no section`,
+				diagnostic: `provider "${provider.identity}" skipped: dependency "${failedRequiredDep.name}" produced no section`,
 			});
 			continue;
 		}
