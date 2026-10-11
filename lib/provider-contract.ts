@@ -14,8 +14,11 @@
  *
  * Rendering is two-phase: providers without `dependsOn` render first
  * (ordered by `budgetHints.priority`), then dependents render with a
- * read-only view of the sections built so far. A provider whose dependency
- * was dropped is dropped too (fail-by-omission cascades); the build continues.
+ * read-only view of the sections built so far. Dependency edges are
+ * two-kind (decision 022, resolved at render time): a *required* edge to
+ * an absent section disables the dependent — with a TUI diagnostic,
+ * cascading transitively — while an *optional* edge to an absent section is
+ * dropped silently. Either way the build continues.
  */
 
 /**

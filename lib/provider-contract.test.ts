@@ -110,7 +110,10 @@ describe("provider contract registration", () => {
 	it("rejects self-dependency at registration", () => {
 		const registry = createProviderRegistry();
 
-		const result = registerProvider(registry, makeProvider({ identity: "semblr.self", dependsOn: [{ name: "semblr.self", required: true }] }));
+		const result = registerProvider(
+			registry,
+			makeProvider({ identity: "semblr.self", dependsOn: [{ name: "semblr.self", required: true }] }),
+		);
 
 		expect(result.status).toBe("circular-dependency");
 		expect(registry.providers.size).toBe(0);
@@ -122,15 +125,27 @@ describe("provider contract registration", () => {
 		// directly; registration still guards against it.
 		const registry = createProviderRegistry();
 		registerProvider(registry, makeProvider({ identity: "semblr.a" }));
-		registry.providers.set("semblr.x", makeProvider({ identity: "semblr.x", dependsOn: [{ name: "semblr.a", required: true }] }));
+		registry.providers.set(
+			"semblr.x",
+			makeProvider({ identity: "semblr.x", dependsOn: [{ name: "semblr.a", required: true }] }),
+		);
 
-		const backEdge = registerProvider(registry, makeProvider({ identity: "semblr.z", dependsOn: [{ name: "semblr.x", required: true }] }));
+		const backEdge = registerProvider(
+			registry,
+			makeProvider({ identity: "semblr.z", dependsOn: [{ name: "semblr.x", required: true }] }),
+		);
 		expect(backEdge.status).toBe("registered"); // x→a, z→x: no cycle
 
 		// Mutate x to depend on the not-yet-registered w; registering w then
 		// would close w→x→w.
-		registry.providers.set("semblr.x", makeProvider({ identity: "semblr.x", dependsOn: [{ name: "semblr.w", required: true }] }));
-		const cycle = registerProvider(registry, makeProvider({ identity: "semblr.w", dependsOn: [{ name: "semblr.x", required: true }] }));
+		registry.providers.set(
+			"semblr.x",
+			makeProvider({ identity: "semblr.x", dependsOn: [{ name: "semblr.w", required: true }] }),
+		);
+		const cycle = registerProvider(
+			registry,
+			makeProvider({ identity: "semblr.w", dependsOn: [{ name: "semblr.x", required: true }] }),
+		);
 		expect(cycle.status).toBe("circular-dependency");
 		expect(cycle.diagnostic).toMatch(/cycle/);
 		expect(registry.providers.size).toBe(3); // a, x, z — w not added
@@ -261,7 +276,11 @@ describe("two-phase render walk", () => {
 					throw new Error("kaboom");
 				},
 			}),
-			makeProvider({ identity: "semblr.dep", dependsOn: [{ name: "semblr.boom", required: true }], render: () => "never" }),
+			makeProvider({
+				identity: "semblr.dep",
+				dependsOn: [{ name: "semblr.boom", required: true }],
+				render: () => "never",
+			}),
 		);
 
 		const result = renderProviders(registry, base);
@@ -273,7 +292,11 @@ describe("two-phase render walk", () => {
 	it("treats a null render as empty — no section, no cascade", () => {
 		const registry = populatedRegistry(
 			makeProvider({ identity: "semblr.nothing", render: () => null }),
-			makeProvider({ identity: "semblr.dep", dependsOn: [{ name: "semblr.nothing", required: true }], render: () => "dep-content" }),
+			makeProvider({
+				identity: "semblr.dep",
+				dependsOn: [{ name: "semblr.nothing", required: true }],
+				render: () => "dep-content",
+			}),
 		);
 
 		const result = renderProviders(registry, base);
@@ -318,7 +341,11 @@ describe("two-phase render walk", () => {
 					throw new Error("mid kaboom");
 				},
 			}),
-			makeProvider({ identity: "semblr.leaf", dependsOn: [{ name: "semblr.mid", required: true }], render: () => "never" }),
+			makeProvider({
+				identity: "semblr.leaf",
+				dependsOn: [{ name: "semblr.mid", required: true }],
+				render: () => "never",
+			}),
 		);
 
 		const result = renderProviders(registry, base);
@@ -360,7 +387,9 @@ describe("two-phase render walk", () => {
 		expect(result.sections.has("semblr.dep")).toBe(false);
 		const outcome = result.outcomes.find((o) => o.identity === "semblr.dep");
 		expect(outcome?.status).toBe("skipped-dependency");
-		expect(outcome?.diagnostic).toBe('provider "semblr.dep" disabled: required provider "semblr.missing" not registered');
+		expect(outcome?.diagnostic).toBe(
+			'provider "semblr.dep" disabled: required provider "semblr.missing" not registered',
+		);
 	});
 
 	it("cascades static disable transitively over required edges (decision 022)", () => {
@@ -390,7 +419,9 @@ describe("two-phase render walk", () => {
 		expect(result.sections.has("semblr.b")).toBe(false);
 		expect(result.sections.get("semblr.c")).toBe("c saw undefined");
 		expect(result.outcomes.find((o) => o.identity === "semblr.b")?.status).toBe("skipped-dependency");
-		expect(result.outcomes.find((o) => o.identity === "semblr.b")?.diagnostic).toMatch(/required provider "semblr.a" is disabled/);
+		expect(result.outcomes.find((o) => o.identity === "semblr.b")?.diagnostic).toMatch(
+			/required provider "semblr.a" is disabled/,
+		);
 	});
 
 	it("renders a dependent whose optional dependency is not registered (edge dropped silently)", () => {
