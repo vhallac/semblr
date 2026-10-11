@@ -12,6 +12,7 @@
 
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { type AtomicWriteFs, atomicWriteFileSync } from "../lib/atomic-write.ts";
 import { pathToFileURL } from "node:url";
 import {
 	bm25IndexPathForRoundsDir,
@@ -88,6 +89,7 @@ export interface DigestSessionOptions extends ScriptConfigOptions {
 	modelRegistry?: EmbeddingModelRegistry;
 	stdout?: Pick<typeof console, "log">;
 	stderr?: Pick<typeof console, "error">;
+	fsImpl?: AtomicWriteFs;
 }
 
 export async function runDigestSession(options: DigestSessionOptions = {}): Promise<number> {
@@ -126,7 +128,13 @@ export async function runDigestSession(options: DigestSessionOptions = {}): Prom
 		}
 
 		// Always write the round file (idempotent) before deleting stale copies.
-		fs.writeFileSync(path.resolve(roundsDir, roundFile), JSON.stringify(round, null, 2));
+		// Atomic (decision-015): tmp write + rename, so a failure leaves the
+		// existing round file byte-identical.
+		atomicWriteFileSync(
+			path.resolve(roundsDir, roundFile),
+			JSON.stringify(round, null, 2),
+			options.fsImpl,
+		);
 		const bm25Index = loadBm25Index(bm25IndexPath);
 		upsertBm25Round(bm25Index, roundFile, roundTextForBm25(round));
 		for (const staleFile of staleFiles) {
