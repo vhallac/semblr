@@ -161,6 +161,46 @@ describe("migrate-content-hash script", () => {
 		expect(logs.stdout.join("\n")).toContain("Dry run:           no");
 	});
 
+	it("leaves round files byte-identical when the atomic write fails (write-then-unlink kept)", () => {
+		const roundsDir = tmpDir();
+		const indexPath = path.join(roundsDir, "index.csv");
+		const renameNewName = roundFileName("rename", "answer");
+		const unchangedName = roundFileName("same", "answer");
+
+		const legacyBefore = JSON.stringify({ userPrompt: "rename", responseSequence: "answer" });
+		const unchangedBefore = JSON.stringify({ id: "old", userPrompt: "same", responseSequence: "answer" });
+		fs.writeFileSync(path.join(roundsDir, "legacy.json"), legacyBefore);
+		fs.writeFileSync(path.join(roundsDir, unchangedName), unchangedBefore);
+		fs.writeFileSync(indexPath, "");
+		const logs = logger();
+
+		const failingFs = {
+			writeFileSync(tmpPath: string) {
+				if (tmpPath.includes(".tmp.")) throw new Error("disk full");
+				throw new Error("unexpected direct write");
+			},
+			renameSync() {
+				throw new Error("unexpected rename");
+			},
+		};
+
+		expect(() =>
+			runContentHashMigration({
+				roundsDir,
+				indexPath,
+				stdout: logs.out,
+				stderr: logs.err,
+				fsImpl: failingFs,
+			}),
+		).toThrow("disk full");
+
+		// Neither the rename target nor the id-update in place may be touched;
+		// sources stay byte-identical (no truncated/partial writes, no premature unlink).
+		expect(fs.readFileSync(path.join(roundsDir, "legacy.json"), "utf-8")).toBe(legacyBefore);
+		expect(fs.readFileSync(path.join(roundsDir, unchangedName), "utf-8")).toBe(unchangedBefore);
+		expect(fs.existsSync(path.join(roundsDir, renameNewName))).toBe(false);
+	});
+
 	it("detects direct CLI execution", () => {
 		expect(isMainModule("file:///tmp/script.ts", "/tmp/script.ts")).toBe(true);
 		expect(isMainModule("file:///tmp/script.ts", "/tmp/other.ts")).toBe(false);
