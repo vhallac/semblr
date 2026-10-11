@@ -12,8 +12,10 @@
  *   re-evaluated between tool calls.
  * - Fail-by-omission: a failing provider never corrupts the whole context.
  *
- * `dependsOn` / phase-2 rendering is a unit of its own (see the #111 plan);
- * registration-level dependsOn validation lands there.
+ * Rendering is two-phase: providers without `dependsOn` render first
+ * (ordered by `budgetHints.priority`), then dependents render with a
+ * read-only view of the sections built so far. A provider whose dependency
+ * was dropped is dropped too (fail-by-omission cascades); the build continues.
  */
 
 /**
@@ -39,6 +41,15 @@ export interface ProviderBudgetHints {
 	minimumViableTokens: number;
 }
 
+/**
+ * Read-only view of the sections built so far in this context build,
+ * keyed by provider identity. Present (empty) for phase-1 providers;
+ * progressively filled for phase-2 providers. Providers MUST NOT rely on
+ * the presence of any particular section — fail-by-omission means a
+ * dependency may be absent.
+ */
+export type SectionsView = Readonly<Record<string, string>>;
+
 /** The per-round allocation handed to a provider's `render`. */
 export interface ProviderBudget {
 	/** The token ceiling allocated to this provider this round. */
@@ -57,6 +68,8 @@ export interface BuildContext {
 	prompt: string;
 	/** Epoch milliseconds at the start of this context build. */
 	now: number;
+	/** Additive field: read-only sections built so far (empty for phase 1). */
+	readonly sections: SectionsView;
 }
 
 /**
@@ -71,6 +84,12 @@ export interface ContextProvider {
 	/** Static budget hints (see {@link ProviderBudgetHints}). */
 	budgetHints: ProviderBudgetHints;
 	/**
+	 * Identities this provider's content depends on (phase-2 providers).
+	 * All dependencies must be registered providers; cycles are rejected
+	 * at registration.
+	 */
+	dependsOn?: readonly string[];
+	/**
 	 * Produce this round's section content, or `null` for nothing to inject.
 	 * Ext 2.a: throwing here drops the section and the build continues
 	 * (fail-by-omission, enforced by the caller — full semantics in #112).
@@ -83,7 +102,13 @@ export interface ProviderRegistry {
 	providers: Map<string, ContextProvider>;
 }
 
-export type RegistrationStatus = "registered" | "duplicate-identity" | "unsupported-api-version" | "invalid-identity";
+export type RegistrationStatus =
+	| "registered"
+	| "duplicate-identity"
+	| "unsupported-api-version"
+	| "invalid-identity"
+	| "unknown-dependency"
+	| "circular-dependency";
 
 export interface RegistrationResult {
 	status: RegistrationStatus;
@@ -126,6 +151,127 @@ export function registerProvider(registry: ProviderRegistry, provider: ContextPr
 			diagnostic: `provider identity "${provider.identity}" is already registered — original provider stands`,
 		};
 	}
+	if (provider.dependsOn?.includes(provider.identity)) {
+		return {
+			status: "circular-dependency",
+			diagnostic: `provider "${provider.identity}" depends on itself`,
+		};
+	}
+	const missing = provider.dependsOn?.filter((dep) => !registry.providers.has(dep)) ?? [];
+	if (missing.length > 0) {
+		return {
+			status: "unknown-dependency",
+			diagnostic: `provider "${provider.identity}" depends on unregistered provider(s): ${missing.join(", ")}`,
+		};
+	}
+	if (reaches(provider.identity, provider.dependsOn ?? [], registry)) {
+		return {
+			status: "circular-dependency",
+			diagnostic: `provider "${provider.identity}" would create a dependsOn cycle`,
+		};
+	}
 	registry.providers.set(provider.identity, provider);
 	return { status: "registered" };
+}
+
+/** Frozen record snapshot of the sections map, for the read-only view. */
+function snapshot(sections: Map<string, string>): SectionsView {
+	return Object.freeze(Object.fromEntries(sections));
+}
+
+/** True if following the dependency edges from `deps` reaches `identity`. */
+function reaches(identity: string, deps: readonly string[], registry: ProviderRegistry): boolean {
+	const seen = new Set<string>();
+	const stack = [...deps];
+	while (stack.length > 0) {
+		const current = stack.pop()!;
+		if (current === identity) return true;
+		if (seen.has(current)) continue;
+		seen.add(current);
+		const provider = registry.providers.get(current);
+		if (provider?.dependsOn) stack.push(...provider.dependsOn);
+	}
+	return false;
+}
+
+export type RenderStatus = "rendered" | "empty" | "dropped" | "skipped-dependency";
+
+export interface RenderedSection {
+	identity: string;
+	status: RenderStatus;
+	/** Content when status is "rendered". */
+	content?: string;
+	/** Human-readable diagnostic when the section was dropped. */
+	diagnostic?: string;
+}
+
+export interface RenderResult {
+	/** Successfully rendered content, in render order (identity -> content). */
+	sections: Map<string, string>;
+	/** Per-provider outcome, in render order. */
+	outcomes: RenderedSection[];
+}
+
+/**
+ * Two-phase render walk over the registry.
+ *
+ * Phase 1: providers without `dependsOn`, ordered by priority (lower first),
+ * ties by registration order. Phase 2: providers with `dependsOn`, same
+ * ordering, rendered after all independents with a read-only view of the
+ * sections built so far.
+ *
+ * Fail-by-omission (ext 2.a): a provider returning `null` yields no section;
+ * a provider throwing has its section dropped with a diagnostic. Either way
+ * the build continues — but dependents of a dropped provider are skipped,
+ * so the omission cascades.
+ */
+export function renderProviders(registry: ProviderRegistry, base: Omit<BuildContext, "sections">): RenderResult {
+	const all = [...registry.providers.values()];
+	const byPriority = (a: ContextProvider, b: ContextProvider) => a.budgetHints.priority - b.budgetHints.priority;
+	const phase1 = all.filter((p) => !p.dependsOn || p.dependsOn.length === 0).sort(byPriority);
+	const phase2 = all.filter((p) => p.dependsOn && p.dependsOn.length > 0).sort(byPriority);
+
+	const sections = new Map<string, string>();
+	const dropped = new Set<string>();
+	const outcomes: RenderedSection[] = [];
+
+	const renderOne = (provider: ContextProvider, phaseSections: SectionsView): void => {
+		const buildContext: BuildContext = Object.freeze({ ...base, sections: phaseSections });
+		let content: string | null;
+		try {
+			content = provider.render(buildContext, { allocatedTokens: provider.budgetHints.preferredTokens });
+		} catch (error) {
+			dropped.add(provider.identity);
+			outcomes.push({
+				identity: provider.identity,
+				status: "dropped",
+				diagnostic: `provider "${provider.identity}" threw during render: ${error instanceof Error ? error.message : String(error)}`,
+			});
+			return;
+		}
+		if (content === null) {
+			outcomes.push({ identity: provider.identity, status: "empty" });
+			return;
+		}
+		sections.set(provider.identity, content);
+		outcomes.push({ identity: provider.identity, status: "rendered", content });
+	};
+
+	for (const provider of phase1) renderOne(provider, snapshot(sections));
+	for (const provider of phase2) {
+		const failedDep = provider.dependsOn!.find((dep) => dropped.has(dep));
+		if (failedDep !== undefined) {
+			dropped.add(provider.identity);
+			outcomes.push({
+				identity: provider.identity,
+				status: "skipped-dependency",
+				diagnostic: `provider "${provider.identity}" skipped: dependency "${failedDep}" produced no section`,
+			});
+			continue;
+		}
+		// Phase-2 providers see only the sections built so far — frozen snapshot.
+		renderOne(provider, snapshot(sections));
+	}
+
+	return { sections, outcomes };
 }
