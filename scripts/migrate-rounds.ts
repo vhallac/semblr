@@ -20,9 +20,9 @@
  */
 
 import * as fs from "node:fs";
-import { type AtomicWriteFs, atomicWriteFileSync } from "../lib/atomic-write.ts";
 import * as path from "node:path";
 import { pathToFileURL } from "node:url";
+import { type AtomicWriteFs, atomicWriteFileSync } from "../lib/atomic-write.ts";
 import { resolveScriptConfig, type ScriptConfigOptions } from "../lib/script-config.ts";
 
 // ─────────────────────────────────────────────

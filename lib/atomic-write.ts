@@ -17,11 +17,7 @@ export interface AtomicWriteFs {
  * The fs implementation is injectable so tests can fail the write and
  * assert the target is untouched.
  */
-export function atomicWriteFileSync(
-	targetPath: string,
-	data: string,
-	fsImpl: AtomicWriteFs = fs,
-): void {
+export function atomicWriteFileSync(targetPath: string, data: string, fsImpl: AtomicWriteFs = fs): void {
 	const tmpPath = `${targetPath}.tmp.${process.pid}`;
 	fsImpl.writeFileSync(tmpPath, data);
 	fsImpl.renameSync(tmpPath, targetPath);

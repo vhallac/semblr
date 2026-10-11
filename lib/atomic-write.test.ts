@@ -44,9 +44,7 @@ describe("atomicWriteFileSync", () => {
 			renameSync: fs.renameSync.bind(fs),
 		};
 
-		expect(() => atomicWriteFileSync(target, "new", failing)).toThrow(
-			"simulated write failure",
-		);
+		expect(() => atomicWriteFileSync(target, "new", failing)).toThrow("simulated write failure");
 		expect(fs.readFileSync(target, "utf-8")).toBe(original);
 	});
 
@@ -62,9 +60,7 @@ describe("atomicWriteFileSync", () => {
 			},
 		};
 
-		expect(() => atomicWriteFileSync(target, "new", failing)).toThrow(
-			"simulated rename failure",
-		);
+		expect(() => atomicWriteFileSync(target, "new", failing)).toThrow("simulated rename failure");
 		expect(fs.readFileSync(target, "utf-8")).toBe(original);
 	});
 
