@@ -1,13 +1,19 @@
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it } from "vitest";
 import { bm25IndexPathForRoundsDir, loadBm25Index, scoreBm25Query } from "../lib/bm25-index.ts";
 import { runRebuildBm25 } from "./rebuild-bm25.ts";
 
 function tmpDir() {
-	return fs.mkdtempSync(path.join(os.tmpdir(), "semblr-rebuild-bm25-"));
+	const dir = fs.mkdtempSync(path.join(os.tmpdir(), "semblr-rebuild-bm25-"));
+	dirs.push(dir);
+	return dir;
 }
+const dirs: string[] = [];
+afterEach(() => {
+	for (const d of dirs.splice(0)) fs.rmSync(d, { recursive: true, force: true });
+});
 
 describe("rebuild-bm25 script", () => {
 	it("rebuilds index.bm25.json from existing round files without embedding", async () => {

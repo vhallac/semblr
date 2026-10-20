@@ -6,7 +6,9 @@ import { computeContentHash, createRoundFilePath } from "../lib/hash.ts";
 import { isMainModule, runPruneMarkerDuplicates, scanMarkerDuplicates } from "./prune-marker-duplicates.ts";
 
 function tmpDir(): string {
-	return fs.mkdtempSync(path.join(os.tmpdir(), "semblr-prune-dups-test-"));
+	const dir = fs.mkdtempSync(path.join(os.tmpdir(), "semblr-prune-dups-test-"));
+	dirs.push(dir);
+	return dir;
 }
 
 const dirs: string[] = [];
@@ -114,7 +116,6 @@ describe("prune-marker-duplicates script", () => {
 	it("returns exit 1 for a missing rounds directory", () => {
 		const logs = { out: [] as string[], err: [] as string[] };
 		const missing = path.join(tmpDir(), "missing");
-		dirs.push(missing);
 		const exit = runPruneMarkerDuplicates({
 			roundsDir: missing,
 			stdout: { log: (l: string) => logs.out.push(l) },

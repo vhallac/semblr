@@ -1,13 +1,19 @@
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it } from "vitest";
 import { encodeVectorIndexLine, readIndexLines } from "../lib/index-io.ts";
 import { isMainModule, runModelColumnMigration } from "./migrate-model-column.ts";
 
 function tmpDir(): string {
-	return fs.mkdtempSync(path.join(os.tmpdir(), "semblr-migrate-model-test-"));
+	const dir = fs.mkdtempSync(path.join(os.tmpdir(), "semblr-migrate-model-test-"));
+	dirs.push(dir);
+	return dir;
 }
+const dirs: string[] = [];
+afterEach(() => {
+	for (const d of dirs.splice(0)) fs.rmSync(d, { recursive: true, force: true });
+});
 
 function logger() {
 	const stdout: string[] = [];

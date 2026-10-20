@@ -1,7 +1,7 @@
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { bm25IndexPathForRoundsDir } from "../lib/bm25-index.ts";
 import { computeContentHash } from "../lib/hash.ts";
 import { encodeVectorIndexLine, loadVectorIndex, readIndexLines } from "../lib/index-io.ts";
@@ -22,8 +22,14 @@ process.env.RELEVANCE_LIST_MIN_WORDS = "1";
 const DEBUG_EMBEDDING_MODEL = SEMBLR_CONFIG_DEFAULTS.embeddingModel;
 
 function tmpDir(): string {
-	return fs.mkdtempSync(path.join(os.tmpdir(), "semblr-digest-all-test-"));
+	const dir = fs.mkdtempSync(path.join(os.tmpdir(), "semblr-digest-all-test-"));
+	dirs.push(dir);
+	return dir;
 }
+const dirs: string[] = [];
+afterEach(() => {
+	for (const d of dirs.splice(0)) fs.rmSync(d, { recursive: true, force: true });
+});
 
 function logger() {
 	const stdout: string[] = [];

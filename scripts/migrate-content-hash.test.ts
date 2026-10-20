@@ -1,14 +1,20 @@
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it } from "vitest";
 import { computeContentHash } from "../lib/hash.ts";
 import { encodeVectorIndexLine, readIndexLines } from "../lib/index-io.ts";
 import { isMainModule, runContentHashMigration } from "./migrate-content-hash.ts";
 
 function tmpDir(): string {
-	return fs.mkdtempSync(path.join(os.tmpdir(), "semblr-migrate-content-hash-test-"));
+	const dir = fs.mkdtempSync(path.join(os.tmpdir(), "semblr-migrate-content-hash-test-"));
+	dirs.push(dir);
+	return dir;
 }
+const dirs: string[] = [];
+afterEach(() => {
+	for (const d of dirs.splice(0)) fs.rmSync(d, { recursive: true, force: true });
+});
 
 function logger() {
 	const stdout: string[] = [];
@@ -132,7 +138,9 @@ describe("migrate-content-hash script", () => {
 			}),
 		).toBe(1);
 
-		expect(fs.existsSync(`${roundsDir}.bak-123`)).toBe(true);
+		const backupDir = `${roundsDir}.bak-123`;
+		dirs.push(backupDir);
+		expect(fs.existsSync(backupDir)).toBe(true);
 		expect(fs.existsSync(path.join(roundsDir, "legacy.json"))).toBe(false);
 		expect(fs.existsSync(path.join(roundsDir, renameNewName))).toBe(true);
 		expect(JSON.parse(fs.readFileSync(path.join(roundsDir, renameNewName), "utf-8")).id).toBe(

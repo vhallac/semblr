@@ -1,12 +1,19 @@
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it } from "vitest";
+
+const dirs: string[] = [];
+afterEach(() => {
+	for (const d of dirs.splice(0)) fs.rmSync(d, { recursive: true, force: true });
+});
+
 import { parseWorksheetSelections, runIngestGoldenLabels } from "./ingest-golden-labels.ts";
 
 describe("ingest-golden-labels script", () => {
 	it("reads the .local pool and worksheet and writes local golden labels with primary", async () => {
 		const root = fs.mkdtempSync(path.join(os.tmpdir(), "semblr-ingest-golden-labels-test-"));
+		dirs.push(root);
 		const poolFile = path.join(root, "docs", "eval", "golden-pool.local.json");
 		const worksheetFile = path.join(root, "docs", "eval", "golden-worksheet.local.md");
 		const outFile = path.join(root, "docs", "eval", "golden-labels.local.json");

@@ -1,12 +1,18 @@
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { isMainModule, runResponseSegmentsMigration } from "./migrate-rounds.ts";
 
 function tmpDir(): string {
-	return fs.mkdtempSync(path.join(os.tmpdir(), "semblr-migrate-rounds-test-"));
+	const dir = fs.mkdtempSync(path.join(os.tmpdir(), "semblr-migrate-rounds-test-"));
+	dirs.push(dir);
+	return dir;
 }
+const dirs: string[] = [];
+afterEach(() => {
+	for (const d of dirs.splice(0)) fs.rmSync(d, { recursive: true, force: true });
+});
 
 function logger() {
 	const stdout: string[] = [];

@@ -1,15 +1,21 @@
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { computeContentHash } from "../lib/hash.ts";
 import { encodeVectorIndexLine, loadVectorIndex, readIndexLines } from "../lib/index-io.ts";
 import { hashEmbeddingInput } from "../lib/round-capture.ts";
 import { embed, isMainModule, normalize, runDigestSession } from "./digest-session.ts";
 
 function tmpDir(): string {
-	return fs.mkdtempSync(path.join(os.tmpdir(), "semblr-digest-session-test-"));
+	const dir = fs.mkdtempSync(path.join(os.tmpdir(), "semblr-digest-session-test-"));
+	dirs.push(dir);
+	return dir;
 }
+const dirs: string[] = [];
+afterEach(() => {
+	for (const d of dirs.splice(0)) fs.rmSync(d, { recursive: true, force: true });
+});
 
 function logger() {
 	const stdout: string[] = [];
