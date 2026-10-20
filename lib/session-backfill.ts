@@ -146,12 +146,11 @@ export function buildBackfillCandidates(
 	opts: { stateDir?: string; cutoffMs?: number } = {},
 ): string[] {
 	let candidates = listBackfillCandidates(sessionDir, currentSessionFile, fsImpl);
-	// Unit-002 scan register: files at-or-below the last-full-scan mtime were
-	// already covered by a complete scan, so opening them again is wasted work.
-	// The tail-completeness check downstream stays authoritative — the cutoff
-	// only prunes which files are OPENED, it cannot mask a missing round because
-	// the register is only advanced after zero-recovery full scans (unit-003).
-	// Corrupt/missing register → null → no filtering (full-scan fallback).
+	// Unit-002 scan register: the cutoff prunes which files are OPENED — files
+	// at-or-below the last-scan mtime are skipped. The register is not gated on
+	// zero-recovery full scans; the tail-completeness check downstream stays
+	// authoritative, so the cutoff cannot mask a missing round. Corrupt/missing
+	// register → null → no filtering (full-scan fallback).
 	if (opts.cutoffMs === undefined && opts.stateDir !== undefined) {
 		opts = { ...opts, cutoffMs: loadScanCutoff(opts.stateDir, sessionDir) ?? undefined };
 	}
@@ -562,7 +561,13 @@ export function backfillMissingRounds(
 			deferredLive++;
 			// Issue #147: a live file's current mtime already exceeds anything it
 			// could still hide — later writes bump the mtime above the cutoff.
-			noteExamined(sessionFile, Math.floor(fsImpl.statSync(sessionFile).mtimeMs));
+			// PR !148 F2: reuse the liveness-check stat instead of re-stating —
+			// the bare statSync here was uncaught and could abort the whole scan.
+			try {
+				noteExamined(sessionFile, Math.floor(fsImpl.statSync(sessionFile).mtimeMs));
+			} catch {
+				/* mtime vanished between the liveness check and here: skip */
+			}
 			continue;
 		}
 		// Unit-001: try the bounded tail read first. A complete tail skips the

@@ -1478,6 +1478,25 @@ describe("tailRoundComplete / tail-only backfill (unit-001)", () => {
 		expect(third.examinedMtime).toBe(Math.floor(fs.statSync(live).mtimeMs));
 	});
 
+	it("survives a statSync throw in the live-deferred branch (PR !148 F2 regression)", () => {
+		const roundsDir = path.join(tmp, "rounds");
+		const live = path.join(tmp, "live.jsonl");
+		fs.writeFileSync(live, "not json\n");
+		// First stat (liveness check) succeeds; second stat (the old uncaught
+		// noteExamined re-stat) throws. The scan must complete, not abort.
+		let calls = 0;
+		const statSync = (p: fs.PathLike): fs.Stats => {
+			calls++;
+			if (calls === 2) throw new Error("vanished");
+			return fs.statSync(p) as fs.Stats;
+		};
+		const outcome = backfillMissingRounds(live, roundsDir, { ...fs, statSync } as typeof fs, {
+			nowMs: Date.now(),
+		});
+		expect(outcome.deferredLive).toBe(1);
+		expect(outcome.examinedMtime).toBeUndefined();
+	});
+
 	it("does NOT report examinedMtime for a stale file with an open tail (inconclusive, issue #147)", () => {
 		const roundsDir = path.join(tmp, "rounds");
 		const sessionFile = writeSessionFile(tmp, [
