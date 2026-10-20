@@ -66,6 +66,15 @@ export interface BackfillOutcome {
 	skippedComplete?: boolean;
 	/** Number of source sessions whose tail round is missing but which look live; recovery is deferred to a later startup (F2). */
 	deferredLive?: number;
+	/**
+	 * Issue #147: max mtime among source files the scan conclusively examined —
+	 * skipped-complete files, live-deferred files (their current mtime already
+	 * exceeds what they could hide), and fully-parsed files whose recovered
+	 * rounds were re-verified on disk after the write. Absent when nothing was
+	 * examined conclusively (e.g. only stale files with open tails were seen) —
+	 * the caller must then keep the previous cutoff.
+	 */
+	examinedMtime?: number;
 }
 
 /**
@@ -523,6 +532,21 @@ export function backfillMissingRounds(
 	let scanned = 0;
 	let skippedComplete = false;
 	let deferredLive = 0;
+	let examinedMtime: number | null = null;
+	// Issue #147: record a file's mtime as examined. Unreadable mtimes leave the
+	// running max untouched — an unmeasurable file cannot bound anything.
+	const noteExamined = (file: string, knownMtime?: number) => {
+		let m = knownMtime;
+		if (m === undefined) {
+			try {
+				// Same sub-ms truncation as the liveness check above.
+				m = Math.floor(fsImpl.statSync(file).mtimeMs);
+			} catch {
+				return;
+			}
+		}
+		if (examinedMtime === null || m > examinedMtime) examinedMtime = m;
+	};
 	for (const sessionFile of files) {
 		let live = false;
 		try {
@@ -536,6 +560,9 @@ export function backfillMissingRounds(
 		// incomplete by definition, so parsing it is wasted startup work.
 		if (live) {
 			deferredLive++;
+			// Issue #147: a live file's current mtime already exceeds anything it
+			// could still hide — later writes bump the mtime above the cutoff.
+			noteExamined(sessionFile, Math.floor(fsImpl.statSync(sessionFile).mtimeMs));
 			continue;
 		}
 		// Unit-001: try the bounded tail read first. A complete tail skips the
@@ -544,10 +571,13 @@ export function backfillMissingRounds(
 		const tail = tailRoundComplete(sessionFile, roundsDir, fsImpl);
 		if (tail === true) {
 			skippedComplete = true;
+			noteExamined(sessionFile);
 			continue;
 		}
 		if (tail === false) {
 			deferredLive++;
+			// Stale file with an open tail: earlier rounds may still be missing and
+			// the mtime does NOT exceed what the file could hide — not examined.
 			continue;
 		}
 		const raw = fs.readFileSync(sessionFile, "utf-8");
@@ -555,6 +585,7 @@ export function backfillMissingRounds(
 		// turn (terminal stopReason) before any of its rounds are recoverable.
 		if (!isSessionTailClosed(raw)) {
 			deferredLive++;
+			// Open tail on a stale file — see the tail===false branch above.
 			continue;
 		}
 		const parsed = parsePiSessionJsonl(raw);
@@ -565,20 +596,28 @@ export function backfillMissingRounds(
 		} = collectMissingRounds(parsed, roundsDir, fsImpl);
 		if (complete) {
 			skippedComplete = true;
+			noteExamined(sessionFile);
 			continue;
 		}
 		scanned += fileScanned;
+		let allWritesVerified = true;
 		for (const { fileName, roundData } of missing) {
 			fsImpl.mkdirSync(roundsDir, { recursive: true });
 			fsImpl.writeFileSync(path.join(roundsDir, fileName), JSON.stringify(roundData, null, 2));
 			recovered.push(fileName);
+			// Issue #147: recovery is conclusive only when the round file is really
+			// on disk under its derived name afterwards — decouples "recovery
+			// happened" from "the register is trustworthy".
+			if (!fsImpl.existsSync(path.join(roundsDir, fileName))) allWritesVerified = false;
 		}
+		if (allWritesVerified) noteExamined(sessionFile);
 	}
 	return {
 		recoveredFiles: recovered,
 		scanned,
 		...(skippedComplete ? { skippedComplete: true } : {}),
 		...(deferredLive > 0 ? { deferredLive } : {}),
+		...(examinedMtime !== null ? { examinedMtime } : {}),
 	};
 }
 

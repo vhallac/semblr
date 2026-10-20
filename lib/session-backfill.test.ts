@@ -1385,7 +1385,7 @@ describe("tailRoundComplete / tail-only backfill (unit-001)", () => {
 		fs.utimesSync(sessionFile, new Date(0), new Date(0));
 		// Second run: readFileSync must never fire — the tail read alone suffices.
 		const outcome = backfillMissingRounds(sessionFile, roundsDir, noFullReadFsImpl(), { liveWindowMs: 0 });
-		expect(outcome).toEqual({ recoveredFiles: [], scanned: 0, skippedComplete: true });
+		expect(outcome).toEqual({ recoveredFiles: [], scanned: 0, skippedComplete: true, examinedMtime: 0 });
 	});
 
 	it("skips a complete session larger than the tail window via the tail read alone", () => {
@@ -1457,5 +1457,73 @@ describe("tailRoundComplete / tail-only backfill (unit-001)", () => {
 			createRoundFilePath("q1", "a1", []),
 			createRoundFilePath("q2", "a2", []),
 		]);
+	});
+
+	it("reports examinedMtime for skipped-complete, recovered, and live-deferred files (issue #147)", () => {
+		const roundsDir = path.join(tmp, "rounds");
+		const stale = writeSessionFile(tmp, [userMsg("q"), assistantMsg("a")]);
+		fs.utimesSync(stale, new Date(1000), new Date(1000));
+		// First run: stale file, round missing -> recovered, writes verified.
+		const first = backfillMissingRounds(stale, roundsDir, undefined, { liveWindowMs: 0 });
+		expect(first.recoveredFiles).toHaveLength(1);
+		expect(first.examinedMtime).toBe(1000);
+		// Second run: same mtime, complete -> skipped-complete still examines.
+		const second = backfillMissingRounds(stale, roundsDir, undefined, { liveWindowMs: 0 });
+		expect(second.examinedMtime).toBe(1000);
+		// A live file's current mtime counts as examined (nothing left to hide).
+		const live = path.join(tmp, "live.jsonl");
+		fs.writeFileSync(live, "not json\n");
+		const third = backfillMissingRounds(live, roundsDir, undefined, { nowMs: Date.now() });
+		expect(third.deferredLive).toBe(1);
+		expect(third.examinedMtime).toBe(Math.floor(fs.statSync(live).mtimeMs));
+	});
+
+	it("does NOT report examinedMtime for a stale file with an open tail (inconclusive, issue #147)", () => {
+		const roundsDir = path.join(tmp, "rounds");
+		const sessionFile = writeSessionFile(tmp, [
+			userMsg("q"),
+			{
+				type: "message",
+				message: { role: "assistant", content: [{ type: "text", text: "partial" }], stopReason: "toolUse" },
+			},
+		]);
+		fs.utimesSync(sessionFile, new Date(0), new Date(0));
+		const outcome = backfillMissingRounds(sessionFile, roundsDir, undefined, { nowMs: Date.now() });
+		expect(outcome.deferredLive).toBe(1);
+		expect(outcome.examinedMtime).toBeUndefined();
+	});
+
+	it("hash-drift convergence: a persistently mis-hashing round keeps being recovered while the cutoff still advances (issue #147)", () => {
+		const roundsDir = path.join(tmp, "rounds");
+		const sessionFile = writeSessionFile(tmp, [userMsg("drift q"), assistantMsg("drift a")]);
+		fs.utimesSync(sessionFile, new Date(1000), new Date(1000));
+		// Simulate persistent hash drift: the derived name NEVER pre-exists and
+		// the disk key scan sees nothing (the legacy file's canonical key differs
+		// from today's parse — the issue's non-convergence case), so every scan
+		// re-detects the round as missing and re-writes it. The write DOES land,
+		// so re-verification sees the file the run itself wrote.
+		const derived = createRoundFilePath("drift q", "drift a", []);
+		let writtenThisRun = false;
+		const driftFs = {
+			existsSync: (p: fs.PathLike) => (String(p).endsWith(derived) ? writtenThisRun : fs.existsSync(p)),
+			readdirSync: (() => []) as unknown as typeof fs.readdirSync,
+			readFileSync: fs.readFileSync,
+			mkdirSync: fs.mkdirSync,
+			writeFileSync: ((f: fs.PathOrFileDescriptor, data: string | NodeJS.ArrayBufferView<ArrayBufferLike>) => {
+				writtenThisRun = true;
+				fs.writeFileSync(f, data);
+			}) as typeof fs.writeFileSync,
+			statSync: fs.statSync,
+		};
+		const first = backfillMissingRounds(sessionFile, roundsDir, driftFs, { liveWindowMs: 0 });
+		expect(first.recoveredFiles).toHaveLength(1);
+		// The write was re-verified on disk -> the file counts as examined.
+		expect(first.examinedMtime).toBe(1000);
+		// Second startup: the round is re-detected as missing (drift persists),
+		// but the cutoff still advances - the recurring-scan loop is broken.
+		writtenThisRun = false;
+		const second = backfillMissingRounds(sessionFile, roundsDir, driftFs, { liveWindowMs: 0 });
+		expect(second.recoveredFiles).toHaveLength(1);
+		expect(second.examinedMtime).toBe(1000);
 	});
 });

@@ -72,7 +72,7 @@ import {
 	renderToolDetailsToolResult,
 	type ToolDetailsParams,
 } from "../lib/round-tool-results.ts";
-import { computeMaxMtime, saveScanCutoff } from "../lib/scan-register.ts";
+import { saveScanCutoff } from "../lib/scan-register.ts";
 import {
 	collectMultiModelSearchRoundScores,
 	collectSearchRoundScores,
@@ -1202,15 +1202,14 @@ export default function (pi: ExtensionAPI) {
 						{ stateDir: SEMBLR_DIR },
 					);
 					const backfill = backfillMissingRounds(candidates, ROUNDS_DIR);
-					// Issue #133 unit-003: advance the scan register only after a scan that
-					// recovered nothing — those scans found every round already on disk.
-					// Deferrals don't block the advance: a deferred file whose in-flight
-					// round completes later gets its mtime bumped above the cutoff and is
-					// re-examined; one that never completes has nothing to recover (F2
-					// defers it on every scan today as well).
-					if (backfill.recoveredFiles.length === 0) {
-						const maxMtime = computeMaxMtime([sessionFile, ...candidates]);
-						if (maxMtime !== null) saveScanCutoff(SEMBLR_DIR, path.dirname(sessionFile), maxMtime);
+					// Issue #133 unit-003 / issue #147: advance the scan register whenever
+					// the scan conclusively examined at least one source file — skipped
+					// complete, live-deferred, or recovered with writes re-verified on
+					// disk. Recovery WORK happening no longer freezes the cutoff (a
+					// persistently mis-hashing round would otherwise keep recovery
+					// non-convergent and the register at null forever).
+					if (backfill.examinedMtime !== undefined) {
+						saveScanCutoff(SEMBLR_DIR, path.dirname(sessionFile), backfill.examinedMtime);
 					}
 					if (backfill.deferredLive) {
 						ctx.ui.setStatus(
