@@ -20,8 +20,12 @@
   "author": "",
   "license": "ISC",
   "description": "",
-  "dependencies": {
-    "@sinclair/typebox": "^0.34.49"
+  "pi": {
+    "extensions": ["./index.ts"]
+  },
+  "dependencies": {},
+  "peerDependencies": {
+    "@sinclair/typebox": "*"
   },
   "devDependencies": {
     "@biomejs/biome": "^2.5.14",
