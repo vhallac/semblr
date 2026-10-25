@@ -71,6 +71,23 @@ export interface AdoptShardFs {
 }
 
 /**
+ * The shard file names of a shard set (basenames), in the given order.
+ * Used by scripts that report which shards they read (issue #149).
+ */
+export function shardNames(shards: readonly string[]): string[] {
+	return shards.map((shardPath) => path.basename(shardPath));
+}
+
+/**
+ * One-line, human-readable label of a shard set: the shard file names joined
+ * by commas, or "none (empty shard set)" when the set is empty (issue #149).
+ */
+export function describeShardSet(shards: readonly string[]): string {
+	const names = shardNames(shards);
+	return names.length === 0 ? "none (empty shard set)" : names.join(", ");
+}
+
+/**
  * Absolute path of the host's own shard file (`index.<hostname>`) inside
  * `roundsDir`. Hostname is injectable for tests; it is only ever used as a
  * filename component, never as a CSV column (assumption A-2).

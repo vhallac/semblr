@@ -15,6 +15,12 @@
  * first, falling back to the earliest recovered round). Only recovered rounds
  * newer than the cutoff (default: 7 days) are ever pruned.
  *
+ * Index cleanup (issue #149): the index is a set of per-host shards
+ * (`index.<host>`). This host cleans its own shard only — a foreign shard is
+ * never rewritten, and a duplicate round file a foreign shard still references
+ * is kept (the other host prunes it). The tools fulltext index and the BM25
+ * index stay single artifacts.
+ *
  * Usage:
  *   npx tsx scripts/prune-recovery-duplicates.ts            # dry run (default)
  *   npx tsx scripts/prune-recovery-duplicates.ts --apply    # actually delete
@@ -32,7 +38,12 @@ import { bm25IndexPathForRoundsDir, buildBm25Index, roundTextForBm25, writeBm25I
 // uses the exact same canonicalization as this prune script.
 import { canonicalDuplicateKey } from "../lib/hash.ts";
 import { filterIndexLinesExcludingFilenames, readIndexLines, writeIndexLines } from "../lib/index-io.ts";
-import { resolveScriptConfig, resolveScriptIndexPath, type ScriptConfigOptions } from "../lib/script-config.ts";
+import {
+	reportForeignShards,
+	resolveScriptConfig,
+	resolveScriptIndexContext,
+	type ScriptConfigOptions,
+} from "../lib/script-config.ts";
 import { toolIndexPathForRoundsDir } from "../lib/search-tools.ts";
 
 export { canonicalDuplicateKey };
@@ -99,6 +110,8 @@ export interface PruneOptions extends ScriptConfigOptions {
 	roundsDir?: string;
 	indexPath?: string;
 	cutoffMs?: number;
+	/** Hostname override for tests; defaults to os.hostname(). */
+	hostname?: string;
 	out?: (line: string) => void;
 }
 
@@ -110,7 +123,14 @@ export async function pruneRecoveryDuplicates(options: PruneOptions = {}): Promi
 
 	const config = resolveScriptConfig(options);
 	const roundsDir = options.roundsDir ?? config.roundsDir;
-	const indexPath = resolveScriptIndexPath(config, roundsDir, options.indexPath);
+	// Issue #149: the index is a set of per-host shards (`index.<host>`). This
+	// host cleans its own shard only (D-005) — a foreign shard keeps its rows
+	// and is updated when that host runs this script.
+	const index = resolveScriptIndexContext(config, roundsDir, options.indexPath, { hostname: options.hostname });
+	// A round file a foreign shard still references is kept: the foreign row
+	// cannot be rewritten by this host, so deleting the file would leave the
+	// other host's rows dangling. That host prunes it.
+	const foreignReferenced = index.foreignReferencedFiles();
 
 	const records: RoundRecord[] = [];
 	for (const entry of fs.readdirSync(roundsDir)) {
@@ -132,12 +152,23 @@ export async function pruneRecoveryDuplicates(options: PruneOptions = {}): Promi
 		});
 	}
 
-	const plans = selectPrunes(records, cutoffMs);
+	const candidatePlans = selectPrunes(records, cutoffMs);
+	// A duplicate whose twin is referenced by a foreign shard is not pruned by
+	// this host (its round file must stay for the other host's rows).
+	const plans = candidatePlans
+		.map((plan) => ({ ...plan, prunes: plan.prunes.filter((filename) => !foreignReferenced.has(filename)) }))
+		.filter((plan) => plan.prunes.length > 0);
 	const allPrunes = new Set(plans.flatMap((p) => p.prunes));
+	const keptForForeign = candidatePlans
+		.flatMap((plan) => plan.prunes)
+		.filter((filename) => foreignReferenced.has(filename) && !allPrunes.has(filename));
 
 	out(`Rounds scanned: ${records.length}`);
 	out(`Duplicate groups with prunable recovered twins: ${plans.length}`);
 	out(`Rounds to prune: ${allPrunes.size} (cutoff: ${new Date(cutoffMs).toISOString()})`);
+	for (const filename of keptForForeign) {
+		out(`  kept (referenced by a foreign shard): ${filename}`);
+	}
 	out(apply ? "Mode: APPLY" : "Mode: DRY RUN (pass --apply to delete)");
 
 	for (const plan of plans) {
@@ -151,17 +182,24 @@ export async function pruneRecoveryDuplicates(options: PruneOptions = {}): Promi
 		fs.unlinkSync(path.join(roundsDir, filename));
 	}
 
-	for (const indexFile of [indexPath, toolIndexPathForRoundsDir(roundsDir)]) {
-		if (!fs.existsSync(indexFile)) continue;
-		const lines = readIndexLines(indexFile);
-		const kept =
-			indexFile === indexPath
-				? filterIndexLinesExcludingFilenames(lines, allPrunes)
-				: // Tools fulltext index lines start with "<filename>,<toolIndex>,...".
-					lines.filter((line) => !allPrunes.has(line.slice(0, line.indexOf(","))));
+	// Issue #149: the index rows of the deleted rounds are dropped from this
+	// host's own shard only (the legacy `index.csv` is claimed by the write);
+	// a foreign shard is never rewritten here (D-005).
+	const ownRows = index.readRewriteRows();
+	const keptRows = filterIndexLinesExcludingFilenames(ownRows, allPrunes);
+	if (keptRows.length !== ownRows.length) {
+		index.writeOwnLines(keptRows);
+		out(`Index cleaned: ${index.ownShardPath} (${ownRows.length - keptRows.length} lines removed)`);
+	}
+
+	// The tools fulltext index stays a single artifact (never a shard).
+	const toolIndexPath = toolIndexPathForRoundsDir(roundsDir);
+	if (fs.existsSync(toolIndexPath)) {
+		const lines = readIndexLines(toolIndexPath);
+		const kept = lines.filter((line) => !allPrunes.has(line.slice(0, line.indexOf(","))));
 		if (kept.length !== lines.length) {
-			writeIndexLines(indexFile, kept);
-			out(`Index cleaned: ${indexFile} (${lines.length - kept.length} lines removed)`);
+			writeIndexLines(toolIndexPath, kept);
+			out(`Index cleaned: ${toolIndexPath} (${lines.length - kept.length} lines removed)`);
 		}
 	}
 
@@ -176,6 +214,7 @@ export async function pruneRecoveryDuplicates(options: PruneOptions = {}): Promi
 	writeBm25Index(bm25Path, buildBm25Index(documents), fs);
 	out(`BM25 index rebuilt: ${documents.length} rounds at ${bm25Path}`);
 	out(`Pruned ${allPrunes.size} duplicate round files.`);
+	reportForeignShards(index, { log: out });
 }
 
 const isMain = process.argv[1] !== undefined && pathToFileURL(process.argv[1]).href === import.meta.url;

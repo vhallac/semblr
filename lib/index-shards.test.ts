@@ -5,10 +5,12 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { encodeVectorIndexLine } from "./index-io.ts";
 import {
 	adoptOwnShard,
+	describeShardSet,
 	discoverIndexShards,
 	isIndexShardFilename,
 	LEGACY_INDEX_FILENAME,
 	ownShardPath,
+	shardNames,
 } from "./index-shards.ts";
 
 describe("isIndexShardFilename", () => {
@@ -33,6 +35,18 @@ describe("isIndexShardFilename", () => {
 	it("rejects non-index files", () => {
 		expect(isIndexShardFilename("abc.json")).toBe(false);
 		expect(isIndexShardFilename("index")).toBe(false);
+	});
+});
+
+describe("describeShardSet", () => {
+	it("lists the shard file names", () => {
+		expect(shardNames(["/rounds/index.host-a", "/rounds/index.host-b"])).toEqual(["index.host-a", "index.host-b"]);
+		expect(describeShardSet(["/rounds/index.host-a", "/rounds/index.host-b"])).toBe("index.host-a, index.host-b");
+	});
+
+	it("labels an empty shard set", () => {
+		expect(shardNames([])).toEqual([]);
+		expect(describeShardSet([])).toBe("none (empty shard set)");
 	});
 });
 

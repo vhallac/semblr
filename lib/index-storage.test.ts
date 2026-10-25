@@ -57,6 +57,27 @@ describe("merged shard reads (#149)", () => {
 		expect(loadIndexFromShards(path.join(tempDir, "nope"))).toEqual([]);
 		expect(countShardLines(path.join(tempDir, "nope"))).toBe(0);
 	});
+
+	it("reads the shards through the injected fs seam", () => {
+		writeShard("index.host-a", ["W1sxXV0=,a.json:prompt"]);
+		const opened: string[] = [];
+		const fsImpl = {
+			existsSync: (p: string) => fs.existsSync(p),
+			openSync: (p: string, flags: string) => {
+				opened.push(p);
+				return fs.openSync(p, flags);
+			},
+			readSync: (fd: number, buffer: Buffer, offset: number, length: number, position: number | null) =>
+				fs.readSync(fd, buffer, offset, length, position),
+			closeSync: (fd: number) => fs.closeSync(fd),
+		};
+		const entries = loadIndexFromShards(tempDir, {
+			shards: [path.join(tempDir, "index.host-a")],
+			fsImpl,
+		});
+		expect(entries.map((entry) => entry.filePath)).toEqual(["a.json:prompt"]);
+		expect(opened).toEqual([path.join(tempDir, "index.host-a")]);
+	});
 });
 
 describe("loadIndexFromPath", () => {

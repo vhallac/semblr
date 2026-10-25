@@ -52,7 +52,7 @@ export function loadIndexFromShards(
 	for (const shardPath of opts.shards ?? discoverIndexShards(roundsDir)) {
 		forEachIndexLine(
 			shardPath,
-			fs,
+			opts.fsImpl ?? fs,
 			(line) => {
 				try {
 					const entry = parseIndexLine(line);
@@ -82,7 +82,7 @@ export function countShardLines(
 	for (const shardPath of opts.shards ?? discoverIndexShards(roundsDir)) {
 		forEachIndexLine(
 			shardPath,
-			fs,
+			opts.fsImpl ?? fs,
 			() => {
 				count++;
 			},

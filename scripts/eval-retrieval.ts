@@ -8,7 +8,8 @@ import { gatherSessionFiles, readCorpusRounds } from "../lib/eval-corpus.ts";
 import { collectWeakLabelExpansionsFromSessionJsonl } from "../lib/eval-labels.ts";
 import { aggregateQueryMetrics, evaluateQueryMetrics, filterCandidatesAsOf, noiseRate } from "../lib/eval-metrics.ts";
 import { indexRoundFileFromPath } from "../lib/index-io.ts";
-import { type IndexEntry, loadIndexFromPath } from "../lib/index-storage.ts";
+import { discoverIndexShards, shardNames } from "../lib/index-shards.ts";
+import { type IndexEntry, loadIndexFromShards } from "../lib/index-storage.ts";
 import type { RoundData } from "../lib/round-data.ts";
 import type { ScriptConfigOptions } from "../lib/script-config.ts";
 import { collectSearchRoundScores } from "../lib/search-interactions.ts";
@@ -71,6 +72,8 @@ export interface EvalRetrievalResult {
 	kind: "weak" | "golden";
 	config_hash: string;
 	corpus: string;
+	/** The shard files the corpus index was read from (issue #149). */
+	shards: string[];
 	counts: EvalRetrievalCounts;
 	hit_at_5: number;
 	recall_at_5: number;
@@ -102,6 +105,8 @@ export function evaluateRetrieval(options: {
 	corpusDir: string;
 	sessionsDir: string;
 	index: readonly IndexEntry[];
+	/** The shard files the index was read from (issue #149). */
+	shards?: readonly string[];
 	rounds: ReadonlyMap<string, RoundData>;
 	statsPath: string;
 	configHash: string;
@@ -258,6 +263,7 @@ export function evaluateRetrieval(options: {
 		kind: options.goldenLabels ? "golden" : "weak",
 		config_hash: options.configHash,
 		corpus: path.basename(options.corpusDir),
+		shards: shardNames(options.shards ?? []),
 		counts,
 		hit_at_5: similarity.hit_at_5,
 		recall_at_5: similarity.recall_at_5,
@@ -298,7 +304,6 @@ export async function runEvalRetrieval(options: RunEvalRetrievalOptions = {}): P
 		options.sessionsDir ?? parseArgValue(args, "--sessions") ?? defaultSessionsDir(resolvedCorpusDir);
 	const resolvedSessionsDir = path.resolve(sessionsDir.replace(/^~(?=$|\/)/, homedir()));
 	const roundsDir = path.join(resolvedCorpusDir, "rounds");
-	const indexPath = path.join(roundsDir, "index.csv");
 	const toolIndexPath = toolIndexPathForRoundsDir(roundsDir);
 	const statsPath = path.join(resolvedCorpusDir, "chain-read-stats.json");
 	const resolvedGoldenFile = goldenFile ? path.resolve(goldenFile.replace(/^~(?=$|\/)/, homedir())) : null;
@@ -307,10 +312,10 @@ export async function runEvalRetrieval(options: RunEvalRetrievalOptions = {}): P
 		err.error(`Corpus rounds directory does not exist: ${roundsDir}`);
 		return 1;
 	}
-	if (!fsImpl.existsSync(indexPath)) {
-		err.error(`Corpus index does not exist: ${indexPath}`);
-		return 1;
-	}
+	// Issue #149: the corpus index is a set of per-host shards (`index.<host>`);
+	// the legacy `index.csv` stays part of the read set until it is adopted. An
+	// empty shard set is an empty corpus, not an error.
+	const shards = discoverIndexShards(roundsDir, fsImpl);
 	if (resolvedGoldenFile && !fsImpl.existsSync(resolvedGoldenFile)) {
 		err.error(`Golden labels file does not exist: ${resolvedGoldenFile}`);
 		return 1;
@@ -324,7 +329,8 @@ export async function runEvalRetrieval(options: RunEvalRetrievalOptions = {}): P
 	const result = evaluateRetrieval({
 		corpusDir: resolvedCorpusDir,
 		sessionsDir: resolvedSessionsDir,
-		index: loadIndexFromPath(indexPath, fsImpl),
+		index: loadIndexFromShards(roundsDir, { shards, fsImpl, warn: (message) => err.error(message) }),
+		shards,
 		rounds: readCorpusRounds(roundsDir, fsImpl),
 		statsPath,
 		configHash: sha256Json({

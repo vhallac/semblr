@@ -97,4 +97,31 @@ describe("snapshot script", () => {
 
 		expect(stderr).toEqual([`Source index does not exist: ${config.indexPath}`]);
 	});
+
+	it("copies the whole shard set of a store that has no legacy index.csv", async () => {
+		const root = tmpDir();
+		const config = testConfig(root);
+		const semblrDir = path.dirname(config.roundsDir);
+		fs.mkdirSync(config.roundsDir, { recursive: true });
+		fs.writeFileSync(path.join(config.roundsDir, "round-a.json"), JSON.stringify({ userPrompt: "hello" }));
+		fs.writeFileSync(path.join(config.roundsDir, "index.host-a"), "vector,round-a.json:prompt\n");
+		fs.writeFileSync(path.join(config.roundsDir, "index.host-b"), "vector,round-b.json:prompt\n");
+
+		const stdout: string[] = [];
+		await expect(
+			runSnapshot({
+				config,
+				now: new Date("2026-06-12T06:24:11.000Z"),
+				stdout: { log: (line: string) => stdout.push(line) },
+			}),
+		).resolves.toBe(0);
+
+		const snapshotDir = path.join(semblrDir, "snapshots", "corpus-2026-06-12T06-24-11-000Z");
+		expect(fs.readFileSync(path.join(snapshotDir, "rounds", "index.host-a"), "utf-8")).toBe(
+			"vector,round-a.json:prompt\n",
+		);
+		expect(fs.readFileSync(path.join(snapshotDir, "rounds", "index.host-b"), "utf-8")).toBe(
+			"vector,round-b.json:prompt\n",
+		);
+	});
 });
