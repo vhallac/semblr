@@ -44,11 +44,15 @@ describe("migrate-model-column script", () => {
 			runModelColumnMigration({
 				stdout: logs.out,
 				stderr: logs.err,
+				hostname: "test-host",
 				configDeps: { cwd: root, agentDir: path.join(root, "agent"), env: {} },
 			}),
 		).toBe(0);
 
-		expect(readIndexLines(indexPath)).toEqual([
+		// Issue #149: the migration published to the host's own shard; the
+		// legacy index.csv was claimed by rename.
+		expect(fs.existsSync(indexPath)).toBe(false);
+		expect(readIndexLines(path.join(roundsDir, "index.test-host"))).toEqual([
 			`${encodeVectorIndexLine([1], "round.json:prompt")},configured-model`,
 		]);
 		expect(logs.stdout.join("\n")).toContain("Model to add: configured-model");
@@ -62,6 +66,35 @@ describe("migrate-model-column script", () => {
 		).toBe(1);
 
 		expect(logs.stderr).toEqual([expect.stringContaining("Index file not found")]);
+	});
+
+	it("migrates the own shard only and leaves a foreign shard byte-identical", () => {
+		const root = tmpDir();
+		const roundsDir = path.join(root, "rounds");
+		fs.mkdirSync(roundsDir, { recursive: true });
+		const ownShard = path.join(roundsDir, "index.host-a");
+		const foreignShard = path.join(roundsDir, "index.host-b");
+		fs.writeFileSync(ownShard, `${encodeVectorIndexLine([1], "round.json:prompt")}\n`);
+		fs.writeFileSync(foreignShard, `${encodeVectorIndexLine([2], "other.json:prompt")}\n`);
+		const foreignBefore = fs.readFileSync(foreignShard, "utf-8");
+		const logs = logger();
+
+		expect(
+			runModelColumnMigration({
+				indexPath: path.join(roundsDir, "index.csv"),
+				hostname: "host-a",
+				stdout: logs.out,
+				stderr: logs.err,
+			}),
+		).toBe(0);
+
+		// The own shard gained the model column; the foreign shard is untouched.
+		expect(readIndexLines(ownShard)).toEqual([
+			`${encodeVectorIndexLine([1], "round.json:prompt")},${readIndexLines(ownShard)[0].split(",")[2] ?? ""}`,
+		]);
+		expect(readIndexLines(ownShard)[0].split(",")).toHaveLength(3);
+		expect(fs.readFileSync(foreignShard, "utf-8")).toBe(foreignBefore);
+		expect(logs.stdout.join("\n")).toContain("index.host-b");
 	});
 
 	it("detects direct CLI execution", () => {

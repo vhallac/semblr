@@ -14,6 +14,9 @@ function makeFS(files: Record<string, string>) {
 			allPaths.add(acc);
 		}
 	}
+	// File-descriptor surface for the chunked index reader (forEachIndexLine).
+	const fds = new Map<number, { path: string; position: number }>();
+	let nextFd = 1;
 	return {
 		existsSync: (p: string) => allPaths.has(p),
 		readFileSync: (p: string) => {
@@ -53,6 +56,24 @@ function makeFS(files: Record<string, string>) {
 		},
 		unlinkSync: (p: string) => {
 			delete files[p];
+		},
+		openSync: (p: string) => {
+			const fd = nextFd++;
+			fds.set(fd, { path: p, position: 0 });
+			return fd;
+		},
+		readSync: (fd: number, buffer: Buffer, offset: number, length: number, position: number | null) => {
+			const entry = fds.get(fd);
+			if (!entry) return 0;
+			const data = Buffer.from(files[entry.path] ?? "", "utf-8");
+			const start = position ?? entry.position;
+			const chunk = data.subarray(start, start + length);
+			chunk.copy(buffer, offset);
+			entry.position = start + chunk.length;
+			return chunk.length;
+		},
+		closeSync: (fd: number) => {
+			fds.delete(fd);
 		},
 	};
 }
@@ -169,6 +190,7 @@ describe("fix-round-tool-ids", () => {
 			sessionsDir: "/sessions",
 			roundsDir: "/rounds",
 			indexPath: "/rounds/index.csv",
+			hostname: "test-host",
 			dryRun: false,
 			stdout,
 			stderr,
@@ -192,9 +214,13 @@ describe("fix-round-tool-ids", () => {
 		expect(corrected.toolCalls[1].name).toBe("beta");
 		expect(corrected.toolCalls[1].result_full).toBe("result of B");
 
-		// Index should not reference the old hash
-		const indexContent = files["/rounds/index.csv"] ?? "";
+		// The legacy index was claimed by the own shard; the migrated row must
+		// not reference the old hash (issue #149: the rewrite touches the own
+		// shard only).
+		expect(files["/rounds/index.csv"]).toBeUndefined();
+		const indexContent = files["/rounds/index.test-host"] ?? "";
 		expect(indexContent).not.toContain(oldHash);
+		expect(indexContent).toContain(newFiles[0].split("/").pop() ?? "");
 	});
 
 	it("skips rounds that are already correct", async () => {
@@ -234,6 +260,7 @@ describe("fix-round-tool-ids", () => {
 			sessionsDir: "/sessions",
 			roundsDir: "/rounds",
 			indexPath: "/rounds/index.csv",
+			hostname: "test-host",
 			dryRun: false,
 			stdout,
 			stderr,
@@ -305,6 +332,7 @@ describe("fix-round-tool-ids", () => {
 			sessionsDir: "/sessions",
 			roundsDir: "/rounds",
 			indexPath: "/rounds/index.csv",
+			hostname: "test-host",
 			dryRun: true,
 			stdout,
 			stderr,
@@ -314,8 +342,9 @@ describe("fix-round-tool-ids", () => {
 		// Broken file must still exist
 		expect(files[`/rounds/${oldHash}`]).toBeDefined();
 
-		// Index must be unchanged
+		// Index must be unchanged — a dry run claims nothing and writes nothing.
 		expect(files["/rounds/index.csv"]).toContain(oldHash);
+		expect(files["/rounds/index.test-host"]).toBeUndefined();
 
 		// Should log dry-run message
 		const joinedLogs = logs.join(" ");
@@ -376,10 +405,11 @@ describe("fix-round-tool-ids", () => {
 		files["/rounds/index.csv"] = `base64vector,${oldHash}:prompt,test-model\n`;
 
 		const fsImpl = makeFS(files) as unknown as typeof fs;
-		// Fail only the atomic tmp write (the corrected round file), not the in-place index write.
+		// Fail only the atomic tmp write of the corrected round file, not the
+		// (also atomic) index publish.
 		const inner = fsImpl.writeFileSync.bind(fsImpl);
 		(fsImpl as { writeFileSync: (p: string, data: string) => void }).writeFileSync = (p, data) => {
-			if (p.includes(".tmp.")) throw new Error("disk full");
+			if (p.includes(".json.tmp.")) throw new Error("disk full");
 			inner(p, data);
 		};
 		const stdout = { log: () => {} } as Pick<typeof console, "log">;
@@ -390,6 +420,7 @@ describe("fix-round-tool-ids", () => {
 			sessionsDir: "/sessions",
 			roundsDir: "/rounds",
 			indexPath: "/rounds/index.csv",
+			hostname: "test-host",
 			dryRun: false,
 			stdout,
 			stderr,
@@ -412,6 +443,6 @@ describe("fix-round-tool-ids", () => {
 		// Pre-existing ordering: index migration runs before the round-file write,
 		// so a failed tmp write leaves the index already migrated (unit scope is the
 		// atomic round write + write-new-then-delete-old, not index reordering).
-		expect(files["/rounds/index.csv"]).not.toContain(oldHash);
+		expect(files["/rounds/index.test-host"]).not.toContain(oldHash);
 	});
 });

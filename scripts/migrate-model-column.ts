@@ -18,8 +18,15 @@
  */
 
 import * as fs from "node:fs";
+import * as path from "node:path";
 import { pathToFileURL } from "node:url";
-import { resolveScriptConfig, type ScriptConfigOptions } from "../lib/script-config.ts";
+import { LEGACY_INDEX_FILENAME } from "../lib/index-shards.ts";
+import {
+	reportForeignShards,
+	resolveScriptConfig,
+	resolveScriptIndexContext,
+	type ScriptConfigOptions,
+} from "../lib/script-config.ts";
 
 // ─────────────────────────────────────────────
 // Config
@@ -56,6 +63,8 @@ export interface MigrateModelColumnOptions extends ScriptConfigOptions {
 	indexPath?: string;
 	dryRun?: boolean;
 	backup?: boolean;
+	/** Hostname override for tests; defaults to os.hostname(). */
+	hostname?: string;
 	stdout?: Pick<typeof console, "log">;
 	stderr?: Pick<typeof console, "error" | "warn">;
 }
@@ -66,19 +75,29 @@ export function runModelColumnMigration(options: MigrateModelColumnOptions = {})
 	const model = config.embeddingModel;
 	const out = options.stdout ?? console;
 	const err = options.stderr ?? console;
+	// Issue #149: the index is a set of per-host shards. The migration rewrites
+	// this host's own shard only (D-005) — a foreign shard keeps its rows and
+	// is updated when that host runs this script.
+	const index = resolveScriptIndexContext(config, config.roundsDir, indexPath, { hostname: options.hostname });
 
-	if (!fs.existsSync(indexPath)) {
+	const foreignShards = index.foreignShards();
+	const legacyPath = path.join(index.shardRoot, LEGACY_INDEX_FILENAME);
+	const hasIndexArtifact = fs.existsSync(index.ownShardPath) || fs.existsSync(legacyPath);
+	if (!hasIndexArtifact && foreignShards.length === 0) {
 		err.error(`❌ Index file not found: ${indexPath}`);
 		return 1;
 	}
 
-	const raw = fs.readFileSync(indexPath, "utf-8").trim();
-	if (!raw) {
-		out.log("ℹ Index file is empty. Nothing to migrate.");
+	const lines = index.readRewriteRows();
+	if (lines.length === 0) {
+		out.log(
+			hasIndexArtifact
+				? "ℹ Index file is empty. Nothing to migrate."
+				: "ℹ This host's shard holds no rows. Nothing to migrate.",
+		);
+		reportForeignShards(index, out);
 		return 0;
 	}
-
-	const lines = raw.split("\n");
 	const migrated: number[] = [];
 
 	for (let i = 0; i < lines.length; i++) {
@@ -108,18 +127,26 @@ export function runModelColumnMigration(options: MigrateModelColumnOptions = {})
 
 	// Create backup if requested
 	if (options.backup) {
-		const backupPath = `${indexPath}.bak.${Date.now()}`;
-		fs.copyFileSync(indexPath, backupPath);
-		out.log(`\n💾 Backup saved to: ${backupPath}`);
+		// Claim the legacy `index.csv` first so the backup covers the rows the
+		// migration publishes; the backup name is excluded from shard discovery.
+		index.adopt();
+		if (fs.existsSync(index.ownShardPath)) {
+			const backupPath = `${index.ownShardPath}.bak.${Date.now()}`;
+			fs.copyFileSync(index.ownShardPath, backupPath);
+			out.log(`\n💾 Backup saved to: ${backupPath}`);
+		}
 	}
 
 	// Apply migration
 	for (const idx of migrated) {
 		lines[idx] = addModelColumn(lines[idx], model);
 	}
-	fs.writeFileSync(indexPath, `${lines.join("\n")}\n`);
+	// Issue #149: publish to the host's own shard (atomic tmp+rename); a
+	// foreign shard is never rewritten here (D-005).
+	index.writeOwnLines(lines);
 
 	out.log(`\n✅ Done. ${migrated.length} entries migrated.`);
+	reportForeignShards(index, out);
 	return 0;
 }
 

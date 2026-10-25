@@ -117,4 +117,24 @@ describe("resolveScriptIndexContext", () => {
 		expect(index.foreignShardsReferencing("old.json")).toHaveLength(1);
 		expect(index.foreignShardsReferencing("other.json")).toHaveLength(0);
 	});
+
+	it("counts the rewrite rows of the own shard plus the claimable legacy file", () => {
+		fs.writeFileSync(path.join(roundsDir, "index.csv"), `${encodeVectorIndexLine([1], "legacy.json:prompt")}\n`);
+		const index = resolveScriptIndexContext(config, roundsDir, undefined, { hostname: "host-a" });
+
+		// The legacy file is this host's rows until the write claims it.
+		expect(index.readRewriteRows()).toHaveLength(1);
+		expect(index.readOwnLines()).toHaveLength(0);
+		// A claimable legacy file is not a foreign shard.
+		expect(index.foreignShards()).toEqual([]);
+	});
+
+	it("reports the foreign shards and the round files they reference", () => {
+		fs.writeFileSync(path.join(roundsDir, "index.host-b"), `${encodeVectorIndexLine([2], "b.json:prompt")}\n`);
+		const index = resolveScriptIndexContext(config, roundsDir, undefined, { hostname: "host-a" });
+
+		expect(index.foreignShards().map((shard) => path.basename(shard.shardPath))).toEqual(["index.host-b"]);
+		expect(index.foreignShards()[0].rows).toBe(1);
+		expect([...index.foreignReferencedFiles()]).toEqual(["b.json"]);
+	});
 });

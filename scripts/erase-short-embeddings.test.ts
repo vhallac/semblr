@@ -6,6 +6,14 @@ import { readIndexLines } from "../lib/index-io.ts";
 import { runEraseShortEmbeddings } from "./erase-short-embeddings.ts";
 
 describe("erase-short-embeddings", () => {
+	// Issue #149: the index is a set of per-host shards; this host rewrites
+	// its own shard (`index.<hostname>`) only.
+	const HOST = "test-host";
+
+	function shardPath(roundsDir: string): string {
+		return path.join(roundsDir, `index.${HOST}`);
+	}
+
 	function makeTempDir() {
 		const dir = fs.mkdtempSync(path.join(os.tmpdir(), "semblr-erase-test-"));
 		return dir;
@@ -28,7 +36,7 @@ describe("erase-short-embeddings", () => {
 	}
 
 	function createIndexFile(roundsDir: string, entries: Array<{ roundFile: string; suffix: string }>) {
-		const indexPath = path.join(roundsDir, "index.csv");
+		const indexPath = shardPath(roundsDir);
 		const lines = entries.map(
 			(e) => `${Buffer.from(JSON.stringify([0.1, 0.2])).toString("base64url")},${e.roundFile}:${e.suffix}`,
 		);
@@ -56,7 +64,7 @@ describe("erase-short-embeddings", () => {
 			{ roundFile: "short1.json", suffix: "response" },
 		]);
 
-		const exitCode = runEraseShortEmbeddings({ roundsDir: dir, indexPath });
+		const exitCode = runEraseShortEmbeddings({ roundsDir: dir, indexPath, hostname: HOST });
 		expect(exitCode).toBe(0);
 
 		// Verify index: short entries should be removed
@@ -78,10 +86,10 @@ describe("erase-short-embeddings", () => {
 
 	it("handles empty index gracefully", () => {
 		const dir = makeTempDir();
-		const indexPath = path.join(dir, "index.csv");
+		const indexPath = shardPath(dir);
 		fs.writeFileSync(indexPath, "");
 
-		const exitCode = runEraseShortEmbeddings({ roundsDir: dir, indexPath });
+		const exitCode = runEraseShortEmbeddings({ roundsDir: dir, indexPath, hostname: HOST });
 		expect(exitCode).toBe(0);
 
 		fs.rmSync(dir, { recursive: true, force: true });
@@ -108,7 +116,7 @@ describe("erase-short-embeddings", () => {
 			{ roundFile: "short1.json", suffix: "prompt" },
 		]);
 
-		const exitCode = runEraseShortEmbeddings({ roundsDir: dir, indexPath, minWords: 10 });
+		const exitCode = runEraseShortEmbeddings({ roundsDir: dir, indexPath, minWords: 10, hostname: HOST });
 		expect(exitCode).toBe(0);
 
 		const retained = readIndexLines(indexPath);
@@ -127,7 +135,7 @@ describe("erase-short-embeddings", () => {
 		createRoundFile(dir, "short1.json", "yes");
 		const indexPath = createIndexFile(dir, [{ roundFile: "short1.json", suffix: "prompt" }]);
 
-		const exitCode = runEraseShortEmbeddings({ roundsDir: dir, indexPath, args: ["--dry-run"] });
+		const exitCode = runEraseShortEmbeddings({ roundsDir: dir, indexPath, args: ["--dry-run"], hostname: HOST });
 		expect(exitCode).toBe(0);
 
 		// Index should be unchanged
@@ -160,12 +168,53 @@ describe("erase-short-embeddings", () => {
 			{ roundFile: "long2.json", suffix: "prompt" },
 		]);
 
-		const exitCode = runEraseShortEmbeddings({ roundsDir: dir, indexPath });
+		const exitCode = runEraseShortEmbeddings({ roundsDir: dir, indexPath, hostname: HOST });
 		expect(exitCode).toBe(0);
 
 		// Index should be unchanged
 		const retained = readIndexLines(indexPath);
 		expect(retained).toHaveLength(2);
+
+		fs.rmSync(dir, { recursive: true, force: true });
+	});
+
+	it("claims a legacy index.csv, rewrites only the own shard, and leaves a foreign shard byte-identical", () => {
+		const dir = makeTempDir();
+		createRoundFile(dir, "short1.json", "yes");
+		createRoundFile(
+			dir,
+			"long1.json",
+			"this is a very clearly long prompt with more than enough words to completely pass the minimum threshold test for short embedding detection purposes",
+		);
+		// Legacy index (claimed by rename on the first write) plus a foreign shard.
+		const legacyPath = path.join(dir, "index.csv");
+		fs.writeFileSync(
+			legacyPath,
+			`${Buffer.from(JSON.stringify([0.1, 0.2])).toString("base64url")},short1.json:prompt\n`,
+		);
+		const foreignPath = path.join(dir, "index.host-b");
+		fs.writeFileSync(
+			foreignPath,
+			`${Buffer.from(JSON.stringify([0.3, 0.4])).toString("base64url")},short1.json:prompt\n`,
+		);
+		const foreignBefore = fs.readFileSync(foreignPath, "utf-8");
+
+		const exitCode = runEraseShortEmbeddings({
+			roundsDir: dir,
+			indexPath: legacyPath,
+			hostname: HOST,
+			stdout: { log: () => {}, error: () => {} },
+		});
+		expect(exitCode).toBe(0);
+
+		// The legacy file was claimed by rename; its rows now live in the own shard.
+		expect(fs.existsSync(legacyPath)).toBe(false);
+		expect(readIndexLines(shardPath(dir))).toEqual([]);
+		// The foreign shard is byte-identical — this host never rewrites it.
+		expect(fs.readFileSync(foreignPath, "utf-8")).toBe(foreignBefore);
+		// The shared round file is kept while a foreign shard references it.
+		const shortData = JSON.parse(fs.readFileSync(path.join(dir, "short1.json"), "utf-8"));
+		expect(shortData.promptEmbedding).toEqual([0.1, 0.2, 0.3]);
 
 		fs.rmSync(dir, { recursive: true, force: true });
 	});

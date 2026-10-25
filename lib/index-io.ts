@@ -422,12 +422,22 @@ export function indexEntryFilename(line: string): string | null {
 }
 
 export function readIndexByFilename(indexPath: string): Map<string, string[]> {
+	return indexLinesByFilename(readIndexLines(indexPath));
+}
+
+/**
+ * Group index lines by the round file they reference. Works on an in-memory
+ * line set so a caller can group the rows of one shard without re-reading a
+ * file (issue #149: a rewrite operates on the host's own shard's rows).
+ */
+export function indexLinesByFilename(lines: string[]): Map<string, string[]> {
 	const index = new Map<string, string[]>();
-	for (const line of readIndexLines(indexPath)) {
+	for (const line of lines) {
 		const filename = indexEntryFilename(line);
 		if (!filename) continue;
-		if (!index.has(filename)) index.set(filename, []);
-		index.get(filename)?.push(line);
+		const bucket = index.get(filename) ?? [];
+		bucket.push(line);
+		index.set(filename, bucket);
 	}
 	return index;
 }

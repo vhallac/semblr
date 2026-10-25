@@ -15,17 +15,17 @@
  */
 
 import * as fs from "node:fs";
+import * as path from "node:path";
 import { pathToFileURL } from "node:url";
 import { type AtomicWriteFs, atomicWriteFileSync } from "../lib/atomic-write.ts";
 import { computeContentHash } from "../lib/hash.ts";
+import { filterIndexLinesExcludingFilenames, indexLinesByFilename, replaceIndexLineFilename } from "../lib/index-io.ts";
 import {
-	filterIndexLinesExcludingFilenames,
-	readIndexByFilename,
-	readIndexLines,
-	replaceIndexLineFilename,
-	writeIndexLines,
-} from "../lib/index-io.ts";
-import { resolveScriptConfig, resolveScriptIndexPath, type ScriptConfigOptions } from "../lib/script-config.ts";
+	reportForeignShards,
+	resolveScriptConfig,
+	resolveScriptIndexContext,
+	type ScriptConfigOptions,
+} from "../lib/script-config.ts";
 
 // ─────────────────────────────────────────────
 // Config
@@ -61,6 +61,8 @@ export interface ContentHashMigrationOptions extends ScriptConfigOptions {
 	roundsDir?: string;
 	indexPath?: string;
 	now?: () => number;
+	/** Hostname override for tests; defaults to os.hostname(). */
+	hostname?: string;
 	stdout?: Pick<typeof console, "log">;
 	stderr?: Pick<typeof console, "error">;
 	fsImpl?: AtomicWriteFs;
@@ -76,7 +78,12 @@ export function runContentHashMigration(options: ContentHashMigrationOptions = {
 	const doBackup = args.includes("--backup");
 	const config = resolveScriptConfig(options);
 	const roundsDir = options.roundsDir ?? config.roundsDir;
-	const indexPath = resolveScriptIndexPath(config, roundsDir, options.indexPath);
+	// Issue #149: the index is a set of per-host shards. The rename migration
+	// rewrites this host's own shard only (D-005) — a foreign shard keeps its
+	// rows and is updated when that host runs this script.
+	const index = resolveScriptIndexContext(config, roundsDir, options.indexPath, {
+		hostname: options.hostname,
+	});
 	const out = options.stdout ?? console;
 	const err = options.stderr ?? console;
 
@@ -93,9 +100,11 @@ export function runContentHashMigration(options: ContentHashMigrationOptions = {
 
 	out.log(`Found ${files.length} round files in ${roundsDir}`);
 
-	// Read index
-	const indexMap = readIndexByFilename(indexPath);
-	out.log(`Found ${indexMap.size} unique filenames in index.csv`);
+	// Read the index rows of this host's own shard (the legacy `index.csv` is
+	// claimed by the write below, so its rows count as ours).
+	const indexRows = index.readRewriteRows();
+	const indexMap = indexLinesByFilename(indexRows);
+	out.log(`Found ${indexMap.size} unique filenames in ${index.ownShardPath}`);
 
 	// Backup
 	if (doBackup && !dryRun) {
@@ -106,6 +115,9 @@ export function runContentHashMigration(options: ContentHashMigrationOptions = {
 
 	// Process rounds
 	const indexUpdates: string[] = [];
+	// Round files a foreign shard still references — renaming them here would
+	// leave the other host's rows dangling (issue #149, D-005).
+	const foreignReferenced = index.foreignReferencedFiles();
 	let renamed = 0;
 	const _skipped = 0;
 	let errors = 0;
@@ -143,6 +155,15 @@ export function runContentHashMigration(options: ContentHashMigrationOptions = {
 					out.log(`  ~ would update id field: ${filename}`);
 				}
 			}
+			hashUnchanged++;
+			continue;
+		}
+
+		// A foreign shard may still hold rows for this round file: renaming it
+		// would leave those rows dangling. Keep the file and report it — the
+		// other host performs the rename when it runs this script.
+		if (!dryRun && foreignReferenced.has(filename)) {
+			out.log(`  ⚠️  Round file kept (referenced by another host's shard): ${filename}`);
 			hashUnchanged++;
 			continue;
 		}
@@ -185,11 +206,13 @@ export function runContentHashMigration(options: ContentHashMigrationOptions = {
 			// oldRenamedFilenames was populated in the rename loop above
 
 			// Read all entries, filter out old renamed ones, add new ones
-			const retained = filterIndexLinesExcludingFilenames(readIndexLines(indexPath), oldRenamedFilenames);
-			writeIndexLines(indexPath, [...retained, ...indexUpdates]);
-			out.log(`✓ Updated index.csv (${indexUpdates.length} entries rewritten)`);
+			const retained = filterIndexLinesExcludingFilenames(indexRows, oldRenamedFilenames);
+			// Issue #149: publish to the host's own shard (atomic tmp+rename);
+			// a foreign shard is never rewritten here (D-005).
+			index.writeOwnLines([...retained, ...indexUpdates]);
+			out.log(`✓ Updated ${path.basename(index.ownShardPath)} (${indexUpdates.length} entries rewritten)`);
 		} else {
-			out.log(`~ Would update index.csv (${indexUpdates.length} entries)`);
+			out.log(`~ Would update ${path.basename(index.ownShardPath)} (${indexUpdates.length} entries)`);
 		}
 	}
 
@@ -201,6 +224,9 @@ export function runContentHashMigration(options: ContentHashMigrationOptions = {
 	out.log(`Renamed:           ${renamed}`);
 	out.log(`Skipped (errors):  ${errors}`);
 	out.log(`Dry run:           ${dryRun ? "yes" : "no"}`);
+
+	reportForeignShards(index, out);
+
 	return errors > 0 ? 1 : 0;
 }
 

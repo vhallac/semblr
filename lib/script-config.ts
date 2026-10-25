@@ -14,7 +14,7 @@ import {
 	type VectorIndexEntry,
 	writeIndexLinesAtomic,
 } from "./index-io.ts";
-import { adoptOwnShard, discoverIndexShards, ownShardPath } from "./index-shards.ts";
+import { adoptOwnShard, discoverIndexShards, LEGACY_INDEX_FILENAME, ownShardPath } from "./index-shards.ts";
 import { appendIndexRowToShards } from "./index-storage.ts";
 import { loadSemblrConfig, type SemblrConfig, type SemblrConfigDeps } from "./semblr-config.ts";
 
@@ -69,6 +69,16 @@ export interface ScriptIndexContext {
 	readMergedEntries(): VectorIndexEntry[];
 	/** The host's own shard's lines only. */
 	readOwnLines(): string[];
+	/**
+	 * The rows a wholesale rewrite operates on: the own shard's rows plus the
+	 * legacy `index.csv` rows the write would claim by rename. Read-only — the
+	 * claim happens in {@link writeOwnLines}.
+	 */
+	readRewriteRows(): string[];
+	/** Foreign shards (never rewritten by this host) with their row counts. */
+	foreignShards(): Array<{ shardPath: string; rows: number }>;
+	/** Round files a foreign shard still references (the own shard excluded). */
+	foreignReferencedFiles(): Set<string>;
 	/** Claim a legacy headerless `index.csv` (atomic rename) — returns the own shard path. */
 	adopt(): string;
 	/** Wholesale rewrite of the own shard (atomic tmp+rename). */
@@ -96,7 +106,12 @@ export function resolveScriptIndexContext(
 	const resolvedIndexPath = resolveScriptIndexPath(config, roundsDir, indexPath);
 	const shardRoot = path.dirname(resolvedIndexPath);
 	const own = ownShardPath(shardRoot, deps.hostname);
+	const legacyPath = path.join(shardRoot, LEGACY_INDEX_FILENAME);
 	const discover = (): string[] => discoverIndexShards(shardRoot, fsImpl);
+	// The legacy `index.csv` belongs to this host while it can still claim it
+	// (no shard of its own yet): the write renames it into the own shard, so
+	// its rows are this host's rows — not a foreign shard's.
+	const legacyClaimable = (): boolean => !fsImpl.existsSync(own) && fsImpl.existsSync(legacyPath);
 
 	return {
 		shardRoot,
@@ -119,8 +134,38 @@ export function resolveScriptIndexContext(
 		},
 		readMergedEntries: () => loadShardVectorIndex(shardRoot, { shards: discover(), fsImpl }),
 		readOwnLines: () => readIndexLines(own, fsImpl),
+		readRewriteRows: () => {
+			const ownRows = readIndexLines(own, fsImpl);
+			// The legacy file is claimed by the write (rename) only when the host
+			// has no shard of its own; otherwise it stays a separate shard and
+			// its rows are not part of this host's rewrite.
+			if (legacyClaimable()) {
+				return [...ownRows, ...readIndexLines(legacyPath, fsImpl)];
+			}
+			return ownRows;
+		},
+		foreignShards: () =>
+			discover()
+				.filter((shardPath) => shardPath !== own)
+				.filter((shardPath) => !(shardPath === legacyPath && legacyClaimable()))
+				.map((shardPath) => ({ shardPath, rows: readIndexLines(shardPath, fsImpl).length })),
+		foreignReferencedFiles: () => {
+			const files = new Set<string>();
+			for (const shardPath of discover()) {
+				if (shardPath === own) continue;
+				if (shardPath === legacyPath && legacyClaimable()) continue;
+				for (const line of readIndexLines(shardPath, fsImpl)) {
+					const entryFile = indexEntryFilename(line);
+					if (entryFile !== null) files.add(path.basename(entryFile));
+				}
+			}
+			return files;
+		},
 		adopt: () => adoptOwnShard(shardRoot, { fsImpl, hostname: deps.hostname }).shardPath,
 		writeOwnLines: (lines) => {
+			// Nothing to publish and no index artifact of our own (no own
+			// shard, no legacy file) — do not create an empty shard file.
+			if (lines.length === 0 && !fsImpl.existsSync(own) && !fsImpl.existsSync(legacyPath)) return;
 			// Claim a legacy `index.csv` first so its rows are part of the
 			// rewritten shard instead of being stranded in a legacy file.
 			adoptOwnShard(shardRoot, { fsImpl, hostname: deps.hostname });
@@ -145,6 +190,24 @@ export function resolveScriptIndexContext(
 					}),
 				),
 	};
+}
+
+/**
+ * One-line notice naming the foreign shards a rewrite left untouched
+ * (issue #149, D-005): a wholesale rewrite touches the host's own shard
+ * only, so the rows another host holds are updated when that host runs the
+ * same script.
+ */
+export function foreignShardNotice(shards: Array<{ shardPath: string; rows: number }>): string {
+	if (shards.length === 0) return "";
+	const summary = shards.map((shard) => `${path.basename(shard.shardPath)} (${shard.rows} rows)`).join(", ");
+	return `Foreign shards left untouched: ${summary} — run this script on that host to update them.`;
+}
+
+/** Log the foreign shards this host left untouched; no-op when there are none. */
+export function reportForeignShards(index: ScriptIndexContext, out: Pick<typeof console, "log">): void {
+	const notice = foreignShardNotice(index.foreignShards());
+	if (notice) out.log(notice);
 }
 
 export function resolveScriptModelRegistry(
