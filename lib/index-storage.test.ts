@@ -8,14 +8,55 @@ import {
 	appendToIndexPath,
 	buildSessionStartStatus,
 	countIndexLines,
+	countShardLines,
 	countUniqueIndexedRounds,
 	type IndexEntry,
 	loadIndexFromPath,
+	loadIndexFromShards,
 	loadSessionStartIndex,
 } from "./index-storage.ts";
 
 /** Chunk size small enough to force multi-chunk reads in tests. */
 const TINY_CHUNK = 16;
+
+const warnings: string[] = [];
+
+describe("merged shard reads (#149)", () => {
+	let tempDir = "";
+
+	beforeEach(() => {
+		tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "semblr-shard-reads-"));
+	});
+
+	afterEach(() => {
+		fs.rmSync(tempDir, { recursive: true, force: true });
+	});
+
+	const writeShard = (shard: string, lines: string[]) =>
+		fs.writeFileSync(path.join(tempDir, shard), lines.join("\n") + "\n");
+
+	it("loads entries from all shards in sorted order; empty dir and empty set yield empty", () => {
+		expect(loadIndexFromShards(tempDir)).toEqual([]); // empty shard set
+		writeShard("index.host-b", [
+			"bm90LWpzb24=,b.json:prompt", // corrupt: decodes to non-JSON
+			"W1swLjVdXQ==,b.json:prompt", // valid: [[0.5]]
+		]);
+		writeShard("index.host-a", ["W1sxXV0=,a.json:prompt,m1"]);
+		writeShard("index.csv", ["W1syXV0=,legacy.json:prompt"]);
+		fs.writeFileSync(path.join(tempDir, "index.host-b.lock"), "held"); // excluded artifact
+
+		const entries = loadIndexFromShards(tempDir, { warn: (message) => warnings.push(message) });
+		expect(entries.map((entry) => entry.filePath)).toEqual(["legacy.json:prompt", "a.json:prompt", "b.json:prompt"]);
+		expect(warnings).toHaveLength(1);
+		expect(warnings[0]).toContain(path.join(tempDir, "index.host-b"));
+		expect(countShardLines(tempDir)).toBe(4); // includes the corrupt row (line-level count)
+	});
+
+	it("tolerates a missing rounds dir", () => {
+		expect(loadIndexFromShards(path.join(tempDir, "nope"))).toEqual([]);
+		expect(countShardLines(path.join(tempDir, "nope"))).toBe(0);
+	});
+});
 
 describe("loadIndexFromPath", () => {
 	let tempDir = "";

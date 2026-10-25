@@ -13,7 +13,10 @@ import {
 	indexEntryFilename,
 	indexRoundFileFromPath,
 	loadIndexedRoundFiles,
+	loadIndexedRoundFilesSharded,
 	loadRoundFilesWithDifferentModel,
+	loadRoundFilesWithDifferentModelSharded,
+	loadShardVectorIndex,
 	loadVectorIndex,
 	makeAssumedStamp,
 	migrateIndexEntries,
@@ -213,6 +216,66 @@ describe("4th-column embedding-input hash (issue #106 re-embed migration)", () =
 		]);
 
 		expect(loadRoundFilesWithDifferentModel(indexPath(), "current-model")).toEqual(new Set(["different.json"]));
+	});
+
+	describe("merged shard reads (#149)", () => {
+		const writeShard = (shard: string, lines: string[]) =>
+			fs.writeFileSync(path.join(tempDir, shard), lines.join("\n") + "\n");
+
+		it("merges rows from all discovered shards in sorted shard order", () => {
+			writeShard("index.csv", [encodeVectorIndexLine([1], "legacy.json:prompt")]);
+			writeShard("index.host-b", [encodeVectorIndexLine([2], "b.json:prompt")]);
+			writeShard("index.host-a", [encodeVectorIndexLine([3], "a.json:prompt")]);
+			fs.writeFileSync(path.join(tempDir, "index.bm25.json"), "{}");
+			fs.writeFileSync(path.join(tempDir, "index-tools.fulltext.csv"), "x");
+
+			expect(loadShardVectorIndex(tempDir)).toEqual([
+				{ vector: [1], filePath: "legacy.json:prompt" }, // "index.csv" sorts before "index.host-*"
+				{ vector: [3], filePath: "a.json:prompt" },
+				{ vector: [2], filePath: "b.json:prompt" },
+			]); // legacy index.csv read until adopted
+			expect(loadIndexedRoundFilesSharded(tempDir)).toEqual(new Set(["legacy.json", "b.json", "a.json"]));
+			expect(loadRoundFilesWithDifferentModelSharded(tempDir, "m2", {})).toEqual(new Set());
+			expect(loadRoundFilesWithDifferentModelSharded(tempDir, "current", {})).toEqual(new Set());
+			writeShard("index.host-b", [encodeVectorIndexLine([2], "b.json:prompt", "old-model")]);
+			expect(loadRoundFilesWithDifferentModelSharded(tempDir, "current")).toEqual(new Set(["b.json"]));
+		});
+
+		it("tolerates a missing rounds dir and an empty shard set", () => {
+			const missing = path.join(tempDir, "nope");
+			expect(loadShardVectorIndex(missing)).toEqual([]);
+			expect(loadIndexedRoundFilesSharded(missing)).toEqual(new Set());
+			expect(loadRoundFilesWithDifferentModelSharded(missing, "m")).toEqual(new Set());
+			expect(loadShardVectorIndex(tempDir)).toEqual([]);
+		});
+
+		it("skips corrupt rows with a warning naming the shard file", () => {
+			writeShard("index.host-a", [
+				encodeVectorIndexLine([1], "good.json:prompt"),
+				"!!!not-base64!!!,corrupt.json:prompt",
+				"bm90LXZhbGlkLWpzb24=,partial.json:prompt", // decodes to non-JSON
+			]);
+			const warnings: string[] = [];
+			const entries = loadShardVectorIndex(tempDir, {
+				warn: (message) => warnings.push(message),
+			});
+
+			expect(entries).toEqual([{ vector: [1], filePath: "good.json:prompt" }]);
+			expect(warnings).toHaveLength(2);
+			for (const warning of warnings) {
+				expect(warning).toContain(path.join(tempDir, "index.host-a"));
+			}
+		});
+
+		it("honors an explicit shard list", () => {
+			writeShard("index.host-a", [encodeVectorIndexLine([1], "a.json:prompt")]);
+			writeShard("index.host-b", [encodeVectorIndexLine([2], "b.json:prompt")]);
+			const onlyB = path.join(tempDir, "index.host-b");
+
+			expect(loadShardVectorIndex(tempDir, { shards: [onlyB] })).toEqual([
+				{ vector: [2], filePath: "b.json:prompt" },
+			]);
+		});
 	});
 });
 

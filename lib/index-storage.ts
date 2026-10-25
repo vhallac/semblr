@@ -4,8 +4,11 @@ import {
 	INDEX_CHUNK_BYTES,
 	type IndexReadFs,
 	indexRoundFileFromPath,
+	loadShardVectorIndex,
+	type ShardedReadOptions,
 	splitVectorIndexMetadata,
 } from "./index-io.ts";
+import { discoverIndexShards } from "./index-shards.ts";
 
 export interface IndexEntry {
 	filePath: string;
@@ -31,6 +34,63 @@ function parseIndexLine(line: string): IndexEntry | null {
 	if (model !== undefined) entry.model = model;
 	if (embeddingInputHash !== undefined) entry.embeddingInputHash = embeddingInputHash;
 	return entry;
+}
+
+/**
+ * Shard-set variant of {@link loadIndexFromPath} (merged view, issue #149):
+ * `indexPath` is the *rounds directory*; every discovered shard is parsed in
+ * deterministic (sorted) order. Missing dir / empty shard set → empty result.
+ * Corrupt lines (bad base64/JSON, partial writes) are skipped with a warning
+ * naming the shard file.
+ */
+export function loadIndexFromShards(
+	roundsDir: string,
+	opts: ShardedReadOptions = {},
+	chunkSize: number = INDEX_CHUNK_BYTES,
+): IndexEntry[] {
+	const warn = opts.warn ?? console.warn;
+	const entries: IndexEntry[] = [];
+	for (const shardPath of opts.shards ?? discoverIndexShards(roundsDir)) {
+		forEachIndexLine(
+			shardPath,
+			fs,
+			(line) => {
+				try {
+					const entry = parseIndexLine(line);
+					if (entry !== null) entries.push(entry);
+				} catch (reason) {
+					warn(
+						`Skipping corrupt index row in ${shardPath}: ${reason instanceof Error ? reason.message : String(reason)}`,
+					);
+				}
+			},
+			chunkSize,
+		);
+	}
+	return entries;
+}
+
+/**
+ * Shard-set variant of {@link countIndexLines} (merged view): count
+ * non-empty rows across every discovered shard.
+ */
+export function countShardLines(
+	roundsDir: string,
+	opts: ShardedReadOptions = {},
+	chunkSize: number = INDEX_CHUNK_BYTES,
+): number {
+	let count = 0;
+	for (const shardPath of opts.shards ?? discoverIndexShards(roundsDir)) {
+		forEachIndexLine(
+			shardPath,
+			fs,
+			() => {
+				count++;
+			},
+			chunkSize,
+		);
+	}
+	return count;
 }
 
 /**

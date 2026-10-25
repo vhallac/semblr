@@ -1,6 +1,7 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { computeContentHash, type HashToolCallDetail } from "./hash.ts";
+import { discoverIndexShards } from "./index-shards.ts";
 
 export interface VectorIndexEntry {
 	vector: number[];
@@ -197,6 +198,67 @@ export function appendVectorIndexEntry(
 	fs.appendFileSync(indexPath, `${encodeVectorIndexLine(vector, filePath, model, embeddingInputHash)}\n`);
 }
 
+/**
+ * Options for the merged (shard-set) read APIs: iterating or loading rows
+ * across every shard discovered in a rounds directory (issue #149).
+ */
+export interface ShardedReadOptions {
+	/**
+	 * Explicit shard set; defaults to {@link discoverIndexShards} over
+	 * `indexPath` interpreted as the *rounds directory*. Missing dirs and
+	 * empty shard sets yield no lines and no errors.
+	 */
+	shards?: string[];
+	/** Warn sink for skipped corrupt lines; defaults to console.warn. */
+	warn?: (message: string) => void;
+}
+
+/**
+ * Invoke `onLine` for every non-blank line across the shard set of a rounds
+ * directory (merged view, issue #149). Each corrupt line — bad base64 or a
+ * partial write — is skipped with a warning naming the shard file it came
+ * from; healthy lines of the same shard are unaffected.
+ *
+ * The corrupt-line guard applies only to vector parsing: this helper yields
+ * raw lines, so parse errors are the caller's concern unless it delegates to
+ * the parsing callbacks below.
+ */
+export function forEachShardLine(
+	roundsDir: string,
+	onLine: (line: string, shardPath: string) => void,
+	shards?: string[],
+): void {
+	for (const shardPath of shards ?? discoverIndexShards(roundsDir)) {
+		forEachIndexLine(shardPath, fs, (line) => {
+			onLine(line, shardPath);
+		});
+	}
+}
+
+/**
+ * Shard-set variant of {@link loadVectorIndex}: parse every row across all
+ * shards, skipping corrupt lines (unparseable base64/JSON, partial writes)
+ * with a warning naming the shard file.
+ */
+export function loadShardVectorIndex(roundsDir: string, opts: ShardedReadOptions = {}): VectorIndexEntry[] {
+	const warn = opts.warn ?? console.warn;
+	const entries: VectorIndexEntry[] = [];
+	forEachShardLine(
+		roundsDir,
+		(line, shardPath) => {
+			try {
+				entries.push(parseVectorIndexLine(line));
+			} catch (reason) {
+				warn(
+					`Skipping corrupt index row in ${shardPath}: ${reason instanceof Error ? reason.message : String(reason)}`,
+				);
+			}
+		},
+		opts.shards,
+	);
+	return entries;
+}
+
 export function loadVectorIndex(indexPath: string, fsImpl: IndexReadFs = fs): VectorIndexEntry[] {
 	const entries: VectorIndexEntry[] = [];
 	forEachIndexLine(indexPath, fsImpl, (line) => {
@@ -220,10 +282,29 @@ export function indexRowSuffix(filePath: string): string {
 	return path.basename(filePath).slice(roundFile.length);
 }
 
+/** Shard-set variant of {@link loadIndexedRoundFiles} (merged view). */
+export function loadIndexedRoundFilesSharded(roundsDir: string, opts: ShardedReadOptions = {}): Set<string> {
+	return new Set(
+		loadShardVectorIndex(roundsDir, opts).map((entry) => path.basename(indexRoundFileFromPath(entry.filePath))),
+	);
+}
+
 export function loadIndexedRoundFiles(indexPath: string, fsImpl: IndexReadFs = fs): Set<string> {
 	return new Set(
 		loadVectorIndex(indexPath, fsImpl).map((entry) => path.basename(indexRoundFileFromPath(entry.filePath))),
 	);
+}
+
+/** Shard-set variant of {@link loadRoundFilesWithDifferentModel} (merged view). */
+export function loadRoundFilesWithDifferentModelSharded(
+	roundsDir: string,
+	currentModel: string,
+	opts: ShardedReadOptions = {},
+): Set<string> {
+	const mismatched = loadShardVectorIndex(roundsDir, opts)
+		.filter((entry) => entry.model !== undefined && entry.model !== currentModel)
+		.map((entry) => path.basename(indexRoundFileFromPath(entry.filePath)));
+	return new Set(mismatched);
 }
 
 export function loadRoundFilesWithDifferentModel(
