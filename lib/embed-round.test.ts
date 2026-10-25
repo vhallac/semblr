@@ -90,6 +90,22 @@ describe("classifyRoundCoverage", () => {
 		expect(c.hasStaleReproducibleRow).toBe(true);
 	});
 
+	it("stays covered when a current row exists for the same suffix (a foreign stale row must not force a re-embed)", () => {
+		// Issue #149: under the per-host shard model a stale row may live in a
+		// foreign shard, which this host must never rewrite. Treating that row as
+		// a re-embed trigger would re-embed the round on every sweep and never
+		// converge. A current row for the same suffix means the round is covered.
+		const c = classify(
+			[
+				{ filePath: "r.json:prompt", model: "m" },
+				{ filePath: "r.json:prompt", model: "old" },
+			],
+			"m",
+		);
+		expect(c.covered).toBe(true);
+		expect(c.hasStaleReproducibleRow).toBe(true);
+	});
+
 	it("treats a legacy model-less row as current (issue #62)", () => {
 		expect(classify([{ filePath: "r.json:response" }], "m").covered).toBe(true);
 	});

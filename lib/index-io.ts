@@ -1,7 +1,7 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { computeContentHash, type HashToolCallDetail } from "./hash.ts";
-import { discoverIndexShards } from "./index-shards.ts";
+import { discoverIndexShards, ownShardPath } from "./index-shards.ts";
 
 export interface VectorIndexEntry {
 	vector: number[];
@@ -188,6 +188,35 @@ export function flushVectorIndex(
 	fsImpl.renameSync(tmp, indexPath);
 }
 
+export interface FlushOwnShardDeps {
+	/** Hostname override for tests; defaults to os.hostname(). */
+	hostname?: string;
+	fsImpl?: Pick<typeof fs, "writeFileSync" | "renameSync">;
+}
+
+/**
+ * Flush the host's own shard (issue #149): the rows are written to
+ * `index.<hostname>` inside `roundsDir` (tmp+rename, decision 015). A
+ * wholesale rewrite is always scoped to one shard — the caller passes only the
+ * rows of the host's own shard, and a foreign shard is never rewritten by this
+ * host (D-005). Because the lockfile protocol is per path
+ * (`<shard>.lock`), the short-lock merge model of decision 005 applies per
+ * shard as well.
+ *
+ * The caller must have resolved the own shard's rows *after* any legacy
+ * adoption (the adoption renames `index.csv` to `index.<hostname>`), so the
+ * legacy rows are part of the flushed content.
+ */
+export function flushOwnShardVectorIndex(
+	roundsDir: string,
+	entries: VectorIndexEntry[],
+	deps: FlushOwnShardDeps = {},
+): string {
+	const shardPath = ownShardPath(roundsDir, deps.hostname);
+	flushVectorIndex(shardPath, entries, deps.fsImpl);
+	return shardPath;
+}
+
 export function appendVectorIndexEntry(
 	indexPath: string,
 	vector: number[],
@@ -211,6 +240,12 @@ export interface ShardedReadOptions {
 	shards?: string[];
 	/** Warn sink for skipped corrupt lines; defaults to console.warn. */
 	warn?: (message: string) => void;
+	/**
+	 * fs surface used to read the shards; defaults to node:fs. Injected so a
+	 * caller with its own fs seam (the sweep script) reads the same files the
+	 * rest of the run sees.
+	 */
+	fsImpl?: IndexReadFs;
 }
 
 /**
@@ -227,9 +262,10 @@ export function forEachShardLine(
 	roundsDir: string,
 	onLine: (line: string, shardPath: string) => void,
 	shards?: string[],
+	fsImpl: IndexReadFs = fs,
 ): void {
 	for (const shardPath of shards ?? discoverIndexShards(roundsDir)) {
-		forEachIndexLine(shardPath, fs, (line) => {
+		forEachIndexLine(shardPath, fsImpl, (line) => {
 			onLine(line, shardPath);
 		});
 	}
@@ -255,6 +291,7 @@ export function loadShardVectorIndex(roundsDir: string, opts: ShardedReadOptions
 			}
 		},
 		opts.shards,
+		opts.fsImpl ?? fs,
 	);
 	return entries;
 }
@@ -318,6 +355,13 @@ export function loadRoundFilesWithDifferentModel(
 	return new Set(mismatched);
 }
 
+/**
+ * Replace every row of one round inside a single index file.
+ *
+ * Issue #149: the index is a set of per-host shards, so this operates on one
+ * shard file. A compaction (wholesale rewrite) must pass the host's own shard
+ * — a foreign shard is never rewritten by this host (D-005).
+ */
 export function replaceIndexEntriesForRoundFile(
 	indexPath: string,
 	roundFile: string,

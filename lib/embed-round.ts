@@ -120,15 +120,29 @@ export function classifyRoundCoverage(
 ): RoundCoverage {
 	let hasReproducibleRow = false;
 	let hasStaleReproducibleRow = false;
+	// Issue #149 (D-005/D-006): a stale row only forces a re-embed when the
+	// same label suffix has no current-model row. Under the per-host shard
+	// model a foreign shard's stale row cannot be rewritten by this host, so
+	// treating it as a re-embed trigger would re-embed the round on every
+	// sweep and never converge. A legacy row without a model column counts as
+	// current (issue #62).
+	const currentSuffixes = new Set<string>();
+	const staleSuffixes = new Set<string>();
 	for (const entry of entries) {
-		if (!forcingSuffixes.has(rowSuffix(entry.filePath))) continue;
+		const suffix = rowSuffix(entry.filePath);
+		if (!forcingSuffixes.has(suffix)) continue;
 		hasReproducibleRow = true;
-		if (entry.model !== undefined && entry.model !== currentModel) hasStaleReproducibleRow = true;
+		if (entry.model === undefined || entry.model === currentModel) currentSuffixes.add(suffix);
+		else {
+			hasStaleReproducibleRow = true;
+			staleSuffixes.add(suffix);
+		}
 	}
+	const staleOnly = [...staleSuffixes].some((suffix) => !currentSuffixes.has(suffix));
 	return {
 		hasReproducibleRow,
 		hasStaleReproducibleRow,
-		covered: hasReproducibleRow && !hasStaleReproducibleRow,
+		covered: hasReproducibleRow && !staleOnly,
 	};
 }
 

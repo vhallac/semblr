@@ -10,6 +10,7 @@ import {
 	encodeVectorIndexLine,
 	filterIndexLinesExcludingFilenames,
 	findStaleContentMatches,
+	flushOwnShardVectorIndex,
 	indexEntryFilename,
 	indexRoundFileFromPath,
 	loadIndexedRoundFiles,
@@ -265,6 +266,18 @@ describe("4th-column embedding-input hash (issue #106 re-embed migration)", () =
 			for (const warning of warnings) {
 				expect(warning).toContain(path.join(tempDir, "index.host-a"));
 			}
+		});
+
+		it("flushes a wholesale rewrite to the host's own shard file", () => {
+			const shardPath = flushOwnShardVectorIndex(tempDir, [{ vector: [1], filePath: "a.json:prompt" }], {
+				hostname: "host-a",
+			});
+
+			expect(shardPath).toBe(path.join(tempDir, "index.host-a"));
+			expect(fs.readFileSync(shardPath, "utf-8")).toBe(`${encodeVectorIndexLine([1], "a.json:prompt")}\n`);
+			// A wholesale rewrite never touches the legacy file or a foreign shard.
+			expect(fs.existsSync(path.join(tempDir, "index.csv"))).toBe(false);
+			expect(fs.existsSync(path.join(tempDir, "index.host-b"))).toBe(false);
 		});
 
 		it("honors an explicit shard list", () => {
