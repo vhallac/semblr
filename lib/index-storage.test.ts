@@ -4,6 +4,7 @@ import * as path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
 	acquireIndexLock,
+	appendIndexRowToShards,
 	appendLineWithLock,
 	appendToIndexPath,
 	buildSessionStartStatus,
@@ -277,6 +278,46 @@ describe("buildSessionStartStatus", () => {
 		];
 		const status = buildSessionStartStatus(entries);
 		expect(status).toBe("🧠 semblr loaded — 1 rounds indexed");
+	});
+});
+
+describe("appendIndexRowToShards (#149)", () => {
+	let tempDir = "";
+
+	beforeEach(() => {
+		tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "semblr-shard-append-"));
+	});
+
+	afterEach(() => {
+		fs.rmSync(tempDir, { recursive: true, force: true });
+	});
+
+	it("appends to the host's own shard, adopting a legacy index.csv on first write", () => {
+		fs.writeFileSync(path.join(tempDir, "index.csv"), "existing,row\n");
+		appendIndexRowToShards(tempDir, "rounds/a.json:prompt", [0.1, 0.2], { hostname: "host-a" }, "m1");
+		expect(fs.existsSync(path.join(tempDir, "index.csv"))).toBe(false);
+		const shard = fs.readFileSync(path.join(tempDir, "index.host-a"), "utf-8");
+		expect(shard).toContain("existing,row");
+		expect(shard).toContain("rounds/a.json:prompt");
+	});
+
+	it("appends only to the own shard, leaving foreign shards untouched", () => {
+		fs.writeFileSync(path.join(tempDir, "index.host-b"), "foreign,row\n");
+		appendIndexRowToShards(tempDir, "rounds/a.json:prompt", [0.1], { hostname: "host-a" });
+		expect(fs.readFileSync(path.join(tempDir, "index.host-b"), "utf-8")).toBe("foreign,row\n");
+		expect(fs.readFileSync(path.join(tempDir, "index.host-a"), "utf-8")).toContain("rounds/a.json:prompt");
+	});
+
+	it("creates the rounds dir and a fresh own shard for a first-time host", () => {
+		const fresh = path.join(tempDir, "rounds");
+		appendIndexRowToShards(fresh, "rounds/a.json:prompt", [0.1], { hostname: "host-c" });
+		expect(fs.readdirSync(fresh)).toEqual(["index.host-c"]);
+	});
+
+	it("stamps model and embedding-input-hash columns through the legacy encoder", () => {
+		appendIndexRowToShards(tempDir, "rounds/a.json:prompt", [0.1], { hostname: "host-a" }, "m1", "stamp");
+		const line = fs.readFileSync(path.join(tempDir, "index.host-a"), "utf-8").trim();
+		expect(line.split(",").slice(1)).toEqual(["rounds/a.json:prompt", "m1", "stamp"]);
 	});
 });
 

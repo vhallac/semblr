@@ -49,10 +49,20 @@ export function isIndexShardFilename(filename: string): boolean {
 	return true;
 }
 
-/** fs surface needed for shard discovery and legacy adoption. */
+/**
+ * fs surface needed for shard discovery and legacy adoption. Only the
+ * narrow slice both operations use — so storage-side fs implementations
+ * (which lack `readdirSync`) can be injected without adaptation.
+ */
 export interface IndexShardsFs {
 	existsSync(filePath: string): boolean;
 	readdirSync(filePath: string): string[];
+	renameSync(oldPath: string, newPath: string): void;
+}
+
+/** fs surface needed for legacy adoption alone (no directory listing). */
+export interface AdoptShardFs {
+	existsSync(filePath: string): boolean;
 	renameSync(oldPath: string, newPath: string): void;
 }
 
@@ -81,7 +91,7 @@ export function discoverIndexShards(roundsDir: string, fsImpl: IndexShardsFs = f
 }
 
 export interface AdoptOwnShardDeps {
-	fsImpl?: IndexShardsFs;
+	fsImpl?: AdoptShardFs;
 	hostname?: string;
 }
 

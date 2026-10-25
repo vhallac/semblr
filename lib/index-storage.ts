@@ -4,11 +4,10 @@ import {
 	INDEX_CHUNK_BYTES,
 	type IndexReadFs,
 	indexRoundFileFromPath,
-	loadShardVectorIndex,
 	type ShardedReadOptions,
 	splitVectorIndexMetadata,
 } from "./index-io.ts";
-import { discoverIndexShards } from "./index-shards.ts";
+import { adoptOwnShard, discoverIndexShards } from "./index-shards.ts";
 
 export interface IndexEntry {
 	filePath: string;
@@ -293,4 +292,34 @@ export function appendToIndexPath(
 	if (model !== undefined) parts.push(model);
 	if (embeddingInputHash !== undefined) parts.push(embeddingInputHash);
 	appendLineWithLock(indexPath, roundsDir, `${parts.join(",")}\n`, deps);
+}
+
+export interface AppendIndexRowToShardsDeps {
+	/** Injected fs/lock surface, passed through to the append protocol. */
+	fsImpl?: IndexStorageFs;
+	/** Hostname override for tests; defaults to os.hostname(). */
+	hostname?: string;
+}
+
+/**
+ * Append one labeled vector-index row to the host's own shard
+ * (`index.<hostname>`, issue #149): the first append adopts a legacy
+ * headerless `index.csv` by renaming it to the own shard (Q1 option b),
+ * then the row is appended under the same lockfile protocol as the legacy
+ * single-path append (D-005 — short lock, same acquire/retry/stale
+ * takeover). Rows land in the own shard only; foreign shards are never
+ * touched by a live append.
+ */
+export function appendIndexRowToShards(
+	roundsDir: string,
+	filePath: string,
+	vector: number[],
+	deps: AppendIndexRowToShardsDeps = {},
+	model?: string,
+	embeddingInputHash?: string,
+): void {
+	const { shardPath } = adoptOwnShard(roundsDir, { fsImpl: deps.fsImpl, hostname: deps.hostname });
+	// appendToIndexPath creates the rounds dir itself (mkdir -p inside
+	// appendLineWithLock), so a fresh host with no shard yet gets one.
+	appendToIndexPath(shardPath, roundsDir, filePath, vector, { fsImpl: deps.fsImpl }, model, embeddingInputHash);
 }

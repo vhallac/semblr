@@ -47,8 +47,9 @@ import { embedRound, FORCING_INDEX_SUFFIXES, forcingReproducibleSuffixes } from 
 import { embedText, getApiKey } from "../lib/embedding-client.ts";
 import { assignToGroup, formatGroupStats } from "../lib/grouping.ts";
 import { indexRoundFileFromPath, loadVectorIndex } from "../lib/index-io.ts";
+import { ownShardPath } from "../lib/index-shards.ts";
 import {
-	appendToIndexPath,
+	appendIndexRowToShards,
 	buildSessionStartStatus,
 	type IndexEntry,
 	type IndexReadFs,
@@ -133,7 +134,12 @@ export {
 	startsWithEnvironmentPreamble,
 } from "../lib/context-messages.ts";
 export { embedText, getApiKey } from "../lib/embedding-client.ts";
-export { appendToIndexPath, buildSessionStartStatus, countUniqueIndexedRounds } from "../lib/index-storage.ts";
+export {
+	type AppendIndexRowToShardsDeps,
+	appendIndexRowToShards,
+	buildSessionStartStatus,
+	countUniqueIndexedRounds,
+} from "../lib/index-storage.ts";
 export type {
 	BuildContext,
 	ContextProvider,
@@ -379,7 +385,9 @@ function buildCheckpointContext(fileName: string): string | null {
 const _agentPendingToolCallIds: Map<string, ToolCallDetail> = new Map(); // toolCallId → partial detail
 
 function appendToIndex(filePath: string, vector: number[], model?: string, embeddingInputHash?: string) {
-	appendToIndexPath(INDEX_PATH, ROUNDS_DIR, filePath, vector, {}, model, embeddingInputHash);
+	// Issue #149: live appends land in the host's own shard (index.<hostname>),
+	// adopting a legacy index.csv on first write; foreign shards are untouched.
+	appendIndexRowToShards(ROUNDS_DIR, filePath, vector, {}, model, embeddingInputHash);
 }
 
 let searchBm25Index: ReturnType<typeof loadOrRebuildBm25Index> | null = null;
@@ -1251,7 +1259,9 @@ export default function (pi: ExtensionAPI) {
 						// count and made startup disagree with the `just index` sweep. Load
 						// the index once here and reuse the same entries for the label
 						// guard below.
-						const indexEntries = loadVectorIndex(INDEX_PATH);
+						// Issue #149 (D-006 scope): the label guard consults only the
+						// host's own shard — the post-adoption write surface.
+						const indexEntries = loadVectorIndex(ownShardPath(ROUNDS_DIR));
 						// F2 (PR !141 review): the pending count and the `just index` sweep must
 						// classify a recovered round alike. The sweep derives the *forcing*
 						// suffix set per round from the round file (a short prompt's `:prompt`
