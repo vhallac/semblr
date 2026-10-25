@@ -168,6 +168,23 @@ export function writeIndexLines(indexPath: string, entries: string[]): void {
 }
 
 /**
+ * Write index lines atomically (tmp+rename, decision 015): a crash during
+ * the write leaves the target byte-identical — only a successful rename
+ * publishes the new content. The tmp file is pid-suffixed
+ * (`<target>.tmp.<pid>`) so concurrent runs cannot collide, and the tmp name
+ * is excluded from shard discovery.
+ */
+export function writeIndexLinesAtomic(
+	indexPath: string,
+	entries: string[],
+	fsImpl: Pick<typeof fs, "writeFileSync" | "renameSync"> = fs,
+): void {
+	const tmp = `${indexPath}.tmp.${process.pid}`;
+	fsImpl.writeFileSync(tmp, entries.length > 0 ? `${entries.join("\n")}\n` : "");
+	fsImpl.renameSync(tmp, indexPath);
+}
+
+/**
  * Write the full vector index atomically (tmp+rename, decision 015) from an
  * in-memory entry list. digest-all's batch path (issue #142) buffers all row
  * mutations in memory — appends and model-change replaces — and flushes once

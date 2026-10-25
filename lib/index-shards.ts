@@ -27,8 +27,12 @@ const TOOL_INDEX_FILENAME = "index-tools.fulltext.csv";
 /** BM25 index, sibling artifact — never a shard. */
 const BM25_INDEX_FILENAME = "index.bm25.json";
 
-/** Migration backup prefix — never a shard. */
-const BACKUP_PATTERN = /^index\.csv\.bak\./;
+/**
+ * Migration backup artifacts — never a shard. Covers the legacy
+ * `index.csv.bak.<ts>` form and the `index.<host>.bak.<ts>` /
+ * `index.csv.bak-<ts>` variants the migration scripts write.
+ */
+const BACKUP_PATTERN = /^index\..*\.bak(?:[.-]|$)/;
 
 /** Lockfile protocol artifact (`<shard>.lock`) — never a shard. */
 const LOCK_PATTERN = /^index\..+\.lock$/;

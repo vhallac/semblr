@@ -4,6 +4,7 @@ import * as path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { computeContentHash } from "../lib/hash.ts";
 import { encodeVectorIndexLine, loadVectorIndex, readIndexLines } from "../lib/index-io.ts";
+import { ownShardPath } from "../lib/index-shards.ts";
 import { hashEmbeddingInput } from "../lib/round-capture.ts";
 import { embed, isMainModule, normalize, runDigestSession } from "./digest-session.ts";
 
@@ -79,7 +80,7 @@ describe("digest-session script", () => {
 		const root = tmpDir();
 		const sessionFile = path.join(root, "session.jsonl");
 		const roundsDir = path.join(root, "rounds");
-		const indexPath = path.join(roundsDir, "index.csv");
+		const indexPath = ownShardPath(roundsDir);
 		const userPrompt = `${"p".repeat(8100)}`;
 		const responseSequence = `${"r".repeat(8100)}`;
 		const requests: unknown[] = [];
@@ -170,7 +171,7 @@ describe("digest-session script", () => {
 		expect(fs.existsSync(path.join(configuredRoundsDir, roundFile))).toBe(true);
 		// The prompt is clipped to the configured budget too (issue #107 F4): 6-char
 		// prompt at embeddingMaxTokens 4 → "1234". The response clip is unchanged.
-		expect(loadVectorIndex(path.join(configuredRoundsDir, "index.csv"))).toEqual([
+		expect(loadVectorIndex(ownShardPath(configuredRoundsDir))).toEqual([
 			{
 				vector: [1],
 				filePath: `${roundFile}:prompt`,
@@ -225,7 +226,7 @@ describe("digest-session script", () => {
 		const roundFile = `${computeContentHash("same prompt", "same response", [])}.json`;
 		expect(fs.existsSync(path.join(roundsDir, "legacy.json"))).toBe(false);
 		expect(fs.existsSync(path.join(roundsDir, roundFile))).toBe(true);
-		expect(readIndexLines(indexPath)).toEqual([encodeVectorIndexLine([1], `${roundFile}:prompt`)]);
+		expect(readIndexLines(ownShardPath(roundsDir))).toEqual([encodeVectorIndexLine([1], `${roundFile}:prompt`)]);
 		expect(logs.stdout.join("\n")).toContain(`Migrated stale: legacy.json → ${roundFile}`);
 		expect(logs.stdout.join("\n")).toContain("0 new rounds embedded, 1 already in index");
 		expect(fetchImpl).not.toHaveBeenCalled();
