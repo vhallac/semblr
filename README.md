@@ -25,7 +25,7 @@ Semblr runs as a [pi coding agent](https://pi.dev) extension.
 
 - **[Node.js](https://nodejs.org/)** >= 22 with npm
 - **TypeScript** (`typescript`) — type checking the extension and scripts
-- **Biome** — linting and formatting (installed as the `@biomejs/biome` devDependency; on NixOS an environment-provided binary is used instead — see the NixOS note below)
+- **Biome** — linting and formatting (external dependency, provided by the environment — never installed via npm; see the Biome note below)
 - **`@earendil-works/pi-coding-agent`** — pi SDK types for type checking
 - **`@types/node`** — Node.js type declarations
 
@@ -514,7 +514,9 @@ Configuration:
 - `tsconfig.json` — TypeScript with strict mode, ES2022 target, Node16 modules
 - `biome.json` — Biome linter and formatter (recommended rules, tabs, 120 char width)
 
-> **NixOS note:** The npm-installed Biome binary is dynamically linked and won't run on NixOS. `npm run lint` and `npm run lint:fix` therefore go through `scripts/run-biome.sh`, which picks the first `biome` on PATH that can actually run: the npm-installed one on CI/generic Linux, or an environment-provided one on NixOS. Add `biome` to `shell.nix` (or the user profile) so a working binary resolves from PATH. When the Biome version changes (npm devDependency or environment), run `biome migrate` to keep `biome.json` in sync.
+> **Biome is an external dependency.** It is **not** an npm dependency of this package and is never installed into `node_modules`. A `biome` binary must be on `PATH` for `npm run lint` and `npm run lint:fix` to work. The required version is the one in `biome.json`'s `$schema` (currently 2.5.5); CI derives its Biome version from that same field, so the local environment, CI, and the config never drift apart. To upgrade, update the environment's Biome, run `biome migrate` to rewrite `biome.json`, and commit the result — that one field is the only place the version is recorded.
+>
+> The `biome` binary must come from the environment — e.g. your NixOS user profile — so it resolves from `PATH`. Nothing in this package fetches Biome from npm.
 
 ### Retrieval evaluation
 
