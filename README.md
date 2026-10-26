@@ -272,9 +272,21 @@ Semblr stores conversation data in two areas, both outside the project tree so t
 | File | Purpose |
 |---|---|
 | `<id>.json` | A single round: user prompt, full assistant response, tool call metadata |
-| `index.csv` | Append-only vector index — one line per embedding: `base64(vector),<filepath>:prompt|response,<model>` |
+| `index.<hostname>` | This host's own append-only vector index shard — one line per embedding: `base64(vector),<filepath>:prompt|response,<model>` |
+| `index.csv` | Legacy single-file index — adopted by rename to `index.<hostname>` on the first write by a host that has no shard of its own; read as part of the shard set until then |
 
 Round IDs are content-addressed (MD5 of `userPrompt + responseSequence`), so re-indexing is idempotent — same content produces the same file.
+
+### Multi-host shard layout
+
+The vector index is a **set of per-host shards**, not one shared file, so a rounds directory shared (or synced) across hosts never has two writers fighting over one artifact:
+
+- **Layout:** one shard per host — `index.<hostname>` sits next to the round files in the rounds directory. The hostname lives in the filename; a shard carries no header of its own, so shard files stay byte-compatible with the legacy CSV format.
+- **Writes stay on the host's own shard.** Live appends, the `just index` sweep/compaction, and the index-rewriting migration scripts all write to `index.<hostname>` only. A foreign shard is never rewritten — compaction leaves it byte-identical, and its rows are reported rather than touched.
+- **Reads use the merged shard set.** Startup loading, the TUI round count, search retrieval, the pending-embedding predicate, the sweep's "already indexed" checks, and the read-only scripts iterate every shard in the directory. An empty shard set is an empty index, not an error.
+- **Adoption rule:** a legacy headerless `index.csv` is claimed by rename (an atomic same-directory rename) by the first host that writes while having no shard of its own. A host that already owns a shard leaves the legacy file alone — renaming would clobber its shard — so the legacy file stays readable as part of the shard set.
+- **Exclusion rule:** shard discovery picks up `index.*` files but explicitly excludes the sibling artifacts and transient files: `index.bm25.json`, `index-tools.fulltext.csv`, migration backups (`index.csv.bak.*`, `index.<host>.bak.*`), lockfiles (`index.<host>.lock`), and atomic-write temps (`index.<host>.tmp.<pid>`).
+- **Caveats:** there is no cross-shard dedup and no global compaction — shards are independent, so a round embedded on two hosts exists as rows in both shards and is counted twice by the merged read. And the first-time adoption of a legacy `index.csv` is a race between hosts: the rename is atomic, so one host wins the claim and the other simply starts with an empty shard of its own.
 
 ### Recovery lifecycle (backfill)
 
@@ -283,7 +295,7 @@ If pi exits before the final round of a session is persisted (crash, hard kill),
 - **Backfill scan:** for each recent session file, reconstructed rounds that have no round file on disk are written. Rounds recovered this way are marked `"recovered": true` in the round JSON, distinguishing second-class (recovered) provenance from live-saved rounds.
 - **Legacy-content match:** a round is considered already stored when a file on disk matches it by whitespace-insensitive content (same canonicalization as the duplicate-prune script: trimmed prompts, trimEnd'ed tool results). This absorbs serialization drift from rounds saved by historical semblr code — whose content-hash filenames are unreproducible by today's parser — so backfill no longer regenerates duplicates of those rounds on every startup. The disk content scan runs only when an exact content-hash miss occurs.
 - **Defer semantics:** if a session's tail round is already on disk, that session is fully backed up and skipped. If the tail is missing and the session file looks live (modified recently), the backfill defers instead of racing the live process — the live process will write those rounds itself.
-- **Startup embedding cost:** recovered rounds are indexed (BM25 + tool index) and — when at most 10 rounds are pending embedding — embedded inline at startup, so they reach every retrieval surface. Above the threshold, the embedding burst is deferred: startup prints `🧠 N rounds pending embedding backfill — run just index` and never pays the API cost inline. Running `just index` redrives the pending rounds. The pending count and the `just index` sweep share one predicate — **current-model `index.csv` rows are the retrieval truth, and the `promptEmbedding` marker is derived state, never a done-signal**. That predicate considers only a round's *forcing* rows (`:prompt` where the prompt survives the short-prompt drop, and `:response`; a `:summary` row is auxiliary and never forces a reindex), the same rule on both sides. A round covered by current-model forcing rows is not counted pending and is not re-embedded, even when its marker is missing, and a round whose only rows are non-forcing (`:summary`/`:round`/bare) is not covered — so it is counted pending and *is* re-embedded, which adds the missing forcing rows. A round with a surviving marker but missing current-model forcing rows is a real retrieval gap and *is* re-embedded (rows missing beats the marker). When only the marker is missing, it is healed in place from the existing `:response` vector with no embedding API call. Only rounds missing current-model rows cost embedding calls, and a round that can never be resolved (an unreadable or invalid round file) is named in a non-convergent list rather than left to inflate the count — so a second `just index` embeds nothing and spends no API call. Healed markers reuse the response-side vector, not the live combined one, so topic grouping (which needs the combined vector) is unsupported for those rounds.
+- **Startup embedding cost:** recovered rounds are indexed (BM25 + tool index) and — when at most 10 rounds are pending embedding — embedded inline at startup, so they reach every retrieval surface. Above the threshold, the embedding burst is deferred: startup prints `🧠 N rounds pending embedding backfill — run just index` and never pays the API cost inline. Running `just index` redrives the pending rounds. The pending count and the `just index` sweep share one predicate — **current-model index rows (across every shard) are the retrieval truth, and the `promptEmbedding` marker is derived state, never a done-signal**. That predicate considers only a round's *forcing* rows (`:prompt` where the prompt survives the short-prompt drop, and `:response`; a `:summary` row is auxiliary and never forces a reindex), the same rule on both sides. A round covered by current-model forcing rows is not counted pending and is not re-embedded, even when its marker is missing, and a round whose only rows are non-forcing (`:summary`/`:round`/bare) is not covered — so it is counted pending and *is* re-embedded, which adds the missing forcing rows. A round with a surviving marker but missing current-model forcing rows is a real retrieval gap and *is* re-embedded (rows missing beats the marker). When only the marker is missing, it is healed in place from the existing `:response` vector with no embedding API call. Only rounds missing current-model rows cost embedding calls, and a round that can never be resolved (an unreadable or invalid round file) is named in a non-convergent list rather than left to inflate the count — so a second `just index` embeds nothing and spends no API call. Healed markers reuse the response-side vector, not the live combined one, so topic grouping (which needs the combined vector) is unsupported for those rounds.
 
 ### Configuration
 
@@ -322,7 +334,7 @@ Relative `roundsDir` values in project settings resolve under the project cwd. R
 | `embeddingModel` | `SEMBLR_EMBEDDING_MODEL` | `openai/text-embedding-3-small` | Model identifier sent in embedding request bodies and written to index rows |
 | `embeddingMaxTokens` | `SEMBLR_EMBEDDING_MAX_TOKENS` | `8000` | Prompt/response clipping budget for embedding inputs |
 | `embeddingApiUrl` | `SEMBLR_EMBEDDING_API_URL` | derived | Full embeddings endpoint override |
-| `roundsDir` | `SEMBLR_ROUNDS_DIR` | `$PI_CODING_AGENT_DIR/semblr/rounds` | Round repository and `index.csv` directory |
+| `roundsDir` | `SEMBLR_ROUNDS_DIR` | `$PI_CODING_AGENT_DIR/semblr/rounds` | Round repository and index-shard directory |
 | `groupThreshold` | `SEMBLR_GROUP_THRESHOLD` | `0.77` | Minimum cosine similarity for grouping rounds into topics. Higher = more groups |
 | `minSimilarity` | `SEMBLR_MIN_SIMILARITY` | `0.3` | Minimum semantic similarity for relevance retrieval |
 | `embedTimeoutMs` | `SEMBLR_EMBED_TIMEOUT` | `15000` | Embedding request timeout |
@@ -366,7 +378,7 @@ Three scripts parse historical conversation data into semblr rounds:
 ### Deduplication
 
 When `digest-all.ts` runs:
-1. Loads all existing entries from `index.csv`
+1. Loads all existing entries from the merged shard set (every `index.<hostname>` shard, plus a legacy `index.csv` until it is adopted)
 2. Computes the expected file path for each parsed round via content hash
 3. Skips rounds already indexed with the current embedding model
 4. Re-embeds rounds whose index rows have an explicit different embedding model
@@ -407,16 +419,16 @@ just query "what did we discuss about caching"
 
 ### Index format
 
-The index is a CSV with no schema header:
+Each index shard is a CSV with no schema header:
 
 ```
 <base64url(JSON vector)>,<round_id>.json:prompt,<embedding-model>
 <base64url(JSON vector)>,<round_id>.json:response,<embedding-model>
 ```
 
-Legacy two-column rows without the model column are still readable and are assumed to use the current configured embedding model. Each round produces two rows: one for the prompt embedding and one for the clipped-response embedding. The combined prompt+response embedding is stored in the round JSON file for grouping, not in the index CSV. The vector dimensions match the configured embedding model (1536 for the default `openai/text-embedding-3-small`). `just index` rewrites the `:prompt`/`:response` rows of rounds that were explicitly embedded with a different model so the index converges to the configured model. A row it cannot reproduce — a legacy `:round` row, or a `:summary` row whose summary is no longer derivable — is reported and preserved with its original model rather than re-stamped, because a vector computed by one model must never be relabelled as another and scored against a current-model query. Such a row does not force a reindex: the round is left alone if its forcing rows (`:prompt` where the prompt survives the short-prompt drop, and `:response`) are already current. The same forcing-row rule drives the start-up pending count, so the sweep and startup classify a round alike. A short-prompt round produces no `:prompt` row, so an old-model `:prompt` row on such a round is preserved as an orphan and never re-flags it. Cosine similarity is used for retrieval.
+Legacy two-column rows without the model column are still readable and are assumed to use the current configured embedding model. Each round produces two rows: one for the prompt embedding and one for the clipped-response embedding. The combined prompt+response embedding is stored in the round JSON file for grouping, not in the index shard. The vector dimensions match the configured embedding model (1536 for the default `openai/text-embedding-3-small`). `just index` rewrites the `:prompt`/`:response` rows of rounds that were explicitly embedded with a different model so the index converges to the configured model. A row it cannot reproduce — a legacy `:round` row, or a `:summary` row whose summary is no longer derivable — is reported and preserved with its original model rather than re-stamped, because a vector computed by one model must never be relabelled as another and scored against a current-model query. Such a row does not force a reindex: the round is left alone if its forcing rows (`:prompt` where the prompt survives the short-prompt drop, and `:response`) are already current. The same forcing-row rule drives the start-up pending count, so the sweep and startup classify a round alike. A short-prompt round produces no `:prompt` row, so an old-model `:prompt` row on such a round is preserved as an orphan and never re-flags it. Cosine similarity is used for retrieval.
 
-Semblr also maintains `index.bm25.json` beside `index.csv`. It stores a local BM25 keyword index over each round's prompt, response, and tool text. Retrieval fuses semantic cosine score with normalized BM25 score using `SEMBLR_HYBRID_SEMANTIC_WEIGHT` / `hybridSemanticWeight` (default `0.7`). Run `just rebuild-bm25` to recreate it from existing round files without calling the embedding API.
+Semblr also maintains `index.bm25.json` beside the index shards. It stores a local BM25 keyword index over each round's prompt, response, and tool text. Retrieval fuses semantic cosine score with normalized BM25 score using `SEMBLR_HYBRID_SEMANTIC_WEIGHT` / `hybridSemanticWeight` (default `0.7`). Run `just rebuild-bm25` to recreate it from existing round files without calling the embedding API.
 
 Load and persistence semantics: at startup the sidecar is loaded if it exists and is consistent with the round files, otherwise the index is rebuilt in memory from the round files — the load path itself never writes. The sidecar is rewritten only by an explicit flush (the per-round `agent_end` upsert, or the single commit after a startup recovery batch), so a stale or corrupt sidecar heals in memory on the next start and on disk at the next flush. Queries are always served from the in-memory index, which matches the round files either way.
 
@@ -427,6 +439,9 @@ The Recency List (see [Injected Context Structure](#injected-context-structure))
 
 ### Embedding API dependency
 Semblr requires a working embedding provider/API key to function. By default it uses pi's `openrouter` provider with `openai/text-embedding-3-small`, but you can configure another pi provider/model or set `embeddingApiUrl` as a full endpoint override. If the API is unreachable, context assembly falls back to a no-op (no historical context injected). The extension degrades gracefully but silently.
+
+### No cross-shard dedup
+The index is split into per-host shards (see [Multi-host shard layout](#multi-host-shard-layout)), and shards are independent: there is no cross-shard dedup and no global compaction. A round that two hosts both embedded exists as rows in both shards and is counted twice by the merged read; each host's rows are deduplicated only within its own shard. A first-time adoption of a legacy `index.csv` is also a race — the rename is atomic, so one host wins the claim and the other starts with an empty shard of its own.
 
 ### No local embedding fallback
 Semblr currently sends OpenAI-compatible embedding requests to a configured HTTP endpoint. There is no local embedding option (e.g., `sentence-transformers` → ONNX → TypeScript). Adding one would eliminate the API dependency and cost for index queries.
@@ -466,6 +481,7 @@ just query "what did we discuss about caching"
 ├── lib/                           # Domain helpers used by the extension, scripts, and tests
 │   ├── context-messages.ts        # User-message preparation and context prefix assembly
 │   ├── embedding-client.ts        # Provider-aware embedding client
+│   ├── index-shards.ts             # Per-host index shard discovery, own-shard resolution, legacy adoption
 │   ├── index-storage.ts           # Runtime vector-index loading and locked appends
 │   ├── message-content.ts         # Shared text extraction from message content blocks
 │   ├── round-capture.ts           # agent_end/message_end round capture helpers

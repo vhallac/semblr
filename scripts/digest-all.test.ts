@@ -921,7 +921,7 @@ describe("digest-all script", () => {
 		// `summary`, which excluded `:summary` by absence — not by rule. With a
 		// readable checkpoint round (summary present) and current :prompt/:response
 		// rows the round must still converge, or the sweep and the start-up pending
-		// count disagree and README:286 is false.
+		// count disagree and the README forcing-row rule is false.
 		const root = tmpDir();
 		const sessionsDir = path.join(root, "sessions");
 		const sDir = path.join(sessionsDir, "--test");
