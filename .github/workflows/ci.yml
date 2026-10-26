@@ -22,6 +22,15 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: "20"
+      # Biome is an external dependency: it is not installed from npm.
+      # The version is derived from biome.json's $schema so there is a single
+      # place to change it (run `biome migrate` there after upgrading).
+      - name: Determine Biome version
+        id: biome-version
+        run: echo "version=$(jq -r '."$schema" | split("/schemas/")[1] | split("/")[0]' biome.json)" >> "$GITHUB_OUTPUT"
+      - uses: biomejs/setup-biome@v2
+        with:
+          version: ${{ steps.biome-version.outputs.version }}
       - run: npm ci
       - run: npm test --if-present
       - run: npm run lint --if-present
