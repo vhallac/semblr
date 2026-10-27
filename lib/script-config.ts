@@ -63,9 +63,9 @@ export interface ScriptIndexContextDeps {
 	/** fs seam for shard discovery, adoption, and index writes. */
 	fsImpl?: ScriptIndexFs;
 	/**
-	 * Host id override for tests; defaults to the configured host id
-	 * (`config.hostId` — env, pi setting, host-local host id file, or the
-	 * machine name; issue #149, OI-6).
+	 * Host id override for tests; defaults to `config.hostId` — the
+	 * `SEMBLR_HOST_ID` env var, then the machine name; nothing is persisted
+	 * (issue #149, OI-6).
 	 */
 	hostname?: string;
 	/**
