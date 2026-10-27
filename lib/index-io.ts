@@ -177,11 +177,20 @@ export function writeIndexLines(indexPath: string, entries: string[]): void {
 export function writeIndexLinesAtomic(
 	indexPath: string,
 	entries: string[],
-	fsImpl: Pick<typeof fs, "writeFileSync" | "renameSync"> = fs,
+	fsImpl: Pick<typeof fs, "writeFileSync" | "renameSync"> & Partial<Pick<typeof fs, "unlinkSync">> = fs,
 ): void {
 	const tmp = `${indexPath}.tmp.${process.pid}`;
-	fsImpl.writeFileSync(tmp, entries.length > 0 ? `${entries.join("\n")}\n` : "");
-	fsImpl.renameSync(tmp, indexPath);
+	try {
+		fsImpl.writeFileSync(tmp, entries.length > 0 ? `${entries.join("\n")}\n` : "");
+		fsImpl.renameSync(tmp, indexPath);
+	} catch (err) {
+		// The publish failed: the target is still the old content (the rename
+		// never happened), and the tmp file is litter — remove it best-effort.
+		try {
+			fsImpl.unlinkSync?.(tmp);
+		} catch {}
+		throw err;
+	}
 }
 
 /**

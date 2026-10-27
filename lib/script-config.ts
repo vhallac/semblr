@@ -10,12 +10,13 @@ import {
 	forEachShardLine,
 	indexEntryFilename,
 	loadShardVectorIndex,
+	migrateIndexEntryLine,
 	readIndexLines,
 	type VectorIndexEntry,
 	writeIndexLinesAtomic,
 } from "./index-io.ts";
 import { adoptOwnShard, discoverIndexShards, LEGACY_INDEX_FILENAME, ownShardPath } from "./index-shards.ts";
-import { appendIndexRowToShards } from "./index-storage.ts";
+import { acquireIndexLock, appendIndexRowToShards } from "./index-storage.ts";
 import { loadSemblrConfig, type SemblrConfig, type SemblrConfigDeps } from "./semblr-config.ts";
 
 export interface ScriptConfigOptions {
@@ -83,6 +84,15 @@ export interface ScriptIndexContext {
 	adopt(): string;
 	/** Wholesale rewrite of the own shard (atomic tmp+rename). */
 	writeOwnLines(lines: string[]): void;
+	/**
+	 * Rename the own shard's rows that reference `oldRoundFile` to
+	 * `newRoundFile` (the stale-round-file migration). The rewrite runs under
+	 * the shard's append lock and publishes atomically (tmp+rename): a crash
+	 * leaves the shard byte-identical, and a session appending concurrently
+	 * blocks on the same lockfile and lands after the publish instead of being
+	 * overwritten. A foreign shard is never touched.
+	 */
+	migrateOwnRows(oldRoundFile: string, newRoundFile: string): void;
 	/** Append one labeled row to the own shard under the lockfile protocol. */
 	appendRow(filePath: string, vector: number[], model?: string, embeddingInputHash?: string): void;
 	/** Foreign shards that still hold a row for `filename` (own shard excluded). */
@@ -170,6 +180,29 @@ export function resolveScriptIndexContext(
 			// rewritten shard instead of being stranded in a legacy file.
 			adoptOwnShard(shardRoot, { fsImpl, hostname: deps.hostname });
 			writeIndexLinesAtomic(own, lines, fsImpl);
+		},
+		migrateOwnRows: (oldRoundFile, newRoundFile) => {
+			// Nothing to migrate — do not create an empty shard file.
+			if (!fsImpl.existsSync(own)) return;
+			// The append lock is the same lockfile the runtime appends take
+			// (`<shard>.lock`), so the read-modify-write of the migration and a
+			// concurrent append serialize: the append waits for the publish
+			// instead of racing it (a wholesale rewrite must never write
+			// unsynchronized — it could drop the appended rows).
+			const lock = acquireIndexLock(own, { fsImpl });
+			if (lock === null) {
+				throw new Error(
+					`Could not acquire the index lock (${own}.lock) after all retries — the index was NOT written.`,
+				);
+			}
+			try {
+				const rows = readIndexLines(own, fsImpl).map((line) =>
+					migrateIndexEntryLine(line, oldRoundFile, newRoundFile),
+				);
+				writeIndexLinesAtomic(own, rows, fsImpl);
+			} finally {
+				lock.release();
+			}
 		},
 		appendRow: (filePath, vector, model, embeddingInputHash) =>
 			appendIndexRowToShards(

@@ -24,11 +24,7 @@ import {
 	writeBm25Index,
 } from "../lib/bm25-index.ts";
 import { type EmbeddingModelRegistry, embedText, normalize } from "../lib/embed.ts";
-import {
-	findStaleContentMatches as findStaleContentMatchesInDir,
-	indexRoundFileFromPath,
-	migrateIndexEntries as migrateIndexEntriesFile,
-} from "../lib/index-io.ts";
+import { findStaleContentMatches as findStaleContentMatchesInDir, indexRoundFileFromPath } from "../lib/index-io.ts";
 import { parsePiSessionJsonl, reconstructPiSessionRounds } from "../lib/pi-session.ts";
 import { buildPromptEmbeddingInput } from "../lib/round-capture.ts";
 import {
@@ -37,6 +33,7 @@ import {
 	resolveScriptIndexContext,
 	resolveScriptModelRegistry,
 	type ScriptConfigOptions,
+	type ScriptIndexFs,
 	scriptEmbeddingConfig,
 } from "../lib/script-config.ts";
 
@@ -89,6 +86,8 @@ export interface DigestSessionOptions extends ScriptConfigOptions {
 	stdout?: Pick<typeof console, "log">;
 	stderr?: Pick<typeof console, "error">;
 	fsImpl?: AtomicWriteFs;
+	/** fs seam for the shard reads/writes and the shard lock (tests). */
+	indexFsImpl?: ScriptIndexFs;
 }
 
 export async function runDigestSession(options: DigestSessionOptions = {}): Promise<number> {
@@ -97,7 +96,7 @@ export async function runDigestSession(options: DigestSessionOptions = {}): Prom
 	const roundsDir = options.roundsDir ?? config.roundsDir;
 	// Issue #149: the index is a set of per-host shards — reads see every
 	// shard, writes land in the host's own shard (`index.<hostname>`).
-	const index = resolveScriptIndexContext(config, roundsDir, options.indexPath);
+	const index = resolveScriptIndexContext(config, roundsDir, options.indexPath, { fsImpl: options.indexFsImpl });
 	const bm25IndexPath = bm25IndexPathForRoundsDir(roundsDir);
 	const modelRegistry = resolveScriptModelRegistry(config, options);
 	const embeddingConfig = scriptEmbeddingConfig(config);
@@ -129,7 +128,10 @@ export async function runDigestSession(options: DigestSessionOptions = {}): Prom
 			// Claim a legacy `index.csv` before rewriting rows, so its rows are
 			// part of the own shard (and not stranded in the legacy file).
 			index.adopt();
-			migrateIndexEntriesFile(index.ownShardPath, staleFile, roundFile);
+			// The migration rewrites the host's own shard atomically and under
+			// the shard's append lock (a crash leaves the shard byte-identical;
+			// a concurrent append blocks and lands after the publish).
+			index.migrateOwnRows(staleFile, roundFile);
 			// A foreign shard may still hold rows for the stale file: this host
 			// rewrites only its own shard, so deleting the file would leave
 			// those rows dangling. Keep the file and report it instead.
