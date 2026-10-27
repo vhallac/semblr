@@ -28,6 +28,7 @@ Started at the archive of the #149 plan (per-host index shards). New entries are
 - **Why it matters:** on a shared rounds directory they carry exactly the write-conflict hazard #149 removed for the vector index — a wholesale rewrite can drop another host's rows — and both write in place with `writeFileSync`, contradicting decision 015 (atomic writes; the BM25 write is named there explicitly). A concurrent reader can observe a half-written file.
 - **Fix sketch:** either shard them like the vector index (own-shard writes, merged reads), or declare them per-host local artifacts that are rebuilt from the round files on demand — both are derivable from the round files, so a shared copy may be unnecessary.
 - **Severity:** medium-high.
+- **Tracked:** [#152](https://github.com/vhallac/semblr/issues/152) — per-host, rebuildable keyword and tool-call artifacts (decided: per-host derived artifacts, no cross-host merge).
 
 ## OI-3 — The stale-file migration in `digest-session` writes the own shard in place, without the append lock
 

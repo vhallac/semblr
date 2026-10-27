@@ -441,10 +441,22 @@ The Recency List (see [Injected Context Structure](#injected-context-structure))
 Semblr requires a working embedding provider/API key to function. By default it uses pi's `openrouter` provider with `openai/text-embedding-3-small`, but you can configure another pi provider/model or set `embeddingApiUrl` as a full endpoint override. If the API is unreachable, context assembly falls back to a no-op (no historical context injected). The extension degrades gracefully but silently.
 
 ### No cross-shard dedup
-The index is split into per-host shards (see [Multi-host shard layout](#multi-host-shard-layout)), and shards are independent: there is no cross-shard dedup and no global compaction. A round that two hosts both embedded exists as rows in both shards and is counted twice by the merged read; each host's rows are deduplicated only within its own shard. A first-time adoption of a legacy `index.csv` is also a race — the rename is atomic, so one host wins the claim and the other starts with an empty shard of its own.
+The index is split into per-host shards (see [Multi-host shard layout](#multi-host-shard-layout)), and shards are independent: there is no cross-shard dedup and no global compaction. A round that two hosts both embedded exists as rows in both shards and is counted twice by the merged read; each host's rows are deduplicated only within its own shard. A first-time adoption of a legacy `index.csv` is also a race — the rename is atomic, so one host wins the claim and the other starts with an empty shard of its own. See [Known Limitations](#known-limitations) for the full set of shard-model boundaries.
 
 ### No local embedding fallback
 Semblr currently sends OpenAI-compatible embedding requests to a configured HTTP endpoint. There is no local embedding option (e.g., `sentence-transformers` → ONNX → TypeScript). Adding one would eliminate the API dependency and cost for index queries.
+
+## Known Limitations
+
+The multi-host shard layout (see [Multi-host shard layout](#multi-host-shard-layout)) has boundaries that are not bugs to be fixed in place — they are the current edges of the model. Each limitation is recorded with its code anchor and a fix sketch in [`docs/open-issues.md`](docs/open-issues.md), which is the running log of everything known and unfixed.
+
+- **Mixed embedding models across shards.** The automatic context injection scores every row of the merged shard set with a single query vector built from the configured model, while the `search_interactions` tool scores per model (`collectMultiModelSearchRoundScores`). A row written by a host that uses a different model is therefore scored in an incompatible vector space: a shorter foreign vector yields `NaN` scores, a longer one is silently truncated to the query's dimensionality. (OI-1)
+- **The BM25 and tool-call indexes are still shared, in-place artifacts.** `index.bm25.json` is rebuilt wholesale from the round files and `index-tools.fulltext.csv` is appended per round and rewritten in place — the write-conflict hazard the shard model removed for the vector index still applies to these two, and both write in place rather than tmp+rename. Tracked as [#152](https://github.com/vhallac/semblr/issues/152). (OI-2)
+- **One migration path still rewrites its own shard in place.** The stale-file migration in `digest-session` renames rows inside the host's own shard through an in-place write with no append lock, so a crash can truncate the shard and a concurrent append can be lost. (OI-3)
+- **No cross-shard dedup at the index level.** Search *results* are deduplicated by round id — the semantic and hybrid paths keep the best-scoring row per round file — but the merged index is not: a round that two hosts both embedded exists as rows in both shards and is counted twice by every merged count (status-bar round count, coverage and pending counts). (OI-4)
+- **A stale row in a shard is never replaced.** A round is treated as covered as soon as *any* shard holds a current-model row for the same label suffix, so an old-model row in one shard survives even though the host that owns it could rewrite it. Stale rows accumulate and keep feeding the mixed-model scoring above. (OI-5)
+- **Host identity is the hostname.** The shard name is `os.hostname()` at write time, so a renamed machine, a new container id, or a moved home directory starts a new shard and leaves the old one behind as a permanent foreign shard that nothing prunes. (OI-6)
+- **Outstanding foreign shards are reported, never tracked.** A rewrite script prints the foreign shards it left untouched, but that backlog is not recorded anywhere, so a half-finished migration on a multi-host store is only visible in the log of the run that noticed it. (OI-8)
 
 ## Quick Start
 
