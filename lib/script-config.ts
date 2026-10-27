@@ -136,6 +136,12 @@ export interface ScriptIndexContext {
 	/** Wholesale rewrite of the own shard (atomic tmp+rename). */
 	writeOwnLines(lines: string[], opts?: WriteOwnLinesOpts): void;
 	/**
+	 * Rewrite the own shard under its append lock. The final read happens
+	 * after the lock is acquired, so the transformation sees rows appended
+	 * since the caller's detection read and cannot overwrite them.
+	 */
+	rewriteOwnRows(transform: (rows: string[]) => string[]): void;
+	/**
 	 * Rename the own shard's rows that reference `oldRoundFile` to
 	 * `newRoundFile` (the stale-round-file migration). The rewrite runs under
 	 * the shard's append lock and publishes atomically (tmp+rename): a crash
@@ -183,6 +189,13 @@ export function resolveScriptIndexContext(
 	const foreignExcludedPaths = (): string[] => (legacyClaimable() ? [own, legacyPath] : [own]);
 	const foreignShardDetails = (): ForeignShardDescription[] =>
 		describeForeignShards(shardRoot, foreignExcludedPaths(), fsImpl);
+	const readRewriteRows = (): string[] => {
+		const ownRows = readIndexLines(own, fsImpl);
+		if (legacyClaimable()) {
+			return [...ownRows, ...readIndexLines(legacyPath, fsImpl)];
+		}
+		return ownRows;
+	};
 
 	return {
 		shardRoot,
@@ -205,16 +218,7 @@ export function resolveScriptIndexContext(
 		},
 		readMergedEntries: () => loadShardVectorIndex(shardRoot, { shards: discover(), fsImpl }),
 		readOwnLines: () => readIndexLines(own, fsImpl),
-		readRewriteRows: () => {
-			const ownRows = readIndexLines(own, fsImpl);
-			// The legacy file is claimed by the write (rename) only when the host
-			// has no shard of its own; otherwise it stays a separate shard and
-			// its rows are not part of this host's rewrite.
-			if (legacyClaimable()) {
-				return [...ownRows, ...readIndexLines(legacyPath, fsImpl)];
-			}
-			return ownRows;
-		},
+		readRewriteRows,
 		foreignShards: () =>
 			foreignShardDetails().map((shard) => ({
 				shardPath: path.join(shardRoot, shard.shard),
@@ -273,6 +277,29 @@ export function resolveScriptIndexContext(
 				writeIndexLinesAtomic(own, lines, fsImpl);
 			} finally {
 				lock?.release();
+			}
+		},
+		rewriteOwnRows: (transform) => {
+			const hasArtifact = fsImpl.existsSync(own) || fsImpl.existsSync(legacyPath);
+			const lock = acquireIndexLock(own, { ...deps.lockDeps, fsImpl });
+			if (lock === null) {
+				throw new Error(
+					`Could not acquire the index lock (${own}.lock) after all retries — the index was NOT written.`,
+				);
+			}
+			try {
+				// The transformation runs on the final, lock-protected read.
+				// Rows appended after the caller's detection read are therefore
+				// present here and are carried into the atomic publish.
+				const freshRows = readRewriteRows();
+				const rewritten = transform(freshRows);
+				if (rewritten.length === 0 && !hasArtifact) return;
+				// Claim a legacy `index.csv` after the final read so its rows
+				// are part of the rewritten shard instead of being stranded.
+				adoptOwnShard(shardRoot, { fsImpl, hostname: hostId });
+				writeIndexLinesAtomic(own, rewritten, fsImpl);
+			} finally {
+				lock.release();
 			}
 		},
 		migrateOwnRows: (oldRoundFile, newRoundFile) => {

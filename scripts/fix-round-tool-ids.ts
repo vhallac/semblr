@@ -152,10 +152,11 @@ export async function runFixRoundToolIds(options: FixRoundToolIdsOptions = {}): 
 					if (!dryRun) {
 						// Migrate the index entries from the broken hash to the corrected
 						// hash — in this host's own shard only (issue #149, D-005).
-						// Read/write through the provided fs impl so tests can inject a mock.
-						const rows = index.readRewriteRows();
-						const migrated = rows.map((line: string) => migrateIndexEntryLine(line, brokenFile, newHash));
-						index.writeOwnLines(migrated);
+						// Transform the final lock-protected read so concurrently
+						// appended rows are preserved.
+						index.rewriteOwnRows((freshRows) =>
+							freshRows.map((line: string) => migrateIndexEntryLine(line, brokenFile, newHash)),
+						);
 
 						// Write corrected round file (atomic: tmp+rename, decision-015)
 						atomicWriteFileSync(path.join(roundsDir, newHash), JSON.stringify(round, null, 2), f);

@@ -176,6 +176,53 @@ describe("resolveScriptIndexContext", () => {
 		expect(ownLines).toContain(encodeVectorIndexLine([8], "live2.json:prompt"));
 	});
 
+	// claim: pr151-review-r2.feature-SC-1/SC-1/rewriteOwnRows_preserves_live_append
+	// claim text: a row appended after a migration's detection read is present in the own shard after the rewrite publishes
+	// scenario: Scenario: SC-1 live append survives a migration rewrite (R2.F1) — Then the appended row is present in the shard after the publish
+	it("rewriteOwnRows preserves a live append after the detection read", () => {
+		const own = path.join(roundsDir, "index.host-a");
+		const index = resolveScriptIndexContext(config, roundsDir, undefined, { hostname: "host-a" });
+		index.writeOwnLines([`${encodeVectorIndexLine([3], "own.json:prompt")}\n`]);
+
+		// The script's detection read happens before this append.
+		const detected = index.readRewriteRows();
+		const live = `${encodeVectorIndexLine([8], "live.json:prompt")}\n`;
+		appendLineWithLock(own, roundsDir, live);
+
+		index.rewriteOwnRows((freshRows) =>
+			freshRows.map((line) => (line.includes("own.json:prompt") ? line.replace("[3]", "[4]") : line)),
+		);
+
+		const published = fs.readFileSync(own, "utf-8").trim().split("\n");
+		expect(published).toContain(detected[0].replace("[3]", "[4]"));
+		expect(published).toContain(live.trim());
+	});
+
+	// claim: pr151-review-r2.feature-SC-1-EXT-1/SC-1-EXT-1/rewriteOwnRows_fails_fast_when_lock_unavailable
+	// claim text: when the own-shard lock cannot be acquired within the retry budget, the rewrite throws and does not publish
+	// scenario: Scenario: SC-1/EXT-1 migration rewrite fails fast without publishing when the lock is unavailable (R2.F1) — Then the migration throws and the shard is not written
+	it("rewriteOwnRows fails fast without publishing when the lock is unavailable", () => {
+		const eexist = Object.assign(new Error("EEXIST"), { code: "EEXIST" });
+		const fsImpl = {
+			...fs,
+			openSync: (file: Parameters<typeof fs.openSync>[0], ...rest: unknown[]) => {
+				if (String(file).endsWith(".lock")) throw eexist;
+				return (fs.openSync as (...a: unknown[]) => number)(file, ...rest);
+			},
+		};
+		const index = resolveScriptIndexContext(config, roundsDir, undefined, {
+			hostname: "host-a",
+			fsImpl: fsImpl as typeof fs,
+			lockDeps: { lockRetries: 2, wait: () => {} },
+		});
+		const before = fs.existsSync(path.join(roundsDir, "index.host-a"));
+
+		expect(() => index.rewriteOwnRows(() => [`${encodeVectorIndexLine([3], "own.json:prompt")}\n`])).toThrow(
+			/NOT written/,
+		);
+		expect(fs.existsSync(path.join(roundsDir, "index.host-a"))).toBe(before);
+	});
+
 	it("reports foreign shards that still reference a round file", () => {
 		fs.writeFileSync(path.join(roundsDir, "index.host-b"), `${encodeVectorIndexLine([2], "old.json:prompt")}\n`);
 		const index = resolveScriptIndexContext(config, roundsDir, undefined, { hostname: "host-a" });

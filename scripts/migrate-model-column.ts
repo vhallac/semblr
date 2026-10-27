@@ -140,13 +140,11 @@ export function runModelColumnMigration(options: MigrateModelColumnOptions = {})
 		}
 	}
 
-	// Apply migration
-	for (const idx of migrated) {
-		lines[idx] = addModelColumn(lines[idx], model);
-	}
-	// Issue #149: publish to the host's own shard (atomic tmp+rename); a
-	// foreign shard is never rewritten here (D-005).
-	index.writeOwnLines(lines);
+	// Apply the migration to the final lock-protected read so rows appended
+	// after the detection read are preserved.
+	index.rewriteOwnRows((freshRows) =>
+		freshRows.map((line) => (hasModelColumn(line) ? line : addModelColumn(line, model))),
+	);
 
 	out.log(`\n✅ Done. ${migrated.length} entries migrated.`);
 	reportForeignShards(index, out);

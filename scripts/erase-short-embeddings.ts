@@ -174,9 +174,14 @@ export function runEraseShortEmbeddings(options: EraseShortEmbeddingsOptions = {
 	out.log(`Would remove ${removed} index entries (${retained.length} retained)`);
 
 	if (!dryRun) {
-		// Issue #149: the rewrite publishes to the host's own shard (atomic
-		// tmp+rename); a foreign shard is never rewritten here (D-005).
-		index.writeOwnLines(retained);
+		// Rewrite the final lock-protected read so rows appended after the
+		// detection read are preserved; a foreign shard is never rewritten.
+		index.rewriteOwnRows((freshRows) =>
+			freshRows.filter((line) => {
+				const entry = parseLine(line);
+				return !entry || !shortRoundFiles.has(entry.roundFile);
+			}),
+		);
 		out.log(`✓ Updated ${path.basename(index.ownShardPath)} (${removed} entries removed)`);
 
 		// Delete promptEmbedding field from round JSON files

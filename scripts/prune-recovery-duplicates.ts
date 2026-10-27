@@ -189,9 +189,9 @@ export async function pruneRecoveryDuplicates(options: PruneOptions = {}): Promi
 	// host's own shard only (the legacy `index.csv` is claimed by the write);
 	// a foreign shard is never rewritten here (D-005).
 	const ownRows = index.readRewriteRows();
+	index.rewriteOwnRows((freshRows) => filterIndexLinesExcludingFilenames(freshRows, allPrunes));
 	const keptRows = filterIndexLinesExcludingFilenames(ownRows, allPrunes);
 	if (keptRows.length !== ownRows.length) {
-		index.writeOwnLines(keptRows);
 		out(`Index cleaned: ${index.ownShardPath} (${ownRows.length - keptRows.length} lines removed)`);
 	}
 

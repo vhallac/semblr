@@ -19,7 +19,7 @@ import * as path from "node:path";
 import { pathToFileURL } from "node:url";
 import { type AtomicWriteFs, atomicWriteFileSync } from "../lib/atomic-write.ts";
 import { computeContentHash } from "../lib/hash.ts";
-import { filterIndexLinesExcludingFilenames, indexLinesByFilename, replaceIndexLineFilename } from "../lib/index-io.ts";
+import { indexEntryFilename, indexLinesByFilename, replaceIndexLineFilename } from "../lib/index-io.ts";
 import {
 	reportForeignShards,
 	resolveScriptConfig,
@@ -124,7 +124,7 @@ export function runContentHashMigration(options: ContentHashMigrationOptions = {
 	let errors = 0;
 	let hashChanged = 0;
 	let hashUnchanged = 0;
-	const oldRenamedFilenames = new Set<string>();
+	const renamedFilenames = new Map<string, string>();
 
 	for (const filename of files) {
 		const filePath = `${roundsDir}/${filename}`;
@@ -192,7 +192,7 @@ export function runContentHashMigration(options: ContentHashMigrationOptions = {
 
 		// Track old filenames that were renamed (for index filtering)
 		const oldFilenameForIndex = filename;
-		oldRenamedFilenames.add(oldFilenameForIndex);
+		renamedFilenames.set(oldFilenameForIndex, newFilename);
 
 		// Collect index updates for this file
 		const oldLines = indexMap.get(filename) ?? [];
@@ -206,11 +206,16 @@ export function runContentHashMigration(options: ContentHashMigrationOptions = {
 		if (!dryRun) {
 			// oldRenamedFilenames was populated in the rename loop above
 
-			// Read all entries, filter out old renamed ones, add new ones
-			const retained = filterIndexLinesExcludingFilenames(indexRows, oldRenamedFilenames);
-			// Issue #149: publish to the host's own shard (atomic tmp+rename);
-			// a foreign shard is never rewritten here (D-005).
-			index.writeOwnLines([...retained, ...indexUpdates]);
+			// Transform the final lock-protected read. Rows appended after the
+			// detection read are included and preserved; renamed rows are
+			// rewritten to their new hash.
+			index.rewriteOwnRows((freshRows) =>
+				freshRows.map((line) => {
+					const oldFilename = indexEntryFilename(line);
+					const newFilename = oldFilename ? renamedFilenames.get(oldFilename) : undefined;
+					return newFilename ? replaceIndexLineFilename(line, newFilename) : line;
+				}),
+			);
 			out.log(`✓ Updated ${path.basename(index.ownShardPath)} (${indexUpdates.length} entries rewritten)`);
 		} else {
 			out.log(`~ Would update ${path.basename(index.ownShardPath)} (${indexUpdates.length} entries)`);
