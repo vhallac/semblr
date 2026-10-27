@@ -177,7 +177,7 @@ describe("4th-column embedding-input hash (issue #106 re-embed migration)", () =
 
 	describe("merged shard reads (#149)", () => {
 		const writeShard = (shard: string, lines: string[]) =>
-			fs.writeFileSync(path.join(tempDir, shard), lines.join("\n") + "\n");
+			fs.writeFileSync(path.join(tempDir, shard), `${lines.join("\n")}\n`);
 
 		it("merges rows from all discovered shards in sorted shard order", () => {
 			writeShard("index.csv", [encodeVectorIndexLine([1], "legacy.json:prompt")]);
@@ -249,6 +249,48 @@ describe("4th-column embedding-input hash (issue #106 re-embed migration)", () =
 			// A wholesale rewrite never touches the legacy file or a foreign shard.
 			expect(fs.existsSync(path.join(tempDir, "index.csv"))).toBe(false);
 			expect(fs.existsSync(path.join(tempDir, "index.host-b"))).toBe(false);
+		});
+
+		it("holds the shard append lock across the flush and releases it (PR #151 R1.F1)", () => {
+			let lockSeenDuringWrite = false;
+			const shardPath = flushOwnShardVectorIndex(tempDir, [{ vector: [1], filePath: "a.json:prompt" }], {
+				hostname: "host-a",
+				fsImpl: {
+					...fs,
+					writeFileSync: (file: Parameters<typeof fs.writeFileSync>[0], ...rest: unknown[]) => {
+						if (fs.existsSync(`${path.join(tempDir, "index.host-a")}.lock`)) {
+							lockSeenDuringWrite = true;
+						}
+						return (fs.writeFileSync as (...a: unknown[]) => ReturnType<typeof fs.writeFileSync>)(file, ...rest);
+					},
+				},
+			});
+
+			expect(shardPath).toBe(path.join(tempDir, "index.host-a"));
+			expect(lockSeenDuringWrite).toBe(true);
+			expect(fs.existsSync(`${shardPath}.lock`)).toBe(false);
+			expect(fs.readFileSync(shardPath, "utf-8")).toBe(`${encodeVectorIndexLine([1], "a.json:prompt")}\n`);
+		});
+
+		it("fails fast without writing when the append lock is exhausted (PR #151 R1.F1)", () => {
+			const eexist = Object.assign(new Error("EEXIST"), { code: "EEXIST" });
+			const fsImpl = {
+				...fs,
+				openSync: (file: Parameters<typeof fs.openSync>[0], ...rest: unknown[]) => {
+					if (String(file).endsWith(".lock")) throw eexist;
+					return (fs.openSync as (...a: unknown[]) => number)(file, ...rest);
+				},
+			};
+
+			expect(() =>
+				flushOwnShardVectorIndex(tempDir, [{ vector: [1], filePath: "a.json:prompt" }], {
+					hostname: "host-a",
+					fsImpl,
+					lockRetries: 2,
+					wait: () => {},
+				}),
+			).toThrow(/NOT written/);
+			expect(fs.existsSync(path.join(tempDir, "index.host-a"))).toBe(false);
 		});
 
 		it("honors an explicit shard list", () => {

@@ -4,6 +4,7 @@ import * as path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { readForeignBacklog } from "./foreign-backlog.ts";
 import { encodeVectorIndexLine } from "./index-io.ts";
+import { appendLineWithLock } from "./index-storage.ts";
 import { reportForeignShards, resolveScriptIndexContext } from "./script-config.ts";
 import { loadSemblrConfig, type SemblrConfig } from "./semblr-config.ts";
 
@@ -114,6 +115,65 @@ describe("resolveScriptIndexContext", () => {
 
 		expect(fs.existsSync(path.join(roundsDir, "index.csv"))).toBe(false);
 		expect(index.readOwnLines()).toHaveLength(1);
+	});
+
+	it("holds the shard append lock across the rewrite window and releases it (PR #151 R1.F1)", () => {
+		const own = path.join(roundsDir, "index.host-a");
+		let lockSeenDuringWrite = false;
+		const fsImpl = {
+			...fs,
+			writeFileSync: (file: Parameters<typeof fs.writeFileSync>[0], ...rest: unknown[]) => {
+				// A wholesale rewrite must hold the append lock while it writes:
+				// a concurrent runtime append takes the same lock, so it waits
+				// instead of landing between the write and the rename.
+				if (fs.existsSync(`${own}.lock`)) lockSeenDuringWrite = true;
+				return (fs.writeFileSync as (...a: unknown[]) => void)(file, ...rest);
+			},
+		};
+		const index = resolveScriptIndexContext(config, roundsDir, undefined, {
+			hostname: "host-a",
+			fsImpl: fsImpl as typeof fs,
+		});
+
+		index.writeOwnLines([`${encodeVectorIndexLine([3], "own.json:prompt")}\n`]);
+
+		expect(lockSeenDuringWrite).toBe(true);
+		expect(fs.existsSync(`${own}.lock`)).toBe(false);
+	});
+
+	it("fails fast without writing when the append lock is exhausted (PR #151 R1.F1)", () => {
+		const eexist = Object.assign(new Error("EEXIST"), { code: "EEXIST" });
+		const fsImpl = {
+			...fs,
+			openSync: (file: Parameters<typeof fs.openSync>[0], ...rest: unknown[]) => {
+				if (String(file).endsWith(".lock")) throw eexist;
+				return (fs.openSync as (...a: unknown[]) => number)(file, ...rest);
+			},
+		};
+		const index = resolveScriptIndexContext(config, roundsDir, undefined, {
+			hostname: "host-a",
+			fsImpl: fsImpl as typeof fs,
+			lockDeps: { lockRetries: 2, wait: () => {} },
+		});
+		const before = fs.existsSync(path.join(roundsDir, "index.host-a"));
+
+		expect(() => index.writeOwnLines([`${encodeVectorIndexLine([3], "own.json:prompt")}\n`])).toThrow(/NOT written/);
+		expect(fs.existsSync(path.join(roundsDir, "index.host-a"))).toBe(before);
+	});
+
+	it("a concurrent append that lands in the rewrite window survives (PR #151 R1.F1, SC-1)", () => {
+		const own = path.join(roundsDir, "index.host-a");
+		const index = resolveScriptIndexContext(config, roundsDir, undefined, { hostname: "host-a" });
+
+		// The caller resolves its lines first; a live session appends through
+		// the runtime protocol (same `<shard>.lock`), so its row serializes
+		// with the rewrite instead of racing it — it is present afterwards.
+		index.writeOwnLines([`${encodeVectorIndexLine([3], "own.json:prompt")}\n`]);
+		appendLineWithLock(own, roundsDir, `${encodeVectorIndexLine([8], "live2.json:prompt")}\n`);
+
+		const ownLines = fs.readFileSync(own, "utf-8").trim().split("\n");
+		expect(ownLines).toContain(encodeVectorIndexLine([3], "own.json:prompt"));
+		expect(ownLines).toContain(encodeVectorIndexLine([8], "live2.json:prompt"));
 	});
 
 	it("reports foreign shards that still reference a round file", () => {

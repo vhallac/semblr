@@ -22,7 +22,7 @@ import {
 	writeIndexLinesAtomic,
 } from "./index-io.ts";
 import { adoptOwnShard, discoverIndexShards, LEGACY_INDEX_FILENAME, ownShardPath } from "./index-shards.ts";
-import { acquireIndexLock, appendIndexRowToShards } from "./index-storage.ts";
+import { type AcquireIndexLockDeps, acquireIndexLock, appendIndexRowToShards } from "./index-storage.ts";
 import { loadSemblrConfig, type SemblrConfig, type SemblrConfigDeps } from "./semblr-config.ts";
 
 export interface ScriptConfigOptions {
@@ -46,6 +46,19 @@ export function resolveScriptIndexPath(config: SemblrConfig, roundsDir: string, 
 /** fs seam for the script shard context; defaults to node:fs. */
 export type ScriptIndexFs = typeof fs;
 
+/**
+ * Options for {@link ScriptIndexContext.writeOwnLines}.
+ */
+export interface WriteOwnLinesOpts {
+	/**
+	 * The caller already holds the shard append lock (e.g. the
+	 * migrate-prompt-embeddings short-lock merge, #107 F2) — skip the
+	 * re-acquire, which cannot succeed while the same process holds the
+	 * lockfile (PR #151 R1.F1). The caller owns fail-fast on lock exhaustion.
+	 */
+	lockHeld?: boolean;
+}
+
 export interface ScriptIndexContextDeps {
 	/** fs seam for shard discovery, adoption, and index writes. */
 	fsImpl?: ScriptIndexFs;
@@ -62,6 +75,11 @@ export interface ScriptIndexContextDeps {
 	 * shard runs the same script.
 	 */
 	script?: string;
+	/**
+	 * Lock-retry knobs for the wholesale-rewrite append lock (PR #151 R1.F1);
+	 * defaults to the shared index-writer protocol. Tests shorten the retries.
+	 */
+	lockDeps?: AcquireIndexLockDeps;
 }
 
 /**
@@ -116,7 +134,7 @@ export interface ScriptIndexContext {
 	/** Claim a legacy headerless `index.csv` (atomic rename) — returns the own shard path. */
 	adopt(): string;
 	/** Wholesale rewrite of the own shard (atomic tmp+rename). */
-	writeOwnLines(lines: string[]): void;
+	writeOwnLines(lines: string[], opts?: WriteOwnLinesOpts): void;
 	/**
 	 * Rename the own shard's rows that reference `oldRoundFile` to
 	 * `newRoundFile` (the stale-round-file migration). The rewrite runs under
@@ -233,14 +251,29 @@ export function resolveScriptIndexContext(
 			return files;
 		},
 		adopt: () => adoptOwnShard(shardRoot, { fsImpl, hostname: hostId }).shardPath,
-		writeOwnLines: (lines) => {
+		writeOwnLines: (lines, opts) => {
 			// Nothing to publish and no index artifact of our own (no own
 			// shard, no legacy file) — do not create an empty shard file.
 			if (lines.length === 0 && !fsImpl.existsSync(own) && !fsImpl.existsSync(legacyPath)) return;
 			// Claim a legacy `index.csv` first so its rows are part of the
 			// rewritten shard instead of being stranded in a legacy file.
 			adoptOwnShard(shardRoot, { fsImpl, hostname: hostId });
-			writeIndexLinesAtomic(own, lines, fsImpl);
+			// The append lock serializes this wholesale rewrite against the
+			// runtime appends (same `<shard>.lock`): an append landing between
+			// the caller's read and the atomic rename would otherwise be
+			// dropped. Fail fast when the lock is exhausted — replacing the
+			// whole file unsynchronized could drop concurrent rows (PR #151 R1.F1).
+			const lock = opts?.lockHeld ? null : acquireIndexLock(own, { ...deps.lockDeps, fsImpl });
+			if (!opts?.lockHeld && lock === null) {
+				throw new Error(
+					`Could not acquire the index lock (${own}.lock) after all retries — the index was NOT written.`,
+				);
+			}
+			try {
+				writeIndexLinesAtomic(own, lines, fsImpl);
+			} finally {
+				lock?.release();
+			}
 		},
 		migrateOwnRows: (oldRoundFile, newRoundFile) => {
 			// Nothing to migrate — do not create an empty shard file.

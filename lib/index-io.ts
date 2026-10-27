@@ -2,6 +2,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { computeContentHash, type HashToolCallDetail } from "./hash.ts";
 import { discoverIndexShards, ownShardPath } from "./index-shards.ts";
+import { type AcquireIndexLockDeps, acquireIndexLock, type IndexStorageFs } from "./index-storage.ts";
 
 export interface VectorIndexEntry {
 	vector: number[];
@@ -210,10 +211,14 @@ export function flushVectorIndex(
 	fsImpl.renameSync(tmp, indexPath);
 }
 
-export interface FlushOwnShardDeps {
+export interface FlushOwnShardDeps extends AcquireIndexLockDeps {
 	/** Hostname override for tests; defaults to os.hostname(). */
 	hostname?: string;
-	fsImpl?: Pick<typeof fs, "writeFileSync" | "renameSync">;
+	/**
+	 * fs surface for the flush and the shard append lock it takes (PR #151
+	 * R1.F1). Defaults to node:fs.
+	 */
+	fsImpl?: IndexStorageFs;
 }
 
 /**
@@ -235,7 +240,21 @@ export function flushOwnShardVectorIndex(
 	deps: FlushOwnShardDeps = {},
 ): string {
 	const shardPath = ownShardPath(roundsDir, deps.hostname);
-	flushVectorIndex(shardPath, entries, deps.fsImpl);
+	// Same append lock the runtime appends take (`<shard>.lock`): a live
+	// append landing between the caller's read and the tmp+rename would
+	// otherwise be dropped. Fail fast when the lock is exhausted — replacing
+	// the whole file unsynchronized could drop concurrent rows (PR #151 R1.F1).
+	const lock = acquireIndexLock(shardPath, deps);
+	if (lock === null) {
+		throw new Error(
+			`Could not acquire the index lock (${shardPath}.lock) after all retries — the index was NOT written.`,
+		);
+	}
+	try {
+		flushVectorIndex(shardPath, entries, deps.fsImpl);
+	} finally {
+		lock.release();
+	}
 	return shardPath;
 }
 

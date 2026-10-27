@@ -424,7 +424,7 @@ export async function runPromptEmbeddingsMigration(options: MigratePromptEmbeddi
 		const mergedLines = mergeAppendedLines(detectionLines, freshLines, lines);
 		// Issue #149: publish to the host's own shard (atomic tmp+rename); a
 		// foreign shard is never rewritten here (D-005).
-		index.writeOwnLines(mergedLines);
+		index.writeOwnLines(mergedLines, { lockHeld: true });
 		mergedRowCount = mergedLines.length;
 	} finally {
 		lock.release();
