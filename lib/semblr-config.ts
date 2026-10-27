@@ -16,8 +16,7 @@ export interface SemblrConfig {
 	indexPath: string;
 	/**
 	 * Stable id of this host — the shard name component (`index.<hostId>`).
-	 * Resolved from the env var, the pi setting, the host-local host id file,
-	 * or `os.hostname()` (issue #149, OI-6).
+	 * Resolved from `SEMBLR_HOST_ID`, then `os.hostname()`; nothing is persisted.
 	 */
 	hostId: string;
 	groupThreshold: number;
