@@ -272,6 +272,44 @@ export interface ShardedReadOptions {
 	 * rest of the run sees.
 	 */
 	fsImpl?: IndexReadFs;
+	/**
+	 * Deduplicate the merged rows by round + suffix + model (issue #149, OI-4).
+	 * Defaults to true: a round embedded by two hosts with the same model
+	 * exists as a row in both shards and must be counted once.
+	 */
+	dedupe?: boolean;
+}
+
+/**
+ * The merge key of an index row: the round file, the row suffix
+ * (`:prompt`/`:response`/…), and the embedding model.
+ *
+ * The model is part of the key on purpose: rows of *different* models are not
+ * duplicates — the search groups the index by model (`getIndexEmbeddingModels`)
+ * and the coverage predicate needs the stale-model rows to detect a round that
+ * still needs a re-embed (issue #140 D1). Collapsing them would silently drop
+ * a searchable model from the index and would mark stale rounds as covered.
+ */
+export function indexRowMergeKey(filePath: string, model?: string): string {
+	const roundFile = path.basename(indexRoundFileFromPath(filePath));
+	return `${roundFile}${indexRowSuffix(filePath)} ${model ?? ""}`;
+}
+
+/**
+ * Drop the duplicate rows of a merged read (issue #149, OI-4): the first row
+ * of a merge key wins, in the deterministic shard order the reader used. The
+ * shards on disk are untouched — the dedup happens at read time.
+ */
+export function dedupeIndexEntries<T extends { filePath: string; model?: string }>(entries: readonly T[]): T[] {
+	const seen = new Set<string>();
+	const deduped: T[] = [];
+	for (const entry of entries) {
+		const key = indexRowMergeKey(entry.filePath, entry.model);
+		if (seen.has(key)) continue;
+		seen.add(key);
+		deduped.push(entry);
+	}
+	return deduped;
 }
 
 /**
@@ -319,7 +357,7 @@ export function loadShardVectorIndex(roundsDir: string, opts: ShardedReadOptions
 		opts.shards,
 		opts.fsImpl ?? fs,
 	);
-	return entries;
+	return opts.dedupe === false ? entries : dedupeIndexEntries(entries);
 }
 
 export function loadVectorIndex(indexPath: string, fsImpl: IndexReadFs = fs): VectorIndexEntry[] {

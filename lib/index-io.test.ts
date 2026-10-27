@@ -242,6 +242,21 @@ describe("4th-column embedding-input hash (issue #106 re-embed migration)", () =
 			expect(loadRoundFilesWithDifferentModelSharded(tempDir, "current")).toEqual(new Set(["b.json"]));
 		});
 
+		it("deduplicates a row that two shards hold for the same round (OI-4)", () => {
+			writeShard("index.host-a", [encodeVectorIndexLine([1], "round1.json:prompt", "m1")]);
+			writeShard("index.host-b", [encodeVectorIndexLine([2], "round1.json:prompt", "m1")]);
+
+			expect(loadShardVectorIndex(tempDir)).toEqual([{ vector: [1], filePath: "round1.json:prompt", model: "m1" }]);
+			expect(loadShardVectorIndex(tempDir, { dedupe: false })).toHaveLength(2);
+		});
+
+		it("keeps rows of different models apart when merging (OI-4)", () => {
+			writeShard("index.host-a", [encodeVectorIndexLine([1], "round1.json:prompt", "m1")]);
+			writeShard("index.host-b", [encodeVectorIndexLine([2], "round1.json:prompt", "m2")]);
+
+			expect(loadShardVectorIndex(tempDir).map((entry) => entry.model)).toEqual(["m1", "m2"]);
+		});
+
 		it("tolerates a missing rounds dir and an empty shard set", () => {
 			const missing = path.join(tempDir, "nope");
 			expect(loadShardVectorIndex(missing)).toEqual([]);

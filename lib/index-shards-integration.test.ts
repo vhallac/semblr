@@ -182,6 +182,21 @@ describe("two-host index shards (issue #149)", () => {
 		expect(scores.every((score) => score.bestScore > 0)).toBe(true);
 	});
 
+	it("counts a round embedded on two hosts once (OI-4)", () => {
+		writeRoundFile("round1.json", "a round both hosts embedded", "the shared answer");
+		writeShard(HOST_A, [indexRow("round1.json:prompt", [1, 0])]);
+		writeShard(HOST_B, [indexRow("round1.json:prompt", [0.99, 0.01])]);
+
+		const index = loadIndexFromShards(roundsDir);
+		expect(index.map((entry) => entry.filePath)).toEqual(["round1.json:prompt"]);
+		expect(buildSessionStartStatus(index)).toContain("1 rounds indexed");
+		// The raw merged read still sees both rows — the dedup is read-time only.
+		expect(loadShardVectorIndex(roundsDir, { dedupe: false })).toHaveLength(2);
+		// The shards on disk are untouched by the dedup.
+		expect(shardRows(HOST_A)).toHaveLength(1);
+		expect(shardRows(HOST_B)).toHaveLength(1);
+	});
+
 	it("starts up and searches an empty rounds dir without error", () => {
 		expect(loadIndexFromShards(roundsDir)).toEqual([]);
 		expect(countShardLines(roundsDir)).toBe(0);

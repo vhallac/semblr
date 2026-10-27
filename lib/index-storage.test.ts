@@ -53,6 +53,33 @@ describe("merged shard reads (#149)", () => {
 		expect(countShardLines(tempDir)).toBe(4); // includes the corrupt row (line-level count)
 	});
 
+	it("deduplicates a round embedded on two hosts (OI-4)", () => {
+		writeShard("index.host-a", ["W1sxXV0=,round1.json:prompt,m1"]);
+		writeShard("index.host-b", ["W1syXV0=,round1.json:prompt,m1"]);
+
+		const entries = loadIndexFromShards(tempDir);
+		expect(entries.map((entry) => entry.filePath)).toEqual(["round1.json:prompt"]);
+		expect(countUniqueIndexedRounds(entries)).toBe(1);
+		expect(buildSessionStartStatus(entries)).toContain("1 rounds indexed");
+
+		// The raw (non-deduplicated) merged view still shows both rows.
+		expect(loadIndexFromShards(tempDir, { dedupe: false }).map((entry) => entry.filePath)).toEqual([
+			"round1.json:prompt",
+			"round1.json:prompt",
+		]);
+	});
+
+	it("keeps rows of different models and different suffixes apart (OI-4)", () => {
+		writeShard("index.host-a", ["W1sxXV0=,round1.json:prompt,m1", "W1syXV0=,round1.json:response,m1"]);
+		writeShard("index.host-b", ["W1szXV0=,round1.json:prompt,m2"]);
+
+		expect(loadIndexFromShards(tempDir).map((entry) => `${entry.filePath}#${entry.model}`)).toEqual([
+			"round1.json:prompt#m1",
+			"round1.json:response#m1",
+			"round1.json:prompt#m2",
+		]);
+	});
+
 	it("tolerates a missing rounds dir", () => {
 		expect(loadIndexFromShards(path.join(tempDir, "nope"))).toEqual([]);
 		expect(countShardLines(path.join(tempDir, "nope"))).toBe(0);

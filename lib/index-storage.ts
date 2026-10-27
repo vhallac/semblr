@@ -1,5 +1,6 @@
 import * as fs from "node:fs";
 import {
+	dedupeIndexEntries,
 	forEachIndexLine,
 	INDEX_CHUNK_BYTES,
 	type IndexReadFs,
@@ -66,7 +67,10 @@ export function loadIndexFromShards(
 			chunkSize,
 		);
 	}
-	return entries;
+	// Issue #149 (OI-4): a round embedded by two hosts exists as a row in both
+	// shards — the merged read returns it once. The shards on disk stay
+	// untouched; the dedup happens at read time.
+	return opts.dedupe === false ? entries : dedupeIndexEntries(entries);
 }
 
 /**

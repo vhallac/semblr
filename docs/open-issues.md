@@ -45,6 +45,7 @@ Started at the archive of the #149 plan (per-host index shards). New entries are
 - **Why it matters:** the merged count overstates the number of distinct rounds, and any future global statistic (coverage, cost, orphan checks) inherits the double count.
 - **Fix sketch:** a global compaction pass (one host owns the dedup) or a round-id-keyed merge at read time — the latter costs a map over the whole index on every read.
 - **Severity:** medium — documented, but every count is affected.
+- **Status:** fixed on the PR !151 branch — the merged read (`loadIndexFromShards`, `loadShardVectorIndex`) now deduplicates by round file, row suffix and embedding model (`dedupeIndexEntries` in `lib/index-io.ts`); the shards on disk are untouched. Rows of different models are deliberately *not* duplicates: the search groups the index by model and the coverage predicate needs the stale-model rows (issue #140 D1).
 
 ## OI-5 — A stale row is never replaced once any shard holds a current-model row for the same label suffix
 
