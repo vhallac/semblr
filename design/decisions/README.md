@@ -4,9 +4,9 @@ One indexed line per decision. Newest at the top.
 
 ## Multi-host index layout
 
-- 025 — Foreign shards are read-only; shared round files are kept and reported — proposed
-- 024 — Legacy index adoption by rename and shard discovery exclusions — proposed
-- 023 — Per-host index shards: own-shard writes, merged reads — proposed
+- 025 — Foreign shards are read-only; shared round files are kept and reported — accepted
+- 024 — Legacy index adoption by rename and shard discovery exclusions — accepted
+- 023 — Per-host index shards: own-shard writes, merged reads — accepted
 
 ## Context-provider contract
 
