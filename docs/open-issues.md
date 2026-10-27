@@ -10,7 +10,7 @@ Started at the archive of the #149 plan (per-host index shards). New entries are
 
 | Issue | Subject | State |
 |---|---|---|
-| [#146](https://github.com/vhallac/semblr/issues/146) | A rewrite that races a concurrent append can drop the appended row (read-modify-write without the append lock) | Open. #149 made the *own-shard* rewrites atomic (tmp+rename) and confined them to one shard; the lock-ordering hazard between a rewrite and a concurrent append, and the failure-injection tests, are still open. |
+| [#146](https://github.com/vhallac/semblr/issues/146) | Index rewrites in `fix-round-tool-ids` and `import-claude-code` remain non-atomic (decision-015 violation) | Open. This branch makes the rewrites atomic (tmp+rename, own-shard only) and deletes the exported in-place whole-index writer (OI-7), but the ordering hazard in `fix-round-tool-ids` (the index is migrated before the corrected round file is written) and the failure-injection tests the issue asks for are still open. |
 | [#136](https://github.com/vhallac/semblr/issues/136) | A startup embedding burst that crashes midway is never retried | Open. Unrelated to the shard model. |
 | [#149](https://github.com/vhallac/semblr/issues/149) | The round index multi-host safety: per-host index shards | Open — PR !151 (`feat/149-multi-host-index-shards`) carries the shard model (decisions 023–025) and the OI-3 … OI-8 fixes; the follow-up work it carries (OI-1) is tracked separately below. |
 | [#152](https://github.com/vhallac/semblr/issues/152) | The BM25 and tool-call indexes are still shared artifacts | Open — owns OI-2 (per-host, rebuildable keyword and tool-call artifacts). |
