@@ -396,9 +396,11 @@ function buildCheckpointContext(fileName: string): string | null {
 const _agentPendingToolCallIds: Map<string, ToolCallDetail> = new Map(); // toolCallId → partial detail
 
 function appendToIndex(filePath: string, vector: number[], model?: string, embeddingInputHash?: string) {
-	// Issue #149: live appends land in the host's own shard (index.<hostname>),
+	// Issue #149: live appends land in the host's own shard (index.<hostId>),
 	// adopting a legacy index.csv on first write; foreign shards are untouched.
-	appendIndexRowToShards(ROUNDS_DIR, filePath, vector, {}, model, embeddingInputHash);
+	// The shard is named after the resolved host id (OI-6), not the raw
+	// machine name.
+	appendIndexRowToShards(ROUNDS_DIR, filePath, vector, { hostname: SEMBLR_CONFIG.hostId }, model, embeddingInputHash);
 }
 
 let searchBm25Index: ReturnType<typeof loadOrRebuildBm25Index> | null = null;
@@ -1275,7 +1277,7 @@ export default function (pi: ExtensionAPI) {
 						const indexEntries = loadShardVectorIndex(ROUNDS_DIR);
 						// Issue #149 (D-006 scope): the live label guard consults only the
 						// host's own shard — the post-adoption write surface.
-						const ownShardEntries = loadVectorIndex(ownShardPath(ROUNDS_DIR));
+						const ownShardEntries = loadVectorIndex(ownShardPath(ROUNDS_DIR, SEMBLR_CONFIG.hostId));
 						// F2 (PR !141 review): the pending count and the `just index` sweep must
 						// classify a recovered round alike. The sweep derives the *forcing*
 						// suffix set per round from the round file (a short prompt's `:prompt`

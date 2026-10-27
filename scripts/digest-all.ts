@@ -248,7 +248,10 @@ export interface DigestAllOptions extends ScriptConfigOptions {
 	fsImpl?: typeof fs;
 	/** Rebuild the tool-call fulltext index from existing round files only — no re-embedding. */
 	toolsOnly?: boolean;
-	/** Hostname override for tests; defaults to os.hostname(). */
+	/**
+	 * Host id override for tests; defaults to the configured host id
+	 * (`config.hostId` — issue #149, OI-6).
+	 */
 	hostname?: string;
 }
 
@@ -264,6 +267,8 @@ export async function runDigestAll(options: DigestAllOptions = {}): Promise<numb
 	// (issue 4.a). The sweep reads the merged view of every shard but writes
 	// only its own shard.
 	const shardRoot = path.dirname(indexPath);
+	// Issue #149 (OI-6): the own shard is named after the resolved host id.
+	const hostId = options.hostname ?? config.hostId;
 	const bm25IndexPath = bm25IndexPathForRoundsDir(roundsDir);
 	const out = options.stdout ?? console;
 	const err = options.stderr ?? console;
@@ -310,7 +315,7 @@ export async function runDigestAll(options: DigestAllOptions = {}): Promise<numb
 	// a wholesale rewrite never drops the legacy rows. When the host already
 	// has a shard of its own, the legacy file is left in place and stays part
 	// of the read shard set.
-	const { shardPath: ownShard } = adoptOwnShard(shardRoot, { fsImpl: f, hostname: options.hostname });
+	const { shardPath: ownShard } = adoptOwnShard(shardRoot, { fsImpl: f, hostname: hostId });
 
 	// Issue #139/#149: parse the index exactly once per run and derive every
 	// index-level structure from that single pass — the dedup set, the
@@ -845,7 +850,7 @@ export async function runDigestAll(options: DigestAllOptions = {}): Promise<numb
 	// Issue #149: the wholesale rewrite is scoped to the host's own shard
 	// (`index.<hostname>`) — a foreign shard is never rewritten by this host
 	// (D-005), and its bytes stay exactly as they were.
-	if (indexDirty) flushOwnShardVectorIndex(shardRoot, ownEntries, { hostname: options.hostname, fsImpl: f });
+	if (indexDirty) flushOwnShardVectorIndex(shardRoot, ownEntries, { hostname: hostId, fsImpl: f });
 
 	const finalCount = ownEntries.length + foreignEntries.length;
 

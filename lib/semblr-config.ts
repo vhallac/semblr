@@ -2,6 +2,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { DEFAULT_MAX_RECENCY_ENTRIES, DEFAULT_PROMPT_TRUNCATION } from "./context-format.ts";
+import { type HostIdFs, resolveHostId } from "./host-id.ts";
 import { DEFAULT_PROMPT_NOISE_CLEANUP } from "./round-capture.ts";
 import { DEFAULT_CONTEXT_BUDGET_RATIO, DEFAULT_MAX_RELEVANCE_ENTRIES } from "./search-interactions.ts";
 
@@ -13,6 +14,12 @@ export interface SemblrConfig {
 	embeddingApiUrl?: string;
 	roundsDir: string;
 	indexPath: string;
+	/**
+	 * Stable id of this host — the shard name component (`index.<hostId>`).
+	 * Resolved from the env var, the pi setting, the host-local host id file,
+	 * or `os.hostname()` (issue #149, OI-6).
+	 */
+	hostId: string;
 	groupThreshold: number;
 	minSimilarity: number;
 	embedTimeoutMs: number;
@@ -46,6 +53,7 @@ export interface SemblrConfigEnv {
 	SEMBLR_EMBEDDING_MAX_TOKENS?: string;
 	SEMBLR_EMBEDDING_API_URL?: string;
 	SEMBLR_ROUNDS_DIR?: string;
+	SEMBLR_HOST_ID?: string;
 	SEMBLR_GROUP_THRESHOLD?: string;
 	SEMBLR_MIN_SIMILARITY?: string;
 	SEMBLR_EMBED_TIMEOUT?: string;
@@ -67,7 +75,12 @@ export interface SemblrConfigDeps {
 	cwd?: string;
 	agentDir?: string;
 	env?: SemblrConfigEnv;
-	fsImpl?: Pick<typeof fs, "existsSync" | "readFileSync">;
+	/**
+	 * fs seam. The write methods are optional: without them the host id
+	 * cannot be persisted (a read-only seam), but it is still resolved.
+	 */
+	fsImpl?: Pick<typeof fs, "existsSync" | "readFileSync"> &
+		Partial<Pick<typeof fs, "writeFileSync" | "mkdirSync" | "renameSync">>;
 	warn?: (message: string) => void;
 }
 
@@ -103,6 +116,7 @@ const ENV_KEYS = {
 	embeddingMaxTokens: "SEMBLR_EMBEDDING_MAX_TOKENS",
 	embeddingApiUrl: "SEMBLR_EMBEDDING_API_URL",
 	roundsDir: "SEMBLR_ROUNDS_DIR",
+	hostId: "SEMBLR_HOST_ID",
 	groupThreshold: "SEMBLR_GROUP_THRESHOLD",
 	minSimilarity: "SEMBLR_MIN_SIMILARITY",
 	embedTimeoutMs: "SEMBLR_EMBED_TIMEOUT",
@@ -229,6 +243,14 @@ function resolveRoundsDir(
 	return path.resolve(source === "project" ? cwd : agentDir, configured);
 }
 
+/**
+ * The fs seam as a host-id surface. A seam without the write methods can
+ * still read the saved host id; it just cannot persist a new one.
+ */
+function hostIdFsImpl(fsImpl: SemblrConfigDeps["fsImpl"]): HostIdFs | undefined {
+	return fsImpl as HostIdFs | undefined;
+}
+
 export function loadSemblrConfig(deps: SemblrConfigDeps = {}): SemblrConfig {
 	const env = deps.env ?? process.env;
 	const cwd = deps.cwd ?? process.cwd();
@@ -242,7 +264,21 @@ export function loadSemblrConfig(deps: SemblrConfigDeps = {}): SemblrConfig {
 
 	const roundsDir = resolveRoundsDir(env, projectSettings, globalSettings, cwd, agentDir);
 
+	// Issue #149 (OI-6): a stable host id names this host's own shard. The
+	// order is env → pi settings → the host-local host id file → the machine
+	// name; the machine name is saved on first use so a renamed machine keeps
+	// its shard. The file is host-local (`<agentDir>/semblr/host-id`), never
+	// the synced rounds directory.
+	const { value: hostIdValue } = resolveValue("hostId", env, mergedSettings, {});
+	const { hostId } = resolveHostId({
+		configuredHostId: asNonEmptyString(hostIdValue),
+		agentDir,
+		fsImpl: hostIdFsImpl(fsImpl),
+		warn,
+	});
+
 	return {
+		hostId,
 		agentDir,
 		embeddingProvider: resolveString(
 			"embeddingProvider",

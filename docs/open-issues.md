@@ -63,6 +63,7 @@ Started at the archive of the #149 plan (per-host index shards). New entries are
 - **Why it matters:** the old shard keeps contributing rows to every merged read (including stale-model rows, OI-1/OI-5), and nothing prunes it.
 - **Fix sketch:** a stable host identity (a configured id, or a marker file inside the rounds dir) instead of the raw hostname, plus a way to retire a shard deliberately.
 - **Severity:** low-medium.
+- **Status:** fixed on the PR !151 branch — the shard name comes from a resolved host id: the `SEMBLR_HOST_ID` env var, then the `hostId` pi setting, then the host-local host id file (`<agentDir>/semblr/host-id`), then `os.hostname()` (`lib/host-id.ts`, `resolveHostId`; wired through `lib/semblr-config.ts` as `config.hostId` and used by the extension and every script for the own-shard name). The machine name is saved to the host-local file on first run, so a renamed machine keeps its shard; the file is host-local on purpose — the rounds directory is synced between hosts, so a marker file there would give every host the same id. An unconfigured host keeps `index.<hostname>`, so today's behaviour is unchanged.
 
 ## OI-7 — `replaceIndexEntriesForRoundFile` is an exported, non-atomic rewrite helper with no production caller left
 

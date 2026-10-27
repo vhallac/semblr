@@ -33,6 +33,11 @@ describe("resolveScriptIndexContext", () => {
 		expect(index.indexPath).toBe(path.join(roundsDir, "index.csv"));
 	});
 
+	it("names the own shard after the configured host id when no override is given", () => {
+		const index = resolveScriptIndexContext({ ...config, hostId: "workstation-1" }, roundsDir);
+		expect(index.ownShardPath).toBe(path.join(roundsDir, "index.workstation-1"));
+	});
+
 	it("honors a custom rounds dir (issue #149 ext 4.a)", () => {
 		const otherDir = path.join(root, "other-rounds");
 		fs.mkdirSync(otherDir, { recursive: true });

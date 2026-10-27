@@ -43,7 +43,11 @@ export type ScriptIndexFs = typeof fs;
 export interface ScriptIndexContextDeps {
 	/** fs seam for shard discovery, adoption, and index writes. */
 	fsImpl?: ScriptIndexFs;
-	/** Hostname override for tests; defaults to os.hostname(). */
+	/**
+	 * Host id override for tests; defaults to the configured host id
+	 * (`config.hostId` — env, pi setting, host-local host id file, or the
+	 * machine name; issue #149, OI-6).
+	 */
 	hostname?: string;
 }
 
@@ -113,9 +117,12 @@ export function resolveScriptIndexContext(
 	deps: ScriptIndexContextDeps = {},
 ): ScriptIndexContext {
 	const fsImpl = deps.fsImpl ?? fs;
+	// Issue #149 (OI-6): the own shard is named after the resolved host id,
+	// not after the raw machine name, so a renamed host keeps its shard.
+	const hostId = deps.hostname ?? config.hostId;
 	const resolvedIndexPath = resolveScriptIndexPath(config, roundsDir, indexPath);
 	const shardRoot = path.dirname(resolvedIndexPath);
-	const own = ownShardPath(shardRoot, deps.hostname);
+	const own = ownShardPath(shardRoot, hostId);
 	const legacyPath = path.join(shardRoot, LEGACY_INDEX_FILENAME);
 	const discover = (): string[] => discoverIndexShards(shardRoot, fsImpl);
 	// The legacy `index.csv` belongs to this host while it can still claim it
@@ -171,14 +178,14 @@ export function resolveScriptIndexContext(
 			}
 			return files;
 		},
-		adopt: () => adoptOwnShard(shardRoot, { fsImpl, hostname: deps.hostname }).shardPath,
+		adopt: () => adoptOwnShard(shardRoot, { fsImpl, hostname: hostId }).shardPath,
 		writeOwnLines: (lines) => {
 			// Nothing to publish and no index artifact of our own (no own
 			// shard, no legacy file) — do not create an empty shard file.
 			if (lines.length === 0 && !fsImpl.existsSync(own) && !fsImpl.existsSync(legacyPath)) return;
 			// Claim a legacy `index.csv` first so its rows are part of the
 			// rewritten shard instead of being stranded in a legacy file.
-			adoptOwnShard(shardRoot, { fsImpl, hostname: deps.hostname });
+			adoptOwnShard(shardRoot, { fsImpl, hostname: hostId });
 			writeIndexLinesAtomic(own, lines, fsImpl);
 		},
 		migrateOwnRows: (oldRoundFile, newRoundFile) => {
@@ -205,14 +212,7 @@ export function resolveScriptIndexContext(
 			}
 		},
 		appendRow: (filePath, vector, model, embeddingInputHash) =>
-			appendIndexRowToShards(
-				shardRoot,
-				filePath,
-				vector,
-				{ fsImpl, hostname: deps.hostname },
-				model,
-				embeddingInputHash,
-			),
+			appendIndexRowToShards(shardRoot, filePath, vector, { fsImpl, hostname: hostId }, model, embeddingInputHash),
 		foreignShardsReferencing: (filename) =>
 			discover()
 				.filter((shardPath) => shardPath !== own)

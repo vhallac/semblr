@@ -272,8 +272,8 @@ Semblr stores conversation data in two areas, both outside the project tree so t
 | File | Purpose |
 |---|---|
 | `<id>.json` | A single round: user prompt, full assistant response, tool call metadata |
-| `index.<hostname>` | This host's own append-only vector index shard — one line per embedding: `base64(vector),<filepath>:prompt|response,<model>` |
-| `index.csv` | Legacy single-file index — adopted by rename to `index.<hostname>` on the first write by a host that has no shard of its own; read as part of the shard set until then |
+| `index.<hostId>` | This host's own append-only vector index shard — one line per embedding: `base64(vector),<filepath>:prompt|response,<model>` |
+| `index.csv` | Legacy single-file index — adopted by rename to `index.<hostId>` on the first write by a host that has no shard of its own; read as part of the shard set until then |
 
 Round IDs are content-addressed (MD5 of `userPrompt + responseSequence`), so re-indexing is idempotent — same content produces the same file.
 
@@ -281,8 +281,9 @@ Round IDs are content-addressed (MD5 of `userPrompt + responseSequence`), so re-
 
 The vector index is a **set of per-host shards**, not one shared file, so a rounds directory shared (or synced) across hosts never has two writers fighting over one artifact:
 
-- **Layout:** one shard per host — `index.<hostname>` sits next to the round files in the rounds directory. The hostname lives in the filename; a shard carries no header of its own, so shard files stay byte-compatible with the legacy CSV format.
-- **Writes stay on the host's own shard.** Live appends, the `just index` sweep/compaction, and the index-rewriting migration scripts all write to `index.<hostname>` only. A foreign shard is never rewritten — compaction leaves it byte-identical, and its rows are reported rather than touched.
+- **Layout:** one shard per host — `index.<hostId>` sits next to the round files in the rounds directory. The host id lives in the filename; a shard carries no header of its own, so shard files stay byte-compatible with the legacy CSV format.
+- **Writes stay on the host's own shard.** Live appends, the `just index` sweep/compaction, and the index-rewriting migration scripts all write to `index.<hostId>` only. A foreign shard is never rewritten — compaction leaves it byte-identical, and its rows are reported rather than touched.
+- **The host id is stable.** The shard name comes from the resolved host id: the `SEMBLR_HOST_ID` env var, then the `hostId` pi setting, then the host-local host id file (`$PI_CODING_AGENT_DIR/semblr/host-id`), then `os.hostname()`. The machine name is saved to that host-local file on first run, so a renamed machine or a new container id keeps writing to the same shard instead of orphaning it. The file is deliberately host-local — the rounds directory is synced between hosts, so a marker file there would give every host the same id.
 - **Reads use the merged shard set.** Startup loading, the TUI round count, search retrieval, the pending-embedding predicate, the sweep's "already indexed" checks, and the read-only scripts iterate every shard in the directory. An empty shard set is an empty index, not an error.
 - **Adoption rule:** a legacy headerless `index.csv` is claimed by rename (an atomic same-directory rename) by the first host that writes while having no shard of its own. A host that already owns a shard leaves the legacy file alone — renaming would clobber its shard — so the legacy file stays readable as part of the shard set.
 - **Exclusion rule:** shard discovery picks up `index.*` files but explicitly excludes the sibling artifacts and transient files: `index.bm25.json`, `index-tools.fulltext.csv`, migration backups (`index.csv.bak.*`, `index.<host>.bak.*`), lockfiles (`index.<host>.lock`), and atomic-write temps (`index.<host>.tmp.<pid>`).
@@ -337,6 +338,7 @@ Relative `roundsDir` values in project settings resolve under the project cwd. R
 | `embeddingMaxTokens` | `SEMBLR_EMBEDDING_MAX_TOKENS` | `8000` | Prompt/response clipping budget for embedding inputs |
 | `embeddingApiUrl` | `SEMBLR_EMBEDDING_API_URL` | derived | Full embeddings endpoint override |
 | `roundsDir` | `SEMBLR_ROUNDS_DIR` | `$PI_CODING_AGENT_DIR/semblr/rounds` | Round repository and index-shard directory |
+| `hostId` | `SEMBLR_HOST_ID` | `os.hostname()` | Id of this host — the name component of its index shard (`index.<hostId>`). Resolved from the env var, the pi setting, the host-local host id file (`$PI_CODING_AGENT_DIR/semblr/host-id`), then the machine name; the machine name is saved to that file on first run so a renamed machine keeps its shard |
 | `groupThreshold` | `SEMBLR_GROUP_THRESHOLD` | `0.77` | Minimum cosine similarity for grouping rounds into topics. Higher = more groups |
 | `minSimilarity` | `SEMBLR_MIN_SIMILARITY` | `0.3` | Minimum semantic similarity for relevance retrieval |
 | `embedTimeoutMs` | `SEMBLR_EMBED_TIMEOUT` | `15000` | Embedding request timeout |
@@ -380,7 +382,7 @@ Three scripts parse historical conversation data into semblr rounds:
 ### Deduplication
 
 When `digest-all.ts` runs:
-1. Loads all existing entries from the merged shard set (every `index.<hostname>` shard, plus a legacy `index.csv` until it is adopted)
+1. Loads all existing entries from the merged shard set (every `index.<hostId>` shard, plus a legacy `index.csv` until it is adopted)
 2. Computes the expected file path for each parsed round via content hash
 3. Skips rounds already indexed with the current embedding model
 4. Re-embeds rounds whose index rows have an explicit different embedding model
@@ -455,7 +457,6 @@ The multi-host shard layout (see [Multi-host shard layout](#multi-host-shard-lay
 - **Mixed embedding models across shards.** The automatic context injection scores every row of the merged shard set with a single query vector built from the configured model, while the `search_interactions` tool scores per model (`collectMultiModelSearchRoundScores`). A row written by a host that uses a different model is therefore scored in an incompatible vector space: a shorter foreign vector yields `NaN` scores, a longer one is silently truncated to the query's dimensionality. (OI-1)
 - **The BM25 and tool-call indexes are still shared, in-place artifacts.** `index.bm25.json` is rebuilt wholesale from the round files and `index-tools.fulltext.csv` is appended per round and rewritten in place — the write-conflict hazard the shard model removed for the vector index still applies to these two, and both write in place rather than tmp+rename. Tracked as [#152](https://github.com/vhallac/semblr/issues/152). (OI-2)
 - **One migration path still rewrites its own shard in place.** The stale-file migration in `digest-session` renames rows inside the host's own shard through an in-place write with no append lock, so a crash can truncate the shard and a concurrent append can be lost. (OI-3)
-- **Host identity is the hostname.** The shard name is `os.hostname()` at write time, so a renamed machine, a new container id, or a moved home directory starts a new shard and leaves the old one behind as a permanent foreign shard that nothing prunes. (OI-6)
 - **Outstanding foreign shards are reported, never tracked.** A rewrite script prints the foreign shards it left untouched, but that backlog is not recorded anywhere, so a half-finished migration on a multi-host store is only visible in the log of the run that noticed it. (OI-8)
 
 ## Quick Start
@@ -559,7 +560,7 @@ just build-baseline-weak ~/.pi/agent/semblr/snapshots/<snapshot-dir>
 just eval <unpacked-snapshot-dir> /tmp/eval.json
 ```
 
-`scripts/eval-retrieval.ts` replays every qualifying historical round (≥20-word prompt and timestamp; similarity mode also requires a stored prompt embedding) through the production scoring path, restricting candidates to strictly-earlier rounds, and scores the top 5 against weak labels (`parentId` links plus `get_round_details` expansions mined from snapshot session JSONL files). Golden labels may select `mode: "tool"` and provide a curated `tool_query`; those queries use the production tool-index matcher. Golden reports include mode-separated metrics in `by_mode`, while the legacy top-level metrics remain similarity-only for stable baseline comparisons. Use `--mode similarity` or `--mode tool` for a focused golden run. Reports Hit@5, Recall@5, MRR, and a noise rate derived from `chain-read-stats.json`. The report also names the index shards the corpus was read from (`shards`) — the corpus index is a set of per-host shards (`index.<hostname>`), and a corpus without any shard is an empty corpus, not an error. Fully offline and deterministic for a given snapshot — never run it against the live rounds directory; snapshot first.
+`scripts/eval-retrieval.ts` replays every qualifying historical round (≥20-word prompt and timestamp; similarity mode also requires a stored prompt embedding) through the production scoring path, restricting candidates to strictly-earlier rounds, and scores the top 5 against weak labels (`parentId` links plus `get_round_details` expansions mined from snapshot session JSONL files). Golden labels may select `mode: "tool"` and provide a curated `tool_query`; those queries use the production tool-index matcher. Golden reports include mode-separated metrics in `by_mode`, while the legacy top-level metrics remain similarity-only for stable baseline comparisons. Use `--mode similarity` or `--mode tool` for a focused golden run. Reports Hit@5, Recall@5, MRR, and a noise rate derived from `chain-read-stats.json`. The report also names the index shards the corpus was read from (`shards`) — the corpus index is a set of per-host shards (`index.<hostId>`), and a corpus without any shard is an empty corpus, not an error. Fully offline and deterministic for a given snapshot — never run it against the live rounds directory; snapshot first.
 
 The committed `docs/eval/baseline-weak.json` was built from a maintainer-private corpus. Users should compare against their own `docs/eval/baseline-weak.local.json` instead. See `docs/eval/README.md` for details.
 

@@ -88,6 +88,7 @@ function testConfig(overrides: Partial<SemblrConfig> = {}): SemblrConfig {
 		embeddingMaxTokens: 8000,
 		roundsDir: "/rounds",
 		indexPath: "/rounds/index.csv",
+		hostId: "test-host",
 		groupThreshold: 0.77,
 		minSimilarity: 0.3,
 		embedTimeoutMs: 15000,

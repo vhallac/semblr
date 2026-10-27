@@ -123,6 +123,7 @@ describe("pruneRecoveryDuplicates shard awareness (#149)", () => {
 			embeddingMaxTokens: 8000,
 			roundsDir,
 			indexPath: path.join(roundsDir, "index.csv"),
+			hostId: "test-host",
 			groupThreshold: 0.77,
 			minSimilarity: 0.3,
 			embedTimeoutMs: 15_000,
