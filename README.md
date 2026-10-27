@@ -453,8 +453,9 @@ Semblr currently sends OpenAI-compatible embedding requests to a configured HTTP
 
 ## Known Limitations
 
-The multi-host shard layout (see [Multi-host shard layout](#multi-host-shard-layout)) has boundaries that are not bugs to be fixed in place — they are the current edges of the model. The still-open limitations are listed below and tracked in the [project issue tracker](https://github.com/vhallac/semblr/issues); this section is the single in-repository reference.
+The multi-host shard layout (see [Multi-host shard layout](#multi-host-shard-layout)) has boundaries that are not bugs to be fixed in place — they are the current edges of the model. The still-open limitations are listed below; issue-tracked limitations link to the [project issue tracker](https://github.com/vhallac/semblr/issues). This section is the single in-repository reference.
 
+- **Unclaimed legacy `index.csv`.** A host that already owns a shard leaves a legacy `index.csv` unclaimed, so the file remains searchable as part of the merged shard set but is not rewritten or adopted by that host.
 - **Mixed embedding models across shards.** The automatic context injection scores every row of the merged shard set with a single query vector built from the configured model, while the `search_interactions` tool scores per model (`collectMultiModelSearchRoundScores`). A row written by a host that uses a different model is therefore scored in an incompatible vector space: a shorter foreign vector yields `NaN` scores, a longer one is silently truncated to the query's dimensionality. Tracked as [#153](https://github.com/vhallac/semblr/issues/153). (OI-1)
 - **The BM25 and tool-call indexes are still shared artifacts.** `index.bm25.json` is rebuilt wholesale from the round files and `index-tools.fulltext.csv` is appended per round — the write-conflict hazard the shard model removed for the vector index still applies to these two, and the BM25 index is still written in place rather than tmp+rename. Tracked as [#152](https://github.com/vhallac/semblr/issues/152). (OI-2)
 

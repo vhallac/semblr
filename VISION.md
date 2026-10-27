@@ -28,7 +28,8 @@ Within a session, as context grows past the window, summarization compresses it.
 
 ### Embedding Index
 - Each round gets two embeddings: prompt vector + response vector
-- Stored as an append-only CSV: `base64url(vector_json),<filepath>:prompt|:response`
+- Stored in per-host append-only CSV shards named `index.<hostId>`: `base64url(vector_json),<filepath>:prompt|:response`
+- Reads merge all discovered shards and deduplicate duplicate round rows by round, row suffix, and embedding model; each host writes only its own shard
 - Embedding provider/model: configurable through Semblr settings; default is pi's `openrouter` provider with `openai/text-embedding-3-small`
 - Bulk indexing scripts in `scripts/` for historical sessions, using the same config resolution as the extension
 
@@ -90,7 +91,7 @@ Because context is assembled dynamically, every prompt is a fresh embedding API 
 - **Agent loop, tools, TUI, model abstraction:** Inherited from pi
 - **Round repository:** Flat files on disk under a `rounds/` directory
 - **Embeddings:** Configurable OpenAI-compatible embedding provider/model; default `openrouter` + `openai/text-embedding-3-small`
-- **Vector index:** Flat CSV + cosine similarity in TypeScript
+- **Vector index:** Per-host flat CSV shards (`index.<hostId>`), merged with deduplicated reads + cosine similarity in TypeScript
 - **Context assembly:** Extension hooks (`agent_start`, `agent_end`, `message_end`, `context`, `session_before_compact`, `session_compact`, `session_start`)
 - **Native tools:** `search_interactions`, `get_round_details`, `get_tool_details` (registered in `session_start`)
 
