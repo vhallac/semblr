@@ -175,7 +175,10 @@ export async function runPromptEmbeddingsMigration(options: MigratePromptEmbeddi
 	// Issue #149: the index is a set of per-host shards. The re-embed rewrites
 	// this host's own shard only (D-005) — a foreign shard keeps its rows and
 	// is updated when that host runs this script.
-	const index = resolveScriptIndexContext(config, roundsDir, options.indexPath, { hostname: options.hostname });
+	const index = resolveScriptIndexContext(config, roundsDir, options.indexPath, {
+		hostname: options.hostname,
+		script: "migrate-prompt-embeddings",
+	});
 	const out = options.stdout ?? console;
 	const err = options.stderr ?? console;
 	const noiseOptions = noiseOptionsFromConfig(config);

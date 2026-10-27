@@ -28,6 +28,13 @@ const TOOL_INDEX_FILENAME = "index-tools.fulltext.csv";
 const BM25_INDEX_FILENAME = "index.bm25.json";
 
 /**
+ * Outstanding foreign-shard backlog (issue #149, OI-8) — a state file, never
+ * a shard. It lives in the shard root next to the shards and is excluded
+ * from shard discovery, like the other sibling artifacts.
+ */
+export const FOREIGN_BACKLOG_FILENAME = "index.backlog.json";
+
+/**
  * Migration backup artifacts — never a shard. Covers the legacy
  * `index.csv.bak.<ts>` form and the `index.<host>.bak.<ts>` /
  * `index.csv.bak-<ts>` variants the migration scripts write.
@@ -49,6 +56,7 @@ const TMP_PATTERN = /^index\..+\.tmp\./;
 export function isIndexShardFilename(filename: string): boolean {
 	if (!filename.startsWith("index.")) return false;
 	if (filename === TOOL_INDEX_FILENAME || filename === BM25_INDEX_FILENAME) return false;
+	if (filename === FOREIGN_BACKLOG_FILENAME) return false;
 	if (BACKUP_PATTERN.test(filename) || LOCK_PATTERN.test(filename) || TMP_PATTERN.test(filename)) return false;
 	return true;
 }

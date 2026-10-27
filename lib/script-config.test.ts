@@ -2,8 +2,9 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { readForeignBacklog } from "./foreign-backlog.ts";
 import { encodeVectorIndexLine } from "./index-io.ts";
-import { resolveScriptIndexContext } from "./script-config.ts";
+import { reportForeignShards, resolveScriptIndexContext } from "./script-config.ts";
 import { loadSemblrConfig, type SemblrConfig } from "./semblr-config.ts";
 
 describe("resolveScriptIndexContext", () => {
@@ -141,5 +142,55 @@ describe("resolveScriptIndexContext", () => {
 		expect(index.foreignShards().map((shard) => path.basename(shard.shardPath))).toEqual(["index.host-b"]);
 		expect(index.foreignShards()[0].rows).toBe(1);
 		expect([...index.foreignReferencedFiles()]).toEqual(["b.json"]);
+	});
+
+	it("records the outstanding foreign shards of a rewrite (issue #149, OI-8)", () => {
+		fs.writeFileSync(path.join(roundsDir, "index.host-b"), `${encodeVectorIndexLine([2], "b.json:prompt")}\n`);
+		const index = resolveScriptIndexContext(config, roundsDir, undefined, {
+			hostname: "host-a",
+			script: "migrate-model-column",
+		});
+		index.writeOwnLines([`${encodeVectorIndexLine([3], "own.json:prompt")}\n`]);
+
+		reportForeignShards(index, { log: () => {} });
+
+		const entries = readForeignBacklog(roundsDir);
+		expect(entries).toHaveLength(1);
+		expect(entries[0].shard).toBe("index.host-b");
+		expect(entries[0].rows).toBe(1);
+		expect(entries[0].roundFiles).toEqual(["b.json"]);
+		expect(entries[0].script).toBe("migrate-model-column");
+	});
+
+	it("clears the own backlog entry when the owning host runs the same rewrite", () => {
+		fs.writeFileSync(path.join(roundsDir, "index.host-b"), `${encodeVectorIndexLine([2], "b.json:prompt")}\n`);
+		const hostA = resolveScriptIndexContext(config, roundsDir, undefined, {
+			hostname: "host-a",
+			script: "migrate-model-column",
+		});
+		hostA.writeOwnLines([`${encodeVectorIndexLine([3], "own.json:prompt")}\n`]);
+		reportForeignShards(hostA, { log: () => {} });
+		expect(readForeignBacklog(roundsDir).map((entry) => entry.shard)).toEqual(["index.host-b"]);
+
+		// The host that owns "index.host-b" runs the same rewrite.
+		const hostB = resolveScriptIndexContext(config, roundsDir, undefined, {
+			hostname: "host-b",
+			script: "migrate-model-column",
+		});
+		hostB.writeOwnLines([`${encodeVectorIndexLine([2], "b.json:prompt")}\n`]);
+		reportForeignShards(hostB, { log: () => {} });
+
+		const entries = readForeignBacklog(roundsDir);
+		expect(entries.map((entry) => entry.shard)).not.toContain("index.host-b");
+	});
+
+	it("records no backlog without a script name", () => {
+		fs.writeFileSync(path.join(roundsDir, "index.host-b"), `${encodeVectorIndexLine([2], "b.json:prompt")}\n`);
+		const index = resolveScriptIndexContext(config, roundsDir, undefined, { hostname: "host-a" });
+		index.writeOwnLines([`${encodeVectorIndexLine([3], "own.json:prompt")}\n`]);
+
+		reportForeignShards(index, { log: () => {} });
+
+		expect(readForeignBacklog(roundsDir)).toEqual([]);
 	});
 });

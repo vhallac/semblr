@@ -83,6 +83,7 @@ export function runContentHashMigration(options: ContentHashMigrationOptions = {
 	// rows and is updated when that host runs this script.
 	const index = resolveScriptIndexContext(config, roundsDir, options.indexPath, {
 		hostname: options.hostname,
+		script: "migrate-content-hash",
 	});
 	const out = options.stdout ?? console;
 	const err = options.stderr ?? console;

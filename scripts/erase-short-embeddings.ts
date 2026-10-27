@@ -88,7 +88,10 @@ export function runEraseShortEmbeddings(options: EraseShortEmbeddingsOptions = {
 	const roundsDir = options.roundsDir ?? config.roundsDir;
 	// Issue #149: the index is a set of per-host shards. The rewrite touches
 	// this host's own shard only (D-005) — a foreign shard stays byte-identical.
-	const index = resolveScriptIndexContext(config, roundsDir, options.indexPath, { hostname: options.hostname });
+	const index = resolveScriptIndexContext(config, roundsDir, options.indexPath, {
+		hostname: options.hostname,
+		script: "erase-short-embeddings",
+	});
 	const minWords = options.minWords ?? MIN_WORDS;
 	const out = options.stdout ?? console;
 

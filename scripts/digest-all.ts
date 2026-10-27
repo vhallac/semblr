@@ -30,6 +30,7 @@ import {
 	forcingReproducibleSuffixes,
 	ownShardHasStaleForcingRow,
 } from "../lib/embed-round.ts";
+import { describeForeignShards, recordForeignBacklog } from "../lib/foreign-backlog.ts";
 import {
 	buildStaleContentMatchMap,
 	flushOwnShardVectorIndex,
@@ -851,6 +852,21 @@ export async function runDigestAll(options: DigestAllOptions = {}): Promise<numb
 	// (`index.<hostname>`) — a foreign shard is never rewritten by this host
 	// (D-005), and its bytes stay exactly as they were.
 	if (indexDirty) flushOwnShardVectorIndex(shardRoot, ownEntries, { hostname: hostId, fsImpl: f });
+
+	// Issue #149 (OI-8): the sweep rewrote the host's own shard; the foreign
+	// shards are still outstanding. The one-line notice is transient, so the
+	// outstanding foreign shards are recorded in the backlog state file. The
+	// record replaces the entries of this script — including the entry the
+	// other host recorded for this host's shard, which the sweep just
+	// resolved.
+	if (indexDirty) {
+		try {
+			recordForeignBacklog(shardRoot, "digest-all", describeForeignShards(shardRoot, [ownShard], f), f);
+		} catch {
+			// The backlog is advisory state — a failed record must never
+			// break the sweep it describes.
+		}
+	}
 
 	const finalCount = ownEntries.length + foreignEntries.length;
 

@@ -78,7 +78,10 @@ export function runModelColumnMigration(options: MigrateModelColumnOptions = {})
 	// Issue #149: the index is a set of per-host shards. The migration rewrites
 	// this host's own shard only (D-005) — a foreign shard keeps its rows and
 	// is updated when that host runs this script.
-	const index = resolveScriptIndexContext(config, config.roundsDir, indexPath, { hostname: options.hostname });
+	const index = resolveScriptIndexContext(config, config.roundsDir, indexPath, {
+		hostname: options.hostname,
+		script: "migrate-model-column",
+	});
 
 	const foreignShards = index.foreignShards();
 	const legacyPath = path.join(index.shardRoot, LEGACY_INDEX_FILENAME);

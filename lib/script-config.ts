@@ -7,6 +7,12 @@ import {
 	getApiKey,
 } from "./embedding-client.ts";
 import {
+	clearForeignBacklog,
+	describeForeignShards,
+	type ForeignShardDescription,
+	recordForeignBacklog,
+} from "./foreign-backlog.ts";
+import {
 	forEachShardLine,
 	indexEntryFilename,
 	loadShardVectorIndex,
@@ -49,6 +55,13 @@ export interface ScriptIndexContextDeps {
 	 * machine name; issue #149, OI-6).
 	 */
 	hostname?: string;
+	/**
+	 * Name of the rewrite script (e.g. `migrate-model-column`). The
+	 * outstanding foreign-shard backlog is keyed by it (issue #149, OI-8):
+	 * the entry a host is waiting for is cleared when the host that owns the
+	 * shard runs the same script.
+	 */
+	script?: string;
 }
 
 /**
@@ -82,6 +95,22 @@ export interface ScriptIndexContext {
 	readRewriteRows(): string[];
 	/** Foreign shards (never rewritten by this host) with their row counts. */
 	foreignShards(): Array<{ shardPath: string; rows: number }>;
+	/**
+	 * The foreign shards with their row counts and the round files they
+	 * reference — the payload of the outstanding backlog entry (OI-8).
+	 */
+	foreignShardDetails(): ForeignShardDescription[];
+	/**
+	 * Record the outstanding foreign shards of this run in the backlog state
+	 * file (issue #149, OI-8). A no-op when the context has no script name.
+	 */
+	recordForeignBacklog(): void;
+	/**
+	 * Clear this host's own backlog entry for the current script — the host
+	 * that owns a shard clears its entry by running the rewrite it was
+	 * waiting for (issue #149, OI-8).
+	 */
+	clearOwnBacklog(): void;
 	/** Round files a foreign shard still references (the own shard excluded). */
 	foreignReferencedFiles(): Set<string>;
 	/** Claim a legacy headerless `index.csv` (atomic rename) — returns the own shard path. */
@@ -129,6 +158,13 @@ export function resolveScriptIndexContext(
 	// (no shard of its own yet): the write renames it into the own shard, so
 	// its rows are this host's rows — not a foreign shard's.
 	const legacyClaimable = (): boolean => !fsImpl.existsSync(own) && fsImpl.existsSync(legacyPath);
+	// The backlog state file is keyed by the script name (OI-8).
+	const scriptName = deps.script ?? null;
+	// The paths that are not foreign shards: the own shard, and the legacy
+	// `index.csv` while this host can still claim it.
+	const foreignExcludedPaths = (): string[] => (legacyClaimable() ? [own, legacyPath] : [own]);
+	const foreignShardDetails = (): ForeignShardDescription[] =>
+		describeForeignShards(shardRoot, foreignExcludedPaths(), fsImpl);
 
 	return {
 		shardRoot,
@@ -162,10 +198,28 @@ export function resolveScriptIndexContext(
 			return ownRows;
 		},
 		foreignShards: () =>
-			discover()
-				.filter((shardPath) => shardPath !== own)
-				.filter((shardPath) => !(shardPath === legacyPath && legacyClaimable()))
-				.map((shardPath) => ({ shardPath, rows: readIndexLines(shardPath, fsImpl).length })),
+			foreignShardDetails().map((shard) => ({
+				shardPath: path.join(shardRoot, shard.shard),
+				rows: shard.rows,
+			})),
+		foreignShardDetails: () => foreignShardDetails(),
+		recordForeignBacklog: () => {
+			if (!scriptName) return;
+			try {
+				recordForeignBacklog(shardRoot, scriptName, foreignShardDetails(), fsImpl);
+			} catch {
+				// The backlog is advisory state: a failed record must never
+				// break the rewrite it describes.
+			}
+		},
+		clearOwnBacklog: () => {
+			if (!scriptName) return;
+			try {
+				clearForeignBacklog(shardRoot, scriptName, [path.basename(own)], fsImpl);
+			} catch {
+				// Advisory state — a failed clear must never break the rewrite.
+			}
+		},
 		foreignReferencedFiles: () => {
 			const files = new Set<string>();
 			for (const shardPath of discover()) {
@@ -239,6 +293,12 @@ export function foreignShardNotice(shards: Array<{ shardPath: string; rows: numb
 
 /** Log the foreign shards this host left untouched; no-op when there are none. */
 export function reportForeignShards(index: ScriptIndexContext, out: Pick<typeof console, "log">): void {
+	// Issue #149 (OI-8): the notice is transient, so the outstanding
+	// foreign-shard backlog is recorded in the backlog state file. This host
+	// clears its own entry first — it just ran the rewrite the foreign hosts
+	// were waiting for.
+	index.clearOwnBacklog();
+	index.recordForeignBacklog();
 	const notice = foreignShardNotice(index.foreignShards());
 	if (notice) out.log(notice);
 }

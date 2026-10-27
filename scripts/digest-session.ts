@@ -96,7 +96,10 @@ export async function runDigestSession(options: DigestSessionOptions = {}): Prom
 	const roundsDir = options.roundsDir ?? config.roundsDir;
 	// Issue #149: the index is a set of per-host shards — reads see every
 	// shard, writes land in the host's own shard (`index.<hostname>`).
-	const index = resolveScriptIndexContext(config, roundsDir, options.indexPath, { fsImpl: options.indexFsImpl });
+	const index = resolveScriptIndexContext(config, roundsDir, options.indexPath, {
+		fsImpl: options.indexFsImpl,
+		script: "digest-session",
+	});
 	const bm25IndexPath = bm25IndexPathForRoundsDir(roundsDir);
 	const modelRegistry = resolveScriptModelRegistry(config, options);
 	const embeddingConfig = scriptEmbeddingConfig(config);

@@ -126,7 +126,10 @@ export async function pruneRecoveryDuplicates(options: PruneOptions = {}): Promi
 	// Issue #149: the index is a set of per-host shards (`index.<host>`). This
 	// host cleans its own shard only (D-005) — a foreign shard keeps its rows
 	// and is updated when that host runs this script.
-	const index = resolveScriptIndexContext(config, roundsDir, options.indexPath, { hostname: options.hostname });
+	const index = resolveScriptIndexContext(config, roundsDir, options.indexPath, {
+		hostname: options.hostname,
+		script: "prune-recovery-duplicates",
+	});
 	// A round file a foreign shard still references is kept: the foreign row
 	// cannot be rewritten by this host, so deleting the file would leave the
 	// other host's rows dangling. That host prunes it.

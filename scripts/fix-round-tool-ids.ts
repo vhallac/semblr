@@ -84,6 +84,7 @@ export async function runFixRoundToolIds(options: FixRoundToolIdsOptions = {}): 
 	const index = resolveScriptIndexContext(config, roundsDir, options.indexPath, {
 		fsImpl: options.fsImpl,
 		hostname: options.hostname,
+		script: "fix-round-tool-ids",
 	});
 	const dryRun = options.dryRun ?? false;
 	const out = options.stdout ?? console;
