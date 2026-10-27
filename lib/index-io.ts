@@ -163,10 +163,6 @@ export function forEachIndexLine(
 	}
 }
 
-export function writeIndexLines(indexPath: string, entries: string[]): void {
-	fs.writeFileSync(indexPath, entries.join("\n") + (entries.length > 0 ? "\n" : ""));
-}
-
 /**
  * Write index lines atomically (tmp+rename, decision 015): a crash during
  * the write leaves the target byte-identical — only a successful rename
@@ -419,28 +415,6 @@ export function loadRoundFilesWithDifferentModel(
 	return new Set(mismatched);
 }
 
-/**
- * Replace every row of one round inside a single index file.
- *
- * Issue #149: the index is a set of per-host shards, so this operates on one
- * shard file. A compaction (wholesale rewrite) must pass the host's own shard
- * — a foreign shard is never rewritten by this host (D-005).
- */
-export function replaceIndexEntriesForRoundFile(
-	indexPath: string,
-	roundFile: string,
-	entries: VectorIndexEntry[],
-): void {
-	const remaining = readIndexLines(indexPath).filter((line) => {
-		const filename = indexEntryFilename(line);
-		return !filename || path.basename(filename) !== roundFile;
-	});
-	const replacement = entries.map((entry) =>
-		encodeVectorIndexLine(entry.vector, entry.filePath, entry.model, entry.embeddingInputHash),
-	);
-	writeIndexLines(indexPath, [...remaining, ...replacement]);
-}
-
 export function migrateIndexEntryLine(line: string, oldRoundFile: string, newRoundFile: string): string {
 	const firstComma = line.indexOf(",");
 	if (firstComma === -1) return line;
@@ -450,12 +424,6 @@ export function migrateIndexEntryLine(line: string, oldRoundFile: string, newRou
 	if (!segments[0].startsWith(oldRoundFile)) return line;
 	segments[0] = newRoundFile + segments[0].slice(oldRoundFile.length);
 	return `${line.slice(0, firstComma + 1)}${segments.join(",")}`;
-}
-
-export function migrateIndexEntries(indexPath: string, oldRoundFile: string, newRoundFile: string): void {
-	if (!fs.existsSync(indexPath)) return;
-	const migrated = readIndexLines(indexPath).map((line) => migrateIndexEntryLine(line, oldRoundFile, newRoundFile));
-	writeIndexLines(indexPath, migrated);
 }
 
 export function indexEntryFilename(line: string): string | null {

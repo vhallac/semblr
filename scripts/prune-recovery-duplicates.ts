@@ -37,7 +37,7 @@ import { bm25IndexPathForRoundsDir, buildBm25Index, roundTextForBm25, writeBm25I
 // Shared duplicate key lives in lib/hash.ts so the backfill existence check
 // uses the exact same canonicalization as this prune script.
 import { canonicalDuplicateKey } from "../lib/hash.ts";
-import { filterIndexLinesExcludingFilenames, readIndexLines, writeIndexLines } from "../lib/index-io.ts";
+import { filterIndexLinesExcludingFilenames, readIndexLines, writeIndexLinesAtomic } from "../lib/index-io.ts";
 import {
 	reportForeignShards,
 	resolveScriptConfig,
@@ -198,7 +198,7 @@ export async function pruneRecoveryDuplicates(options: PruneOptions = {}): Promi
 		const lines = readIndexLines(toolIndexPath);
 		const kept = lines.filter((line) => !allPrunes.has(line.slice(0, line.indexOf(","))));
 		if (kept.length !== lines.length) {
-			writeIndexLines(toolIndexPath, kept);
+			writeIndexLinesAtomic(toolIndexPath, kept);
 			out(`Index cleaned: ${toolIndexPath} (${lines.length - kept.length} lines removed)`);
 		}
 	}

@@ -32,11 +32,12 @@ Started at the archive of the #149 plan (per-host index shards). New entries are
 
 ## OI-3 — The stale-file migration in `digest-session` writes the own shard in place, without the append lock
 
-- **Anchor:** `scripts/digest-session.ts` — `migrateIndexEntriesFile(index.ownShardPath, staleFile, roundFile)`; `lib/index-io.ts` — `migrateIndexEntries` → `writeIndexLines` (in-place `writeFileSync`).
+- **Anchor:** `scripts/digest-session.ts` — the stale-file migration (`index.migrateOwnRows(staleFile, roundFile)`); formerly `lib/index-io.ts` — `migrateIndexEntries` → `writeIndexLines` (in-place `writeFileSync`).
 - **What:** the content-hash migration renames the rows of a stale round file inside the own shard through a read-modify-write that ends in an in-place write — no tmp+rename (decision 015) and no lockfile (decision 005's short-lock merge model).
 - **Why it matters:** a crash mid-write leaves a truncated shard, and a concurrent append by the extension can be lost by the read-modify-write. The rewrite scripts migrated in #149 all publish through the atomic path (`writeOwnLines`); this one did not.
 - **Fix sketch:** route the row migration through the same atomic own-shard write as the other rewrite scripts.
 - **Severity:** medium.
+- **Status:** fixed on the PR !151 branch — the stale-file migration publishes through the host's own shard via the atomic (tmp+rename) write under the shard's append lock (`index.migrateOwnRows` in `scripts/digest-session.ts`, `writeOwnLines` in `lib/script-config.ts`); a fault-injected write leaves the shard byte-identical and a concurrent append is preserved. The old in-place helper (`migrateIndexEntries`) is gone (OI-7).
 
 ## OI-4 — The merged read does not deduplicate across shards
 
@@ -72,6 +73,7 @@ Started at the archive of the #149 plan (per-host index shards). New entries are
 - **Why it matters:** it is a trap for the next caller: a correct-looking helper that reintroduces a non-atomic whole-index write (decision 015) and that takes no shard argument, so it cannot respect the own-shard rule of decision 023.
 - **Fix sketch:** delete it, or reroute it to the atomic own-shard write.
 - **Severity:** low.
+- **Status:** fixed on the PR !151 branch — the non-atomic whole-index rewrite helpers are gone from `lib/index-io.ts`: `replaceIndexEntriesForRoundFile`, `writeIndexLines` and the (already unused) `migrateIndexEntries` were deleted. The one remaining production caller of a whole-index rewrite — `scripts/prune-recovery-duplicates.ts` writing the tool-call fulltext index — now publishes through `writeIndexLinesAtomic` (tmp+rename), so `lib/index-io.ts` exports no in-place whole-index writer and the next caller cannot reintroduce one.
 
 ## OI-8 — Outstanding per-host work is reported, never tracked
 

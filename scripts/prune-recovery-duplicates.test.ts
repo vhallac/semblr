@@ -144,6 +144,39 @@ describe("pruneRecoveryDuplicates shard awareness (#149)", () => {
 
 	const row = (file: string): string => encodeVectorIndexLine([0.1, 0.2], `${file}:prompt`);
 
+	it("rewrites the tool index atomically (tmp+rename, decision 015)", async () => {
+		const dir = fs.mkdtempSync(path.join(os.tmpdir(), "prune-tools-"));
+		dirs.push(dir);
+		fs.writeFileSync(path.join(dir, "live.json"), JSON.stringify({ userPrompt: "q", responseSequence: "a" }));
+		fs.writeFileSync(
+			path.join(dir, "dup.json"),
+			JSON.stringify({ userPrompt: "q", responseSequence: "a", recovered: true }),
+		);
+		const ownShard = path.join(dir, "index.host-a");
+		fs.writeFileSync(ownShard, `${[row("live.json"), row("dup.json")].join("\n")}\n`);
+		const toolIndex = path.join(dir, "index-tools.fulltext.csv");
+		fs.writeFileSync(toolIndex, "live.json,abc,0,bash\ndup.json,def,0,bash\n");
+		const inodeBefore = fs.statSync(toolIndex).ino;
+
+		await pruneRecoveryDuplicates({
+			config: testConfig(dir),
+			roundsDir: dir,
+			cutoffMs: 0,
+			args: ["--apply"],
+			hostname: "host-a",
+			out: () => {},
+		});
+
+		const toolIndexAfter = fs.readFileSync(toolIndex, "utf-8");
+		expect(toolIndexAfter).toContain("live.json");
+		expect(toolIndexAfter).not.toContain("dup.json");
+		// A published rename installs a new file (new inode); an in-place write
+		// would keep the old inode.
+		expect(fs.statSync(toolIndex).ino).not.toBe(inodeBefore);
+		// No temp artifact is left behind.
+		expect(fs.readdirSync(dir).filter((name) => name.includes(".tmp."))).toEqual([]);
+	});
+
 	it("prunes only the duplicates this host owns and cleans its own shard", async () => {
 		const dir = fs.mkdtempSync(path.join(os.tmpdir(), "prune-shards-"));
 		dirs.push(dir);

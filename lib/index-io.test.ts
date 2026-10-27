@@ -20,13 +20,11 @@ import {
 	loadShardVectorIndex,
 	loadVectorIndex,
 	makeAssumedStamp,
-	migrateIndexEntries,
 	migrateIndexEntryLine,
 	readIndexByFilename,
 	readIndexLines,
-	replaceIndexEntriesForRoundFile,
 	replaceIndexLineFilename,
-	writeIndexLines,
+	writeIndexLinesAtomic,
 } from "./index-io.ts";
 
 let tempDir = "";
@@ -51,7 +49,7 @@ describe("index I/O helpers", () => {
 	});
 
 	it("writes index lines and extracts round filenames", () => {
-		writeIndexLines(indexPath(), [
+		writeIndexLinesAtomic(indexPath(), [
 			encodeVectorIndexLine([1], "dir/one.json:prompt"),
 			encodeVectorIndexLine([2], "two.json:response"),
 			encodeVectorIndexLine([3], "three.json:round"),
@@ -62,7 +60,7 @@ describe("index I/O helpers", () => {
 	});
 
 	it("detects only explicit non-current model rows as model mismatches", () => {
-		writeIndexLines(indexPath(), [
+		writeIndexLinesAtomic(indexPath(), [
 			encodeVectorIndexLine([1], "legacy.json:prompt"),
 			encodeVectorIndexLine([2], "same.json:prompt", "current-model"),
 			encodeVectorIndexLine([3], "different.json:prompt", "old-model"),
@@ -74,25 +72,6 @@ describe("index I/O helpers", () => {
 		);
 	});
 
-	it("replaces all rows for one round file while preserving unrelated and malformed rows", () => {
-		const keep = encodeVectorIndexLine([1], "keep.json:prompt", "old-model");
-		const oldPrompt = encodeVectorIndexLine([2], "old.json:prompt", "old-model");
-		const oldResponse = encodeVectorIndexLine([3], "old.json:response", "old-model");
-		writeIndexLines(indexPath(), [keep, oldPrompt, oldResponse, "malformed"]);
-
-		replaceIndexEntriesForRoundFile(indexPath(), "old.json", [
-			{ vector: [4], filePath: "old.json:prompt", model: "current-model" },
-			{ vector: [5], filePath: "old.json:response", model: "current-model" },
-		]);
-
-		expect(readIndexLines(indexPath())).toEqual([
-			keep,
-			"malformed",
-			encodeVectorIndexLine([4], "old.json:prompt", "current-model"),
-			encodeVectorIndexLine([5], "old.json:response", "current-model"),
-		]);
-	});
-
 	it("migrates matching index entry prefixes and leaves unrelated rows unchanged", () => {
 		const oldLine = encodeVectorIndexLine([1], "old.json:prompt");
 		const unrelated = encodeVectorIndexLine([2], "other.json:prompt");
@@ -101,18 +80,13 @@ describe("index I/O helpers", () => {
 			encodeVectorIndexLine([1], "new.json:prompt"),
 		);
 		expect(migrateIndexEntryLine(unrelated, "old.json", "new.json")).toBe(unrelated);
-
-		writeIndexLines(indexPath(), [oldLine, unrelated]);
-		migrateIndexEntries(indexPath(), "old.json", "new.json");
-
-		expect(readIndexLines(indexPath())).toEqual([encodeVectorIndexLine([1], "new.json:prompt"), unrelated]);
 	});
 
 	it("groups rows by filename and filters renamed filenames", () => {
 		const keep = encodeVectorIndexLine([1], "keep.json:prompt");
 		const oldPrompt = encodeVectorIndexLine([2], "old.json:prompt");
 		const oldResponse = encodeVectorIndexLine([3], "old.json:response");
-		writeIndexLines(indexPath(), [keep, oldPrompt, oldResponse, "malformed"]);
+		writeIndexLinesAtomic(indexPath(), [keep, oldPrompt, oldResponse, "malformed"]);
 
 		expect(indexEntryFilename(keep)).toBe("keep.json");
 		expect(indexEntryFilename("malformed")).toBeNull();
@@ -155,7 +129,7 @@ describe("index I/O helpers", () => {
 
 describe("4th-column embedding-input hash (issue #106 re-embed migration)", () => {
 	it("round-trips 2/3/4-column lines through loadVectorIndex", () => {
-		writeIndexLines(indexPath(), [
+		writeIndexLinesAtomic(indexPath(), [
 			encodeVectorIndexLine([1], "a.json:prompt"),
 			encodeVectorIndexLine([2], "b.json:prompt", "model-x"),
 			encodeVectorIndexLine([3], "c.json:prompt", "model-x", "abc123"),
@@ -192,26 +166,8 @@ describe("4th-column embedding-input hash (issue #106 re-embed migration)", () =
 		expect(migrateIndexEntryLine(line, "other.json", "dir/moved.json")).toBe(line);
 	});
 
-	it("preserves the hash column when replacing rows for a round", () => {
-		const keep = encodeVectorIndexLine([1], "keep.json:prompt", "model-x", "keep-hash");
-		const oldPrompt = encodeVectorIndexLine([2], "old.json:prompt", "model-x", "old-hash");
-		const oldResponse = encodeVectorIndexLine([3], "old.json:response", "model-x");
-		writeIndexLines(indexPath(), [keep, oldPrompt, oldResponse]);
-
-		replaceIndexEntriesForRoundFile(indexPath(), "old.json", [
-			{ vector: [4], filePath: "old.json:prompt", model: "model-y", embeddingInputHash: "new-hash" },
-			{ vector: [5], filePath: "old.json:response", model: "model-y" },
-		]);
-
-		expect(loadVectorIndex(indexPath())).toEqual([
-			{ vector: [1], filePath: "keep.json:prompt", model: "model-x", embeddingInputHash: "keep-hash" },
-			{ vector: [4], filePath: "old.json:prompt", model: "model-y", embeddingInputHash: "new-hash" },
-			{ vector: [5], filePath: "old.json:response", model: "model-y" },
-		]);
-	});
-
 	it("detects model mismatches on 4-column rows without treating the hash as model", () => {
-		writeIndexLines(indexPath(), [
+		writeIndexLinesAtomic(indexPath(), [
 			encodeVectorIndexLine([1], "same.json:prompt", "current-model", "hash-1"),
 			encodeVectorIndexLine([2], "different.json:prompt", "old-model", "hash-2"),
 		]);
@@ -321,7 +277,9 @@ describe("assumed- provenance stamps (#107 F1)", () => {
 	});
 
 	it("round-trips an assumed- stamp through the 4th CSV column", () => {
-		writeIndexLines(indexPath(), [encodeVectorIndexLine([1], "a.json:prompt", "model-x", makeAssumedStamp("h1"))]);
+		writeIndexLinesAtomic(indexPath(), [
+			encodeVectorIndexLine([1], "a.json:prompt", "model-x", makeAssumedStamp("h1")),
+		]);
 
 		expect(loadVectorIndex(indexPath())).toEqual([
 			{ vector: [1], filePath: "a.json:prompt", model: "model-x", embeddingInputHash: "assumed-h1" },
