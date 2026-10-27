@@ -12,6 +12,9 @@ Started at the archive of the #149 plan (per-host index shards). New entries are
 |---|---|---|
 | [#146](https://github.com/vhallac/semblr/issues/146) | A rewrite that races a concurrent append can drop the appended row (read-modify-write without the append lock) | Open. #149 made the *own-shard* rewrites atomic (tmp+rename) and confined them to one shard; the lock-ordering hazard between a rewrite and a concurrent append, and the failure-injection tests, are still open. |
 | [#136](https://github.com/vhallac/semblr/issues/136) | A startup embedding burst that crashes midway is never retried | Open. Unrelated to the shard model. |
+| [#149](https://github.com/vhallac/semblr/issues/149) | The round index multi-host safety: per-host index shards | Open — PR !151 (`feat/149-multi-host-index-shards`) carries the shard model (decisions 023–025) and the OI-3 … OI-8 fixes; the follow-up work it carries (OI-1) is tracked separately below. |
+| [#152](https://github.com/vhallac/semblr/issues/152) | The BM25 and tool-call indexes are still shared artifacts | Open — owns OI-2 (per-host, rebuildable keyword and tool-call artifacts). |
+| [#153](https://github.com/vhallac/semblr/issues/153) | The context-injection path scores every merged shard row with a single query vector | Open — owns OI-1 (model-aware injection scoring). |
 
 ## OI-1 — A merged read mixes embedding models, and the injection path scores every row with one query vector
 
@@ -20,6 +23,7 @@ Started at the archive of the #149 plan (per-host index shards). New entries are
 - **Why it matters:** a shard written by a host that uses a different embedding model is scored in an incompatible vector space. `cosineSimilarity` iterates over the *query* length, so a foreign vector that is shorter yields `NaN` scores (a silent poison for the ranking) and a longer one is silently truncated to the query's dimensionality — plausible-looking but meaningless scores.
 - **Fix sketch:** filter the merged rows by the current model in the injection path (or score per model as the tool path does), and skip a row whose vector dimension does not match the query.
 - **Severity:** high — silently wrong context on a multi-host store whose hosts use different models.
+- **Status:** still open — tracked by [#153](https://github.com/vhallac/semblr/issues/153) (model-aware injection scoring). Not fixed by the shard work: the shard model (decision 023) makes the mixed-model shard set normal, it does not make the injection path model-aware.
 
 ## OI-2 — The BM25 index and the tool-call fulltext index are still single shared artifacts, written in place
 
@@ -29,6 +33,7 @@ Started at the archive of the #149 plan (per-host index shards). New entries are
 - **Fix sketch:** either shard them like the vector index (own-shard writes, merged reads), or declare them per-host local artifacts that are rebuilt from the round files on demand — both are derivable from the round files, so a shared copy may be unnecessary.
 - **Severity:** medium-high.
 - **Tracked:** [#152](https://github.com/vhallac/semblr/issues/152) — per-host, rebuildable keyword and tool-call artifacts (decided: per-host derived artifacts, no cross-host merge).
+- **Status:** still open — tracked by [#152](https://github.com/vhallac/semblr/issues/152). Not fixed by the shard work: the shard model covers the vector index only.
 
 ## OI-3 — The stale-file migration in `digest-session` writes the own shard in place, without the append lock
 
