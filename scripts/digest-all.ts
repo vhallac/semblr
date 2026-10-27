@@ -28,6 +28,7 @@ import {
 	embedRound,
 	FORCING_INDEX_SUFFIXES,
 	forcingReproducibleSuffixes,
+	ownShardHasStaleForcingRow,
 } from "../lib/embed-round.ts";
 import {
 	buildStaleContentMatchMap,
@@ -405,6 +406,25 @@ export async function runDigestAll(options: DigestAllOptions = {}): Promise<numb
 		if (hasReproducibleRow) roundsWithReproducibleRow.add(roundFile);
 		if (hasStaleReproducibleRow) roundsWithStaleReproducibleRow.add(roundFile);
 		if (!covered) modelMismatchedRounds.add(roundFile);
+		// Issue #149 (OI-5): the *write* side decides staleness per shard. A
+		// stale forcing row in the host's OWN shard must be replaced even when a
+		// foreign shard holds a current-model row for the same suffix — the
+		// foreign shard is read-only for this host (decision 025), so nobody
+		// else can replace the own shard's stale row and it would keep feeding
+		// the mixed-model scoring (OI-1). The merged coverage above stays
+		// cross-shard, so the startup pending predicate
+		// (lib/session-backfill.ts) and this sweep still agree on which rounds
+		// are covered; only the write side is per shard.
+		if (
+			ownShardHasStaleForcingRow(
+				ownEntriesByRoundFile.get(roundFile) ?? [],
+				config.embeddingModel,
+				readReproducibleSuffixes(roundFile),
+				indexRowSuffix,
+			)
+		) {
+			modelMismatchedRounds.add(roundFile);
+		}
 	}
 	out.log(`📊 Already indexed: ${existingRounds.size} rounds`);
 	out.log(`📊 Model-mismatched rounds to re-index: ${modelMismatchedRounds.size}\n`);

@@ -4,6 +4,7 @@ import {
 	type EmbedRoundDeps,
 	embedRound,
 	forcingReproducibleSuffixes,
+	ownShardHasStaleForcingRow,
 	reproducedIndexSuffixes,
 } from "./embed-round.ts";
 import { indexRowSuffix } from "./index-io.ts";
@@ -232,5 +233,48 @@ describe("embedRound (shared F4+F6 policy core)", () => {
 		expect(promptRow.vec).toEqual([1 / Math.sqrt(14), 2 / Math.sqrt(14), 3 / Math.sqrt(14)]);
 		// the response and combined inputs still go through the plain embed dep
 		expect(embeddedTexts).toHaveLength(2);
+	});
+});
+
+// Issue #149 (OI-5) — the write side decides staleness per shard: a stale
+// forcing row in the host's own shard must be replaceable even when another
+// shard holds a current-model row for the same suffix.
+describe("ownShardHasStaleForcingRow", () => {
+	const forcing = new Set([":prompt", ":response"]);
+	const stale = (entries: Array<{ filePath: string; model?: string }>, current = "m") =>
+		ownShardHasStaleForcingRow(entries, current, forcing, indexRowSuffix);
+
+	it("reports a stale own-shard row whose suffix has no current-model row in the own shard", () => {
+		expect(stale([{ filePath: "r.json:response", model: "old" }])).toBe(true);
+	});
+
+	it("reports a stale own-shard suffix even when another suffix is current", () => {
+		expect(
+			stale([
+				{ filePath: "r.json:prompt", model: "m" },
+				{ filePath: "r.json:response", model: "old" },
+			]),
+		).toBe(true);
+	});
+
+	it("does not report a round the own shard does not hold", () => {
+		expect(stale([])).toBe(false);
+	});
+
+	it("does not report an own shard whose rows are current", () => {
+		expect(
+			stale([
+				{ filePath: "r.json:prompt", model: "m" },
+				{ filePath: "r.json:response", model: "m" },
+			]),
+		).toBe(false);
+	});
+
+	it("treats a legacy row without a model column as current (issue #62)", () => {
+		expect(stale([{ filePath: "r.json:response" }])).toBe(false);
+	});
+
+	it("ignores a non-forcing suffix", () => {
+		expect(stale([{ filePath: "r.json:summary", model: "old" }])).toBe(false);
 	});
 });

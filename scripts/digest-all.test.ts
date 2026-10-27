@@ -2420,3 +2420,125 @@ describe("digest-all shard isolation (issue #149)", () => {
 		]);
 	});
 });
+
+// Issue #149 (OI-5) — the sweep's staleness decision is per shard: a stale
+// forcing row in the host's own shard is replaced even when a foreign shard
+// holds a current-model row for the same suffix. The foreign shard is
+// read-only for this host and must stay byte-identical (decision 025).
+describe("digest-all per-shard staleness (issue #149 OI-5)", () => {
+	const setup = (): { roundsDir: string; sessionsDir: string; sDir: string } => {
+		const root = tmpDir();
+		const sessionsDir = path.join(root, "sessions");
+		const sDir = path.join(sessionsDir, "--test");
+		fs.mkdirSync(sDir, { recursive: true });
+		const roundsDir = path.join(root, "rounds");
+		fs.mkdirSync(roundsDir, { recursive: true });
+		return { roundsDir, sessionsDir, sDir };
+	};
+
+	const STALE_MODEL = "openai/text-embedding-3-small-old";
+
+	it("replaces a stale own-shard row even though a foreign shard holds a current-model row", async () => {
+		const { roundsDir, sessionsDir, sDir } = setup();
+		const userPrompt = "Which shard still holds the stale embedding for this round?";
+		const responseSequence = "The own shard does, and only the own shard can replace it.";
+		writeSession(path.join(sDir, "session.jsonl"), [{ userPrompt, responseSequence }]);
+		const roundFile = `${computeContentHash(userPrompt, responseSequence, [])}.json`;
+
+		// The own shard holds the round under an old model.
+		const ownShard = ownShardPath(roundsDir, "host-a");
+		fs.writeFileSync(
+			ownShard,
+			`${[
+				encodeVectorIndexLine([1], `${roundFile}:prompt`, STALE_MODEL),
+				encodeVectorIndexLine([2], `${roundFile}:response`, STALE_MODEL),
+			].join("\n")}\n`,
+		);
+
+		// A foreign shard already holds the same round under the current model.
+		const foreignShard = path.join(roundsDir, "index.host-b");
+		const foreignBytes = `${[
+			encodeVectorIndexLine([3], `${roundFile}:prompt`, DEBUG_EMBEDDING_MODEL),
+			encodeVectorIndexLine([4], `${roundFile}:response`, DEBUG_EMBEDDING_MODEL),
+		].join("\n")}\n`;
+		fs.writeFileSync(foreignShard, foreignBytes);
+
+		const logs = logger();
+		const requests: unknown[] = [];
+		await expect(
+			runDigestAll({
+				sessionsDir,
+				roundsDir,
+				indexPath: ownShard,
+				hostname: "host-a",
+				apiKey: "key",
+				fetchImpl: embeddingFetch(
+					[
+						[3, 4],
+						[0, 5],
+					],
+					requests,
+				),
+				stdout: logs.out,
+				stderr: logs.err,
+			}),
+		).resolves.toBe(0);
+
+		// The stale own-shard row forced a re-embed even though the merged view
+		// was covered by the foreign shard's current-model rows.
+		expect(requests.length).toBeGreaterThan(0);
+		const ownRows = loadVectorIndex(ownShard);
+		expect(ownRows.map((row) => row.filePath).sort()).toEqual([`${roundFile}:prompt`, `${roundFile}:response`]);
+		expect(ownRows.every((row) => row.model === DEBUG_EMBEDDING_MODEL)).toBe(true);
+
+		// The foreign shard is read-only for this host.
+		expect(fs.readFileSync(foreignShard, "utf-8")).toBe(foreignBytes);
+	});
+
+	it("converges — a second sweep spends no embedding call", async () => {
+		const { roundsDir, sessionsDir, sDir } = setup();
+		const userPrompt = "Does the per-shard staleness rule converge on the next sweep?";
+		const responseSequence = "It does, because the own shard now holds current-model rows.";
+		writeSession(path.join(sDir, "session.jsonl"), [{ userPrompt, responseSequence }]);
+		const roundFile = `${computeContentHash(userPrompt, responseSequence, [])}.json`;
+
+		const ownShard = ownShardPath(roundsDir, "host-a");
+		fs.writeFileSync(ownShard, `${encodeVectorIndexLine([1], `${roundFile}:response`, STALE_MODEL)}\n`);
+		const foreignShard = path.join(roundsDir, "index.host-b");
+		const foreignBytes = `${encodeVectorIndexLine([3], `${roundFile}:response`, DEBUG_EMBEDDING_MODEL)}\n`;
+		fs.writeFileSync(foreignShard, foreignBytes);
+
+		const logs = logger();
+		const firstRequests: unknown[] = [];
+		await expect(
+			runDigestAll({
+				sessionsDir,
+				roundsDir,
+				indexPath: ownShard,
+				hostname: "host-a",
+				apiKey: "key",
+				fetchImpl: embeddingFetch([], firstRequests),
+				stdout: logs.out,
+				stderr: logs.err,
+			}),
+		).resolves.toBe(0);
+		expect(firstRequests.length).toBeGreaterThan(0);
+
+		const secondLogs = logger();
+		const secondRequests: unknown[] = [];
+		await expect(
+			runDigestAll({
+				sessionsDir,
+				roundsDir,
+				indexPath: ownShard,
+				hostname: "host-a",
+				apiKey: "key",
+				fetchImpl: embeddingFetch([], secondRequests),
+				stdout: secondLogs.out,
+				stderr: secondLogs.err,
+			}),
+		).resolves.toBe(0);
+		expect(secondRequests).toHaveLength(0);
+		expect(fs.readFileSync(foreignShard, "utf-8")).toBe(foreignBytes);
+	});
+});

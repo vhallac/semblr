@@ -147,6 +147,33 @@ export function classifyRoundCoverage(
 }
 
 /**
+ * Issue #149 (OI-5): does the host's OWN shard hold a stale forcing row that
+ * only the own shard can replace?
+ *
+ * The merged coverage (`classifyRoundCoverage` over every shard) treats a
+ * stale row as covered as soon as *another* shard holds a current-model row
+ * for the same suffix. That is right for a read (the round is retrievable)
+ * but wrong for a write: a foreign shard is read-only for this host
+ * (decision 025), so nobody would ever replace the own shard's stale row and
+ * it would keep feeding the mixed-model scoring (OI-1).
+ *
+ * The rule is deliberately narrow: true only when the own shard holds a
+ * forcing row for a suffix that has no current-model row *in the own shard*.
+ * A round the own shard does not hold at all is not stale — there is nothing
+ * to replace — so a foreign-only round is never re-embedded, and the startup
+ * pending predicate keeps its cross-shard meaning.
+ */
+export function ownShardHasStaleForcingRow(
+	ownEntries: readonly { filePath: string; model?: string }[],
+	currentModel: string,
+	forcingSuffixes: ReadonlySet<string>,
+	rowSuffix: (filePath: string) => string,
+): boolean {
+	const { hasReproducibleRow, covered } = classifyRoundCoverage(ownEntries, currentModel, forcingSuffixes, rowSuffix);
+	return hasReproducibleRow && !covered;
+}
+
+/**
  * Embed one round under the single shared policy.
  *
  * Short-prompt drop (shouldDropEmbedding over the raw prompt's word count):

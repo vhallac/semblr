@@ -54,6 +54,7 @@ Started at the archive of the #149 plan (per-host index shards). New entries are
 - **Why it matters:** the stale embedding is never replaced by anyone — the host that owns it sees the round as covered, and the host that owns the current row cannot rewrite a foreign shard (decision 025). Stale rows therefore accumulate in shards and keep feeding the mixed-model scoring of OI-1.
 - **Fix sketch:** make the staleness decision per shard (ignore foreign shards), or add a sweep step that rewrites the own shard's stale rows regardless of what other shards hold.
 - **Severity:** medium.
+- **Status:** fixed on the PR !151 branch — the `just index` sweep now decides staleness per shard on the write side: a stale forcing row in the host's own shard triggers a rewrite of that shard's rows even when a foreign shard holds a current-model row for the same suffix (`ownShardHasStaleForcingRow` in `lib/embed-round.ts`, applied in `scripts/digest-all.ts`). The start-up pending predicate keeps its cross-shard meaning (a round covered by current-model rows anywhere is not pending), so startup does not re-embed in a loop. A stale row in a foreign shard is untouched — it is replaced when the host that owns it runs the sweep.
 
 ## OI-6 — Host identity is `os.hostname()`, so a renamed host orphans its shard
 
