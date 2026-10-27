@@ -161,30 +161,33 @@ describe("resolveScriptIndexContext", () => {
 		expect(fs.existsSync(path.join(roundsDir, "index.host-a"))).toBe(before);
 	});
 
-	it("a concurrent append that lands in the rewrite window survives (PR #151 R1.F1, SC-1)", () => {
-		const own = path.join(roundsDir, "index.host-a");
-		const index = resolveScriptIndexContext(config, roundsDir, undefined, { hostname: "host-a" });
-
-		// The caller resolves its lines first; a live session appends through
-		// the runtime protocol (same `<shard>.lock`), so its row serializes
-		// with the rewrite instead of racing it — it is present afterwards.
-		index.writeOwnLines([`${encodeVectorIndexLine([3], "own.json:prompt")}\n`]);
-		appendLineWithLock(own, roundsDir, `${encodeVectorIndexLine([8], "live2.json:prompt")}\n`);
-
-		const ownLines = fs.readFileSync(own, "utf-8").trim().split("\n");
-		expect(ownLines).toContain(encodeVectorIndexLine([3], "own.json:prompt"));
-		expect(ownLines).toContain(encodeVectorIndexLine([8], "live2.json:prompt"));
-	});
-
 	// claim: pr151-review-r2.feature-SC-1/SC-1/rewriteOwnRows_preserves_live_append
 	// claim text: a row appended after a migration's detection read is present in the own shard after the rewrite publishes
 	// scenario: Scenario: SC-1 live append survives a migration rewrite (R2.F1) — Then the appended row is present in the shard after the publish
 	it("rewriteOwnRows preserves a live append after the detection read", () => {
 		const own = path.join(roundsDir, "index.host-a");
-		const index = resolveScriptIndexContext(config, roundsDir, undefined, { hostname: "host-a" });
+		let lockSeenDuringRead = false;
+		let lockSeenDuringPublish = false;
+		const fsImpl = {
+			...fs,
+			openSync: (file: Parameters<typeof fs.openSync>[0], flags: Parameters<typeof fs.openSync>[1]) => {
+				if (String(file) === own && flags === "r" && fs.existsSync(`${own}.lock`)) lockSeenDuringRead = true;
+				return (fs.openSync as (...a: unknown[]) => number)(file, flags);
+			},
+			writeFileSync: (file: Parameters<typeof fs.writeFileSync>[0], ...rest: unknown[]) => {
+				if (fs.existsSync(`${own}.lock`)) lockSeenDuringPublish = true;
+				return (fs.writeFileSync as (...a: unknown[]) => void)(file, ...rest);
+			},
+		};
+		const index = resolveScriptIndexContext(config, roundsDir, undefined, {
+			hostname: "host-a",
+			fsImpl: fsImpl as typeof fs,
+		});
 		index.writeOwnLines([`${encodeVectorIndexLine([3], "own.json:prompt")}\n`]);
 
-		// The script's detection read happens before this append.
+		// The script's detection read happens before this runtime append. The
+		// append lands before the rewrite acquires the lock, so the locked
+		// final read must include it in the published result.
 		const detected = index.readRewriteRows();
 		const live = `${encodeVectorIndexLine([8], "live.json:prompt")}\n`;
 		appendLineWithLock(own, roundsDir, live);
@@ -196,6 +199,9 @@ describe("resolveScriptIndexContext", () => {
 		const published = fs.readFileSync(own, "utf-8").trim().split("\n");
 		expect(published).toContain(detected[0].replace("[3]", "[4]"));
 		expect(published).toContain(live.trim());
+		expect(lockSeenDuringRead).toBe(true);
+		expect(lockSeenDuringPublish).toBe(true);
+		expect(fs.existsSync(`${own}.lock`)).toBe(false);
 	});
 
 	// claim: pr151-review-r2.feature-SC-1-EXT-1/SC-1-EXT-1/rewriteOwnRows_fails_fast_when_lock_unavailable

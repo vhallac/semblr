@@ -6,6 +6,7 @@ import { bm25IndexPathForRoundsDir } from "../lib/bm25-index.ts";
 import { computeContentHash } from "../lib/hash.ts";
 import { encodeVectorIndexLine, loadVectorIndex, readIndexLines } from "../lib/index-io.ts";
 import { ownShardPath } from "../lib/index-shards.ts";
+import { appendLineWithLock } from "../lib/index-storage.ts";
 import { hashEmbeddingInput } from "../lib/round-capture.ts";
 import { loadToolIndex, toolIndexPathForRoundsDir } from "../lib/search-tools.ts";
 import { SEMBLR_CONFIG_DEFAULTS } from "../lib/semblr-config.ts";
@@ -214,6 +215,47 @@ describe("digest-all script", () => {
 
 		expect(logs.stdout.join("\n")).toContain("📂 Found 0 session files");
 		expect(logs.stdout.join("\n")).toContain("📊 New rounds to embed: 0");
+	});
+
+	it("preserves a live append that lands after the sweep's initial read", async () => {
+		const root = tmpDir();
+		const sessionsDir = path.join(root, "sessions");
+		const sessionDir = path.join(sessionsDir, "--session");
+		const roundsDir = path.join(root, "rounds");
+		fs.mkdirSync(sessionDir, { recursive: true });
+		fs.mkdirSync(roundsDir, { recursive: true });
+		const indexPath = ownShardPath(roundsDir);
+		const liveLine = `${encodeVectorIndexLine([9], "live.json:prompt")}\n`;
+		let appended = false;
+		const fetchImpl = vi.fn(async () => {
+			if (!appended) {
+				appended = true;
+				// This runtime append lands after digest-all's initial own-shard
+				// read but before the final locked merge and publish.
+				appendLineWithLock(indexPath, roundsDir, liveLine);
+			}
+			return new Response(JSON.stringify({ data: [{ embedding: [1, 0] }] }), { status: 200 });
+		}) as typeof fetch;
+
+		writeSession(path.join(sessionDir, "session.jsonl"), [
+			{ userPrompt: "What should the sweep preserve?", responseSequence: "A row appended by a live session." },
+		]);
+
+		await expect(
+			runDigestAll({
+				sessionsDir,
+				roundsDir,
+				indexPath,
+				apiKey: "key",
+				fetchImpl,
+				stdout: logger().out,
+				stderr: logger().err,
+			}),
+		).resolves.toBe(0);
+
+		expect(appended).toBe(true);
+		expect(readIndexLines(indexPath)).toContain(liveLine.trim());
+		expect(loadVectorIndex(indexPath).some((entry) => entry.filePath === "live.json:prompt")).toBe(true);
 	});
 
 	it("processes multiple sessions, embeds prompts and responses, and writes round files", async () => {
