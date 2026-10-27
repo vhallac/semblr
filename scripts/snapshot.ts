@@ -2,6 +2,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { pathToFileURL } from "node:url";
+import { discoverIndexShards } from "../lib/index-shards.ts";
 import { resolveScriptConfig, type ScriptConfigOptions } from "../lib/script-config.ts";
 import { createDefaultStatsState } from "../lib/stats.ts";
 
@@ -55,7 +56,11 @@ export async function runSnapshot(options: RunSnapshotOptions = {}): Promise<num
 		err.error(`Source rounds path is not a directory: ${roundsDir}`);
 		return 1;
 	}
-	if (!fsImpl.existsSync(indexPath)) {
+	// Issue #149: the index is a set of per-host shards (`index.<host>`); the
+	// legacy `index.csv` stays part of the set until it is adopted. The
+	// snapshot copies the whole shard set (the rounds dir is copied whole).
+	const shards = discoverIndexShards(roundsDir, fsImpl);
+	if (shards.length === 0) {
 		err.error(`Source index does not exist: ${indexPath}`);
 		return 1;
 	}

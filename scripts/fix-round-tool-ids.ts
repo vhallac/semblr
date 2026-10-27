@@ -15,10 +15,15 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { pathToFileURL } from "node:url";
 import { atomicWriteFileSync } from "../lib/atomic-write.ts";
-import { migrateIndexEntryLine, readIndexLines } from "../lib/index-io.ts";
+import { migrateIndexEntryLine } from "../lib/index-io.ts";
 import { parsePiSessionJsonl } from "../lib/pi-session.ts";
 import { deriveRoundFile } from "../lib/round-capture.ts";
-import { resolveScriptConfig, resolveScriptIndexPath, type ScriptConfigOptions } from "../lib/script-config.ts";
+import {
+	reportForeignShards,
+	resolveScriptConfig,
+	resolveScriptIndexContext,
+	type ScriptConfigOptions,
+} from "../lib/script-config.ts";
 
 // ─────────────────────────────────────────────
 // File gathering (mirrors digest-all.ts)
@@ -62,6 +67,8 @@ export interface FixRoundToolIdsOptions extends ScriptConfigOptions {
 	roundsDir?: string;
 	indexPath?: string;
 	dryRun?: boolean;
+	/** Hostname override for tests; defaults to os.hostname(). */
+	hostname?: string;
 	stdout?: Pick<typeof console, "log">;
 	stderr?: Pick<typeof console, "error">;
 	fsImpl?: typeof fs;
@@ -71,7 +78,14 @@ export async function runFixRoundToolIds(options: FixRoundToolIdsOptions = {}): 
 	const config = resolveScriptConfig(options);
 	const sessionsDir = options.sessionsDir ?? defaultSessionsDir(config.agentDir);
 	const roundsDir = options.roundsDir ?? config.roundsDir;
-	const indexPath = resolveScriptIndexPath(config, roundsDir, options.indexPath);
+	// Issue #149: the index is a set of per-host shards. The row migration
+	// rewrites this host's own shard only (D-005) — a foreign shard is never
+	// rewritten here, so its rows keep pointing at the old round file.
+	const index = resolveScriptIndexContext(config, roundsDir, options.indexPath, {
+		fsImpl: options.fsImpl,
+		hostname: options.hostname,
+		script: "fix-round-tool-ids",
+	});
 	const dryRun = options.dryRun ?? false;
 	const out = options.stdout ?? console;
 	const err = options.stderr ?? console;
@@ -104,6 +118,9 @@ export async function runFixRoundToolIds(options: FixRoundToolIdsOptions = {}): 
 	let totalChanged = 0;
 	let totalUnchanged = 0;
 	let totalErrors = 0;
+	// Round files a foreign shard still references — deleting one of them here
+	// would leave the other host's rows dangling (issue #149, D-005).
+	const foreignReferenced = index.foreignReferencedFiles();
 
 	for (const { filePath, label } of jsonlFiles) {
 		const fileId = `${label}/${path.basename(filePath)}`;
@@ -133,19 +150,26 @@ export async function runFixRoundToolIds(options: FixRoundToolIdsOptions = {}): 
 					totalChanged++;
 
 					if (!dryRun) {
-						// Migrate index entries from broken hash to corrected hash.
-						// Read/write through the provided fs impl so tests can inject a mock.
-						if (f.existsSync(indexPath)) {
-							const lines = f.readFileSync(indexPath, "utf-8").trim().split("\n").filter(Boolean);
-							const migrated = lines.map((line: string) => migrateIndexEntryLine(line, brokenFile, newHash));
-							f.writeFileSync(indexPath, migrated.join("\n") + (migrated.length > 0 ? "\n" : ""));
-						}
+						// Migrate the index entries from the broken hash to the corrected
+						// hash — in this host's own shard only (issue #149, D-005).
+						// Transform the final lock-protected read so concurrently
+						// appended rows are preserved.
+						index.rewriteOwnRows((freshRows) =>
+							freshRows.map((line: string) => migrateIndexEntryLine(line, brokenFile, newHash)),
+						);
 
 						// Write corrected round file (atomic: tmp+rename, decision-015)
 						atomicWriteFileSync(path.join(roundsDir, newHash), JSON.stringify(round, null, 2), f);
 
-						// Delete old broken file
-						f.unlinkSync(path.join(roundsDir, brokenFile));
+						// A foreign shard may still hold rows for the broken file: this
+						// host rewrites only its own shard, so deleting the file would
+						// leave those rows dangling. Keep the file and report it.
+						if (foreignReferenced.has(brokenFile)) {
+							out.log(`  ⚠️  Broken file kept (referenced by another host's shard): ${brokenFile}`);
+						} else {
+							// Delete old broken file
+							f.unlinkSync(path.join(roundsDir, brokenFile));
+						}
 
 						// Update the lookup map for this round id
 						if (round.id) roundIdToFile.set(round.id, newHash);
@@ -166,13 +190,16 @@ export async function runFixRoundToolIds(options: FixRoundToolIdsOptions = {}): 
 	}
 
 	// Count how many index lines were affected
-	const indexLines = readIndexLines(indexPath).length;
+	const indexLines = index.readMergedLines().length;
+	const ownLines = index.readOwnLines().length;
 
 	out.log(
 		`\n${dryRun ? "🔍 Would fix" : "✅ Fixed"} ${totalChanged} rounds (${totalUnchanged} unchanged, ${totalParsed} total parsed)`,
 	);
-	out.log(`   Index: ${indexLines} vectors at ${indexPath}`);
+	out.log(`   Index: ${indexLines} vectors (own shard ${index.ownShardPath}: ${ownLines})`);
 	if (totalErrors > 0) out.log(`   Errors: ${totalErrors}`);
+
+	reportForeignShards(index, out);
 
 	if (dryRun && totalChanged > 0) {
 		out.log("\n   Run without --dry-run to apply fixes.");

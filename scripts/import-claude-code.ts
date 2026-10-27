@@ -20,11 +20,11 @@ import { pathToFileURL } from "node:url";
 import { atomicWriteFileSync } from "../lib/atomic-write.ts";
 import { type ClaudeRound, claudeRoundFileName, parseClaudeCodeJsonl } from "../lib/claude-code.ts";
 import { type EmbeddingModelRegistry, embedText, normalize } from "../lib/embed.ts";
-import { appendVectorIndexEntry, loadIndexedRoundFiles as loadIndexedRoundFilesFromIndex } from "../lib/index-io.ts";
+import { loadIndexedRoundFilesSharded } from "../lib/index-io.ts";
 import {
 	resolveScriptApiKey,
 	resolveScriptConfig,
-	resolveScriptIndexPath,
+	resolveScriptIndexContext,
 	resolveScriptModelRegistry,
 	type ScriptConfigOptions,
 	scriptEmbeddingConfig,
@@ -80,7 +80,9 @@ export async function runImportClaudeCode(options: ImportClaudeCodeOptions = {})
 	const config = resolveScriptConfig(options);
 	const projectsDir = options.projectsDir ?? CLAUDE_PROJECTS_DIR;
 	const roundsDir = options.roundsDir ?? config.roundsDir;
-	const indexPath = resolveScriptIndexPath(config, roundsDir, options.indexPath);
+	// Issue #149: the index is a set of per-host shards — the merged view
+	// decides what is already indexed, writes land in the host's own shard.
+	const index = resolveScriptIndexContext(config, roundsDir, options.indexPath);
 	const modelRegistry = resolveScriptModelRegistry(config, options);
 	const embeddingConfig = scriptEmbeddingConfig(config);
 	const dryRun = options.dryRun ?? false;
@@ -118,7 +120,7 @@ export async function runImportClaudeCode(options: ImportClaudeCodeOptions = {})
 		}
 	}
 
-	const indexed = loadIndexedRoundFilesFromIndex(indexPath);
+	const indexed = loadIndexedRoundFilesSharded(index.shardRoot);
 	const seen = new Set<string>();
 	let duplicates = 0;
 	let alreadyIndexed = 0;
@@ -159,7 +161,7 @@ export async function runImportClaudeCode(options: ImportClaudeCodeOptions = {})
 				config: embeddingConfig,
 				modelRegistry,
 			});
-			appendVectorIndexEntry(indexPath, normalize(promptVec), `${file}:prompt`, config.embeddingModel);
+			index.appendRow(`${file}:prompt`, normalize(promptVec), config.embeddingModel);
 			const respText = round.responseSequence.slice(0, config.embeddingMaxTokens);
 			if (respText) {
 				const respVec = await embedText(respText, apiKey!, {
@@ -167,7 +169,7 @@ export async function runImportClaudeCode(options: ImportClaudeCodeOptions = {})
 					config: embeddingConfig,
 					modelRegistry,
 				});
-				appendVectorIndexEntry(indexPath, normalize(respVec), `${file}:response`, config.embeddingModel);
+				index.appendRow(`${file}:response`, normalize(respVec), config.embeddingModel);
 			}
 			completed++;
 			err.error(`  ✅ [${completed}/${newRounds.length}] ${file} ${round.cwd ?? ""}`);
@@ -185,13 +187,13 @@ export async function runImportClaudeCode(options: ImportClaudeCodeOptions = {})
 	const started = Date.now();
 	await Promise.all(workers);
 	const elapsed = ((Date.now() - started) / 1000).toFixed(1);
-	const vectors = f.existsSync(indexPath) ? f.readFileSync(indexPath, "utf-8").split("\n").filter(Boolean).length : 0;
+	const vectors = index.readMergedLines().length;
 	const roundFiles = f.existsSync(roundsDir)
 		? f.readdirSync(roundsDir).filter((rf) => rf.endsWith(".json")).length
 		: 0;
 
 	out.log(`\n✅ Done in ${elapsed}s. ${completed} Claude Code rounds imported, ${errors} errors.`);
-	out.log(`   Index: ${vectors} vectors at ${indexPath}`);
+	out.log(`   Index: ${vectors} vectors at ${index.ownShardPath}`);
 	out.log(`   Rounds: ${roundFiles} files at ${roundsDir}`);
 	return 0;
 }

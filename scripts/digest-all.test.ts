@@ -5,6 +5,8 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { bm25IndexPathForRoundsDir } from "../lib/bm25-index.ts";
 import { computeContentHash } from "../lib/hash.ts";
 import { encodeVectorIndexLine, loadVectorIndex, readIndexLines } from "../lib/index-io.ts";
+import { ownShardPath } from "../lib/index-shards.ts";
+import { appendLineWithLock } from "../lib/index-storage.ts";
 import { hashEmbeddingInput } from "../lib/round-capture.ts";
 import { loadToolIndex, toolIndexPathForRoundsDir } from "../lib/search-tools.ts";
 import { SEMBLR_CONFIG_DEFAULTS } from "../lib/semblr-config.ts";
@@ -215,6 +217,47 @@ describe("digest-all script", () => {
 		expect(logs.stdout.join("\n")).toContain("📊 New rounds to embed: 0");
 	});
 
+	it("preserves a live append that lands after the sweep's initial read", async () => {
+		const root = tmpDir();
+		const sessionsDir = path.join(root, "sessions");
+		const sessionDir = path.join(sessionsDir, "--session");
+		const roundsDir = path.join(root, "rounds");
+		fs.mkdirSync(sessionDir, { recursive: true });
+		fs.mkdirSync(roundsDir, { recursive: true });
+		const indexPath = ownShardPath(roundsDir);
+		const liveLine = `${encodeVectorIndexLine([9], "live.json:prompt")}\n`;
+		let appended = false;
+		const fetchImpl = vi.fn(async () => {
+			if (!appended) {
+				appended = true;
+				// This runtime append lands after digest-all's initial own-shard
+				// read but before the final locked merge and publish.
+				appendLineWithLock(indexPath, roundsDir, liveLine);
+			}
+			return new Response(JSON.stringify({ data: [{ embedding: [1, 0] }] }), { status: 200 });
+		}) as typeof fetch;
+
+		writeSession(path.join(sessionDir, "session.jsonl"), [
+			{ userPrompt: "What should the sweep preserve?", responseSequence: "A row appended by a live session." },
+		]);
+
+		await expect(
+			runDigestAll({
+				sessionsDir,
+				roundsDir,
+				indexPath,
+				apiKey: "key",
+				fetchImpl,
+				stdout: logger().out,
+				stderr: logger().err,
+			}),
+		).resolves.toBe(0);
+
+		expect(appended).toBe(true);
+		expect(readIndexLines(indexPath)).toContain(liveLine.trim());
+		expect(loadVectorIndex(indexPath).some((entry) => entry.filePath === "live.json:prompt")).toBe(true);
+	});
+
 	it("processes multiple sessions, embeds prompts and responses, and writes round files", async () => {
 		const root = tmpDir();
 		// Create a sessions directory structure: --session1/file.jsonl, --session2/file.jsonl
@@ -225,7 +268,7 @@ describe("digest-all script", () => {
 		fs.mkdirSync(s2Dir, { recursive: true });
 
 		const roundsDir = path.join(root, "rounds");
-		const indexPath = path.join(roundsDir, "index.csv");
+		const indexPath = ownShardPath(roundsDir);
 		const logs = logger();
 		const requests: unknown[] = [];
 
@@ -323,7 +366,7 @@ describe("digest-all script", () => {
 		const sDir = path.join(sessionsDir, "--test");
 		fs.mkdirSync(sDir, { recursive: true });
 		const roundsDir = path.join(root, "rounds");
-		const indexPath = path.join(roundsDir, "index.csv");
+		const indexPath = ownShardPath(roundsDir);
 		const userPrompt = "What is the capital of France?";
 		const responseSequence = "The capital of France is Paris.";
 
@@ -382,7 +425,7 @@ describe("digest-all script", () => {
 		fs.mkdirSync(sDir, { recursive: true });
 		const roundsDir = path.join(root, "rounds");
 		fs.mkdirSync(roundsDir, { recursive: true });
-		const indexPath = path.join(roundsDir, "index.csv");
+		const indexPath = ownShardPath(roundsDir);
 		const userPrompt = "What is a legacy indexed prompt?";
 		const responseSequence = "It is an old two-column index row.";
 		const roundFile = `${computeContentHash(userPrompt, responseSequence, [])}.json`;
@@ -429,7 +472,7 @@ describe("digest-all script", () => {
 		fs.mkdirSync(sDir, { recursive: true });
 		const roundsDir = path.join(root, "rounds");
 		fs.mkdirSync(roundsDir, { recursive: true });
-		const indexPath = path.join(roundsDir, "index.csv");
+		const indexPath = ownShardPath(roundsDir);
 		const userPrompt = "What should be re-indexed?";
 		const responseSequence = "Rounds embedded with an old model should be refreshed.";
 		const roundFile = `${computeContentHash(userPrompt, responseSequence, [])}.json`;
@@ -497,7 +540,7 @@ describe("digest-all script", () => {
 		fs.mkdirSync(sDir, { recursive: true });
 		const roundsDir = path.join(root, "rounds");
 		fs.mkdirSync(roundsDir, { recursive: true });
-		const indexPath = path.join(roundsDir, "index.csv");
+		const indexPath = ownShardPath(roundsDir);
 		const userPrompt = "What is the checkpoint state right now?";
 		const responseSequence = "Checkpoint saved with the mid-task state.";
 		const summary = {
@@ -567,7 +610,7 @@ describe("digest-all script", () => {
 		fs.mkdirSync(sDir, { recursive: true });
 		const roundsDir = path.join(root, "rounds");
 		fs.mkdirSync(roundsDir, { recursive: true });
-		const indexPath = path.join(roundsDir, "index.csv");
+		const indexPath = ownShardPath(roundsDir);
 		const userPrompt = "No checkpoint here, just a plain round?";
 		const responseSequence = "A plain answer without any checkpoint call.";
 		const roundFile = `${computeContentHash(userPrompt, responseSequence, [])}.json`;
@@ -607,7 +650,7 @@ describe("digest-all script", () => {
 		fs.mkdirSync(sDir, { recursive: true });
 		const roundsDir = path.join(root, "rounds");
 		fs.mkdirSync(roundsDir, { recursive: true });
-		const indexPath = path.join(roundsDir, "index.csv");
+		const indexPath = ownShardPath(roundsDir);
 		const userPrompt = "Does the reindex silently drop my orphan row?";
 		const responseSequence = "It must be reported and preserved.";
 		const roundFile = `${computeContentHash(userPrompt, responseSequence, [])}.json`;
@@ -696,7 +739,7 @@ describe("digest-all script", () => {
 		fs.mkdirSync(sDir, { recursive: true });
 		const roundsDir = path.join(root, "rounds");
 		fs.mkdirSync(roundsDir, { recursive: true });
-		const indexPath = path.join(roundsDir, "index.csv");
+		const indexPath = ownShardPath(roundsDir);
 		const userPrompt = "Does a stale reproducible row still converge?";
 		const responseSequence = "It must be re-embedded under the current model.";
 		const roundFile = `${computeContentHash(userPrompt, responseSequence, [])}.json`;
@@ -742,7 +785,7 @@ describe("digest-all script", () => {
 		fs.mkdirSync(sDir, { recursive: true });
 		const roundsDir = path.join(root, "rounds");
 		fs.mkdirSync(roundsDir, { recursive: true });
-		const indexPath = path.join(roundsDir, "index.csv");
+		const indexPath = ownShardPath(roundsDir);
 		const userPrompt = "Only a legacy combined row exists for this round, with plenty of words to keep the prompt.";
 		const responseSequence = "It must gain current-model rows and then stop being reindexed.";
 		const roundFile = `${computeContentHash(userPrompt, responseSequence, [])}.json`;
@@ -809,7 +852,7 @@ describe("digest-all script", () => {
 			const sessionsDir = tmpDir(); // sweep-only
 			const roundsDir = path.join(root, "rounds");
 			fs.mkdirSync(roundsDir, { recursive: true });
-			const indexPath = path.join(roundsDir, "index.csv");
+			const indexPath = ownShardPath(roundsDir);
 			const userPrompt = "What was recovered?"; // 3 words — under the threshold
 			const responseSequence = "Short prompts never carry prompt-side embeddings on the live path.";
 			const roundFile = `${computeContentHash(userPrompt, responseSequence, [])}.json`;
@@ -878,7 +921,7 @@ describe("digest-all script", () => {
 		fs.mkdirSync(sDir, { recursive: true });
 		const roundsDir = path.join(root, "rounds");
 		fs.mkdirSync(roundsDir, { recursive: true });
-		const indexPath = path.join(roundsDir, "index.csv");
+		const indexPath = ownShardPath(roundsDir);
 		const userPrompt = "A round with current retrieval rows and a stale summary row, long enough to keep the prompt.";
 		const responseSequence = "The summary staleness must not force a reindex.";
 		const roundFile = `${computeContentHash(userPrompt, responseSequence, [])}.json`;
@@ -920,14 +963,14 @@ describe("digest-all script", () => {
 		// `summary`, which excluded `:summary` by absence — not by rule. With a
 		// readable checkpoint round (summary present) and current :prompt/:response
 		// rows the round must still converge, or the sweep and the start-up pending
-		// count disagree and README:286 is false.
+		// count disagree and the README forcing-row rule is false.
 		const root = tmpDir();
 		const sessionsDir = path.join(root, "sessions");
 		const sDir = path.join(sessionsDir, "--test");
 		fs.mkdirSync(sDir, { recursive: true });
 		const roundsDir = path.join(root, "rounds");
 		fs.mkdirSync(roundsDir, { recursive: true });
-		const indexPath = path.join(roundsDir, "index.csv");
+		const indexPath = ownShardPath(roundsDir);
 		const userPrompt =
 			"A checkpoint round whose prompt is long enough to survive the short-prompt drop under the default threshold.";
 		const responseSequence = "Its summary row is stale but must not force a reindex.";
@@ -977,7 +1020,7 @@ describe("digest-all script", () => {
 		fs.mkdirSync(sDir, { recursive: true });
 		const roundsDir = path.join(root, "rounds");
 		fs.mkdirSync(roundsDir, { recursive: true });
-		const indexPath = path.join(roundsDir, "index.csv");
+		const indexPath = ownShardPath(roundsDir);
 
 		const userPrompt = "What is the same prompt?";
 		const responseSequence = "The same prompt always returns the same answer.";
@@ -1023,7 +1066,7 @@ describe("digest-all script", () => {
 		fs.mkdirSync(s1Dir, { recursive: true });
 		fs.mkdirSync(s2Dir, { recursive: true });
 		const roundsDir = path.join(root, "rounds");
-		const indexPath = path.join(roundsDir, "index.csv");
+		const indexPath = ownShardPath(roundsDir);
 
 		const userPrompt1 = "What is a good prompt?";
 		const resp1 = "A good prompt is clear and specific.";
@@ -1073,7 +1116,7 @@ describe("digest-all script", () => {
 		const sDir = path.join(sessionsDir, "--test");
 		fs.mkdirSync(sDir, { recursive: true });
 		const roundsDir = path.join(root, "rounds");
-		const indexPath = path.join(roundsDir, "index.csv");
+		const indexPath = ownShardPath(roundsDir);
 		const requests: unknown[] = [];
 
 		const longPrompt = `${"A".repeat(10000)}`;
@@ -1116,7 +1159,7 @@ describe("digest-all script", () => {
 		const sDir = path.join(sessionsDir, "--test");
 		fs.mkdirSync(sDir, { recursive: true });
 		const roundsDir = path.join(root, "rounds");
-		const indexPath = path.join(roundsDir, "index.csv");
+		const indexPath = ownShardPath(roundsDir);
 		const requests: unknown[] = [];
 
 		writeSession(path.join(sDir, "session.jsonl"), [
@@ -1166,7 +1209,7 @@ describe("digest-all script", () => {
 		]);
 
 		const roundsDir = path.join(root, "rounds");
-		const indexPath = path.join(roundsDir, "index.csv");
+		const indexPath = ownShardPath(roundsDir);
 		const logs = logger();
 		const requests: unknown[] = [];
 
@@ -1201,7 +1244,7 @@ describe("digest-all script", () => {
 		const root = tmpDir();
 		const _sessionsDir = tmpDir();
 		const roundsDir = path.join(root, "rounds");
-		const indexPath = path.join(roundsDir, "index.csv");
+		const indexPath = ownShardPath(roundsDir);
 
 		const oldKey = process.env.OPENROUTER_API_KEY;
 		const oldFetch = globalThis.fetch;
@@ -1238,7 +1281,7 @@ describe("digest-all script", () => {
 		const sessionsDir = tmpDir(); // no session files at all
 		const roundsDir = path.join(root, "rounds");
 		fs.mkdirSync(roundsDir, { recursive: true });
-		const indexPath = path.join(roundsDir, "index.csv");
+		const indexPath = ownShardPath(roundsDir);
 		const requests: unknown[] = [];
 
 		const userPrompt = "What was recovered after the crash?";
@@ -1286,7 +1329,7 @@ describe("digest-all script", () => {
 		const sessionsDir = tmpDir();
 		const roundsDir = path.join(root, "rounds");
 		fs.mkdirSync(roundsDir, { recursive: true });
-		const indexPath = path.join(roundsDir, "index.csv");
+		const indexPath = ownShardPath(roundsDir);
 
 		const userPrompt = "What is swept exactly once?";
 		const responseSequence = "The sweep must not duplicate index rows on re-run.";
@@ -1337,7 +1380,7 @@ describe("digest-all script", () => {
 		const sessionsDir = tmpDir();
 		const roundsDir = path.join(root, "rounds");
 		fs.mkdirSync(roundsDir, { recursive: true });
-		const indexPath = path.join(roundsDir, "index.csv");
+		const indexPath = ownShardPath(roundsDir);
 
 		const userPrompt = "A recovered round whose rows survived but whose marker did not.";
 		const responseSequence = "The startup pending counter must agree with what just index can do.";
@@ -1385,7 +1428,7 @@ describe("digest-all script", () => {
 		const sessionsDir = tmpDir();
 		const roundsDir = path.join(root, "rounds");
 		fs.mkdirSync(roundsDir, { recursive: true });
-		const indexPath = path.join(roundsDir, "index.csv");
+		const indexPath = ownShardPath(roundsDir);
 
 		const userPrompt = "A round with a prompt row but no response row.";
 		const responseSequence = "Re-embedded because no truthful vector was available to heal from.";
@@ -1453,7 +1496,7 @@ describe("digest-all script", () => {
 		const sessionsDir = tmpDir();
 		const roundsDir = path.join(root, "rounds");
 		fs.mkdirSync(roundsDir, { recursive: true });
-		const indexPath = path.join(roundsDir, "index.csv");
+		const indexPath = ownShardPath(roundsDir);
 
 		fs.writeFileSync(path.join(roundsDir, "corrupt.json"), "{not json");
 		fs.writeFileSync(path.join(roundsDir, "no-prompt.json"), JSON.stringify({ responseSequence: "orphan" }));
@@ -1489,7 +1532,7 @@ describe("digest-all script", () => {
 		const sessionsDir = tmpDir();
 		const roundsDir = path.join(root, "rounds");
 		fs.mkdirSync(roundsDir, { recursive: true });
-		const indexPath = path.join(roundsDir, "index.csv");
+		const indexPath = ownShardPath(roundsDir);
 
 		// One round the sweep cannot resolve, one it can.
 		fs.writeFileSync(path.join(roundsDir, "broken.json"), "{not json");
@@ -1559,7 +1602,7 @@ describe("digest-all script", () => {
 		const sessionsDir = tmpDir();
 		const roundsDir = path.join(root, "rounds");
 		fs.mkdirSync(roundsDir, { recursive: true });
-		const indexPath = path.join(roundsDir, "index.csv");
+		const indexPath = ownShardPath(roundsDir);
 		const requests: unknown[] = [];
 
 		// F5 shape: parseable JSON whose missing fields would throw inside
@@ -1608,7 +1651,7 @@ describe("digest-all script", () => {
 		const sessionsDir = tmpDir();
 		const roundsDir = path.join(root, "rounds");
 		fs.mkdirSync(roundsDir, { recursive: true });
-		const indexPath = path.join(roundsDir, "index.csv");
+		const indexPath = ownShardPath(roundsDir);
 		const requests: unknown[] = [];
 
 		// F3 shape: Array.isArray passes, but a null element throws in
@@ -1658,7 +1701,7 @@ describe("digest-all script", () => {
 		const sessionsDir = tmpDir();
 		const roundsDir = path.join(root, "rounds");
 		fs.mkdirSync(roundsDir, { recursive: true });
-		const indexPath = path.join(roundsDir, "index.csv");
+		const indexPath = ownShardPath(roundsDir);
 
 		// Recovered round (no session JSONL) forces the sweep -> processRound path,
 		// which performs both writes under test: the round file, then the
@@ -1720,9 +1763,9 @@ describe("digest-all script", () => {
 		const sessionsDir = tmpDir(); // no session files: force the rounds-dir sweep
 		const roundsDir = path.join(root, "rounds");
 		fs.mkdirSync(roundsDir, { recursive: true });
-		const indexPath = path.join(roundsDir, "index.csv");
+		const indexPath = ownShardPath(roundsDir);
 
-		// Seed an existing index.csv so the run genuinely reads it (a missing file
+		// Seed an existing own shard so the run genuinely reads it (a missing file
 		// read would also count, but a populated index exercises the dedup path).
 		fs.writeFileSync(
 			indexPath,
@@ -1827,7 +1870,7 @@ describe("digest-all script", () => {
 		const sessionsDir = tmpDir(); // no session files: force the rounds-dir sweep
 		const roundsDir = path.join(root, "rounds");
 		fs.mkdirSync(roundsDir, { recursive: true });
-		const indexPath = path.join(roundsDir, "index.csv");
+		const indexPath = ownShardPath(roundsDir);
 
 		const oldModel = "old-model";
 		const seedRows: string[] = [
@@ -1907,10 +1950,13 @@ describe("digest-all script", () => {
 		const medium = await runModelChangeFixture(4);
 		const large = await runModelChangeFixture(8);
 
-		// O(1) evidence: full-index opens stay constant in N — one for the initial
-		// in-memory load (issue #139) and one for the trailing countIndexLines
-		// summary (per-chunk readSync granularity is why opens, not reads, count).
-		// The single full-index write is the one tmp+rename flush.
+		// O(1) evidence: full-index opens stay constant in N — one for the
+		// initial in-memory load (issue #139) and one for the final locked
+		// re-read that merges rows appended during the sweep (decision 005).
+		// The trailing summary count comes from the in-memory rows, so it costs
+		// no extra full-index read (per-chunk readSync granularity is why opens,
+		// not reads, count). The single full-index write is the one tmp+rename
+		// flush.
 		expect(small.indexReads).toBe(2);
 		expect(medium.indexReads).toBe(2);
 		expect(large.indexReads).toBe(2);
@@ -1942,7 +1988,7 @@ describe("digest-all script", () => {
 			const sessionsDir = tmpDir(); // sweep-only
 			const roundsDir = path.join(root, "rounds");
 			fs.mkdirSync(roundsDir, { recursive: true });
-			const indexPath = path.join(roundsDir, "index.csv");
+			const indexPath = ownShardPath(roundsDir);
 			const requests: unknown[] = [];
 
 			const userPrompt = "What was recovered?"; // 3 words — under the threshold
@@ -1980,7 +2026,7 @@ describe("digest-all script", () => {
 		const sessionsDir = tmpDir();
 		const roundsDir = path.join(root, "rounds");
 		fs.mkdirSync(roundsDir, { recursive: true });
-		const indexPath = path.join(roundsDir, "index.csv");
+		const indexPath = ownShardPath(roundsDir);
 		const requests: unknown[] = [];
 
 		const userPrompt = "Where did the checkpoint stand?";
@@ -2048,7 +2094,7 @@ describe("digest-all script", () => {
 			runDigestAll({
 				sessionsDir: tmpDir(), // no session files — sweep only
 				roundsDir: roundsDirA,
-				indexPath: path.join(roundsDirA, "index.csv"),
+				indexPath: ownShardPath(roundsDirA),
 				apiKey: "key",
 				fetchImpl: embeddingFetch(
 					[
@@ -2063,7 +2109,7 @@ describe("digest-all script", () => {
 			}),
 		).resolves.toBe(0);
 		const inputsA = requestsA.map((r) => (r as { body: { input: string } }).body.input);
-		const rowsA = loadVectorIndex(path.join(roundsDirA, "index.csv"));
+		const rowsA = loadVectorIndex(ownShardPath(roundsDirA));
 		const writtenA = JSON.parse(fs.readFileSync(path.join(roundsDirA, roundFile), "utf-8"));
 
 		// Path B: startup recovery embedding (injected embeds).
@@ -2162,7 +2208,7 @@ describe("digest-all script", () => {
 			const sDir = path.join(sessionsDir, "--test");
 			fs.mkdirSync(sDir, { recursive: true });
 			const roundsDir = path.join(root, "rounds");
-			const indexPath = path.join(roundsDir, "index.csv");
+			const indexPath = ownShardPath(roundsDir);
 
 			writeSessionWithToolCall(
 				path.join(sDir, "session.jsonl"),
@@ -2199,7 +2245,7 @@ describe("digest-all script", () => {
 			fs.mkdirSync(sDir, { recursive: true });
 			const roundsDir = path.join(root, "rounds");
 			fs.mkdirSync(roundsDir, { recursive: true });
-			const indexPath = path.join(roundsDir, "index.csv");
+			const indexPath = ownShardPath(roundsDir);
 
 			writeSessionWithToolCall(
 				path.join(sDir, "session.jsonl"),
@@ -2281,5 +2327,262 @@ describe("digest-all script", () => {
 			await expect(runDigestAll({ roundsDir, toolsOnly: true, stdout: logs.out })).resolves.toBe(0);
 			expect(logs.stdout.join("\n")).toContain("Rebuilt tool index: 0 rows across 0 rounds");
 		});
+	});
+});
+
+// Issue #149 — the sweep reads the merged shard view but writes only the
+// host's own shard. The anchors below are the acceptance criteria of the
+// issue: a foreign shard stays byte-identical across a compaction, and a
+// round a foreign host already embedded is not embedded again locally.
+describe("digest-all shard isolation (issue #149)", () => {
+	const setup = (): { roundsDir: string; sessionsDir: string; sDir: string } => {
+		const root = tmpDir();
+		const sessionsDir = path.join(root, "sessions");
+		const sDir = path.join(sessionsDir, "--test");
+		fs.mkdirSync(sDir, { recursive: true });
+		const roundsDir = path.join(root, "rounds");
+		fs.mkdirSync(roundsDir, { recursive: true });
+		return { roundsDir, sessionsDir, sDir };
+	};
+
+	it("leaves a foreign shard byte-identical while rewriting the host's own shard", async () => {
+		const { roundsDir, sessionsDir, sDir } = setup();
+		const userPrompt = "Which host owns the index rows?";
+		const responseSequence = "Only the host that appended them owns them.";
+		writeSession(path.join(sDir, "session.jsonl"), [{ userPrompt, responseSequence }]);
+		const roundFile = `${computeContentHash(userPrompt, responseSequence, [])}.json`;
+
+		// A shard owned by another host — this host never rewrites it.
+		const foreignShard = path.join(roundsDir, "index.host-b");
+		const foreignBytes = `${encodeVectorIndexLine([9], "foreign.json:prompt", DEBUG_EMBEDDING_MODEL)}\n`;
+		fs.writeFileSync(foreignShard, foreignBytes);
+
+		const logs = logger();
+		const requests: unknown[] = [];
+		await expect(
+			runDigestAll({
+				sessionsDir,
+				roundsDir,
+				indexPath: ownShardPath(roundsDir, "host-a"),
+				hostname: "host-a",
+				apiKey: "key",
+				fetchImpl: embeddingFetch(
+					[
+						[3, 4],
+						[0, 5],
+					],
+					requests,
+				),
+				stdout: logs.out,
+				stderr: logs.err,
+			}),
+		).resolves.toBe(0);
+
+		expect(fs.readFileSync(foreignShard, "utf-8")).toBe(foreignBytes);
+		const ownRows = loadVectorIndex(ownShardPath(roundsDir, "host-a"));
+		expect(ownRows.map((row) => row.filePath)).toEqual([`${roundFile}:prompt`, `${roundFile}:response`]);
+	});
+
+	it("does not re-embed a round a foreign shard already holds under the current model", async () => {
+		const { roundsDir, sessionsDir, sDir } = setup();
+		const userPrompt = "Was this round already embedded elsewhere?";
+		const responseSequence = "Yes, by the other host, under the same model.";
+		writeSession(path.join(sDir, "session.jsonl"), [{ userPrompt, responseSequence }]);
+		const roundFile = `${computeContentHash(userPrompt, responseSequence, [])}.json`;
+		// The synced store carries the round file too.
+		fs.writeFileSync(
+			path.join(roundsDir, roundFile),
+			JSON.stringify({ userPrompt, responseSequence, toolCalls: [] }),
+		);
+
+		const foreignShard = path.join(roundsDir, "index.host-b");
+		const foreignBytes = `${[
+			encodeVectorIndexLine([1], `${roundFile}:prompt`, DEBUG_EMBEDDING_MODEL),
+			encodeVectorIndexLine([2], `${roundFile}:response`, DEBUG_EMBEDDING_MODEL),
+		].join("\n")}\n`;
+		fs.writeFileSync(foreignShard, foreignBytes);
+
+		const logs = logger();
+		const requests: unknown[] = [];
+		await expect(
+			runDigestAll({
+				sessionsDir,
+				roundsDir,
+				indexPath: ownShardPath(roundsDir, "host-a"),
+				hostname: "host-a",
+				apiKey: "key",
+				fetchImpl: embeddingFetch([], requests),
+				stdout: logs.out,
+				stderr: logs.err,
+			}),
+		).resolves.toBe(0);
+
+		// The sweep-time guard spans every shard: no embedding call, no own shard.
+		expect(requests).toHaveLength(0);
+		expect(fs.readFileSync(foreignShard, "utf-8")).toBe(foreignBytes);
+		expect(fs.existsSync(ownShardPath(roundsDir, "host-a"))).toBe(false);
+	});
+
+	it("adopts the legacy index.csv on the first sweep write", async () => {
+		const { roundsDir, sessionsDir, sDir } = setup();
+		const userPrompt = "Who owns the legacy index rows?";
+		const responseSequence = "The first host to write adopts them.";
+		writeSession(path.join(sDir, "session.jsonl"), [{ userPrompt, responseSequence }]);
+		const roundFile = `${computeContentHash(userPrompt, responseSequence, [])}.json`;
+
+		const legacyPath = path.join(roundsDir, "index.csv");
+		fs.writeFileSync(legacyPath, `${encodeVectorIndexLine([5], "legacy.json:prompt", DEBUG_EMBEDDING_MODEL)}\n`);
+
+		const logs = logger();
+		const requests: unknown[] = [];
+		await expect(
+			runDigestAll({
+				sessionsDir,
+				roundsDir,
+				indexPath: ownShardPath(roundsDir, "host-a"),
+				hostname: "host-a",
+				apiKey: "key",
+				fetchImpl: embeddingFetch(
+					[
+						[3, 4],
+						[0, 5],
+					],
+					requests,
+				),
+				stdout: logs.out,
+				stderr: logs.err,
+			}),
+		).resolves.toBe(0);
+
+		// The legacy file was renamed away and its rows now live in the own shard.
+		expect(fs.existsSync(legacyPath)).toBe(false);
+		const ownRows = loadVectorIndex(ownShardPath(roundsDir, "host-a"));
+		expect(ownRows.map((row) => row.filePath)).toEqual([
+			"legacy.json:prompt",
+			`${roundFile}:prompt`,
+			`${roundFile}:response`,
+		]);
+	});
+});
+
+// Issue #149 (OI-5) — the sweep's staleness decision is per shard: a stale
+// forcing row in the host's own shard is replaced even when a foreign shard
+// holds a current-model row for the same suffix. The foreign shard is
+// read-only for this host and must stay byte-identical (decision 025).
+describe("digest-all per-shard staleness (issue #149 OI-5)", () => {
+	const setup = (): { roundsDir: string; sessionsDir: string; sDir: string } => {
+		const root = tmpDir();
+		const sessionsDir = path.join(root, "sessions");
+		const sDir = path.join(sessionsDir, "--test");
+		fs.mkdirSync(sDir, { recursive: true });
+		const roundsDir = path.join(root, "rounds");
+		fs.mkdirSync(roundsDir, { recursive: true });
+		return { roundsDir, sessionsDir, sDir };
+	};
+
+	const STALE_MODEL = "openai/text-embedding-3-small-old";
+
+	it("replaces a stale own-shard row even though a foreign shard holds a current-model row", async () => {
+		const { roundsDir, sessionsDir, sDir } = setup();
+		const userPrompt = "Which shard still holds the stale embedding for this round?";
+		const responseSequence = "The own shard does, and only the own shard can replace it.";
+		writeSession(path.join(sDir, "session.jsonl"), [{ userPrompt, responseSequence }]);
+		const roundFile = `${computeContentHash(userPrompt, responseSequence, [])}.json`;
+
+		// The own shard holds the round under an old model.
+		const ownShard = ownShardPath(roundsDir, "host-a");
+		fs.writeFileSync(
+			ownShard,
+			`${[
+				encodeVectorIndexLine([1], `${roundFile}:prompt`, STALE_MODEL),
+				encodeVectorIndexLine([2], `${roundFile}:response`, STALE_MODEL),
+			].join("\n")}\n`,
+		);
+
+		// A foreign shard already holds the same round under the current model.
+		const foreignShard = path.join(roundsDir, "index.host-b");
+		const foreignBytes = `${[
+			encodeVectorIndexLine([3], `${roundFile}:prompt`, DEBUG_EMBEDDING_MODEL),
+			encodeVectorIndexLine([4], `${roundFile}:response`, DEBUG_EMBEDDING_MODEL),
+		].join("\n")}\n`;
+		fs.writeFileSync(foreignShard, foreignBytes);
+
+		const logs = logger();
+		const requests: unknown[] = [];
+		await expect(
+			runDigestAll({
+				sessionsDir,
+				roundsDir,
+				indexPath: ownShard,
+				hostname: "host-a",
+				apiKey: "key",
+				fetchImpl: embeddingFetch(
+					[
+						[3, 4],
+						[0, 5],
+					],
+					requests,
+				),
+				stdout: logs.out,
+				stderr: logs.err,
+			}),
+		).resolves.toBe(0);
+
+		// The stale own-shard row forced a re-embed even though the merged view
+		// was covered by the foreign shard's current-model rows.
+		expect(requests.length).toBeGreaterThan(0);
+		const ownRows = loadVectorIndex(ownShard);
+		expect(ownRows.map((row) => row.filePath).sort()).toEqual([`${roundFile}:prompt`, `${roundFile}:response`]);
+		expect(ownRows.every((row) => row.model === DEBUG_EMBEDDING_MODEL)).toBe(true);
+
+		// The foreign shard is read-only for this host.
+		expect(fs.readFileSync(foreignShard, "utf-8")).toBe(foreignBytes);
+	});
+
+	it("converges — a second sweep spends no embedding call", async () => {
+		const { roundsDir, sessionsDir, sDir } = setup();
+		const userPrompt = "Does the per-shard staleness rule converge on the next sweep?";
+		const responseSequence = "It does, because the own shard now holds current-model rows.";
+		writeSession(path.join(sDir, "session.jsonl"), [{ userPrompt, responseSequence }]);
+		const roundFile = `${computeContentHash(userPrompt, responseSequence, [])}.json`;
+
+		const ownShard = ownShardPath(roundsDir, "host-a");
+		fs.writeFileSync(ownShard, `${encodeVectorIndexLine([1], `${roundFile}:response`, STALE_MODEL)}\n`);
+		const foreignShard = path.join(roundsDir, "index.host-b");
+		const foreignBytes = `${encodeVectorIndexLine([3], `${roundFile}:response`, DEBUG_EMBEDDING_MODEL)}\n`;
+		fs.writeFileSync(foreignShard, foreignBytes);
+
+		const logs = logger();
+		const firstRequests: unknown[] = [];
+		await expect(
+			runDigestAll({
+				sessionsDir,
+				roundsDir,
+				indexPath: ownShard,
+				hostname: "host-a",
+				apiKey: "key",
+				fetchImpl: embeddingFetch([], firstRequests),
+				stdout: logs.out,
+				stderr: logs.err,
+			}),
+		).resolves.toBe(0);
+		expect(firstRequests.length).toBeGreaterThan(0);
+
+		const secondLogs = logger();
+		const secondRequests: unknown[] = [];
+		await expect(
+			runDigestAll({
+				sessionsDir,
+				roundsDir,
+				indexPath: ownShard,
+				hostname: "host-a",
+				apiKey: "key",
+				fetchImpl: embeddingFetch([], secondRequests),
+				stdout: secondLogs.out,
+				stderr: secondLogs.err,
+			}),
+		).resolves.toBe(0);
+		expect(secondRequests).toHaveLength(0);
+		expect(fs.readFileSync(foreignShard, "utf-8")).toBe(foreignBytes);
 	});
 });

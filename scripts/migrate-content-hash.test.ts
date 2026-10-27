@@ -69,6 +69,7 @@ describe("migrate-content-hash script", () => {
 				args: ["--dry-run", "--backup"],
 				roundsDir,
 				indexPath,
+				hostname: "test-host",
 				now: () => 123,
 				stdout: logs.out,
 				stderr: logs.err,
@@ -81,7 +82,7 @@ describe("migrate-content-hash script", () => {
 		expect(readIndexLines(indexPath)).toEqual([encodeVectorIndexLine([1], "legacy.json:prompt")]);
 		expect(logs.stdout.join("\n")).toContain("Found 3 round files");
 		expect(logs.stdout.join("\n")).toContain(`would update id field: ${unchangedName}`);
-		expect(logs.stdout.join("\n")).toContain("~ Would update index.csv (1 entries)");
+		expect(logs.stdout.join("\n")).toContain("~ Would update index.test-host (1 entries)");
 		expect(logs.stdout.join("\n")).toContain("Hash changed:      2");
 		expect(logs.stdout.join("\n")).toContain("Hash unchanged:    1");
 		expect(logs.stdout.join("\n")).toContain("Renamed:           2");
@@ -132,6 +133,7 @@ describe("migrate-content-hash script", () => {
 				args: ["--backup"],
 				roundsDir,
 				indexPath,
+				hostname: "test-host",
 				now: () => 123,
 				stdout: logs.out,
 				stderr: logs.err,
@@ -151,14 +153,17 @@ describe("migrate-content-hash script", () => {
 		expect(JSON.parse(fs.readFileSync(path.join(roundsDir, unchangedName), "utf-8")).id).toBe(
 			unchangedName.replace(/\.json$/, ""),
 		);
-		expect(readIndexLines(indexPath)).toEqual(
+		// Issue #149: the rewrite published to the host's own shard; the legacy
+		// index.csv was claimed by rename.
+		expect(fs.existsSync(indexPath)).toBe(false);
+		expect(readIndexLines(path.join(roundsDir, "index.test-host"))).toEqual(
 			expect.arrayContaining([
 				encodeVectorIndexLine([3], "retained.json:prompt"),
 				encodeVectorIndexLine([1], `${renameNewName}:prompt`),
 				encodeVectorIndexLine([2], `${collisionNewName}:response`),
 			]),
 		);
-		expect(readIndexLines(indexPath)).toHaveLength(3);
+		expect(readIndexLines(path.join(roundsDir, "index.test-host"))).toHaveLength(3);
 		expect(logs.stderr.join("\n")).toContain("Failed to parse bad.json");
 		expect(logs.stdout.join("\n")).toContain("Found 5 round files");
 		expect(logs.stdout.join("\n")).toContain("Backup created:");

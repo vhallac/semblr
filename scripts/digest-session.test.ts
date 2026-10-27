@@ -1,9 +1,11 @@
+import { spawn } from "node:child_process";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { computeContentHash } from "../lib/hash.ts";
 import { encodeVectorIndexLine, loadVectorIndex, readIndexLines } from "../lib/index-io.ts";
+import { ownShardPath } from "../lib/index-shards.ts";
 import { hashEmbeddingInput } from "../lib/round-capture.ts";
 import { embed, isMainModule, normalize, runDigestSession } from "./digest-session.ts";
 
@@ -79,7 +81,7 @@ describe("digest-session script", () => {
 		const root = tmpDir();
 		const sessionFile = path.join(root, "session.jsonl");
 		const roundsDir = path.join(root, "rounds");
-		const indexPath = path.join(roundsDir, "index.csv");
+		const indexPath = ownShardPath(roundsDir);
 		const userPrompt = `${"p".repeat(8100)}`;
 		const responseSequence = `${"r".repeat(8100)}`;
 		const requests: unknown[] = [];
@@ -170,7 +172,7 @@ describe("digest-session script", () => {
 		expect(fs.existsSync(path.join(configuredRoundsDir, roundFile))).toBe(true);
 		// The prompt is clipped to the configured budget too (issue #107 F4): 6-char
 		// prompt at embeddingMaxTokens 4 → "1234". The response clip is unchanged.
-		expect(loadVectorIndex(path.join(configuredRoundsDir, "index.csv"))).toEqual([
+		expect(loadVectorIndex(ownShardPath(configuredRoundsDir))).toEqual([
 			{
 				vector: [1],
 				filePath: `${roundFile}:prompt`,
@@ -225,11 +227,125 @@ describe("digest-session script", () => {
 		const roundFile = `${computeContentHash("same prompt", "same response", [])}.json`;
 		expect(fs.existsSync(path.join(roundsDir, "legacy.json"))).toBe(false);
 		expect(fs.existsSync(path.join(roundsDir, roundFile))).toBe(true);
-		expect(readIndexLines(indexPath)).toEqual([encodeVectorIndexLine([1], `${roundFile}:prompt`)]);
+		expect(readIndexLines(ownShardPath(roundsDir))).toEqual([encodeVectorIndexLine([1], `${roundFile}:prompt`)]);
 		expect(logs.stdout.join("\n")).toContain(`Migrated stale: legacy.json → ${roundFile}`);
 		expect(logs.stdout.join("\n")).toContain("0 new rounds embedded, 1 already in index");
 		expect(fetchImpl).not.toHaveBeenCalled();
 	});
+
+	it("leaves the own shard byte-identical when the stale-file migration publish fails", async () => {
+		const root = tmpDir();
+		const sessionFile = path.join(root, "session.jsonl");
+		const roundsDir = path.join(root, "rounds");
+		fs.mkdirSync(roundsDir, { recursive: true });
+		writeSession(sessionFile, "same prompt", "same response");
+		fs.writeFileSync(
+			path.join(roundsDir, "legacy.json"),
+			JSON.stringify({ userPrompt: "same prompt", responseSequence: "same response", toolCalls: [] }),
+		);
+		const shardPath = ownShardPath(roundsDir);
+		const shardContent = `${encodeVectorIndexLine([1], "legacy.json:prompt")}\n`;
+		fs.writeFileSync(shardPath, shardContent);
+		const logs = logger();
+		const fetchImpl = vi.fn(async () => new Response("should not be called")) as typeof fetch;
+		// The shard publish (tmp+rename) fails; the target must survive intact.
+		const indexFsImpl = {
+			...fs,
+			writeFileSync: ((filePath: fs.PathOrFileDescriptor, data: unknown) => {
+				if (String(filePath).includes(".tmp.")) throw new Error("disk full");
+				return fs.writeFileSync(filePath, data as never);
+			}) as typeof fs.writeFileSync,
+		} as unknown as typeof fs;
+
+		await expect(
+			runDigestSession({
+				sessionFile,
+				roundsDir,
+				apiKey: "key",
+				fetchImpl,
+				stdout: logs.out,
+				stderr: logs.err,
+				indexFsImpl,
+			}),
+		).rejects.toThrow("disk full");
+
+		expect(fs.readFileSync(shardPath, "utf8")).toBe(shardContent);
+		expect(fs.readdirSync(roundsDir).filter((f) => f.includes(".tmp.") || f.includes(".lock"))).toEqual([]);
+	});
+
+	it("keeps a concurrently appended row when the stale-file migration publishes", async () => {
+		const root = tmpDir();
+		const sessionFile = path.join(root, "session.jsonl");
+		const roundsDir = path.join(root, "rounds");
+		fs.mkdirSync(roundsDir, { recursive: true });
+		writeSession(sessionFile, "same prompt", "same response");
+		fs.writeFileSync(
+			path.join(roundsDir, "legacy.json"),
+			JSON.stringify({ userPrompt: "same prompt", responseSequence: "same response", toolCalls: [] }),
+		);
+		const shardPath = ownShardPath(roundsDir);
+		fs.writeFileSync(shardPath, `${encodeVectorIndexLine([1], "legacy.json:prompt")}\n`);
+		const roundFile = `${computeContentHash("same prompt", "same response", [])}.json`;
+
+		// A live session appends a row to the same shard while the migration is
+		// publishing: the append takes the shard's append lock, so it must
+		// block until the migration released it — and its row must survive.
+		const goPath = path.join(root, "go");
+		const attemptedPath = path.join(root, "attempted");
+		const childPath = path.join(root, "appender.ts");
+		fs.writeFileSync(
+			childPath,
+			[
+				`import * as fs from "node:fs";`,
+				`import { appendIndexRowToShards } from ${JSON.stringify(path.resolve("lib/index-storage.ts"))};`,
+				`const [roundsDir, goPath, attemptedPath] = process.argv.slice(2);`,
+				`const sleep = (ms: number) => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);`,
+				`while (!fs.existsSync(goPath)) sleep(20);`,
+				`fs.writeFileSync(attemptedPath, "attempting");`,
+				`appendIndexRowToShards(roundsDir, "live.json:prompt", [7]);`,
+			].join("\n"),
+		);
+		const child = spawn(process.execPath, ["--import", "tsx", childPath, roundsDir, goPath, attemptedPath], {
+			cwd: process.cwd(),
+			stdio: "ignore",
+		});
+		const childExited = new Promise<void>((resolve) => child.on("exit", () => resolve()));
+		const sleep = (ms: number) => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+		const indexFsImpl = {
+			...fs,
+			writeFileSync: ((filePath: fs.PathOrFileDescriptor, data: unknown) => {
+				if (String(filePath).includes(".tmp.")) {
+					// The migration holds the shard lock and is about to publish:
+					// let the live appender reach the lock, then publish.
+					fs.writeFileSync(goPath, "go");
+					const deadline = Date.now() + 30_000;
+					while (!fs.existsSync(attemptedPath) && Date.now() < deadline) sleep(20);
+					sleep(300);
+				}
+				return fs.writeFileSync(filePath, data as never);
+			}) as typeof fs.writeFileSync,
+		} as unknown as typeof fs;
+		const logs = logger();
+		const fetchImpl = embeddingFetch([[1], [2]]);
+
+		await expect(
+			runDigestSession({
+				sessionFile,
+				roundsDir,
+				apiKey: "key",
+				fetchImpl,
+				stdout: logs.out,
+				stderr: logs.err,
+				indexFsImpl,
+			}),
+		).resolves.toBe(0);
+		await childExited;
+
+		const rows = readIndexLines(shardPath);
+		expect(rows.some((row) => row.includes(`${roundFile}:prompt`))).toBe(true);
+		expect(rows.some((row) => row.includes("live.json:prompt"))).toBe(true);
+		expect(fs.readdirSync(roundsDir).filter((f) => f.includes(".tmp.") || f.includes(".lock"))).toEqual([]);
+	}, 60_000);
 
 	it("leaves round files byte-identical when the atomic write fails", async () => {
 		const root = tmpDir();

@@ -55,10 +55,9 @@ import {
 	encodeVectorIndexLine,
 	indexRoundFileFromPath,
 	makeAssumedStamp,
-	readIndexLines,
 	splitVectorIndexMetadata,
-	writeIndexLines,
 } from "../lib/index-io.ts";
+import { LEGACY_INDEX_FILENAME } from "../lib/index-shards.ts";
 import { type AcquireIndexLockDeps, acquireIndexLock } from "../lib/index-storage.ts";
 import {
 	buildAgentEndEmbeddingTexts,
@@ -66,9 +65,10 @@ import {
 	embeddingMaxTokensToResponseBytes,
 } from "../lib/round-capture.ts";
 import {
+	reportForeignShards,
 	resolveScriptApiKey,
 	resolveScriptConfig,
-	resolveScriptIndexPath,
+	resolveScriptIndexContext,
 	resolveScriptModelRegistry,
 	type ScriptConfigOptions,
 	scriptEmbeddingConfig,
@@ -83,6 +83,8 @@ export interface MigratePromptEmbeddingsOptions extends ScriptConfigOptions {
 	roundsDir?: string;
 	dryRun?: boolean;
 	backup?: boolean;
+	/** Hostname override for tests; defaults to os.hostname(). */
+	hostname?: string;
 	/** Override the embedding fetch impl (tests). */
 	fetchImpl?: typeof fetch;
 	/** Pre-resolved API key (tests); skips keyring/env resolution. */
@@ -155,13 +157,6 @@ export function mergeAppendedLines(
 	return [...rewritten, ...appended];
 }
 
-/** Publish a wholesale index rewrite via tmp + atomic rename (readers never see a partial index). */
-function writeIndexLinesAtomic(indexPath: string, entries: string[]): void {
-	const tmp = `${indexPath}.tmp.${process.pid}`;
-	writeIndexLines(tmp, entries);
-	fs.renameSync(tmp, indexPath);
-}
-
 /** Atomic round.json update preserving all other fields. */
 function updateRoundFile(roundPath: string, mutate: (round: Record<string, unknown>) => void): void {
 	const existing = JSON.parse(fs.readFileSync(roundPath, "utf-8")) as Record<string, unknown>;
@@ -177,20 +172,36 @@ function updateRoundFile(roundPath: string, mutate: (round: Record<string, unkno
 export async function runPromptEmbeddingsMigration(options: MigratePromptEmbeddingsOptions = {}): Promise<number> {
 	const config = resolveScriptConfig(options);
 	const roundsDir = options.roundsDir ?? config.roundsDir;
-	const indexPath = resolveScriptIndexPath(config, roundsDir, options.indexPath);
+	// Issue #149: the index is a set of per-host shards. The re-embed rewrites
+	// this host's own shard only (D-005) — a foreign shard keeps its rows and
+	// is updated when that host runs this script.
+	const index = resolveScriptIndexContext(config, roundsDir, options.indexPath, {
+		hostname: options.hostname,
+		script: "migrate-prompt-embeddings",
+	});
 	const out = options.stdout ?? console;
 	const err = options.stderr ?? console;
 	const noiseOptions = noiseOptionsFromConfig(config);
 	const responseBytes = embeddingMaxTokensToResponseBytes(config.embeddingMaxTokens);
 
-	if (!fs.existsSync(indexPath)) {
-		err.error(`❌ Index file not found: ${indexPath}`);
+	const foreignShards = index.foreignShards();
+	const legacyPath = path.join(index.shardRoot, LEGACY_INDEX_FILENAME);
+	const hasIndexArtifact = fs.existsSync(index.ownShardPath) || fs.existsSync(legacyPath);
+	if (!hasIndexArtifact && foreignShards.length === 0) {
+		err.error(`❌ Index file not found: ${options.indexPath ?? config.indexPath}`);
 		return 1;
 	}
 
-	const lines = readIndexLines(indexPath);
+	// The rows this host rewrites: its own shard (plus the legacy `index.csv`
+	// rows the write claims by rename).
+	const lines = index.readRewriteRows();
 	if (lines.length === 0) {
-		out.log("ℹ Index file is empty. Nothing to migrate.");
+		out.log(
+			hasIndexArtifact
+				? "ℹ Index file is empty. Nothing to migrate."
+				: "ℹ This host's shard holds no rows. Nothing to migrate.",
+		);
+		reportForeignShards(index, out);
 		return 0;
 	}
 	// Detection-time snapshot for the final short-lock merge (#107 F2): rows
@@ -305,13 +316,6 @@ export async function runPromptEmbeddingsMigration(options: MigratePromptEmbeddi
 	}
 
 	// ── Pass 2: apply ──
-	// Backup before any write (index.csv is rewritten wholesale).
-	if (options.backup) {
-		const backupPath = `${indexPath}.bak.${Date.now()}`;
-		fs.copyFileSync(indexPath, backupPath);
-		out.log(`\n💾 Backup saved to: ${backupPath}`);
-	}
-
 	const apiKey = await resolveScriptApiKey(config, options);
 	const modelRegistry = resolveScriptModelRegistry(config, {
 		apiKey: apiKey ?? undefined,
@@ -323,6 +327,18 @@ export async function runPromptEmbeddingsMigration(options: MigratePromptEmbeddi
 		err.error("❌ Embedding API key required to re-embed stale rows (no key resolved).");
 		err.error("   Set OPENROUTER_API_KEY (or the provider key) and re-run, or use --dry-run to preview.");
 		return 1;
+	}
+
+	// Claim the legacy `index.csv` before the re-embed loop so a live session
+	// appends to this host's own shard (and the merge below sees its rows).
+	index.adopt();
+	// Backup before any write (the own shard is rewritten wholesale).
+	if (options.backup) {
+		if (fs.existsSync(index.ownShardPath)) {
+			const backupPath = `${index.ownShardPath}.bak.${Date.now()}`;
+			fs.copyFileSync(index.ownShardPath, backupPath);
+			out.log(`\n💾 Backup saved to: ${backupPath}`);
+		}
 	}
 
 	// Stale rows: re-embed via the configured provider/model, update round.json
@@ -392,10 +408,10 @@ export async function runPromptEmbeddingsMigration(options: MigratePromptEmbeddi
 	// could drop concurrent rows; the runtime's single-line append fallback is
 	// the pre-existing accepted behavior, and this narrows its exposure window
 	// from minutes of re-embedding to the seconds-long merge phase).
-	const lock = acquireIndexLock(indexPath, options.lockDeps);
+	const lock = acquireIndexLock(index.ownShardPath, options.lockDeps);
 	if (lock === null) {
 		err.error(
-			`❌ Could not acquire the index lock (${indexPath}.lock) after all retries — the index was NOT written.`,
+			`❌ Could not acquire the index lock (${index.ownShardPath}.lock) after all retries — the index was NOT written.`,
 		);
 		err.error(
 			"   A live session is likely holding it. This run's re-embed results were discarded; re-run the migration (already-restamped rows cost zero API calls).",
@@ -404,9 +420,11 @@ export async function runPromptEmbeddingsMigration(options: MigratePromptEmbeddi
 	}
 	let mergedRowCount = lines.length;
 	try {
-		const freshLines = readIndexLines(indexPath);
+		const freshLines = index.readRewriteRows();
 		const mergedLines = mergeAppendedLines(detectionLines, freshLines, lines);
-		writeIndexLinesAtomic(indexPath, mergedLines);
+		// Issue #149: publish to the host's own shard (atomic tmp+rename); a
+		// foreign shard is never rewritten here (D-005).
+		index.writeOwnLines(mergedLines, { lockHeld: true });
 		mergedRowCount = mergedLines.length;
 	} finally {
 		lock.release();
@@ -415,7 +433,8 @@ export async function runPromptEmbeddingsMigration(options: MigratePromptEmbeddi
 	out.log(
 		`\n✅ Done. ${reembedded} rounds re-embedded (${combinedReembedded} combined vectors), ${assumedStamped} legacy rows re-stamped with assumed- provenance.`,
 	);
-	out.log(`   Index: ${indexPath} (${mergedRowCount} rows)`);
+	out.log(`   Index: ${index.ownShardPath} (${mergedRowCount} rows)`);
+	reportForeignShards(index, out);
 	return 0;
 }
 

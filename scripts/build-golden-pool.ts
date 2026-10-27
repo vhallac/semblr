@@ -10,7 +10,8 @@ import {
 	type WeakBaselineEntry,
 } from "../lib/eval-golden.ts";
 import { collectWeakLabelExpansionsFromSessionJsonl } from "../lib/eval-labels.ts";
-import { loadIndexFromPath } from "../lib/index-storage.ts";
+import { describeShardSet, discoverIndexShards } from "../lib/index-shards.ts";
+import { loadIndexFromShards } from "../lib/index-storage.ts";
 import type { RoundData } from "../lib/round-data.ts";
 
 const SEMBLR_ACTIVITY_SIGNALS = [
@@ -162,23 +163,23 @@ export async function runBuildGoldenPool(options: RunBuildGoldenPoolOptions = {}
 	const resolvedOutFile = path.resolve(expandHome(outFile, homedir));
 	const resolvedWorksheetFile = path.resolve(expandHome(worksheetFile, homedir));
 	const roundsDir = path.join(resolvedCorpusDir, "rounds");
-	const indexPath = path.join(roundsDir, "index.csv");
 
 	if (!fsImpl.existsSync(roundsDir)) {
 		err.error(`Corpus rounds directory does not exist: ${roundsDir}`);
 		return 1;
 	}
-	if (!fsImpl.existsSync(indexPath)) {
-		err.error(`Corpus index does not exist: ${indexPath}`);
-		return 1;
-	}
+	// Issue #149: the corpus index is a set of per-host shards (`index.<host>`);
+	// the legacy `index.csv` stays part of the read set until it is adopted. An
+	// empty shard set is an empty corpus, not an error.
+	const shards = discoverIndexShards(roundsDir, fsImpl);
 	if (!fsImpl.existsSync(resolvedBaselineFile)) {
 		err.error(`Weak baseline does not exist: ${resolvedBaselineFile}`);
 		return 1;
 	}
 
 	const rounds = readCorpusRounds(roundsDir, fsImpl);
-	const index = loadIndexFromPath(indexPath, fsImpl);
+	const index = loadIndexFromShards(roundsDir, { shards, fsImpl, warn: (message) => err.error(message) });
+	out.log(`Corpus shards read: ${describeShardSet(shards)}`);
 	const weakEntries = readWeakEntries(resolvedBaselineFile, fsImpl);
 	const queryInfo = collectQueryInfo(resolvedSessionsDir, fsImpl);
 	const universe = collectReplayableGoldenUniverse(rounds, queryInfo, weakEntries);

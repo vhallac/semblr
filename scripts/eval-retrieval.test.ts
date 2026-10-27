@@ -213,6 +213,7 @@ describe("eval-retrieval script", () => {
 			kind: "weak",
 			config_hash: expect.any(String),
 			corpus: "snapshot-a",
+			shards: ["index.csv"],
 			counts: {
 				total_rounds: 8,
 				replayed: 5,
@@ -681,5 +682,106 @@ describe("eval-retrieval script", () => {
 		expect(stderr).toEqual([
 			"Usage: npx tsx scripts/eval-retrieval.ts --corpus <dir> [--sessions <dir>] [--out <file>] [--golden <file>] [--mode <similarity|tool>]",
 		]);
+	});
+
+	it("replays retrieval over the merged shard set (issue #149)", async () => {
+		const root = tmpDir();
+		const corpusDir = path.join(root, "snapshot-a");
+		const roundsDir = path.join(corpusDir, "rounds");
+		const sessionsDir = path.join(root, "sessions");
+		const outFile = path.join(root, "out", "eval.json");
+		fs.mkdirSync(roundsDir, { recursive: true });
+
+		const older = {
+			userPrompt: prompt(
+				"alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu nu xi omicron pi rho sigma tau upsilon",
+			),
+			responseSequence: "older response",
+			turnIndex: 0,
+			userTimestamp: 10,
+			promptEmbedding: [1, 0, 0, 0],
+		} satisfies RoundData;
+		const olderFile = writeRound(roundsDir, older);
+		const query = {
+			userPrompt: prompt(
+				"query prompt has enough words to replay retrieval against earlier rounds and produce a stable deterministic ranking for this script test case",
+			),
+			responseSequence: "query response",
+			turnIndex: 1,
+			userTimestamp: 40,
+			promptEmbedding: [1, 0, 0, 0],
+			parentId: olderFile,
+			toolCallCount: 1,
+			toolCallNames: ["get_round_details"],
+			toolCalls: [
+				{
+					index: 0,
+					name: "get_round_details",
+					arguments: JSON.stringify({ round: olderFile }),
+					result_summary: "",
+				},
+			],
+		} satisfies RoundData;
+		const queryFile = writeRound(roundsDir, query);
+
+		// The query's row lives in one shard, the target round's row in another:
+		// the target is retrievable only through the merged shard view.
+		fs.writeFileSync(path.join(roundsDir, "index.host-a"), `${encodeEntry([1, 0, 0, 0], `${queryFile}:prompt`)}\n`);
+		fs.writeFileSync(path.join(roundsDir, "index.host-b"), `${encodeEntry([1, 0, 0, 0], `${olderFile}:prompt`)}\n`);
+		fs.writeFileSync(
+			path.join(corpusDir, "chain-read-stats.json"),
+			JSON.stringify(createDefaultStatsState("2026-06-12T03:01:09.000Z"), null, 2),
+		);
+		writeSessionWithExpansion(
+			path.join(sessionsDir, "--session-a", "rounds.jsonl"),
+			query.userPrompt,
+			query.responseSequence,
+			olderFile,
+		);
+
+		await expect(
+			runEvalRetrieval({
+				corpusDir,
+				sessionsDir,
+				outFile,
+				args: ["--corpus", corpusDir, "--sessions", sessionsDir, "--out", outFile],
+				gitRev: "test-rev",
+			}),
+		).resolves.toBe(0);
+
+		const result = JSON.parse(fs.readFileSync(outFile, "utf-8"));
+		expect(result.shards).toEqual(["index.host-a", "index.host-b"]);
+		expect(result.hit_at_5).toBe(1);
+		expect(result.per_query).toEqual([
+			{
+				query: queryFile,
+				labels: [olderFile],
+				top5: [{ file: olderFile, score: 1 }],
+				first_hit_rank: 1,
+			},
+		]);
+	});
+
+	it("treats a corpus without any index shard as an empty corpus, not an error (issue #149)", async () => {
+		const root = tmpDir();
+		const corpusDir = path.join(root, "snapshot-a");
+		const roundsDir = path.join(corpusDir, "rounds");
+		const sessionsDir = path.join(root, "sessions");
+		const outFile = path.join(root, "out", "eval.json");
+		fs.mkdirSync(roundsDir, { recursive: true });
+
+		await expect(
+			runEvalRetrieval({
+				corpusDir,
+				sessionsDir,
+				outFile,
+				args: ["--corpus", corpusDir, "--sessions", sessionsDir, "--out", outFile],
+				gitRev: "test-rev",
+			}),
+		).resolves.toBe(0);
+
+		const result = JSON.parse(fs.readFileSync(outFile, "utf-8"));
+		expect(result.shards).toEqual([]);
+		expect(result.counts.total_rounds).toBe(0);
 	});
 });

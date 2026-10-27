@@ -9,6 +9,14 @@ import { isMainModule, mergeAppendedLines, runPromptEmbeddingsMigration } from "
 
 let tempDir = "";
 
+// Issue #149: the index is a set of per-host shards; this host rewrites its
+// own shard (`index.<hostname>`) only.
+const HOST = "test-host";
+
+function shardPath(): string {
+	return path.join(tempDir, `index.${HOST}`);
+}
+
 beforeEach(() => {
 	tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "semblr-migrate-prompt-embeddings-"));
 });
@@ -62,13 +70,14 @@ function writeRound(
 }
 
 function writeIndex(lines: string[]): void {
-	fs.writeFileSync(path.join(tempDir, "index.csv"), `${lines.join("\n")}\n`);
+	fs.writeFileSync(shardPath(), `${lines.join("\n")}\n`);
 }
 
 function baseOptions(stdout: Pick<typeof console, "log">, extra: Record<string, unknown> = {}) {
 	return {
 		roundsDir: tempDir,
 		indexPath: path.join(tempDir, "index.csv"),
+		hostname: HOST,
 		apiKey: "key",
 		configDeps: { cwd: tempDir, agentDir: path.join(tempDir, "agent"), env: {} },
 		...extra,
@@ -100,7 +109,7 @@ describe("migrate-prompt-embeddings script", () => {
 
 		// Prompt row: normalized fresh vector, current model, assumed- stamp over the
 		// cleaned input (legacy capture — original capture input unverifiable, #107 F1)
-		const index = loadVectorIndex(path.join(tempDir, "index.csv"));
+		const index = loadVectorIndex(shardPath());
 		expect(index).toEqual([
 			{
 				vector: [0.6, 0.8],
@@ -153,7 +162,7 @@ describe("migrate-prompt-embeddings script", () => {
 		).resolves.toBe(0);
 
 		// Re-embedded (not stamped in place): fresh vector, current model, assumed- stamp
-		expect(loadVectorIndex(path.join(tempDir, "index.csv"))).toEqual([
+		expect(loadVectorIndex(shardPath())).toEqual([
 			{
 				vector: [0.6, 0.8],
 				filePath: `${roundFile}:prompt`,
@@ -212,7 +221,7 @@ describe("migrate-prompt-embeddings script", () => {
 		).resolves.toBe(0);
 
 		expect(fetchImpl).not.toHaveBeenCalled();
-		expect(readIndexLines(path.join(tempDir, "index.csv"))).toEqual([
+		expect(readIndexLines(shardPath())).toEqual([
 			encodeVectorIndexLine(
 				[9, 9],
 				`${roundFile}:prompt`,
@@ -249,7 +258,7 @@ describe("migrate-prompt-embeddings script", () => {
 
 		expect(requests).toHaveLength(1); // re-embedded despite the "matching" stamp
 		expect((requests[0] as any).body.input).toBe(PLAIN_PROMPT);
-		expect(loadVectorIndex(path.join(tempDir, "index.csv"))).toEqual([
+		expect(loadVectorIndex(shardPath())).toEqual([
 			{
 				vector: [0.6, 0.8],
 				filePath: `${roundFile}:prompt`,
@@ -287,7 +296,7 @@ describe("migrate-prompt-embeddings script", () => {
 
 		expect((requests[0] as any).body.input).toBe(PLAIN_PROMPT);
 		expect((requests[1] as any).body.input).toBe(`${PLAIN_PROMPT}\n\n${RESPONSE}`);
-		expect(loadVectorIndex(path.join(tempDir, "index.csv"))).toEqual([
+		expect(loadVectorIndex(shardPath())).toEqual([
 			{
 				vector: [0.6, 0.8],
 				filePath: `${roundFile}:prompt`,
@@ -323,7 +332,7 @@ describe("migrate-prompt-embeddings script", () => {
 		const clipped = longPrompt.slice(0, 8000); // default embeddingMaxTokens
 		expect((requests[0] as any).body.input).toBe(clipped);
 		expect((requests[1] as any).body.input).toBe(`${clipped}\n\n${RESPONSE}`);
-		expect(loadVectorIndex(path.join(tempDir, "index.csv"))).toEqual([
+		expect(loadVectorIndex(shardPath())).toEqual([
 			{
 				vector: [0.6, 0.8],
 				filePath: `${roundFile}:prompt`,
@@ -346,7 +355,7 @@ describe("migrate-prompt-embeddings script", () => {
 
 		expect(requests).toHaveLength(1);
 		expect((requests[0] as any).body.input).toBe(CLEANED_NOISY_PROMPT);
-		expect(loadVectorIndex(path.join(tempDir, "index.csv"))).toEqual([
+		expect(loadVectorIndex(shardPath())).toEqual([
 			{
 				vector: [0.6, 0.8],
 				filePath: `${roundFile}:prompt`,
@@ -372,9 +381,7 @@ describe("migrate-prompt-embeddings script", () => {
 		).resolves.toBe(0);
 
 		expect(fetchImpl).not.toHaveBeenCalled();
-		expect(readIndexLines(path.join(tempDir, "index.csv"))).toEqual([
-			encodeVectorIndexLine([9, 9], `${roundFile}:prompt`, "old-model"),
-		]);
+		expect(readIndexLines(shardPath())).toEqual([encodeVectorIndexLine([9, 9], `${roundFile}:prompt`, "old-model")]);
 		expect(logs.stdout.join("\n")).toContain("Dry-run mode: no changes written.");
 		expect(logs.stdout.join("\n")).toContain("[legacy]");
 	});
@@ -394,7 +401,7 @@ describe("migrate-prompt-embeddings script", () => {
 			}),
 		).resolves.toBe(0);
 
-		const backups = fs.readdirSync(tempDir).filter((f) => f.startsWith("index.csv.bak."));
+		const backups = fs.readdirSync(tempDir).filter((f) => f.startsWith(`index.${HOST}.bak.`));
 		expect(backups).toHaveLength(1);
 		expect(fs.readFileSync(path.join(tempDir, backups[0]), "utf-8")).toBe(
 			`${encodeVectorIndexLine([9, 9], `${roundFile}:prompt`, "old-model")}\n`,
@@ -412,7 +419,7 @@ describe("migrate-prompt-embeddings script", () => {
 		).resolves.toBe(0);
 
 		expect(fetchImpl).not.toHaveBeenCalled();
-		expect(readIndexLines(path.join(tempDir, "index.csv"))).toEqual([orphanLine]);
+		expect(readIndexLines(shardPath())).toEqual([orphanLine]);
 		expect(logs.stdout.join("\n")).toContain("without a round file (skipped)");
 	});
 
@@ -427,7 +434,7 @@ describe("migrate-prompt-embeddings script", () => {
 			runPromptEmbeddingsMigration({ ...baseOptions(logs.out, { apiKey: "" }), stderr: logs.err }),
 		).resolves.toBe(1);
 
-		expect(readIndexLines(path.join(tempDir, "index.csv"))).toEqual([legacyLine]);
+		expect(readIndexLines(shardPath())).toEqual([legacyLine]);
 		expect(logs.stderr.join("\n")).toContain("Embedding API key required");
 	});
 
@@ -463,7 +470,7 @@ describe("final write: short-lock merge (#107 F2)", () => {
 		writeRound("live-b.json", { userPrompt: PLAIN_PROMPT, responseSequence: RESPONSE });
 		const responseLine = encodeVectorIndexLine([8, 8], `${roundFile}:response`, "old-model");
 		writeIndex([encodeVectorIndexLine([9, 9], `${roundFile}:prompt`, "old-model"), responseLine]);
-		const indexPath = path.join(tempDir, "index.csv");
+		const indexPath = shardPath();
 
 		const requests: unknown[] = [];
 		const vectors = [
@@ -507,7 +514,7 @@ describe("final write: short-lock merge (#107 F2)", () => {
 		writeRound(roundFile, { userPrompt: NOISY_PROMPT, responseSequence: RESPONSE, promptEmbedding: [0.5] });
 		const originalLine = encodeVectorIndexLine([9, 9], `${roundFile}:prompt`, "old-model");
 		writeIndex([originalLine]);
-		const indexPath = path.join(tempDir, "index.csv");
+		const indexPath = shardPath();
 		// A live session holds the lock (fresh mtime — no stale takeover).
 		fs.writeFileSync(`${indexPath}.lock`, "held");
 

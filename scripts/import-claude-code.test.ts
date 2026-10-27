@@ -4,6 +4,7 @@ import * as path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { claudeRoundFileName } from "../lib/claude-code.ts";
 import { loadVectorIndex } from "../lib/index-io.ts";
+import { ownShardPath } from "../lib/index-shards.ts";
 import { isMainModule, runImportClaudeCode } from "./import-claude-code.ts";
 
 function tmpDir(): string {
@@ -186,7 +187,7 @@ describe("import-claude-code script", () => {
 		expect(writtenRound.cwd).toBe("/home/user/work");
 		expect(writtenRound.gitBranch).toBe("main");
 
-		expect(loadVectorIndex(indexPath)).toEqual([
+		expect(loadVectorIndex(ownShardPath(roundsDir))).toEqual([
 			{ vector: [0.6, 0.8], filePath: `${roundFile}:prompt`, model: "openai/text-embedding-3-small" },
 			{ vector: [0.6, 0.8], filePath: `${roundFile}:response`, model: "openai/text-embedding-3-small" },
 		]);
@@ -261,7 +262,7 @@ describe("import-claude-code script", () => {
 
 		expect(logs.stdout.join("\n")).toContain("📊 Parsed rounds: 5");
 		expect(logs.stdout.join("\n")).toContain("📊 New rounds to import: 2");
-		expect(loadVectorIndex(indexPath)).toHaveLength(4); // 2 prompt + 2 response
+		expect(loadVectorIndex(ownShardPath(roundsDir))).toHaveLength(4); // 2 prompt + 2 response
 	});
 
 	it("skips already-indexed rounds on second run", async () => {
@@ -470,7 +471,7 @@ describe("import-claude-code script", () => {
 
 		expect(fs.readFileSync(target, "utf-8")).toBe(sentinel);
 		expect(fs.readdirSync(roundsDir).filter((name) => name.includes(".tmp."))).toEqual([]);
-		expect(loadVectorIndex(path.join(roundsDir, "index.csv"))).toEqual([]);
+		expect(loadVectorIndex(ownShardPath(roundsDir))).toEqual([]);
 	});
 
 	it("detects direct CLI execution", () => {

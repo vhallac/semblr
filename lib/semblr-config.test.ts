@@ -1,6 +1,7 @@
+import * as os from "node:os";
 import * as path from "node:path";
 import { describe, expect, it } from "vitest";
-import { loadSemblrConfig } from "./semblr-config.ts";
+import { loadSemblrConfig, type SemblrConfigDeps } from "./semblr-config.ts";
 
 function fsFromFiles(files: Record<string, unknown>) {
 	const normalized = new Map(Object.entries(files).map(([filePath, content]) => [path.normalize(filePath), content]));
@@ -26,6 +27,7 @@ describe("loadSemblrConfig", () => {
 			embeddingApiUrl: undefined,
 			roundsDir: "/agent/semblr/rounds",
 			indexPath: "/agent/semblr/rounds/index.csv",
+			hostId: os.hostname(),
 			groupThreshold: 0.77,
 			minSimilarity: 0.3,
 			embedTimeoutMs: 15_000,
@@ -209,5 +211,37 @@ describe("loadSemblrConfig", () => {
 		});
 
 		expect(config.roundsDir).toBe("/configured-agent/semblr/rounds");
+	});
+
+	it("resolves the host id from the env var first", () => {
+		const config = loadSemblrConfig({
+			cwd: "/repo",
+			agentDir: "/agent",
+			env: { SEMBLR_HOST_ID: "workstation-1" },
+			fsImpl: fsFromFiles({ "/repo/.pi/settings.json": { semblr: { hostId: "from-settings" } } }),
+		});
+
+		expect(config.hostId).toBe("workstation-1");
+	});
+
+	it("ignores the hostId pi setting (PR!151 F2: env-var only)", () => {
+		const config = loadSemblrConfig({
+			cwd: "/repo",
+			agentDir: "/agent",
+			env: {},
+			fsImpl: fsFromFiles({ "/repo/.pi/settings.json": { semblr: { hostId: "from-settings" } } }),
+		});
+
+		expect(config.hostId).toBe(os.hostname());
+	});
+
+	it("falls back to the machine name without persisting a host-id file", () => {
+		const files = new Map<string, string>();
+		const fsImpl = fsFromFiles({});
+
+		const config = loadSemblrConfig({ cwd: "/repo", agentDir: "/agent", env: {}, fsImpl });
+
+		expect(config.hostId).toBe(os.hostname());
+		expect(files.size).toBe(0);
 	});
 });

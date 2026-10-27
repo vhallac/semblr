@@ -20,9 +20,14 @@
  */
 
 import * as fs from "node:fs";
+import * as path from "node:path";
 import { pathToFileURL } from "node:url";
-import { readIndexLines, writeIndexLines } from "../lib/index-io.ts";
-import { resolveScriptConfig, resolveScriptIndexPath, type ScriptConfigOptions } from "../lib/script-config.ts";
+import {
+	reportForeignShards,
+	resolveScriptConfig,
+	resolveScriptIndexContext,
+	type ScriptConfigOptions,
+} from "../lib/script-config.ts";
 
 // ─────────────────────────────────────────────
 // Config
@@ -69,6 +74,8 @@ export interface EraseShortEmbeddingsOptions extends ScriptConfigOptions {
 	indexPath?: string;
 	minWords?: number;
 	now?: () => number;
+	/** Hostname override for tests; defaults to os.hostname(). */
+	hostname?: string;
 	stdout?: Pick<typeof console, "log" | "error">;
 }
 
@@ -79,7 +86,12 @@ export function runEraseShortEmbeddings(options: EraseShortEmbeddingsOptions = {
 	const verbose = args.includes("--verbose");
 	const config = resolveScriptConfig(options);
 	const roundsDir = options.roundsDir ?? config.roundsDir;
-	const indexPath = resolveScriptIndexPath(config, roundsDir, options.indexPath);
+	// Issue #149: the index is a set of per-host shards. The rewrite touches
+	// this host's own shard only (D-005) — a foreign shard stays byte-identical.
+	const index = resolveScriptIndexContext(config, roundsDir, options.indexPath, {
+		hostname: options.hostname,
+		script: "erase-short-embeddings",
+	});
 	const minWords = options.minWords ?? MIN_WORDS;
 	const out = options.stdout ?? console;
 
@@ -88,19 +100,25 @@ export function runEraseShortEmbeddings(options: EraseShortEmbeddingsOptions = {
 		return 1;
 	}
 
-	const indexLines = readIndexLines(indexPath);
+	const indexLines = index.readRewriteRows();
 	if (indexLines.length === 0) {
 		console.log("No index entries found. Nothing to do.");
+		reportForeignShards(index, out);
 		return 0;
 	}
 
-	out.log(`Found ${indexLines.length} index entries (${indexPath})`);
+	out.log(`Found ${indexLines.length} index entries (${index.ownShardPath})`);
 
 	// Backup
 	if (doBackup && !dryRun) {
-		const backupPath = `${indexPath}.bak-${options.now?.() ?? Date.now()}`;
-		fs.copyFileSync(indexPath, backupPath);
-		out.log(`Backup created: ${backupPath}`);
+		// Claim the legacy `index.csv` first so the backup covers the rows the
+		// rewrite publishes (the legacy rows become part of the own shard).
+		index.adopt();
+		if (fs.existsSync(index.ownShardPath)) {
+			const backupPath = `${index.ownShardPath}.bak-${options.now?.() ?? Date.now()}`;
+			fs.copyFileSync(index.ownShardPath, backupPath);
+			out.log(`Backup created: ${backupPath}`);
+		}
 	}
 
 	// Parse all entries
@@ -156,12 +174,29 @@ export function runEraseShortEmbeddings(options: EraseShortEmbeddingsOptions = {
 	out.log(`Would remove ${removed} index entries (${retained.length} retained)`);
 
 	if (!dryRun) {
-		writeIndexLines(indexPath, retained);
-		out.log(`✓ Updated index.csv (${removed} entries removed)`);
+		// Rewrite the final lock-protected read so rows appended after the
+		// detection read are preserved; a foreign shard is never rewritten.
+		index.rewriteOwnRows((freshRows) =>
+			freshRows.filter((line) => {
+				const entry = parseLine(line);
+				return !entry || !shortRoundFiles.has(entry.roundFile);
+			}),
+		);
+		out.log(`✓ Updated ${path.basename(index.ownShardPath)} (${removed} entries removed)`);
 
 		// Delete promptEmbedding field from round JSON files
 		let cleanedFiles = 0;
+		// Round files a foreign shard still references — the round file is
+		// shared, so this host leaves those untouched (issue #149, D-005).
+		const foreignReferenced = index.foreignReferencedFiles();
 		for (const roundPath of shortRoundPaths) {
+			// A foreign shard may still hold rows for this round: the round file
+			// is shared, so this host leaves it untouched and reports it instead.
+			const roundFile = path.basename(roundPath);
+			if (foreignReferenced.has(roundFile)) {
+				out.log(`  ⚠️  Round file kept (referenced by another host's shard): ${roundFile}`);
+				continue;
+			}
 			try {
 				const data = JSON.parse(fs.readFileSync(roundPath, "utf-8"));
 				if (data.promptEmbedding) {
@@ -179,6 +214,8 @@ export function runEraseShortEmbeddings(options: EraseShortEmbeddingsOptions = {
 		out.log(`~ Dry run: would remove ${removed} index entries`);
 		out.log(`~ Dry run: would clean promptEmbedding from ${shortRoundPaths.size} round files`);
 	}
+
+	reportForeignShards(index, out);
 
 	return 0;
 }

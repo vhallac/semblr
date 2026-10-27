@@ -2,6 +2,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { DEFAULT_MAX_RECENCY_ENTRIES, DEFAULT_PROMPT_TRUNCATION } from "./context-format.ts";
+import { resolveHostId } from "./host-id.ts";
 import { DEFAULT_PROMPT_NOISE_CLEANUP } from "./round-capture.ts";
 import { DEFAULT_CONTEXT_BUDGET_RATIO, DEFAULT_MAX_RELEVANCE_ENTRIES } from "./search-interactions.ts";
 
@@ -13,6 +14,11 @@ export interface SemblrConfig {
 	embeddingApiUrl?: string;
 	roundsDir: string;
 	indexPath: string;
+	/**
+	 * Stable id of this host — the shard name component (`index.<hostId>`).
+	 * Resolved from `SEMBLR_HOST_ID`, then `os.hostname()`; nothing is persisted.
+	 */
+	hostId: string;
 	groupThreshold: number;
 	minSimilarity: number;
 	embedTimeoutMs: number;
@@ -46,6 +52,7 @@ export interface SemblrConfigEnv {
 	SEMBLR_EMBEDDING_MAX_TOKENS?: string;
 	SEMBLR_EMBEDDING_API_URL?: string;
 	SEMBLR_ROUNDS_DIR?: string;
+	SEMBLR_HOST_ID?: string;
 	SEMBLR_GROUP_THRESHOLD?: string;
 	SEMBLR_MIN_SIMILARITY?: string;
 	SEMBLR_EMBED_TIMEOUT?: string;
@@ -67,7 +74,12 @@ export interface SemblrConfigDeps {
 	cwd?: string;
 	agentDir?: string;
 	env?: SemblrConfigEnv;
-	fsImpl?: Pick<typeof fs, "existsSync" | "readFileSync">;
+	/**
+	 * fs seam. The write methods are optional: without them the host id
+	 * cannot be persisted (a read-only seam), but it is still resolved.
+	 */
+	fsImpl?: Pick<typeof fs, "existsSync" | "readFileSync"> &
+		Partial<Pick<typeof fs, "writeFileSync" | "mkdirSync" | "renameSync">>;
 	warn?: (message: string) => void;
 }
 
@@ -103,6 +115,7 @@ const ENV_KEYS = {
 	embeddingMaxTokens: "SEMBLR_EMBEDDING_MAX_TOKENS",
 	embeddingApiUrl: "SEMBLR_EMBEDDING_API_URL",
 	roundsDir: "SEMBLR_ROUNDS_DIR",
+	hostId: "SEMBLR_HOST_ID",
 	groupThreshold: "SEMBLR_GROUP_THRESHOLD",
 	minSimilarity: "SEMBLR_MIN_SIMILARITY",
 	embedTimeoutMs: "SEMBLR_EMBED_TIMEOUT",
@@ -242,7 +255,16 @@ export function loadSemblrConfig(deps: SemblrConfigDeps = {}): SemblrConfig {
 
 	const roundsDir = resolveRoundsDir(env, projectSettings, globalSettings, cwd, agentDir);
 
+	// Issue #149 (OI-6): a stable host id names this host's own shard. The
+	// order is the `SEMBLR_HOST_ID` env var → the machine name. Nothing is
+	// persisted (PR!151 F2): the id is recomputed each run.
+	const { hostId } = resolveHostId({
+		configuredHostId: asNonEmptyString(env[ENV_KEYS.hostId]),
+		warn,
+	});
+
 	return {
+		hostId,
 		agentDir,
 		embeddingProvider: resolveString(
 			"embeddingProvider",

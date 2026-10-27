@@ -46,13 +46,15 @@ import {
 import { embedRound, FORCING_INDEX_SUFFIXES, forcingReproducibleSuffixes } from "../lib/embed-round.ts";
 import { embedText, getApiKey } from "../lib/embedding-client.ts";
 import { assignToGroup, formatGroupStats } from "../lib/grouping.ts";
-import { indexRoundFileFromPath, loadVectorIndex } from "../lib/index-io.ts";
+import { indexRoundFileFromPath, loadShardVectorIndex, loadVectorIndex } from "../lib/index-io.ts";
+import { ownShardPath } from "../lib/index-shards.ts";
 import {
-	appendToIndexPath,
+	appendIndexRowToShards,
 	buildSessionStartStatus,
 	type IndexEntry,
 	type IndexReadFs,
 	loadIndexFromPath as loadIndexFromPathCore,
+	loadIndexFromShards,
 	loadSessionStartIndex as loadSessionStartIndexCore,
 } from "../lib/index-storage.ts";
 import { createRecoveryIndexDeps } from "../lib/recovery-index-deps.ts";
@@ -133,7 +135,12 @@ export {
 	startsWithEnvironmentPreamble,
 } from "../lib/context-messages.ts";
 export { embedText, getApiKey } from "../lib/embedding-client.ts";
-export { appendToIndexPath, buildSessionStartStatus, countUniqueIndexedRounds } from "../lib/index-storage.ts";
+export {
+	type AppendIndexRowToShardsDeps,
+	appendIndexRowToShards,
+	buildSessionStartStatus,
+	countUniqueIndexedRounds,
+} from "../lib/index-storage.ts";
 export type {
 	BuildContext,
 	ContextProvider,
@@ -333,8 +340,18 @@ export function loadIndexFromPath(indexPath: string = INDEX_PATH, fsImpl: IndexR
 	return loadIndexFromPathCore(indexPath, fsImpl);
 }
 
+/**
+ * Issue #149: the extension's merged index read — startup, TUI counts, and
+ * search all see rows from every host's shard; an empty shard set yields an
+ * empty index without error. Exported as the test seam for the extension's
+ * read surface (mirrors the appendIndexRowToShards write seam).
+ */
+export function loadMergedIndex(roundsDir: string = ROUNDS_DIR): IndexEntry[] {
+	return loadIndexFromShards(roundsDir);
+}
+
 function loadIndex(): IndexEntry[] {
-	return loadIndexFromPathCore(INDEX_PATH);
+	return loadMergedIndex();
 }
 
 export function loadSessionStartIndex(
@@ -379,7 +396,11 @@ function buildCheckpointContext(fileName: string): string | null {
 const _agentPendingToolCallIds: Map<string, ToolCallDetail> = new Map(); // toolCallId → partial detail
 
 function appendToIndex(filePath: string, vector: number[], model?: string, embeddingInputHash?: string) {
-	appendToIndexPath(INDEX_PATH, ROUNDS_DIR, filePath, vector, {}, model, embeddingInputHash);
+	// Issue #149: live appends land in the host's own shard (index.<hostId>),
+	// adopting a legacy index.csv on first write; foreign shards are untouched.
+	// The shard is named after the resolved host id (OI-6), not the raw
+	// machine name.
+	appendIndexRowToShards(ROUNDS_DIR, filePath, vector, { hostname: SEMBLR_CONFIG.hostId }, model, embeddingInputHash);
 }
 
 let searchBm25Index: ReturnType<typeof loadOrRebuildBm25Index> | null = null;
@@ -1151,9 +1172,10 @@ export default function (pi: ExtensionAPI) {
 		// ◈ Flush stats to disk (atomically) and show in TUI
 		flushStatsFile(statsState, STATS_PATH, SEMBLR_DIR);
 
-		// Combine chain-read stats with total indexed rounds count
-		const indexExists = fs.existsSync(INDEX_PATH);
-		const idx = indexExists ? loadIndex() : [];
+		// Combine chain-read stats with total indexed rounds count.
+		// Issue #149: no existence guard keyed on the legacy index.csv — the
+		// merged shard view tolerates a missing dir / empty shard set.
+		const idx = loadIndex();
 		const totalRounds = new Set(idx.map((e: { filePath: string }) => indexRoundFileFromPath(e.filePath))).size;
 		ctx.ui.setStatus(
 			"semblr",
@@ -1248,10 +1270,14 @@ export default function (pi: ExtensionAPI) {
 						// rows, not the promptEmbedding marker. A recovered round with
 						// current-model rows but no marker (rows written without one, e.g.
 						// after a crash) is not pending — counting it inflated the startup
-						// count and made startup disagree with the `just index` sweep. Load
-						// the index once here and reuse the same entries for the label
-						// guard below.
-						const indexEntries = loadVectorIndex(INDEX_PATH);
+						// count and made startup disagree with the `just index` sweep.
+						// Issue #149 (D-010): the pending predicate counts rows across ALL
+						// shards — a round a foreign host already embedded with the current
+						// model must not be re-embedded locally on every startup.
+						const indexEntries = loadShardVectorIndex(ROUNDS_DIR);
+						// Issue #149 (D-006 scope): the live label guard consults only the
+						// host's own shard — the post-adoption write surface.
+						const ownShardEntries = loadVectorIndex(ownShardPath(ROUNDS_DIR, SEMBLR_CONFIG.hostId));
 						// F2 (PR !141 review): the pending count and the `just index` sweep must
 						// classify a recovered round alike. The sweep derives the *forcing*
 						// suffix set per round from the round file (a short prompt's `:prompt`
@@ -1285,7 +1311,7 @@ export default function (pi: ExtensionAPI) {
 									// every append. Previously hasIndexRow re-read the full index
 									// file per recovered round (O(n × index size) — minutes of
 									// blocking startup work with a large index).
-									const indexedLabels = new Set(indexEntries.map((entry) => entry.filePath));
+									const indexedLabels = new Set(ownShardEntries.map((entry) => entry.filePath));
 									const embedResult = await embedRecoveredRounds(
 										backfill.recoveredFiles,
 										ROUNDS_DIR,
@@ -1344,7 +1370,9 @@ export default function (pi: ExtensionAPI) {
 				}
 			}
 		}
-		const index = loadSessionStartIndex();
+		// Issue #149: the startup status counts rounds across the merged shard
+		// view; an empty shard set (fresh machine) reports zero without error.
+		const index = loadIndexFromShards(ROUNDS_DIR);
 		ctx.ui.setStatus("semblr", buildSessionStartStatus(index));
 
 		// Register the search_interactions tool here, not at factory level

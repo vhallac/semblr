@@ -28,16 +28,19 @@ import {
 	embedRound,
 	FORCING_INDEX_SUFFIXES,
 	forcingReproducibleSuffixes,
+	ownShardHasStaleForcingRow,
 } from "../lib/embed-round.ts";
+import { describeForeignShards, recordForeignBacklog } from "../lib/foreign-backlog.ts";
 import {
 	buildStaleContentMatchMap,
-	flushVectorIndex,
+	flushOwnShardVectorIndex,
 	indexRoundFileFromPath,
 	indexRowSuffix,
+	loadShardVectorIndex,
 	loadVectorIndex,
 	type VectorIndexEntry,
 } from "../lib/index-io.ts";
-import { countIndexLines } from "../lib/index-storage.ts";
+import { adoptOwnShard, discoverIndexShards } from "../lib/index-shards.ts";
 import { type ParsedPiRound, parsePiSessionJsonl } from "../lib/pi-session.ts";
 import { deriveRoundFile, embeddingMaxTokensToResponseBytes } from "../lib/round-capture.ts";
 import { buildCheckpointSummaryText, type CheckpointSummary, type RoundData } from "../lib/round-data.ts";
@@ -246,6 +249,11 @@ export interface DigestAllOptions extends ScriptConfigOptions {
 	fsImpl?: typeof fs;
 	/** Rebuild the tool-call fulltext index from existing round files only — no re-embedding. */
 	toolsOnly?: boolean;
+	/**
+	 * Host id override for tests; defaults to the configured host id
+	 * (`config.hostId` — issue #149, OI-6).
+	 */
+	hostname?: string;
 }
 
 export async function runDigestAll(options: DigestAllOptions = {}): Promise<number> {
@@ -253,6 +261,15 @@ export async function runDigestAll(options: DigestAllOptions = {}): Promise<numb
 	const sessionsDir = options.sessionsDir ?? defaultSessionsDir(config.agentDir);
 	const roundsDir = options.roundsDir ?? config.roundsDir;
 	const indexPath = resolveScriptIndexPath(config, roundsDir, options.indexPath);
+	// Issue #149: the vector index is a set of per-host shards
+	// (`index.<hostname>`), not one shared `index.csv`. The shard root is the
+	// directory that holds the index artifact — the rounds dir in every
+	// default configuration, and the directory of an explicit `--index-path`
+	// (issue 4.a). The sweep reads the merged view of every shard but writes
+	// only its own shard.
+	const shardRoot = path.dirname(indexPath);
+	// Issue #149 (OI-6): the own shard is named after the resolved host id.
+	const hostId = options.hostname ?? config.hostId;
 	const bm25IndexPath = bm25IndexPathForRoundsDir(roundsDir);
 	const out = options.stdout ?? console;
 	const err = options.stderr ?? console;
@@ -289,14 +306,41 @@ export async function runDigestAll(options: DigestAllOptions = {}): Promise<numb
 
 	// Ensure rounds dir
 	f.mkdirSync(roundsDir, { recursive: true });
+	// Issue #149: ensure the shard root exists (it is the rounds dir in every
+	// default configuration, and the directory of an explicit `--index-path`).
+	f.mkdirSync(shardRoot, { recursive: true });
 
-	// Issue #139: parse index.csv exactly once per run and derive every
+	// Issue #149: claim the legacy headerless `index.csv` before loading (Q1
+	// option b — atomic same-directory rename, decision 015). The sweep is a
+	// writer, and the own shard's rows must be known before the merge phase so
+	// a wholesale rewrite never drops the legacy rows. When the host already
+	// has a shard of its own, the legacy file is left in place and stays part
+	// of the read shard set.
+	const { shardPath: ownShard } = adoptOwnShard(shardRoot, { fsImpl: f, hostname: hostId });
+
+	// Issue #139/#149: parse the index exactly once per run and derive every
 	// index-level structure from that single pass — the dedup set, the
 	// model-mismatch set, and the F2 sweep-heal response-vector map. processRound
-	// used to re-read and re-parse index.csv twice per round (O(n²)); the
+	// used to re-read and re-parse the index twice per round (O(n²)); the
 	// in-memory sets it now consumes are seeded from this one load.
 	// Legacy two-column rows have no model and are treated as current per #62.
-	const indexEntries = loadVectorIndex(indexPath, f);
+	//
+	// Issue #149: the load spans the whole shard set (D-006 sweep clause — a
+	// foreign host may have embedded a round this host is about to re-embed),
+	// but the rows are split by shard: only the own shard's rows are ever
+	// rewritten, and a foreign shard is never written by this host (D-005).
+	// The own shard is read strictly (a corrupt own row must not be dropped by
+	// a rewrite); foreign shards are read tolerantly (a corrupt foreign row is
+	// skipped with a warning, never fatal).
+	const shardPaths = discoverIndexShards(shardRoot, f);
+	const foreignShards = shardPaths.filter((shardPath) => shardPath !== ownShard);
+	const ownEntries = loadVectorIndex(ownShard, f);
+	// Keep an immutable baseline of the own shard before the sweep's embedding
+	// work. The final locked flush compares its fresh read with this snapshot
+	// to identify rows appended concurrently and preserve them.
+	const ownEntriesBaseline = ownEntries.map((entry) => ({ ...entry }));
+	const foreignEntries = loadShardVectorIndex(shardRoot, { fsImpl: f, shards: foreignShards });
+	const indexEntries = [...ownEntries, ...foreignEntries];
 	const existingRounds = new Set<string>();
 	const modelMismatchedRounds = new Set<string>();
 	// F1 (PR #141 review): a round needs a reindex only when its *reproducible*
@@ -340,6 +384,11 @@ export async function runDigestAll(options: DigestAllOptions = {}): Promise<numb
 		return suffixes;
 	};
 	const entriesByRoundFile = new Map<string, VectorIndexEntry[]>();
+	// Issue #149: the rows of the host's own shard, keyed by round file — the
+	// write side of the sweep. Orphan discovery (D-007) and the per-round
+	// replace are scoped to the shard being rewritten, so a foreign shard's
+	// rows are never touched.
+	const ownEntriesByRoundFile = new Map<string, VectorIndexEntry[]>();
 	for (const entry of indexEntries) {
 		// indexRoundFileFromPath strips the :prompt/:response/:round/:summary suffix.
 		const roundFile = path.basename(indexRoundFileFromPath(entry.filePath));
@@ -351,6 +400,12 @@ export async function runDigestAll(options: DigestAllOptions = {}): Promise<numb
 			responseVectorByRoundFile.set(roundFile, entry.vector);
 		}
 	}
+	for (const entry of ownEntries) {
+		const roundFile = path.basename(indexRoundFileFromPath(entry.filePath));
+		const list = ownEntriesByRoundFile.get(roundFile);
+		if (list) list.push(entry);
+		else ownEntriesByRoundFile.set(roundFile, [entry]);
+	}
 	for (const roundFile of existingRounds) {
 		const { hasReproducibleRow, hasStaleReproducibleRow, covered } = classifyRoundCoverage(
 			entriesByRoundFile.get(roundFile) ?? [],
@@ -361,6 +416,25 @@ export async function runDigestAll(options: DigestAllOptions = {}): Promise<numb
 		if (hasReproducibleRow) roundsWithReproducibleRow.add(roundFile);
 		if (hasStaleReproducibleRow) roundsWithStaleReproducibleRow.add(roundFile);
 		if (!covered) modelMismatchedRounds.add(roundFile);
+		// Issue #149 (OI-5): the *write* side decides staleness per shard. A
+		// stale forcing row in the host's OWN shard must be replaced even when a
+		// foreign shard holds a current-model row for the same suffix — the
+		// foreign shard is read-only for this host (decision 025), so nobody
+		// else can replace the own shard's stale row and it would keep feeding
+		// the mixed-model scoring (OI-1). The merged coverage above stays
+		// cross-shard, so the startup pending predicate
+		// (lib/session-backfill.ts) and this sweep still agree on which rounds
+		// are covered; only the write side is per shard.
+		if (
+			ownShardHasStaleForcingRow(
+				ownEntriesByRoundFile.get(roundFile) ?? [],
+				config.embeddingModel,
+				readReproducibleSuffixes(roundFile),
+				indexRowSuffix,
+			)
+		) {
+			modelMismatchedRounds.add(roundFile);
+		}
 	}
 	out.log(`📊 Already indexed: ${existingRounds.size} rounds`);
 	out.log(`📊 Model-mismatched rounds to re-index: ${modelMismatchedRounds.size}\n`);
@@ -554,16 +628,20 @@ export async function runDigestAll(options: DigestAllOptions = {}): Promise<numb
 			// on-disk read+write per migration. The map holds the same entry
 			// objects as the ordered batch list below, so the rename is visible
 			// to both; the rows keep their loaded positions.
-			const staleRows = entriesByRoundFile.get(staleFile) ?? [];
+			//
+			// Issue #149: the rename is scoped to the host's own shard — a
+			// foreign shard's rows are never rewritten by this host (D-005),
+			// so a stale row living in a foreign shard keeps its old name.
+			const staleRows = ownEntriesByRoundFile.get(staleFile) ?? [];
 			for (const row of staleRows) {
 				if (row.filePath.startsWith(staleFile)) {
 					row.filePath = roundFile + row.filePath.slice(staleFile.length);
 				}
 			}
-			entriesByRoundFile.delete(staleFile);
-			const targetList = entriesByRoundFile.get(roundFile);
+			ownEntriesByRoundFile.delete(staleFile);
+			const targetList = ownEntriesByRoundFile.get(roundFile);
 			if (targetList) targetList.push(...staleRows);
-			else entriesByRoundFile.set(roundFile, staleRows);
+			else ownEntriesByRoundFile.set(roundFile, staleRows);
 			indexDirty = true;
 			// Mirror the migration in the in-memory dedup sets: the stale
 			// filename's rows now belong to roundFile.
@@ -696,20 +774,23 @@ export async function runDigestAll(options: DigestAllOptions = {}): Promise<numb
 				// end). One full flush of the batch list happens after the workers
 				// join, so the run does exactly one full index read and one full index
 				// write regardless of the mismatched-round count N.
-				const existingEntries = entriesByRoundFile.get(roundFile) ?? [];
+				// Issue #149: the orphan set is scoped to the shard being
+				// rewritten (the host's own shard) — a foreign shard's rows are
+				// never rewritten and never dropped by this sweep (D-005, D-007).
+				const existingEntries = ownEntriesByRoundFile.get(roundFile) ?? [];
 				const orphanEntries = findOrphanIndexEntries(existingEntries, entries);
 				for (const orphan of orphanEntries) {
 					err.error(`  ⚠️  Preserving non-reproduced index row: ${orphan.filePath}`);
 				}
-				entriesByRoundFile.set(roundFile, [...entries, ...orphanEntries]);
+				ownEntriesByRoundFile.set(roundFile, [...entries, ...orphanEntries]);
 				indexDirty = true;
-				for (let i = indexEntries.length - 1; i >= 0; i--) {
-					const entry = indexEntries[i];
+				for (let i = ownEntries.length - 1; i >= 0; i--) {
+					const entry = ownEntries[i];
 					if (isLabeledIndexEntry(entry) && path.basename(indexRoundFileFromPath(entry.filePath)) === roundFile) {
-						indexEntries.splice(i, 1);
+						ownEntries.splice(i, 1);
 					}
 				}
-				indexEntries.push(...entries, ...orphanEntries);
+				ownEntries.push(...entries, ...orphanEntries);
 				modelMismatched.delete(roundFile);
 			} else {
 				for (const entry of entries) {
@@ -717,10 +798,12 @@ export async function runDigestAll(options: DigestAllOptions = {}): Promise<numb
 					// and flushed once after the batch (decision 006 idempotency is
 					// enforced in memory by the indexedRounds set, which gates this
 					// branch).
-					indexEntries.push(entry);
-					const list = entriesByRoundFile.get(roundFile);
+					//
+					// Issue #149: appended rows land in the host's own shard only.
+					ownEntries.push(entry);
+					const list = ownEntriesByRoundFile.get(roundFile);
 					if (list) list.push(entry);
-					else entriesByRoundFile.set(roundFile, [entry]);
+					else ownEntriesByRoundFile.set(roundFile, [entry]);
 					indexDirty = true;
 				}
 			}
@@ -768,12 +851,37 @@ export async function runDigestAll(options: DigestAllOptions = {}): Promise<numb
 	// writeBm25Index seam. A crash before this point self-heals: round files are
 	// durable and the next run re-derives the rows. Skipped when the batch
 	// mutated nothing (no-op run) so the on-disk bytes are left untouched.
-	if (indexDirty) flushVectorIndex(indexPath, indexEntries, f);
+	//
+	// Issue #149: the wholesale rewrite is scoped to the host's own shard
+	// (`index.<hostname>`) — a foreign shard is never rewritten by this host
+	// (D-005), and its bytes stay exactly as they were.
+	if (indexDirty) {
+		flushOwnShardVectorIndex(shardRoot, ownEntries, {
+			hostname: hostId,
+			fsImpl: f,
+			baselineEntries: ownEntriesBaseline,
+		});
+	}
 
-	const finalCount = countIndexLines(indexPath, f);
+	// Issue #149 (OI-8): the sweep rewrote the host's own shard; the foreign
+	// shards are still outstanding. The one-line notice is transient, so the
+	// outstanding foreign shards are recorded in the backlog state file. The
+	// record replaces the entries of this script — including the entry the
+	// other host recorded for this host's shard, which the sweep just
+	// resolved.
+	if (indexDirty) {
+		try {
+			recordForeignBacklog(shardRoot, "digest-all", describeForeignShards(shardRoot, [ownShard], f), f);
+		} catch {
+			// The backlog is advisory state — a failed record must never
+			// break the sweep it describes.
+		}
+	}
+
+	const finalCount = ownEntries.length + foreignEntries.length;
 
 	out.log(`\n✅ Done in ${elapsed}s. ${completed} rounds embedded, ${errors} errors.`);
-	out.log(`   Index: ${finalCount} vectors at ${indexPath}`);
+	out.log(`   Index: ${finalCount} vectors across ${shardPaths.length} shard(s) (own shard: ${ownShard})`);
 	out.log(
 		`   Rounds: ${f.readdirSync(roundsDir).filter((rf) => rf.endsWith(".json") && !rf.startsWith("index")).length} files`,
 	);

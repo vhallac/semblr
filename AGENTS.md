@@ -7,7 +7,8 @@ Next-generation context management for AI agents. See [VISION.md](VISION.md) for
 The extension lives at `src/semblr.ts` (moved from `.pi/extensions/semblr.ts` to avoid pi auto-loading). It:
 
 - Saves every completed conversation round to a persistent round repository (`rounds/<hash>.json`)
-- Embeds two separate vectors per round (prompt and response, noise-collapsed inputs) to an append-only `index.csv` (via OpenRouter, `text-embedding-3-small`, inputs clipped to the configured embedding budget)
+- Embeds two separate vectors per round (prompt and response, noise-collapsed inputs) to an append-only per-host index shard `index.<hostId>` (via OpenRouter, `text-embedding-3-small`, inputs clipped to the configured embedding budget); a legacy `index.csv` is adopted by rename on the first write by a host that has no shard of its own
+- Writes only to the host's own shard (`index.<hostId>`) and reads the merged shard set across every shard — startup, search, the sweep, and the scripts all see all rows; a foreign shard is never rewritten
 - On every user prompt, retrieves the most semantically similar rounds and injects them into context
 - Registers three native tools: `search_interactions`, `get_round_details`, `get_tool_details`
 - Integrates with pi's compaction system (captures summaries as rounds with referenced turn pointers)
@@ -21,13 +22,14 @@ The extension lives at `src/semblr.ts` (moved from `.pi/extensions/semblr.ts` to
 - `README.md` — project overview, premise, cost, known problems
 - `AGENTS.md` — this file (project context for AI agents)
 - `src/semblr.ts` — the extension (single file)
+- `lib/index-shards.ts` — per-host index shard discovery, own-shard resolution, legacy `index.csv` adoption
 - `scripts/digest-all.ts` — bulk-embed all historical pi sessions
 - `scripts/digest-session.ts` — embed a single session JSONL file
 - `scripts/import-claude-code.ts` — import Claude Code JSONL history
 - `scripts/migrate-content-hash.ts` — content-hash-based round migration
 - `scripts/migrate-rounds.ts` — old round migration (pre-content-hash)
 - `justfile` — command recipes (index, digest-session, query, import-claude, migrate)
-- `rounds/` — round repository (stored outside the project tree, survives moves and clones)
+- `rounds/` — round repository (stored outside the project tree, survives moves and clones); the vector index lives there as per-host shards `index.<hostId>`
 
 ## Development Methodology
 

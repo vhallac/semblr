@@ -1,11 +1,14 @@
 import * as fs from "node:fs";
 import {
+	dedupeIndexEntries,
 	forEachIndexLine,
 	INDEX_CHUNK_BYTES,
 	type IndexReadFs,
 	indexRoundFileFromPath,
+	type ShardedReadOptions,
 	splitVectorIndexMetadata,
 } from "./index-io.ts";
+import { adoptOwnShard, discoverIndexShards } from "./index-shards.ts";
 
 export interface IndexEntry {
 	filePath: string;
@@ -31,6 +34,66 @@ function parseIndexLine(line: string): IndexEntry | null {
 	if (model !== undefined) entry.model = model;
 	if (embeddingInputHash !== undefined) entry.embeddingInputHash = embeddingInputHash;
 	return entry;
+}
+
+/**
+ * Shard-set variant of {@link loadIndexFromPath} (merged view, issue #149):
+ * `indexPath` is the *rounds directory*; every discovered shard is parsed in
+ * deterministic (sorted) order. Missing dir / empty shard set → empty result.
+ * Corrupt lines (bad base64/JSON, partial writes) are skipped with a warning
+ * naming the shard file.
+ */
+export function loadIndexFromShards(
+	roundsDir: string,
+	opts: ShardedReadOptions = {},
+	chunkSize: number = INDEX_CHUNK_BYTES,
+): IndexEntry[] {
+	const warn = opts.warn ?? console.warn;
+	const entries: IndexEntry[] = [];
+	for (const shardPath of opts.shards ?? discoverIndexShards(roundsDir)) {
+		forEachIndexLine(
+			shardPath,
+			opts.fsImpl ?? fs,
+			(line) => {
+				try {
+					const entry = parseIndexLine(line);
+					if (entry !== null) entries.push(entry);
+				} catch (reason) {
+					warn(
+						`Skipping corrupt index row in ${shardPath}: ${reason instanceof Error ? reason.message : String(reason)}`,
+					);
+				}
+			},
+			chunkSize,
+		);
+	}
+	// Issue #149 (OI-4): a round embedded by two hosts exists as a row in both
+	// shards — the merged read returns it once. The shards on disk stay
+	// untouched; the dedup happens at read time.
+	return opts.dedupe === false ? entries : dedupeIndexEntries(entries);
+}
+
+/**
+ * Shard-set variant of {@link countIndexLines} (merged view): count
+ * non-empty rows across every discovered shard.
+ */
+export function countShardLines(
+	roundsDir: string,
+	opts: ShardedReadOptions = {},
+	chunkSize: number = INDEX_CHUNK_BYTES,
+): number {
+	let count = 0;
+	for (const shardPath of opts.shards ?? discoverIndexShards(roundsDir)) {
+		forEachIndexLine(
+			shardPath,
+			opts.fsImpl ?? fs,
+			() => {
+				count++;
+			},
+			chunkSize,
+		);
+	}
+	return count;
 }
 
 /**
@@ -233,4 +296,34 @@ export function appendToIndexPath(
 	if (model !== undefined) parts.push(model);
 	if (embeddingInputHash !== undefined) parts.push(embeddingInputHash);
 	appendLineWithLock(indexPath, roundsDir, `${parts.join(",")}\n`, deps);
+}
+
+export interface AppendIndexRowToShardsDeps {
+	/** Injected fs/lock surface, passed through to the append protocol. */
+	fsImpl?: IndexStorageFs;
+	/** Hostname override for tests; defaults to os.hostname(). */
+	hostname?: string;
+}
+
+/**
+ * Append one labeled vector-index row to the host's own shard
+ * (`index.<hostname>`, issue #149): the first append adopts a legacy
+ * headerless `index.csv` by renaming it to the own shard (Q1 option b),
+ * then the row is appended under the same lockfile protocol as the legacy
+ * single-path append (D-005 — short lock, same acquire/retry/stale
+ * takeover). Rows land in the own shard only; foreign shards are never
+ * touched by a live append.
+ */
+export function appendIndexRowToShards(
+	roundsDir: string,
+	filePath: string,
+	vector: number[],
+	deps: AppendIndexRowToShardsDeps = {},
+	model?: string,
+	embeddingInputHash?: string,
+): void {
+	const { shardPath } = adoptOwnShard(roundsDir, { fsImpl: deps.fsImpl, hostname: deps.hostname });
+	// appendToIndexPath creates the rounds dir itself (mkdir -p inside
+	// appendLineWithLock), so a fresh host with no shard yet gets one.
+	appendToIndexPath(shardPath, roundsDir, filePath, vector, { fsImpl: deps.fsImpl }, model, embeddingInputHash);
 }

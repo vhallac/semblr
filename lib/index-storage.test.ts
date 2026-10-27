@@ -4,18 +4,108 @@ import * as path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
 	acquireIndexLock,
+	appendIndexRowToShards,
 	appendLineWithLock,
 	appendToIndexPath,
 	buildSessionStartStatus,
 	countIndexLines,
+	countShardLines,
 	countUniqueIndexedRounds,
 	type IndexEntry,
 	loadIndexFromPath,
+	loadIndexFromShards,
 	loadSessionStartIndex,
 } from "./index-storage.ts";
 
 /** Chunk size small enough to force multi-chunk reads in tests. */
 const TINY_CHUNK = 16;
+
+const warnings: string[] = [];
+
+describe("merged shard reads (#149)", () => {
+	let tempDir = "";
+
+	beforeEach(() => {
+		tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "semblr-shard-reads-"));
+	});
+
+	afterEach(() => {
+		fs.rmSync(tempDir, { recursive: true, force: true });
+	});
+
+	const writeShard = (shard: string, lines: string[]) =>
+		fs.writeFileSync(path.join(tempDir, shard), lines.join("\n") + "\n");
+
+	it("loads entries from all shards in sorted order; empty dir and empty set yield empty", () => {
+		expect(loadIndexFromShards(tempDir)).toEqual([]); // empty shard set
+		writeShard("index.host-b", [
+			"bm90LWpzb24=,b.json:prompt", // corrupt: decodes to non-JSON
+			"W1swLjVdXQ==,b.json:prompt", // valid: [[0.5]]
+		]);
+		writeShard("index.host-a", ["W1sxXV0=,a.json:prompt,m1"]);
+		writeShard("index.csv", ["W1syXV0=,legacy.json:prompt"]);
+		fs.writeFileSync(path.join(tempDir, "index.host-b.lock"), "held"); // excluded artifact
+
+		const entries = loadIndexFromShards(tempDir, { warn: (message) => warnings.push(message) });
+		expect(entries.map((entry) => entry.filePath)).toEqual(["legacy.json:prompt", "a.json:prompt", "b.json:prompt"]);
+		expect(warnings).toHaveLength(1);
+		expect(warnings[0]).toContain(path.join(tempDir, "index.host-b"));
+		expect(countShardLines(tempDir)).toBe(4); // includes the corrupt row (line-level count)
+	});
+
+	it("deduplicates a round embedded on two hosts (OI-4)", () => {
+		writeShard("index.host-a", ["W1sxXV0=,round1.json:prompt,m1"]);
+		writeShard("index.host-b", ["W1syXV0=,round1.json:prompt,m1"]);
+
+		const entries = loadIndexFromShards(tempDir);
+		expect(entries.map((entry) => entry.filePath)).toEqual(["round1.json:prompt"]);
+		expect(countUniqueIndexedRounds(entries)).toBe(1);
+		expect(buildSessionStartStatus(entries)).toContain("1 rounds indexed");
+
+		// The raw (non-deduplicated) merged view still shows both rows.
+		expect(loadIndexFromShards(tempDir, { dedupe: false }).map((entry) => entry.filePath)).toEqual([
+			"round1.json:prompt",
+			"round1.json:prompt",
+		]);
+	});
+
+	it("keeps rows of different models and different suffixes apart (OI-4)", () => {
+		writeShard("index.host-a", ["W1sxXV0=,round1.json:prompt,m1", "W1syXV0=,round1.json:response,m1"]);
+		writeShard("index.host-b", ["W1szXV0=,round1.json:prompt,m2"]);
+
+		expect(loadIndexFromShards(tempDir).map((entry) => `${entry.filePath}#${entry.model}`)).toEqual([
+			"round1.json:prompt#m1",
+			"round1.json:response#m1",
+			"round1.json:prompt#m2",
+		]);
+	});
+
+	it("tolerates a missing rounds dir", () => {
+		expect(loadIndexFromShards(path.join(tempDir, "nope"))).toEqual([]);
+		expect(countShardLines(path.join(tempDir, "nope"))).toBe(0);
+	});
+
+	it("reads the shards through the injected fs seam", () => {
+		writeShard("index.host-a", ["W1sxXV0=,a.json:prompt"]);
+		const opened: string[] = [];
+		const fsImpl = {
+			existsSync: (p: string) => fs.existsSync(p),
+			openSync: (p: string, flags: string) => {
+				opened.push(p);
+				return fs.openSync(p, flags);
+			},
+			readSync: (fd: number, buffer: Buffer, offset: number, length: number, position: number | null) =>
+				fs.readSync(fd, buffer, offset, length, position),
+			closeSync: (fd: number) => fs.closeSync(fd),
+		};
+		const entries = loadIndexFromShards(tempDir, {
+			shards: [path.join(tempDir, "index.host-a")],
+			fsImpl,
+		});
+		expect(entries.map((entry) => entry.filePath)).toEqual(["a.json:prompt"]);
+		expect(opened).toEqual([path.join(tempDir, "index.host-a")]);
+	});
+});
 
 describe("loadIndexFromPath", () => {
 	let tempDir = "";
@@ -236,6 +326,46 @@ describe("buildSessionStartStatus", () => {
 		];
 		const status = buildSessionStartStatus(entries);
 		expect(status).toBe("🧠 semblr loaded — 1 rounds indexed");
+	});
+});
+
+describe("appendIndexRowToShards (#149)", () => {
+	let tempDir = "";
+
+	beforeEach(() => {
+		tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "semblr-shard-append-"));
+	});
+
+	afterEach(() => {
+		fs.rmSync(tempDir, { recursive: true, force: true });
+	});
+
+	it("appends to the host's own shard, adopting a legacy index.csv on first write", () => {
+		fs.writeFileSync(path.join(tempDir, "index.csv"), "existing,row\n");
+		appendIndexRowToShards(tempDir, "rounds/a.json:prompt", [0.1, 0.2], { hostname: "host-a" }, "m1");
+		expect(fs.existsSync(path.join(tempDir, "index.csv"))).toBe(false);
+		const shard = fs.readFileSync(path.join(tempDir, "index.host-a"), "utf-8");
+		expect(shard).toContain("existing,row");
+		expect(shard).toContain("rounds/a.json:prompt");
+	});
+
+	it("appends only to the own shard, leaving foreign shards untouched", () => {
+		fs.writeFileSync(path.join(tempDir, "index.host-b"), "foreign,row\n");
+		appendIndexRowToShards(tempDir, "rounds/a.json:prompt", [0.1], { hostname: "host-a" });
+		expect(fs.readFileSync(path.join(tempDir, "index.host-b"), "utf-8")).toBe("foreign,row\n");
+		expect(fs.readFileSync(path.join(tempDir, "index.host-a"), "utf-8")).toContain("rounds/a.json:prompt");
+	});
+
+	it("creates the rounds dir and a fresh own shard for a first-time host", () => {
+		const fresh = path.join(tempDir, "rounds");
+		appendIndexRowToShards(fresh, "rounds/a.json:prompt", [0.1], { hostname: "host-c" });
+		expect(fs.readdirSync(fresh)).toEqual(["index.host-c"]);
+	});
+
+	it("stamps model and embedding-input-hash columns through the legacy encoder", () => {
+		appendIndexRowToShards(tempDir, "rounds/a.json:prompt", [0.1], { hostname: "host-a" }, "m1", "stamp");
+		const line = fs.readFileSync(path.join(tempDir, "index.host-a"), "utf-8").trim();
+		expect(line.split(",").slice(1)).toEqual(["rounds/a.json:prompt", "m1", "stamp"]);
 	});
 });
 

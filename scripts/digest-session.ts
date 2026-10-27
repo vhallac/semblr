@@ -7,7 +7,8 @@
  *
  * Output (default, override with Semblr settings or SEMBLR_ROUNDS_DIR):
  *   ~/.pi/agent/semblr/rounds/<id>.json  — each round as a file
- *   ~/.pi/agent/semblr/rounds/index.csv  — vector index (base64(vector),filepath,model)
+ *   ~/.pi/agent/semblr/rounds/index.<hostname> — this host's vector index shard
+ *     (base64(vector),filepath,model); reads span every host's shard (issue #149)
  */
 
 import * as fs from "node:fs";
@@ -23,21 +24,16 @@ import {
 	writeBm25Index,
 } from "../lib/bm25-index.ts";
 import { type EmbeddingModelRegistry, embedText, normalize } from "../lib/embed.ts";
-import {
-	appendVectorIndexEntry,
-	findStaleContentMatches as findStaleContentMatchesInDir,
-	indexRoundFileFromPath,
-	loadVectorIndex,
-	migrateIndexEntries as migrateIndexEntriesFile,
-} from "../lib/index-io.ts";
+import { findStaleContentMatches as findStaleContentMatchesInDir, indexRoundFileFromPath } from "../lib/index-io.ts";
 import { parsePiSessionJsonl, reconstructPiSessionRounds } from "../lib/pi-session.ts";
 import { buildPromptEmbeddingInput } from "../lib/round-capture.ts";
 import {
 	resolveScriptApiKey,
 	resolveScriptConfig,
-	resolveScriptIndexPath,
+	resolveScriptIndexContext,
 	resolveScriptModelRegistry,
 	type ScriptConfigOptions,
+	type ScriptIndexFs,
 	scriptEmbeddingConfig,
 } from "../lib/script-config.ts";
 
@@ -90,13 +86,20 @@ export interface DigestSessionOptions extends ScriptConfigOptions {
 	stdout?: Pick<typeof console, "log">;
 	stderr?: Pick<typeof console, "error">;
 	fsImpl?: AtomicWriteFs;
+	/** fs seam for the shard reads/writes and the shard lock (tests). */
+	indexFsImpl?: ScriptIndexFs;
 }
 
 export async function runDigestSession(options: DigestSessionOptions = {}): Promise<number> {
 	const sessionFile = options.sessionFile;
 	const config = resolveScriptConfig(options);
 	const roundsDir = options.roundsDir ?? config.roundsDir;
-	const indexPath = resolveScriptIndexPath(config, roundsDir, options.indexPath);
+	// Issue #149: the index is a set of per-host shards — reads see every
+	// shard, writes land in the host's own shard (`index.<hostname>`).
+	const index = resolveScriptIndexContext(config, roundsDir, options.indexPath, {
+		fsImpl: options.indexFsImpl,
+		script: "digest-session",
+	});
 	const bm25IndexPath = bm25IndexPathForRoundsDir(roundsDir);
 	const modelRegistry = resolveScriptModelRegistry(config, options);
 	const embeddingConfig = scriptEmbeddingConfig(config);
@@ -123,8 +126,23 @@ export async function runDigestSession(options: DigestSessionOptions = {}): Prom
 		// content-hash filename. If found, migrate old index entries before deleting
 		// old files so the round remains retrievable even if embedding is unavailable.
 		const staleFiles = findStaleContentMatchesInDir(roundsDir, roundFile);
+		const removableStaleFiles: string[] = [];
 		for (const staleFile of staleFiles) {
-			migrateIndexEntriesFile(indexPath, staleFile, roundFile);
+			// Claim a legacy `index.csv` before rewriting rows, so its rows are
+			// part of the own shard (and not stranded in the legacy file).
+			index.adopt();
+			// The migration rewrites the host's own shard atomically and under
+			// the shard's append lock (a crash leaves the shard byte-identical;
+			// a concurrent append blocks and lands after the publish).
+			index.migrateOwnRows(staleFile, roundFile);
+			// A foreign shard may still hold rows for the stale file: this host
+			// rewrites only its own shard, so deleting the file would leave
+			// those rows dangling. Keep the file and report it instead.
+			if (index.foreignShardsReferencing(staleFile).length > 0) {
+				out.log(`  ⚠️  Stale file kept (referenced by another host's shard): ${staleFile}`);
+				continue;
+			}
+			removableStaleFiles.push(staleFile);
 		}
 
 		// Always write the round file (idempotent) before deleting stale copies.
@@ -133,18 +151,19 @@ export async function runDigestSession(options: DigestSessionOptions = {}): Prom
 		atomicWriteFileSync(path.resolve(roundsDir, roundFile), JSON.stringify(round, null, 2), options.fsImpl);
 		const bm25Index = loadBm25Index(bm25IndexPath);
 		upsertBm25Round(bm25Index, roundFile, roundTextForBm25(round));
-		for (const staleFile of staleFiles) {
+		for (const staleFile of removableStaleFiles) {
 			deleteBm25Round(bm25Index, staleFile);
 		}
 		writeBm25Index(bm25IndexPath, bm25Index);
-		for (const staleFile of staleFiles) {
+		for (const staleFile of removableStaleFiles) {
 			fs.unlinkSync(path.join(roundsDir, staleFile));
 			out.log(`  ♻️  Migrated stale: ${staleFile} → ${roundFile}`);
 		}
 
-		// Refresh existing set after potential deletions
+		// Refresh existing set after potential deletions — the merged shard
+		// view, so a round another host embedded is not embedded twice.
 		const freshExisting = new Set(
-			loadVectorIndex(indexPath).map((e) => path.basename(indexRoundFileFromPath(e.filePath))),
+			index.readMergedEntries().map((e) => path.basename(indexRoundFileFromPath(e.filePath))),
 		);
 		if (freshExisting.has(roundFile)) {
 			skipped++;
@@ -173,13 +192,7 @@ export async function runDigestSession(options: DigestSessionOptions = {}): Prom
 			config: embeddingConfig,
 			modelRegistry,
 		});
-		appendVectorIndexEntry(
-			indexPath,
-			normalize(promptVector),
-			`${roundFile}:prompt`,
-			config.embeddingModel,
-			promptInputHash,
-		);
+		index.appendRow(`${roundFile}:prompt`, normalize(promptVector), config.embeddingModel, promptInputHash);
 
 		// Embed response
 		const respVector = await embedText(round.responseSequence.slice(0, config.embeddingMaxTokens), apiKey, {
@@ -187,13 +200,13 @@ export async function runDigestSession(options: DigestSessionOptions = {}): Prom
 			config: embeddingConfig,
 			modelRegistry,
 		});
-		appendVectorIndexEntry(indexPath, normalize(respVector), `${roundFile}:response`, config.embeddingModel);
+		index.appendRow(`${roundFile}:response`, normalize(respVector), config.embeddingModel);
 
 		embedded++;
 	}
 
 	out.log(`\n✅ Done. ${embedded} new rounds embedded, ${skipped} already in index.`);
-	out.log(`   Index: ${indexPath} (${loadVectorIndex(indexPath).length} vectors)`);
+	out.log(`   Index: ${index.ownShardPath} (${index.readMergedEntries().length} vectors)`);
 	return 0;
 }
 

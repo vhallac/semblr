@@ -1,6 +1,8 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { computeContentHash, type HashToolCallDetail } from "./hash.ts";
+import { discoverIndexShards, ownShardPath } from "./index-shards.ts";
+import { type AcquireIndexLockDeps, acquireIndexLock, type IndexStorageFs } from "./index-storage.ts";
 
 export interface VectorIndexEntry {
 	vector: number[];
@@ -162,8 +164,30 @@ export function forEachIndexLine(
 	}
 }
 
-export function writeIndexLines(indexPath: string, entries: string[]): void {
-	fs.writeFileSync(indexPath, entries.join("\n") + (entries.length > 0 ? "\n" : ""));
+/**
+ * Write index lines atomically (tmp+rename, decision 015): a crash during
+ * the write leaves the target byte-identical — only a successful rename
+ * publishes the new content. The tmp file is pid-suffixed
+ * (`<target>.tmp.<pid>`) so concurrent runs cannot collide, and the tmp name
+ * is excluded from shard discovery.
+ */
+export function writeIndexLinesAtomic(
+	indexPath: string,
+	entries: string[],
+	fsImpl: Pick<typeof fs, "writeFileSync" | "renameSync"> & Partial<Pick<typeof fs, "unlinkSync">> = fs,
+): void {
+	const tmp = `${indexPath}.tmp.${process.pid}`;
+	try {
+		fsImpl.writeFileSync(tmp, entries.length > 0 ? `${entries.join("\n")}\n` : "");
+		fsImpl.renameSync(tmp, indexPath);
+	} catch (err) {
+		// The publish failed: the target is still the old content (the rename
+		// never happened), and the tmp file is litter — remove it best-effort.
+		try {
+			fsImpl.unlinkSync?.(tmp);
+		} catch {}
+		throw err;
+	}
 }
 
 /**
@@ -187,6 +211,81 @@ export function flushVectorIndex(
 	fsImpl.renameSync(tmp, indexPath);
 }
 
+export interface FlushOwnShardDeps extends AcquireIndexLockDeps {
+	/** Hostname override for tests; defaults to os.hostname(). */
+	hostname?: string;
+	/**
+	 * fs surface for the flush and the shard append lock it takes (PR #151
+	 * R1.F1). Defaults to node:fs.
+	 */
+	fsImpl?: IndexStorageFs;
+	/**
+	 * The own shard's rows before the caller's long-running work began. When
+	 * provided, the final locked read uses this snapshot to identify rows
+	 * appended concurrently and preserves them alongside the desired rows.
+	 */
+	baselineEntries?: readonly VectorIndexEntry[];
+}
+
+/**
+ * Flush the host's own shard (issue #149): the rows are written to
+ * `index.<hostname>` inside `roundsDir` (tmp+rename, decision 015). A
+ * wholesale rewrite is always scoped to one shard — the caller passes only the
+ * rows of the host's own shard, and a foreign shard is never rewritten by this
+ * host (D-005). Because the lockfile protocol is per path
+ * (`<shard>.lock`), the short-lock merge model of decision 005 applies per
+ * shard as well.
+ *
+ * The caller must have resolved the own shard's rows *after* any legacy
+ * adoption (the adoption renames `index.csv` to `index.<hostname>`), so the
+ * legacy rows are part of the flushed content.
+ */
+export function flushOwnShardVectorIndex(
+	roundsDir: string,
+	entries: VectorIndexEntry[],
+	deps: FlushOwnShardDeps = {},
+): string {
+	const shardPath = ownShardPath(roundsDir, deps.hostname);
+	// Same append lock the runtime appends take (`<shard>.lock`): a live
+	// append landing between the caller's read and the tmp+rename would
+	// otherwise be dropped. Fail fast when the lock is exhausted — replacing
+	// the whole file unsynchronized could drop concurrent rows (PR #151 R1.F1).
+	const lock = acquireIndexLock(shardPath, deps);
+	if (lock === null) {
+		throw new Error(
+			`Could not acquire the index lock (${shardPath}.lock) after all retries — the index was NOT written.`,
+		);
+	}
+	try {
+		const desiredLines = entries.map((entry) =>
+			encodeVectorIndexLine(entry.vector, entry.filePath, entry.model, entry.embeddingInputHash),
+		);
+		if (deps.baselineEntries) {
+			// The caller's long-running work happened outside the lock. Re-read
+			// under it and merge rows appended since the baseline snapshot, using
+			// exact-string multiset difference so duplicate live rows are kept.
+			const baselineLines = deps.baselineEntries.map((entry) =>
+				encodeVectorIndexLine(entry.vector, entry.filePath, entry.model, entry.embeddingInputHash),
+			);
+			const freshLines = readIndexLines(shardPath, deps.fsImpl ?? fs);
+			const baselineCounts = new Map<string, number>();
+			for (const line of baselineLines) baselineCounts.set(line, (baselineCounts.get(line) ?? 0) + 1);
+			const appendedLines = freshLines.filter((line) => {
+				const remaining = baselineCounts.get(line) ?? 0;
+				if (remaining === 0) return true;
+				baselineCounts.set(line, remaining - 1);
+				return false;
+			});
+			writeIndexLinesAtomic(shardPath, [...desiredLines, ...appendedLines], deps.fsImpl);
+		} else {
+			flushVectorIndex(shardPath, entries, deps.fsImpl);
+		}
+	} finally {
+		lock.release();
+	}
+	return shardPath;
+}
+
 export function appendVectorIndexEntry(
 	indexPath: string,
 	vector: number[],
@@ -195,6 +294,113 @@ export function appendVectorIndexEntry(
 	embeddingInputHash?: string,
 ): void {
 	fs.appendFileSync(indexPath, `${encodeVectorIndexLine(vector, filePath, model, embeddingInputHash)}\n`);
+}
+
+/**
+ * Options for the merged (shard-set) read APIs: iterating or loading rows
+ * across every shard discovered in a rounds directory (issue #149).
+ */
+export interface ShardedReadOptions {
+	/**
+	 * Explicit shard set; defaults to {@link discoverIndexShards} over
+	 * `indexPath` interpreted as the *rounds directory*. Missing dirs and
+	 * empty shard sets yield no lines and no errors.
+	 */
+	shards?: string[];
+	/** Warn sink for skipped corrupt lines; defaults to console.warn. */
+	warn?: (message: string) => void;
+	/**
+	 * fs surface used to read the shards; defaults to node:fs. Injected so a
+	 * caller with its own fs seam (the sweep script) reads the same files the
+	 * rest of the run sees.
+	 */
+	fsImpl?: IndexReadFs;
+	/**
+	 * Deduplicate the merged rows by round + suffix + model (issue #149, OI-4).
+	 * Defaults to true: a round embedded by two hosts with the same model
+	 * exists as a row in both shards and must be counted once.
+	 */
+	dedupe?: boolean;
+}
+
+/**
+ * The merge key of an index row: the round file, the row suffix
+ * (`:prompt`/`:response`/…), and the embedding model.
+ *
+ * The model is part of the key on purpose: rows of *different* models are not
+ * duplicates — the search groups the index by model (`getIndexEmbeddingModels`)
+ * and the coverage predicate needs the stale-model rows to detect a round that
+ * still needs a re-embed (issue #140 D1). Collapsing them would silently drop
+ * a searchable model from the index and would mark stale rounds as covered.
+ */
+export function indexRowMergeKey(filePath: string, model?: string): string {
+	const roundFile = path.basename(indexRoundFileFromPath(filePath));
+	return `${roundFile}${indexRowSuffix(filePath)} ${model ?? ""}`;
+}
+
+/**
+ * Drop the duplicate rows of a merged read (issue #149, OI-4): the first row
+ * of a merge key wins, in the deterministic shard order the reader used. The
+ * shards on disk are untouched — the dedup happens at read time.
+ */
+export function dedupeIndexEntries<T extends { filePath: string; model?: string }>(entries: readonly T[]): T[] {
+	const seen = new Set<string>();
+	const deduped: T[] = [];
+	for (const entry of entries) {
+		const key = indexRowMergeKey(entry.filePath, entry.model);
+		if (seen.has(key)) continue;
+		seen.add(key);
+		deduped.push(entry);
+	}
+	return deduped;
+}
+
+/**
+ * Invoke `onLine` for every non-blank line across the shard set of a rounds
+ * directory (merged view, issue #149). Each corrupt line — bad base64 or a
+ * partial write — is skipped with a warning naming the shard file it came
+ * from; healthy lines of the same shard are unaffected.
+ *
+ * The corrupt-line guard applies only to vector parsing: this helper yields
+ * raw lines, so parse errors are the caller's concern unless it delegates to
+ * the parsing callbacks below.
+ */
+export function forEachShardLine(
+	roundsDir: string,
+	onLine: (line: string, shardPath: string) => void,
+	shards?: string[],
+	fsImpl: IndexReadFs = fs,
+): void {
+	for (const shardPath of shards ?? discoverIndexShards(roundsDir)) {
+		forEachIndexLine(shardPath, fsImpl, (line) => {
+			onLine(line, shardPath);
+		});
+	}
+}
+
+/**
+ * Shard-set variant of {@link loadVectorIndex}: parse every row across all
+ * shards, skipping corrupt lines (unparseable base64/JSON, partial writes)
+ * with a warning naming the shard file.
+ */
+export function loadShardVectorIndex(roundsDir: string, opts: ShardedReadOptions = {}): VectorIndexEntry[] {
+	const warn = opts.warn ?? console.warn;
+	const entries: VectorIndexEntry[] = [];
+	forEachShardLine(
+		roundsDir,
+		(line, shardPath) => {
+			try {
+				entries.push(parseVectorIndexLine(line));
+			} catch (reason) {
+				warn(
+					`Skipping corrupt index row in ${shardPath}: ${reason instanceof Error ? reason.message : String(reason)}`,
+				);
+			}
+		},
+		opts.shards,
+		opts.fsImpl ?? fs,
+	);
+	return opts.dedupe === false ? entries : dedupeIndexEntries(entries);
 }
 
 export function loadVectorIndex(indexPath: string, fsImpl: IndexReadFs = fs): VectorIndexEntry[] {
@@ -220,10 +426,29 @@ export function indexRowSuffix(filePath: string): string {
 	return path.basename(filePath).slice(roundFile.length);
 }
 
+/** Shard-set variant of {@link loadIndexedRoundFiles} (merged view). */
+export function loadIndexedRoundFilesSharded(roundsDir: string, opts: ShardedReadOptions = {}): Set<string> {
+	return new Set(
+		loadShardVectorIndex(roundsDir, opts).map((entry) => path.basename(indexRoundFileFromPath(entry.filePath))),
+	);
+}
+
 export function loadIndexedRoundFiles(indexPath: string, fsImpl: IndexReadFs = fs): Set<string> {
 	return new Set(
 		loadVectorIndex(indexPath, fsImpl).map((entry) => path.basename(indexRoundFileFromPath(entry.filePath))),
 	);
+}
+
+/** Shard-set variant of {@link loadRoundFilesWithDifferentModel} (merged view). */
+export function loadRoundFilesWithDifferentModelSharded(
+	roundsDir: string,
+	currentModel: string,
+	opts: ShardedReadOptions = {},
+): Set<string> {
+	const mismatched = loadShardVectorIndex(roundsDir, opts)
+		.filter((entry) => entry.model !== undefined && entry.model !== currentModel)
+		.map((entry) => path.basename(indexRoundFileFromPath(entry.filePath)));
+	return new Set(mismatched);
 }
 
 export function loadRoundFilesWithDifferentModel(
@@ -237,21 +462,6 @@ export function loadRoundFilesWithDifferentModel(
 	return new Set(mismatched);
 }
 
-export function replaceIndexEntriesForRoundFile(
-	indexPath: string,
-	roundFile: string,
-	entries: VectorIndexEntry[],
-): void {
-	const remaining = readIndexLines(indexPath).filter((line) => {
-		const filename = indexEntryFilename(line);
-		return !filename || path.basename(filename) !== roundFile;
-	});
-	const replacement = entries.map((entry) =>
-		encodeVectorIndexLine(entry.vector, entry.filePath, entry.model, entry.embeddingInputHash),
-	);
-	writeIndexLines(indexPath, [...remaining, ...replacement]);
-}
-
 export function migrateIndexEntryLine(line: string, oldRoundFile: string, newRoundFile: string): string {
 	const firstComma = line.indexOf(",");
 	if (firstComma === -1) return line;
@@ -261,12 +471,6 @@ export function migrateIndexEntryLine(line: string, oldRoundFile: string, newRou
 	if (!segments[0].startsWith(oldRoundFile)) return line;
 	segments[0] = newRoundFile + segments[0].slice(oldRoundFile.length);
 	return `${line.slice(0, firstComma + 1)}${segments.join(",")}`;
-}
-
-export function migrateIndexEntries(indexPath: string, oldRoundFile: string, newRoundFile: string): void {
-	if (!fs.existsSync(indexPath)) return;
-	const migrated = readIndexLines(indexPath).map((line) => migrateIndexEntryLine(line, oldRoundFile, newRoundFile));
-	writeIndexLines(indexPath, migrated);
 }
 
 export function indexEntryFilename(line: string): string | null {
@@ -280,12 +484,22 @@ export function indexEntryFilename(line: string): string | null {
 }
 
 export function readIndexByFilename(indexPath: string): Map<string, string[]> {
+	return indexLinesByFilename(readIndexLines(indexPath));
+}
+
+/**
+ * Group index lines by the round file they reference. Works on an in-memory
+ * line set so a caller can group the rows of one shard without re-reading a
+ * file (issue #149: a rewrite operates on the host's own shard's rows).
+ */
+export function indexLinesByFilename(lines: string[]): Map<string, string[]> {
 	const index = new Map<string, string[]>();
-	for (const line of readIndexLines(indexPath)) {
+	for (const line of lines) {
 		const filename = indexEntryFilename(line);
 		if (!filename) continue;
-		if (!index.has(filename)) index.set(filename, []);
-		index.get(filename)?.push(line);
+		const bucket = index.get(filename) ?? [];
+		bucket.push(line);
+		index.set(filename, bucket);
 	}
 	return index;
 }
