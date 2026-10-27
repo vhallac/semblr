@@ -219,6 +219,12 @@ export interface FlushOwnShardDeps extends AcquireIndexLockDeps {
 	 * R1.F1). Defaults to node:fs.
 	 */
 	fsImpl?: IndexStorageFs;
+	/**
+	 * The own shard's rows before the caller's long-running work began. When
+	 * provided, the final locked read uses this snapshot to identify rows
+	 * appended concurrently and preserves them alongside the desired rows.
+	 */
+	baselineEntries?: readonly VectorIndexEntry[];
 }
 
 /**
@@ -251,7 +257,29 @@ export function flushOwnShardVectorIndex(
 		);
 	}
 	try {
-		flushVectorIndex(shardPath, entries, deps.fsImpl);
+		const desiredLines = entries.map((entry) =>
+			encodeVectorIndexLine(entry.vector, entry.filePath, entry.model, entry.embeddingInputHash),
+		);
+		if (deps.baselineEntries) {
+			// The caller's long-running work happened outside the lock. Re-read
+			// under it and merge rows appended since the baseline snapshot, using
+			// exact-string multiset difference so duplicate live rows are kept.
+			const baselineLines = deps.baselineEntries.map((entry) =>
+				encodeVectorIndexLine(entry.vector, entry.filePath, entry.model, entry.embeddingInputHash),
+			);
+			const freshLines = readIndexLines(shardPath, deps.fsImpl ?? fs);
+			const baselineCounts = new Map<string, number>();
+			for (const line of baselineLines) baselineCounts.set(line, (baselineCounts.get(line) ?? 0) + 1);
+			const appendedLines = freshLines.filter((line) => {
+				const remaining = baselineCounts.get(line) ?? 0;
+				if (remaining === 0) return true;
+				baselineCounts.set(line, remaining - 1);
+				return false;
+			});
+			writeIndexLinesAtomic(shardPath, [...desiredLines, ...appendedLines], deps.fsImpl);
+		} else {
+			flushVectorIndex(shardPath, entries, deps.fsImpl);
+		}
 	} finally {
 		lock.release();
 	}

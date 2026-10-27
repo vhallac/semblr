@@ -1908,14 +1908,16 @@ describe("digest-all script", () => {
 		const medium = await runModelChangeFixture(4);
 		const large = await runModelChangeFixture(8);
 
-		// O(1) evidence: full-index opens stay constant in N — one for the initial
-		// in-memory load (issue #139). The trailing summary count comes from the
-		// in-memory rows, so it costs no second full-index read (per-chunk
-		// readSync granularity is why opens, not reads, count).
-		// The single full-index write is the one tmp+rename flush.
-		expect(small.indexReads).toBe(1);
-		expect(medium.indexReads).toBe(1);
-		expect(large.indexReads).toBe(1);
+		// O(1) evidence: full-index opens stay constant in N — one for the
+		// initial in-memory load (issue #139) and one for the final locked
+		// re-read that merges rows appended during the sweep (decision 005).
+		// The trailing summary count comes from the in-memory rows, so it costs
+		// no extra full-index read (per-chunk readSync granularity is why opens,
+		// not reads, count). The single full-index write is the one tmp+rename
+		// flush.
+		expect(small.indexReads).toBe(2);
+		expect(medium.indexReads).toBe(2);
+		expect(large.indexReads).toBe(2);
 		expect(small.indexWrites).toBe(1);
 		expect(medium.indexWrites).toBe(1);
 		expect(large.indexWrites).toBe(1);

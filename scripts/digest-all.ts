@@ -335,6 +335,10 @@ export async function runDigestAll(options: DigestAllOptions = {}): Promise<numb
 	const shardPaths = discoverIndexShards(shardRoot, f);
 	const foreignShards = shardPaths.filter((shardPath) => shardPath !== ownShard);
 	const ownEntries = loadVectorIndex(ownShard, f);
+	// Keep an immutable baseline of the own shard before the sweep's embedding
+	// work. The final locked flush compares its fresh read with this snapshot
+	// to identify rows appended concurrently and preserve them.
+	const ownEntriesBaseline = ownEntries.map((entry) => ({ ...entry }));
 	const foreignEntries = loadShardVectorIndex(shardRoot, { fsImpl: f, shards: foreignShards });
 	const indexEntries = [...ownEntries, ...foreignEntries];
 	const existingRounds = new Set<string>();
@@ -851,7 +855,13 @@ export async function runDigestAll(options: DigestAllOptions = {}): Promise<numb
 	// Issue #149: the wholesale rewrite is scoped to the host's own shard
 	// (`index.<hostname>`) — a foreign shard is never rewritten by this host
 	// (D-005), and its bytes stay exactly as they were.
-	if (indexDirty) flushOwnShardVectorIndex(shardRoot, ownEntries, { hostname: hostId, fsImpl: f });
+	if (indexDirty) {
+		flushOwnShardVectorIndex(shardRoot, ownEntries, {
+			hostname: hostId,
+			fsImpl: f,
+			baselineEntries: ownEntriesBaseline,
+		});
+	}
 
 	// Issue #149 (OI-8): the sweep rewrote the host's own shard; the foreign
 	// shards are still outstanding. The one-line notice is transient, so the
