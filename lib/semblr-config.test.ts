@@ -1,7 +1,6 @@
 import * as os from "node:os";
 import * as path from "node:path";
 import { describe, expect, it } from "vitest";
-import { hostIdFilePath } from "./host-id.ts";
 import { loadSemblrConfig, type SemblrConfigDeps } from "./semblr-config.ts";
 
 function fsFromFiles(files: Record<string, unknown>) {
@@ -225,7 +224,7 @@ describe("loadSemblrConfig", () => {
 		expect(config.hostId).toBe("workstation-1");
 	});
 
-	it("resolves the host id from the pi settings", () => {
+	it("ignores the hostId pi setting (PR!151 F2: env-var only)", () => {
 		const config = loadSemblrConfig({
 			cwd: "/repo",
 			agentDir: "/agent",
@@ -233,44 +232,16 @@ describe("loadSemblrConfig", () => {
 			fsImpl: fsFromFiles({ "/repo/.pi/settings.json": { semblr: { hostId: "from-settings" } } }),
 		});
 
-		expect(config.hostId).toBe("from-settings");
+		expect(config.hostId).toBe(os.hostname());
 	});
 
-	it("falls back to the saved host id file", () => {
-		const config = loadSemblrConfig({
-			cwd: "/repo",
-			agentDir: "/agent",
-			env: {},
-			fsImpl: fsFromFiles({ [hostIdFilePath("/agent")]: "saved-host\n" }),
-		});
-
-		expect(config.hostId).toBe("saved-host");
-	});
-
-	it("saves the machine name as the host id on first run", () => {
+	it("falls back to the machine name without persisting a host-id file", () => {
 		const files = new Map<string, string>();
-		const fsImpl = {
-			existsSync: (filePath: string) => files.has(path.normalize(filePath)),
-			readFileSync: (filePath: string) => {
-				const content = files.get(path.normalize(filePath));
-				if (content === undefined) throw new Error(`Missing file: ${filePath}`);
-				return content;
-			},
-			writeFileSync: (filePath: string, data: string) => {
-				files.set(path.normalize(filePath), data);
-			},
-			mkdirSync: () => {},
-			renameSync: (from: string, to: string) => {
-				const content = files.get(path.normalize(from));
-				if (content === undefined) throw new Error(`Missing file: ${from}`);
-				files.delete(path.normalize(from));
-				files.set(path.normalize(to), content);
-			},
-		} as unknown as SemblrConfigDeps["fsImpl"];
+		const fsImpl = fsFromFiles({});
 
 		const config = loadSemblrConfig({ cwd: "/repo", agentDir: "/agent", env: {}, fsImpl });
 
 		expect(config.hostId).toBe(os.hostname());
-		expect(files.get(path.normalize(hostIdFilePath("/agent")))).toBe(`${os.hostname()}\n`);
+		expect(files.size).toBe(0);
 	});
 });

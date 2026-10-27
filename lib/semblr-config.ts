@@ -2,7 +2,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { DEFAULT_MAX_RECENCY_ENTRIES, DEFAULT_PROMPT_TRUNCATION } from "./context-format.ts";
-import { type HostIdFs, resolveHostId } from "./host-id.ts";
+import { resolveHostId } from "./host-id.ts";
 import { DEFAULT_PROMPT_NOISE_CLEANUP } from "./round-capture.ts";
 import { DEFAULT_CONTEXT_BUDGET_RATIO, DEFAULT_MAX_RELEVANCE_ENTRIES } from "./search-interactions.ts";
 
@@ -243,14 +243,6 @@ function resolveRoundsDir(
 	return path.resolve(source === "project" ? cwd : agentDir, configured);
 }
 
-/**
- * The fs seam as a host-id surface. A seam without the write methods can
- * still read the saved host id; it just cannot persist a new one.
- */
-function hostIdFsImpl(fsImpl: SemblrConfigDeps["fsImpl"]): HostIdFs | undefined {
-	return fsImpl as HostIdFs | undefined;
-}
-
 export function loadSemblrConfig(deps: SemblrConfigDeps = {}): SemblrConfig {
 	const env = deps.env ?? process.env;
 	const cwd = deps.cwd ?? process.cwd();
@@ -265,15 +257,10 @@ export function loadSemblrConfig(deps: SemblrConfigDeps = {}): SemblrConfig {
 	const roundsDir = resolveRoundsDir(env, projectSettings, globalSettings, cwd, agentDir);
 
 	// Issue #149 (OI-6): a stable host id names this host's own shard. The
-	// order is env → pi settings → the host-local host id file → the machine
-	// name; the machine name is saved on first use so a renamed machine keeps
-	// its shard. The file is host-local (`<agentDir>/semblr/host-id`), never
-	// the synced rounds directory.
-	const { value: hostIdValue } = resolveValue("hostId", env, mergedSettings, {});
+	// order is the `SEMBLR_HOST_ID` env var → the machine name. Nothing is
+	// persisted (PR!151 F2): the id is recomputed each run.
 	const { hostId } = resolveHostId({
-		configuredHostId: asNonEmptyString(hostIdValue),
-		agentDir,
-		fsImpl: hostIdFsImpl(fsImpl),
+		configuredHostId: asNonEmptyString(env[ENV_KEYS.hostId]),
 		warn,
 	});
 
