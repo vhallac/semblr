@@ -21,11 +21,20 @@ import * as path from "node:path";
 /** Legacy headerless index filename, adopted by rename on first write. */
 export const LEGACY_INDEX_FILENAME = "index.csv";
 
-/** Fulltext tool-call index, sibling artifact — never a shard. */
-const TOOL_INDEX_FILENAME = "index-tools.fulltext.csv";
+/**
+ * Fulltext tool-call index, sibling artifact — never a shard. Covers the
+ * legacy `index-tools.fulltext.csv` and the per-host
+ * `index-tools.<hostId>.fulltext.csv` variants (issue #152).
+ */
+const TOOL_INDEX_PATTERN = /^index-tools(?:\..+)?\.fulltext\.csv$/;
 
-/** BM25 index, sibling artifact — never a shard. */
-const BM25_INDEX_FILENAME = "index.bm25.json";
+/**
+ * BM25 index, sibling artifact — never a shard. Covers the legacy
+ * `index.bm25.json` and the per-host `index.bm25.<hostId>.json` variants
+ * (issue #152). The per-host form shares the `index.` prefix, so without
+ * this pattern it would be discovered as a shard.
+ */
+const BM25_INDEX_PATTERN = /^index\.bm25(?:\..+)?\.json$/;
 
 /**
  * Outstanding foreign-shard backlog (issue #149, OI-8) — a state file, never
@@ -50,12 +59,13 @@ const TMP_PATTERN = /^index\..+\.tmp\./;
 /**
  * Classify a rounds-directory filename as an index shard. Shards are
  * `index.<name>` files (`index.csv` = legacy, included for read tolerance);
- * sibling artifacts, migration backups, lockfiles, and atomic-write temps
- * are explicitly excluded (issue #149 extension 3.a).
+ * sibling artifacts (legacy and per-host keyword indexes, issue #152),
+ * migration backups, lockfiles, and atomic-write temps are explicitly
+ * excluded (issue #149 extension 3.a, decision 024 naming contract).
  */
 export function isIndexShardFilename(filename: string): boolean {
 	if (!filename.startsWith("index.")) return false;
-	if (filename === TOOL_INDEX_FILENAME || filename === BM25_INDEX_FILENAME) return false;
+	if (TOOL_INDEX_PATTERN.test(filename) || BM25_INDEX_PATTERN.test(filename)) return false;
 	if (filename === FOREIGN_BACKLOG_FILENAME) return false;
 	if (BACKUP_PATTERN.test(filename) || LOCK_PATTERN.test(filename) || TMP_PATTERN.test(filename)) return false;
 	return true;
