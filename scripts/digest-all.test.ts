@@ -1826,7 +1826,9 @@ describe("digest-all script", () => {
 		).resolves.toBe(0);
 
 		return {
-			bm25Writes: writes.filter((w) => w === bm25IndexPathForRoundsDir(roundsDir)).length,
+			// The flush stages to a tmp file and renames (decision 015): count the
+			// staged write of the bm25 artifact.
+			bm25Writes: writes.filter((w) => w.startsWith(`${bm25IndexPathForRoundsDir(roundsDir)}.tmp.`)).length,
 			// One full-index load = one openSync; readSync fires per chunk, so it
 			// is not a load counter.
 			indexReads: opens.filter((r) => r === indexPath).length,

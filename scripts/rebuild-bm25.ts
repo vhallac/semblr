@@ -15,7 +15,10 @@ export interface RebuildBm25Options extends ScriptConfigOptions {
 	roundsDir?: string;
 	stdout?: Pick<typeof console, "log">;
 	stderr?: Pick<typeof console, "error">;
-	fsImpl?: Pick<typeof fs, "existsSync" | "mkdirSync" | "readFileSync" | "readdirSync" | "writeFileSync">;
+	fsImpl?: Pick<
+		typeof fs,
+		"existsSync" | "mkdirSync" | "readFileSync" | "readdirSync" | "writeFileSync" | "renameSync"
+	>;
 }
 
 export async function runRebuildBm25(options: RebuildBm25Options = {}): Promise<number> {

@@ -7,7 +7,10 @@ import { createRecoveryIndexDeps } from "./recovery-index-deps.ts";
 import { loadToolIndex, toolIndexPathForRoundsDir } from "./search-tools.ts";
 import { indexRecoveredRounds } from "./session-backfill.ts";
 
-type RecoveryFs = Pick<typeof fs, "existsSync" | "mkdirSync" | "readFileSync" | "readdirSync" | "writeFileSync">;
+type RecoveryFs = Pick<
+	typeof fs,
+	"existsSync" | "mkdirSync" | "readFileSync" | "readdirSync" | "writeFileSync" | "renameSync"
+>;
 
 function tmpDir() {
 	return fs.mkdtempSync(path.join(os.tmpdir(), "semblr-recovery-deps-"));
@@ -17,7 +20,7 @@ function writeRound(roundsDir: string, fileName: string, data: object): void {
 	fs.writeFileSync(path.join(roundsDir, fileName), JSON.stringify(data));
 }
 
-function writeSpy(written: string[]): RecoveryFs {
+function writeSpy(written: string[], renamed: Array<[string, string]>): RecoveryFs {
 	return {
 		existsSync: fs.existsSync,
 		mkdirSync: fs.mkdirSync,
@@ -26,6 +29,10 @@ function writeSpy(written: string[]): RecoveryFs {
 		writeFileSync: (p, data) => {
 			written.push(String(p));
 			fs.writeFileSync(p, data);
+		},
+		renameSync: (from, to) => {
+			renamed.push([String(from), String(to)]);
+			fs.renameSync(from, to);
 		},
 	};
 }
@@ -43,7 +50,8 @@ describe("createRecoveryIndexDeps (PR !138 F3: production wiring)", () => {
 		});
 
 		const written: string[] = [];
-		const fsImpl = writeSpy(written);
+		const renamed: Array<[string, string]> = [];
+		const fsImpl = writeSpy(written, renamed);
 		let cached: ReturnType<typeof loadOrRebuildBm25Index> | null = null;
 		const deps = createRecoveryIndexDeps({
 			roundsDir,
@@ -55,10 +63,13 @@ describe("createRecoveryIndexDeps (PR !138 F3: production wiring)", () => {
 
 		const report = indexRecoveredRounds(["a.json", "b.json", "missing.json"], deps);
 
-		// Exactly-once contract (issue #137): the batch committed the sidecar
-		// with a single real file write; unreadable rounds error out and never
-		// trigger a write.
-		expect(written).toEqual([indexPath]);
+		// Exactly-once contract (issue #137), now atomic (decision 015): the
+		// batch committed the sidecar with one staged tmp write and one
+		// publishing rename; unreadable rounds error out and never trigger a
+		// write.
+		const tmpPath = `${indexPath}.tmp.${process.pid}`;
+		expect(written).toEqual([tmpPath]);
+		expect(renamed).toEqual([[tmpPath, indexPath]]);
 		expect(report.bm25Indexed).toBe(2);
 		expect(report.toolIndexed).toBe(1);
 		expect(report.errors).toEqual(["missing.json: unreadable round file"]);
@@ -72,7 +83,8 @@ describe("createRecoveryIndexDeps (PR !138 F3: production wiring)", () => {
 		const roundsDir = tmpDir();
 		const indexPath = bm25IndexPathForRoundsDir(roundsDir);
 		const written: string[] = [];
-		const fsImpl = writeSpy(written);
+		const renamed: Array<[string, string]> = [];
+		const fsImpl = writeSpy(written, renamed);
 		let cached: ReturnType<typeof loadOrRebuildBm25Index> | null = null;
 		const deps = createRecoveryIndexDeps({
 			roundsDir,

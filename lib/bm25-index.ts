@@ -1,5 +1,6 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { atomicWriteFileSync } from "./atomic-write.ts";
 import type { RoundData } from "./round-data.ts";
 
 const BM25_VERSION = 1;
@@ -18,8 +19,25 @@ export interface Bm25Index {
 	documents: Record<string, Bm25Document>;
 }
 
+/** Legacy BM25 artifact name, adopted by rename on first write (decision 024). */
+export const LEGACY_BM25_FILENAME = "index.bm25.json";
+
+/**
+ * Legacy artifact path — superseded by `ownBm25IndexPath` (issue #152); kept
+ * until every caller routes to the host's own artifact (units 005/006).
+ */
 export function bm25IndexPathForRoundsDir(roundsDir: string): string {
-	return path.join(roundsDir, "index.bm25.json");
+	return path.join(roundsDir, LEGACY_BM25_FILENAME);
+}
+
+/**
+ * Path of the host's own BM25 artifact (`index.bm25.<hostId>.json`, issue #152).
+ * The host id is resolved by the caller (`resolveHostId`, lib/host-id.ts) and
+ * is only ever used as a filename component — the artifact format is unchanged
+ * (assumption A-2).
+ */
+export function ownBm25IndexPath(roundsDir: string, hostId: string): string {
+	return path.join(roundsDir, `index.bm25.${hostId}.json`);
 }
 
 function stemToken(token: string): string {
@@ -192,13 +210,47 @@ export function loadOrRebuildBm25Index(
 	return buildBm25Index(rounds);
 }
 
-export function writeBm25Index(
-	indexPath: string,
-	index: Bm25Index,
-	fsImpl: Pick<typeof fs, "mkdirSync" | "writeFileSync"> = fs,
-): void {
+/** fs surface needed to flush a BM25 artifact: adoption checks plus the atomic tmp+rename write. */
+export type Bm25WriteFs = Pick<typeof fs, "existsSync" | "mkdirSync" | "writeFileSync" | "renameSync">;
+
+/**
+ * Adopt a legacy `index.bm25.json` into the host's own artifact path by
+ * rename (decision 024): on the first write to a path other than the legacy
+ * one, when the legacy artifact exists and the target does not, the legacy
+ * file is renamed to the target — an atomic same-directory rename (decision
+ * 015). The flushed index is a superset of the legacy content (the caller
+ * loaded the legacy artifact before upserting its rounds), so the rename is
+ * immediately followed by the publishing write. A host that already owns its
+ * artifact leaves the legacy file untouched (POSIX rename overwrites, so
+ * renaming would clobber the host's own artifact). A lost adoption race (the
+ * legacy file was claimed by another host between the check and the rename)
+ * is swallowed: the host proceeds with its own artifact.
+ */
+function adoptLegacyBm25Index(indexPath: string, fsImpl: Bm25WriteFs): boolean {
+	if (path.basename(indexPath) === LEGACY_BM25_FILENAME) return false;
+	const legacyPath = path.join(path.dirname(indexPath), LEGACY_BM25_FILENAME);
+	if (!fsImpl.existsSync(legacyPath) || fsImpl.existsSync(indexPath)) return false;
+	try {
+		fsImpl.renameSync(legacyPath, indexPath);
+		return true;
+	} catch {
+		// Lost the adoption race: the legacy file is gone (claimed by another
+		// host) — proceed with the host's own artifact.
+		return false;
+	}
+}
+
+/**
+ * Flush a BM25 index atomically (decision 015): the content is staged to a
+ * sibling tmp file (`<target>.tmp.<pid>`) and renamed over the target, so
+ * concurrent readers never see a partial artifact and a crash mid-write
+ * leaves the previous artifact byte-identical. In-place `writeFileSync` of
+ * the artifact is gone (issue #152; decision 015 already named BM25 writes).
+ */
+export function writeBm25Index(indexPath: string, index: Bm25Index, fsImpl: Bm25WriteFs = fs): void {
 	fsImpl.mkdirSync(path.dirname(indexPath), { recursive: true });
-	fsImpl.writeFileSync(indexPath, `${JSON.stringify(refreshStats(index), null, 2)}\n`);
+	adoptLegacyBm25Index(indexPath, fsImpl);
+	atomicWriteFileSync(indexPath, `${JSON.stringify(refreshStats(index), null, 2)}\n`, fsImpl);
 }
 
 export function scoreBm25Query(index: Bm25Index, query: string): Map<string, number> {

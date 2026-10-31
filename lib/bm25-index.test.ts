@@ -9,6 +9,7 @@ import {
 	loadBm25Index,
 	loadOrRebuildBm25Index,
 	normalizeBm25Scores,
+	ownBm25IndexPath,
 	scoreBm25Query,
 	tokenizeBm25,
 	upsertBm25Round,
@@ -137,7 +138,11 @@ describe("bm25 index", () => {
 		const roundsDir = tmpDir();
 		const indexPath = bm25IndexPathForRoundsDir(roundsDir);
 		const writtenFiles: string[] = [];
-		const fsImpl: Pick<typeof fs, "existsSync" | "mkdirSync" | "readFileSync" | "readdirSync" | "writeFileSync"> = {
+		const renames: Array<[string, string]> = [];
+		const fsImpl: Pick<
+			typeof fs,
+			"existsSync" | "mkdirSync" | "readFileSync" | "readdirSync" | "writeFileSync" | "renameSync"
+		> = {
 			existsSync: fs.existsSync,
 			mkdirSync: fs.mkdirSync,
 			readFileSync: fs.readFileSync,
@@ -145,6 +150,10 @@ describe("bm25 index", () => {
 			writeFileSync: (p, data) => {
 				writtenFiles.push(String(p));
 				fs.writeFileSync(p, data);
+			},
+			renameSync: (from, to) => {
+				renames.push([String(from), String(to)]);
+				fs.renameSync(from, to);
 			},
 		};
 		fs.mkdirSync(roundsDir, { recursive: true });
@@ -162,8 +171,118 @@ describe("bm25 index", () => {
 		upsertBm25Round(index, "newer.json", "newer token_c round");
 		writeBm25Index(indexPath, index, fsImpl);
 
-		expect(writtenFiles).toEqual([indexPath]);
+		// Exactly-once flush (issue #137), now atomic (decision 015): one staged
+		// tmp write, one rename publishing it onto the artifact path.
+		const tmpPath = `${indexPath}.tmp.${process.pid}`;
+		expect(writtenFiles).toEqual([tmpPath]);
+		expect(renames).toEqual([[tmpPath, indexPath]]);
 		expect(loadBm25Index(indexPath).documents["newer.json"]).toBeDefined();
+	});
+});
+
+describe("per-host BM25 artifacts (issue #152, decision 024)", () => {
+	it("ownBm25IndexPath places the artifact beside the shards", () => {
+		expect(ownBm25IndexPath("/rounds", "laptop-x")).toBe(path.join("/rounds", "index.bm25.laptop-x.json"));
+	});
+
+	it("adopts the legacy artifact by rename on the first write to a host's own path", () => {
+		const roundsDir = tmpDir();
+		const legacyPath = path.join(roundsDir, "index.bm25.json");
+		const ownPath = ownBm25IndexPath(roundsDir, "host-a");
+		fs.mkdirSync(roundsDir, { recursive: true });
+		fs.writeFileSync(legacyPath, JSON.stringify({ version: 1, documents: {} }));
+
+		writeBm25Index(ownPath, buildBm25Index([{ fileName: "a.json", text: "fresh token" }]));
+
+		// The legacy file is gone — renamed onto the own path and immediately
+		// replaced by the flushed superset of its content.
+		expect(fs.existsSync(legacyPath)).toBe(false);
+		expect(loadBm25Index(ownPath).documents["a.json"]).toBeDefined();
+	});
+
+	it("leaves the legacy artifact untouched when the own artifact already exists (clobber guard)", () => {
+		const roundsDir = tmpDir();
+		const legacyPath = path.join(roundsDir, "index.bm25.json");
+		const ownPath = ownBm25IndexPath(roundsDir, "host-a");
+		fs.mkdirSync(roundsDir, { recursive: true });
+		writeBm25Index(ownPath, buildBm25Index([{ fileName: "a.json", text: "host artifact" }]));
+		const legacyBytes = JSON.stringify({ version: 1, documents: {} });
+		fs.writeFileSync(legacyPath, legacyBytes);
+
+		writeBm25Index(ownPath, buildBm25Index([{ fileName: "b.json", text: "another flush" }]));
+
+		// Renaming would clobber the host's own artifact (POSIX rename
+		// overwrites) — the orphan legacy file stays on disk untouched.
+		expect(fs.readFileSync(legacyPath, "utf-8")).toBe(legacyBytes);
+	});
+
+	it("swallows a lost adoption race and still writes its own artifact", () => {
+		const roundsDir = tmpDir();
+		const legacyPath = path.join(roundsDir, "index.bm25.json");
+		const ownPath = ownBm25IndexPath(roundsDir, "host-a");
+		fs.mkdirSync(roundsDir, { recursive: true });
+		fs.writeFileSync(legacyPath, JSON.stringify({ version: 1, documents: {} }));
+		const fsImpl: Pick<typeof fs, "existsSync" | "mkdirSync" | "writeFileSync" | "renameSync"> = {
+			existsSync: fs.existsSync,
+			mkdirSync: fs.mkdirSync,
+			writeFileSync: fs.writeFileSync,
+			renameSync: (from, to) => {
+				if (String(from) === legacyPath) throw new Error("claimed by another host");
+				return fs.renameSync(from, to);
+			},
+		};
+
+		writeBm25Index(ownPath, buildBm25Index([{ fileName: "a.json", text: "token" }]), fsImpl);
+
+		// The lost legacy claim does not block the flush.
+		expect(loadBm25Index(ownPath).documents["a.json"]).toBeDefined();
+	});
+
+	it("writes the artifact atomically: staged tmp write, rename publish, never in-place (decision 015)", () => {
+		const roundsDir = tmpDir();
+		const indexPath = ownBm25IndexPath(roundsDir, "host-a");
+		const writes: string[] = [];
+		const renames: Array<[string, string]> = [];
+		const fsImpl: Pick<typeof fs, "existsSync" | "mkdirSync" | "writeFileSync" | "renameSync"> = {
+			existsSync: fs.existsSync,
+			mkdirSync: fs.mkdirSync,
+			writeFileSync: (p, data) => {
+				writes.push(String(p));
+				fs.writeFileSync(p, data);
+			},
+			renameSync: (from, to) => {
+				renames.push([String(from), String(to)]);
+				fs.renameSync(from, to);
+			},
+		};
+
+		writeBm25Index(indexPath, buildBm25Index([{ fileName: "a.json", text: "token" }]), fsImpl);
+
+		const tmpPath = `${indexPath}.tmp.${process.pid}`;
+		expect(writes).toEqual([tmpPath]);
+		expect(renames).toEqual([[tmpPath, indexPath]]);
+		expect(fs.existsSync(tmpPath)).toBe(false);
+	});
+
+	it("writes the legacy path directly without attempting adoption", () => {
+		const roundsDir = tmpDir();
+		const legacyPath = bm25IndexPathForRoundsDir(roundsDir);
+		const renames: Array<[string, string]> = [];
+		const fsImpl: Pick<typeof fs, "existsSync" | "mkdirSync" | "writeFileSync" | "renameSync"> = {
+			existsSync: fs.existsSync,
+			mkdirSync: fs.mkdirSync,
+			writeFileSync: fs.writeFileSync,
+			renameSync: (from, to) => {
+				renames.push([String(from), String(to)]);
+				return fs.renameSync(from, to);
+			},
+		};
+
+		writeBm25Index(legacyPath, buildBm25Index([{ fileName: "a.json", text: "token" }]), fsImpl);
+
+		// Callers still on the legacy path (units 005/006 pending) are unaffected.
+		expect(renames.filter(([from]) => from !== `${legacyPath}.tmp.${process.pid}`)).toEqual([]);
+		expect(loadBm25Index(legacyPath).documents["a.json"]).toBeDefined();
 	});
 });
 
