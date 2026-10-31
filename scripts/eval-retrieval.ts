@@ -11,9 +11,9 @@ import { indexRoundFileFromPath } from "../lib/index-io.ts";
 import { discoverIndexShards, shardNames } from "../lib/index-shards.ts";
 import { type IndexEntry, loadIndexFromShards } from "../lib/index-storage.ts";
 import type { RoundData } from "../lib/round-data.ts";
-import type { ScriptConfigOptions } from "../lib/script-config.ts";
+import { resolveScriptConfig, type ScriptConfigOptions } from "../lib/script-config.ts";
 import { collectSearchRoundScores } from "../lib/search-interactions.ts";
-import { loadToolIndex, searchToolIndex, type ToolIndexRow, toolIndexPathForRoundsDir } from "../lib/search-tools.ts";
+import { loadToolIndex, ownToolIndexPath, searchToolIndex, type ToolIndexRow } from "../lib/search-tools.ts";
 import { loadStatsFile } from "../lib/stats.ts";
 import type { GoldenLabelsFile } from "./ingest-golden-labels.ts";
 
@@ -95,6 +95,8 @@ export interface RunEvalRetrievalOptions extends ScriptConfigOptions {
 	fsImpl?: typeof fs;
 	homedir?: () => string;
 	gitRev?: string;
+	/** Host id override for tests; defaults to the configured host id (`config.hostId`). */
+	hostname?: string;
 }
 
 function loadGoldenLabels(filePath: string, fsImpl: typeof fs = fs): GoldenLabelsFile {
@@ -304,7 +306,10 @@ export async function runEvalRetrieval(options: RunEvalRetrievalOptions = {}): P
 		options.sessionsDir ?? parseArgValue(args, "--sessions") ?? defaultSessionsDir(resolvedCorpusDir);
 	const resolvedSessionsDir = path.resolve(sessionsDir.replace(/^~(?=$|\/)/, homedir()));
 	const roundsDir = path.join(resolvedCorpusDir, "rounds");
-	const toolIndexPath = toolIndexPathForRoundsDir(roundsDir);
+	// Issue #152: the corpus tool index is read from the host's own artifact
+	// (`index-tools.<hostId>.fulltext.csv`); the legacy name is not read here.
+	const hostId = options.hostname ?? resolveScriptConfig(options).hostId;
+	const toolIndexPath = ownToolIndexPath(roundsDir, hostId);
 	const statsPath = path.join(resolvedCorpusDir, "chain-read-stats.json");
 	const resolvedGoldenFile = goldenFile ? path.resolve(goldenFile.replace(/^~(?=$|\/)/, homedir())) : null;
 

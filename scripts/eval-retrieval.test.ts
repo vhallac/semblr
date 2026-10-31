@@ -4,6 +4,7 @@ import * as path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { createRoundFilePath } from "../lib/hash.ts";
 import type { RoundData } from "../lib/round-data.ts";
+import { ownToolIndexPath } from "../lib/search-tools.ts";
 import { createDefaultStatsState } from "../lib/stats.ts";
 import { runEvalRetrieval } from "./eval-retrieval.ts";
 
@@ -347,6 +348,7 @@ describe("eval-retrieval script", () => {
 				args: ["--corpus", corpusDir, "--out", outFile, "--golden", goldenFile],
 				outFile,
 				gitRev: "test-rev",
+				hostname: "host-e",
 			}),
 		).resolves.toBe(0);
 		const result = JSON.parse(fs.readFileSync(outFile, "utf-8"));
@@ -439,7 +441,7 @@ describe("eval-retrieval script", () => {
 			].join("\n")}\n`,
 		);
 		fs.writeFileSync(
-			path.join(roundsDir, "index-tools.fulltext.csv"),
+			ownToolIndexPath(roundsDir, "host-e"),
 			[`${toolTargetFile},0,bash,bash ssh prod-db-2`, `${futureToolTargetFile},0,bash,bash ssh prod-db-2`].join(
 				"\n",
 			),
@@ -481,6 +483,7 @@ describe("eval-retrieval script", () => {
 				args: ["--corpus", corpusDir, "--out", outFile, "--golden", goldenFile],
 				outFile,
 				gitRev: "test-rev",
+				hostname: "host-e",
 			}),
 		).resolves.toBe(0);
 		const result = JSON.parse(fs.readFileSync(outFile, "utf-8"));
@@ -501,6 +504,7 @@ describe("eval-retrieval script", () => {
 				args: ["--corpus", corpusDir, "--out", toolOnlyOutFile, "--golden", goldenFile, "--mode", "tool"],
 				outFile: toolOnlyOutFile,
 				gitRev: "test-rev",
+				hostname: "host-e",
 			}),
 		).resolves.toBe(0);
 		const toolOnly = JSON.parse(fs.readFileSync(toolOnlyOutFile, "utf-8"));
@@ -553,10 +557,11 @@ describe("eval-retrieval script", () => {
 			runEvalRetrieval({
 				args: ["--corpus", corpusDir, "--golden", goldenFile],
 				gitRev: "test-rev",
+				hostname: "host-e",
 				stderr: { error: (message: string) => stderr.push(message) },
 			}),
 		).resolves.toBe(1);
-		expect(stderr[0]).toBe(`Corpus tool index does not exist: ${path.join(roundsDir, "index-tools.fulltext.csv")}`);
+		expect(stderr[0]).toBe(`Corpus tool index does not exist: ${ownToolIndexPath(roundsDir, "host-e")}`);
 	});
 
 	it("rejects a tool-mode golden query without tool_query", async () => {
@@ -576,7 +581,7 @@ describe("eval-retrieval script", () => {
 		} satisfies RoundData;
 		const queryFile = writeRound(roundsDir, query);
 		fs.writeFileSync(path.join(roundsDir, "index.csv"), `${encodeEntry([1, 0], `${queryFile}:prompt`)}\n`);
-		fs.writeFileSync(path.join(roundsDir, "index-tools.fulltext.csv"), "");
+		fs.writeFileSync(ownToolIndexPath(roundsDir, "host-e"), "");
 		fs.writeFileSync(
 			goldenFile,
 			JSON.stringify({
@@ -596,7 +601,11 @@ describe("eval-retrieval script", () => {
 			}),
 		);
 		await expect(
-			runEvalRetrieval({ args: ["--corpus", corpusDir, "--golden", goldenFile], gitRev: "test-rev" }),
+			runEvalRetrieval({
+				args: ["--corpus", corpusDir, "--golden", goldenFile],
+				gitRev: "test-rev",
+				hostname: "host-e",
+			}),
 		).rejects.toThrow(`Tool-mode golden query ${queryFile} is missing tool_query`);
 	});
 

@@ -2,13 +2,13 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { bm25IndexPathForRoundsDir } from "../lib/bm25-index.ts";
+import { ownBm25IndexPath } from "../lib/bm25-index.ts";
 import { computeContentHash } from "../lib/hash.ts";
 import { encodeVectorIndexLine, loadVectorIndex, readIndexLines } from "../lib/index-io.ts";
 import { ownShardPath } from "../lib/index-shards.ts";
 import { appendLineWithLock } from "../lib/index-storage.ts";
 import { hashEmbeddingInput } from "../lib/round-capture.ts";
-import { loadToolIndex, toolIndexPathForRoundsDir } from "../lib/search-tools.ts";
+import { loadToolIndex, ownToolIndexPath } from "../lib/search-tools.ts";
 import { SEMBLR_CONFIG_DEFAULTS } from "../lib/semblr-config.ts";
 import { embedRecoveredRounds } from "../lib/session-backfill.ts";
 import { isMainModule, runDigestAll } from "./digest-all.ts";
@@ -1778,11 +1778,14 @@ describe("digest-all script", () => {
 		// Seed a valid bm25 sidecar so the run's single load actually reads it
 		// (loadBm25Index skips a missing file without a read).
 		fs.writeFileSync(
-			bm25IndexPathForRoundsDir(roundsDir),
+			ownBm25IndexPath(roundsDir, os.hostname()),
 			JSON.stringify({ version: 1, documentCount: 0, averageDocumentLength: 0, documents: {} }),
 		);
 		// Seed the tool index too, so its once-per-run load is exercised.
-		fs.writeFileSync(toolIndexPathForRoundsDir(roundsDir), "00000000000000000000000000000000,0,bash,placeholder\n");
+		fs.writeFileSync(
+			ownToolIndexPath(roundsDir, os.hostname()),
+			"00000000000000000000000000000000,0,bash,placeholder\n",
+		);
 
 		const vectors: number[][] = [];
 		for (let i = 0; i < roundCount; i++) {
@@ -1828,12 +1831,12 @@ describe("digest-all script", () => {
 		return {
 			// The flush stages to a tmp file and renames (decision 015): count the
 			// staged write of the bm25 artifact.
-			bm25Writes: writes.filter((w) => w.startsWith(`${bm25IndexPathForRoundsDir(roundsDir)}.tmp.`)).length,
+			bm25Writes: writes.filter((w) => w.startsWith(`${ownBm25IndexPath(roundsDir, os.hostname())}.tmp.`)).length,
 			// One full-index load = one openSync; readSync fires per chunk, so it
 			// is not a load counter.
 			indexReads: opens.filter((r) => r === indexPath).length,
-			bm25Reads: reads.filter((r) => r === bm25IndexPathForRoundsDir(roundsDir)).length,
-			toolIndexReads: reads.filter((r) => r === toolIndexPathForRoundsDir(roundsDir)).length,
+			bm25Reads: reads.filter((r) => r === ownBm25IndexPath(roundsDir, os.hostname())).length,
+			toolIndexReads: reads.filter((r) => r === ownToolIndexPath(roundsDir, os.hostname())).length,
 		};
 	}
 
@@ -2233,7 +2236,7 @@ describe("digest-all script", () => {
 				}),
 			).resolves.toBe(0);
 
-			const toolIndexPath = toolIndexPathForRoundsDir(roundsDir);
+			const toolIndexPath = ownToolIndexPath(roundsDir, os.hostname());
 			const rows = loadToolIndex(toolIndexPath);
 			expect(rows).toHaveLength(1);
 			expect(rows[0]).toMatchObject({ toolIndex: 0, toolName: "bash" });
@@ -2268,7 +2271,7 @@ describe("digest-all script", () => {
 				stdout: logger().out,
 			});
 
-			const toolIndexPath = toolIndexPathForRoundsDir(roundsDir);
+			const toolIndexPath = ownToolIndexPath(roundsDir, os.hostname());
 			expect(loadToolIndex(toolIndexPath)).toHaveLength(1);
 
 			// Force a model mismatch so the round is re-processed on the next run.
@@ -2315,7 +2318,7 @@ describe("digest-all script", () => {
 			).resolves.toBe(0);
 
 			expect(fetchImpl).not.toHaveBeenCalled();
-			const toolIndexPath = toolIndexPathForRoundsDir(roundsDir);
+			const toolIndexPath = ownToolIndexPath(roundsDir, os.hostname());
 			expect(loadToolIndex(toolIndexPath)).toEqual([
 				{ hash: "abc.json", toolIndex: 0, toolName: "bash", searchableText: "bash curl x" },
 			]);

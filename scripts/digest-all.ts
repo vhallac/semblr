@@ -15,9 +15,9 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { pathToFileURL } from "node:url";
 import {
-	bm25IndexPathForRoundsDir,
 	deleteBm25Round,
 	loadBm25Index,
+	ownBm25IndexPath,
 	roundTextForBm25,
 	upsertBm25Round,
 	writeBm25Index,
@@ -57,7 +57,7 @@ import {
 	buildToolIndexRows,
 	buildToolIndexRowsFromRoundsDir,
 	loadToolIndexedRoundFiles,
-	toolIndexPathForRoundsDir,
+	ownToolIndexPath,
 	writeToolIndexRows,
 } from "../lib/search-tools.ts";
 import { extractCheckpointSummary } from "../lib/session-backfill.ts";
@@ -270,13 +270,16 @@ export async function runDigestAll(options: DigestAllOptions = {}): Promise<numb
 	const shardRoot = path.dirname(indexPath);
 	// Issue #149 (OI-6): the own shard is named after the resolved host id.
 	const hostId = options.hostname ?? config.hostId;
-	const bm25IndexPath = bm25IndexPathForRoundsDir(roundsDir);
+	// Issue #152: the keyword artifacts are the host's own
+	// (`index.bm25.<hostId>.json`, `index-tools.<hostId>.fulltext.csv`); a legacy
+	// artifact is adopted by rename on the first rewrite (decision 024).
+	const bm25IndexPath = ownBm25IndexPath(roundsDir, hostId);
 	const out = options.stdout ?? console;
 	const err = options.stderr ?? console;
 	const f = options.fsImpl ?? fs;
 
 	if (options.toolsOnly) {
-		const toolIndexPath = toolIndexPathForRoundsDir(roundsDir);
+		const toolIndexPath = ownToolIndexPath(roundsDir, hostId);
 		const rows = f.existsSync(roundsDir) ? buildToolIndexRowsFromRoundsDir(roundsDir, f) : [];
 		f.mkdirSync(roundsDir, { recursive: true });
 		writeToolIndexRows(toolIndexPath, rows, f);
@@ -492,7 +495,7 @@ export async function runDigestAll(options: DigestAllOptions = {}): Promise<numb
 	// sets are seeded once and updated in memory as rows are appended/replaced,
 	// so processRound never re-parses index.csv or the tool index per round.
 	const bm25Index = loadBm25Index(bm25IndexPath, f);
-	const toolIndexPath = toolIndexPathForRoundsDir(roundsDir);
+	const toolIndexPath = ownToolIndexPath(roundsDir, hostId);
 	const toolIndexedRounds = loadToolIndexedRoundFiles(toolIndexPath, f);
 	// Seed the in-memory indexed/mismatched sets from the one index load and
 	// keep them current as rows are appended or replaced.
