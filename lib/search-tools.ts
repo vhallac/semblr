@@ -1,9 +1,11 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { atomicWriteFileSync } from "./atomic-write.ts";
 import { appendLineWithLock, type IndexStorageFs, type LockedAppendDeps } from "./index-storage.ts";
 import type { ToolCallDetail } from "./round-data.ts";
 
-const TOOLS_INDEX_FILENAME = "index-tools.fulltext.csv";
+/** Legacy tool-index artifact name, adopted by rename on first write (decision 024). */
+export const LEGACY_TOOL_INDEX_FILENAME = "index-tools.fulltext.csv";
 
 export interface ToolIndexRow {
 	hash: string;
@@ -19,9 +21,22 @@ export interface ToolSearchMatch {
 	matchedTools: Array<{ index: number; name: string }>;
 }
 
-/** Path to the tool-call fulltext index, sibling to index.csv in roundsDir. */
+/**
+ * Legacy artifact path — superseded by `ownToolIndexPath` (issue #152); kept
+ * until every caller routes to the host's own artifact (units 005/006).
+ */
 export function toolIndexPathForRoundsDir(roundsDir: string): string {
-	return path.join(roundsDir, TOOLS_INDEX_FILENAME);
+	return path.join(roundsDir, LEGACY_TOOL_INDEX_FILENAME);
+}
+
+/**
+ * Path of the host's own tool-index artifact (`index-tools.<hostId>.fulltext.csv`,
+ * issue #152). The host id is resolved by the caller (`resolveHostId`,
+ * lib/host-id.ts) and is only ever used as a filename component — the artifact
+ * format is unchanged (assumption A-2).
+ */
+export function ownToolIndexPath(roundsDir: string, hostId: string): string {
+	return path.join(roundsDir, `index-tools.${hostId}.fulltext.csv`);
 }
 
 function collectStringValues(value: unknown, out: string[]): void {
@@ -131,14 +146,52 @@ export function appendToolIndexRows(
 	appendLineWithLock(indexPath, roundsDir, line, deps);
 }
 
-/** Overwrite the tool index file with exactly these rows (used for full rebuilds). */
+/** fs surface needed to rewrite the tool index: adoption checks plus the atomic tmp+rename write. */
+export type ToolIndexWriteFs = Pick<typeof fs, "existsSync" | "mkdirSync" | "writeFileSync" | "renameSync">;
+
+/**
+ * Adopt a legacy `index-tools.fulltext.csv` into the host's own artifact path
+ * by rename (decision 024): on the first write to a path other than the legacy
+ * one, when the legacy artifact exists and the target does not, the legacy
+ * file is renamed to the target — an atomic same-directory rename (decision
+ * 015). The rewrite that follows is built from locally visible round files
+ * (the tool index is a wholesale rebuild, not an upsert). A host that already
+ * owns its artifact leaves the legacy file untouched (POSIX rename overwrites,
+ * so renaming would clobber the host's own artifact). A lost adoption race
+ * (the legacy file was claimed by another host between the check and the
+ * rename) is swallowed: the host proceeds with its own artifact.
+ */
+function adoptLegacyToolIndex(indexPath: string, fsImpl: ToolIndexWriteFs): boolean {
+	if (path.basename(indexPath) === LEGACY_TOOL_INDEX_FILENAME) return false;
+	const legacyPath = path.join(path.dirname(indexPath), LEGACY_TOOL_INDEX_FILENAME);
+	if (!fsImpl.existsSync(legacyPath) || fsImpl.existsSync(indexPath)) return false;
+	try {
+		fsImpl.renameSync(legacyPath, indexPath);
+		return true;
+	} catch {
+		// Lost the adoption race: the legacy file is gone (claimed by another
+		// host) — proceed with the host's own artifact.
+		return false;
+	}
+}
+
+/**
+ * Overwrite the tool index file with exactly these rows (used for full
+ * rebuilds), atomically (decision 015): the content is staged to a sibling
+ * tmp file (`<target>.tmp.<pid>`) and renamed over the target, so concurrent
+ * readers never see a partial artifact and a crash mid-write leaves the
+ * previous artifact byte-identical. In-place `writeFileSync` of the artifact
+ * is gone (issue #152; decision 015 already named BM25/tool writes).
+ */
 export function writeToolIndexRows(
 	indexPath: string,
 	rows: readonly ToolIndexRow[],
-	fsImpl: Pick<typeof fs, "writeFileSync"> = fs,
+	fsImpl: ToolIndexWriteFs = fs,
 ): void {
+	fsImpl.mkdirSync(path.dirname(indexPath), { recursive: true });
+	adoptLegacyToolIndex(indexPath, fsImpl);
 	const content = rows.length > 0 ? `${rows.map(encodeToolIndexRow).join("\n")}\n` : "";
-	fsImpl.writeFileSync(indexPath, content);
+	atomicWriteFileSync(indexPath, content, fsImpl);
 }
 
 /** Scan every round file in roundsDir and rebuild tool index rows from scratch. */
