@@ -46,7 +46,7 @@ import {
 import { embedRound, FORCING_INDEX_SUFFIXES, forcingReproducibleSuffixes } from "../lib/embed-round.ts";
 import { embedText, getApiKey } from "../lib/embedding-client.ts";
 import { assignToGroup, formatGroupStats } from "../lib/grouping.ts";
-import { indexRoundFileFromPath, loadShardVectorIndex, loadVectorIndex } from "../lib/index-io.ts";
+import { indexRoundFileFromPath, loadShardVectorIndex } from "../lib/index-io.ts";
 import { ownShardPath } from "../lib/index-shards.ts";
 import {
 	appendIndexRowToShards,
@@ -1277,7 +1277,13 @@ export default function (pi: ExtensionAPI) {
 						const indexEntries = loadShardVectorIndex(ROUNDS_DIR);
 						// Issue #149 (D-006 scope): the live label guard consults only the
 						// host's own shard — the post-adoption write surface.
-						const ownShardEntries = loadVectorIndex(ownShardPath(ROUNDS_DIR, SEMBLR_CONFIG.hostId));
+						// Issue #154 (PR !151 R1.F4): the own-shard startup read must tolerate
+						// corrupt rows like merged reads do — skip with a warning instead of
+						// crashing startup; the sweep's strict reload catches corruption at
+						// write time.
+						const ownShardEntries = loadShardVectorIndex(ROUNDS_DIR, {
+							shards: [ownShardPath(ROUNDS_DIR, SEMBLR_CONFIG.hostId)],
+						});
 						// F2 (PR !141 review): the pending count and the `just index` sweep must
 						// classify a recovered round alike. The sweep derives the *forcing*
 						// suffix set per round from the round file (a short prompt's `:prompt`
