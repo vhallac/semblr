@@ -564,6 +564,81 @@ describe("eval-retrieval script", () => {
 		expect(stderr[0]).toBe(`Corpus tool index does not exist: ${ownToolIndexPath(roundsDir, "host-e")}`);
 	});
 
+	// claim: issue-152/scripts-route-keyword-io-to-own-artifacts/tool-mode-eval-reads-a-legacy-single-host-corpus
+	// claim text: tool-mode eval falls back to the legacy tool index when the own artifact is missing, so a pre-152 single-host corpus evaluates without migration
+	// scenario: a corpus with only index-tools.fulltext.csv — tool-mode eval completes using the legacy artifact
+	it("evaluates tool mode on a legacy-only single-host corpus via the fallback read", async () => {
+		const root = tmpDir();
+		const corpusDir = path.join(root, "snapshot-a");
+		const roundsDir = path.join(corpusDir, "rounds");
+		const goldenFile = path.join(root, "golden.json");
+		const outFile = path.join(root, "eval.json");
+		fs.mkdirSync(roundsDir, { recursive: true });
+		const toolTarget = {
+			userPrompt: prompt(
+				"tool target has enough words to qualify as an earlier candidate in this golden retrieval evaluation test with stable deterministic ranking today",
+			),
+			responseSequence: "tool target response",
+			turnIndex: 0,
+			userTimestamp: 10,
+			promptEmbedding: [0, 1],
+		} satisfies RoundData;
+		const toolQuery = {
+			userPrompt: prompt(
+				"tool query has enough words but deliberately uses an unrelated embedding because explicit tool query text drives retrieval in this golden evaluation case",
+			),
+			responseSequence: "tool query response",
+			turnIndex: 1,
+			userTimestamp: 40,
+			promptEmbedding: [1, 0],
+		} satisfies RoundData;
+		const toolTargetFile = writeRound(roundsDir, toolTarget);
+		const toolQueryFile = writeRound(roundsDir, toolQuery);
+		fs.writeFileSync(
+			path.join(roundsDir, "index.csv"),
+			`${[encodeEntry([0, 1], `${toolTargetFile}:prompt`), encodeEntry([1, 0], `${toolQueryFile}:prompt`)].join("\n")}\n`,
+		);
+		// Legacy artifact only — no index-tools.<hostId>.fulltext.csv anywhere.
+		fs.writeFileSync(
+			path.join(roundsDir, "index-tools.fulltext.csv"),
+			`${toolTargetFile},0,bash,bash ssh prod-db-2\n`,
+		);
+		fs.writeFileSync(
+			path.join(corpusDir, "chain-read-stats.json"),
+			JSON.stringify(createDefaultStatsState("2026-06-12T03:01:09.000Z"), null, 2),
+		);
+		fs.writeFileSync(
+			goldenFile,
+			JSON.stringify({
+				kind: "golden-labels",
+				version: 1,
+				source_pool: "test",
+				queries: [
+					{
+						query: toolQueryFile,
+						prompt: toolQuery.userPrompt,
+						mode: "tool",
+						tool_query: "ssh prod-db-2",
+						difficulty: "tool",
+						primary: toolTargetFile,
+						labels: [toolTargetFile],
+					},
+				],
+			}),
+		);
+
+		await expect(
+			runEvalRetrieval({
+				args: ["--corpus", corpusDir, "--out", outFile, "--golden", goldenFile, "--mode", "tool"],
+				outFile,
+				gitRev: "test-rev",
+				hostname: "host-e",
+			}),
+		).resolves.toBe(0);
+		const result = JSON.parse(fs.readFileSync(outFile, "utf-8"));
+		expect(result.by_mode.tool.hit_at_5).toBe(1);
+	});
+
 	it("rejects a tool-mode golden query without tool_query", async () => {
 		const root = tmpDir();
 		const corpusDir = path.join(root, "snapshot-a");

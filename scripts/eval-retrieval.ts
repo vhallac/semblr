@@ -13,7 +13,7 @@ import { type IndexEntry, loadIndexFromShards } from "../lib/index-storage.ts";
 import type { RoundData } from "../lib/round-data.ts";
 import { resolveScriptConfig, type ScriptConfigOptions } from "../lib/script-config.ts";
 import { collectSearchRoundScores } from "../lib/search-interactions.ts";
-import { loadToolIndex, ownToolIndexPath, searchToolIndex, type ToolIndexRow } from "../lib/search-tools.ts";
+import { loadToolIndex, ownToolIndexPath, searchToolIndex, toolIndexPathForRoundsDir, type ToolIndexRow } from "../lib/search-tools.ts";
 import { loadStatsFile } from "../lib/stats.ts";
 import type { GoldenLabelsFile } from "./ingest-golden-labels.ts";
 
@@ -307,9 +307,16 @@ export async function runEvalRetrieval(options: RunEvalRetrievalOptions = {}): P
 	const resolvedSessionsDir = path.resolve(sessionsDir.replace(/^~(?=$|\/)/, homedir()));
 	const roundsDir = path.join(resolvedCorpusDir, "rounds");
 	// Issue #152: the corpus tool index is read from the host's own artifact
-	// (`index-tools.<hostId>.fulltext.csv`); the legacy name is not read here.
+	// (`index-tools.<hostId>.fulltext.csv`). Issue #152 F6: on a pre-152
+	// single-host corpus the own artifact does not exist yet — fall back to the
+	// legacy `index-tools.fulltext.csv` so tool-mode eval works without a
+	// migration (single-host behavior is unchanged).
 	const hostId = options.hostname ?? resolveScriptConfig(options).hostId;
-	const toolIndexPath = ownToolIndexPath(roundsDir, hostId);
+	let toolIndexPath = ownToolIndexPath(roundsDir, hostId);
+	if (!fsImpl.existsSync(toolIndexPath)) {
+		const legacyToolPath = toolIndexPathForRoundsDir(roundsDir);
+		if (fsImpl.existsSync(legacyToolPath)) toolIndexPath = legacyToolPath;
+	}
 	const statsPath = path.join(resolvedCorpusDir, "chain-read-stats.json");
 	const resolvedGoldenFile = goldenFile ? path.resolve(goldenFile.replace(/^~(?=$|\/)/, homedir())) : null;
 

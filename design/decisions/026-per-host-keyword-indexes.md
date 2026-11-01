@@ -13,7 +13,7 @@ Decisions 023–025 made the vector index a set of per-host shards with own-shar
 - **File formats unchanged.** The BM25 JSON and tool-CSV schemas stay byte-compatible; the host id lives only in the filename (decision 023's no-header choice).
 - **Discovery exclusions are pattern-based.** `isIndexShardFilename` excludes the per-host keyword artifact names (and their backups) instead of the two exact legacy names, keeping decision 024's naming contract.
 - **Atomic writes.** `writeBm25Index` and `writeToolIndexRows` move from in-place `writeFileSync` to tmp+rename, aligning the code with decision 015.
-- **eval-retrieval routes to the own artifact**, so a multi-host corpus eval reads what the corpus host built; single-host behavior is unchanged.
+- **eval-retrieval routes to the own artifact**, so a multi-host corpus eval reads what the corpus host built; on a pre-152 single-host corpus (only the legacy `index-tools.fulltext.csv`), tool-mode eval falls back to reading the legacy artifact, so single-host behavior is unchanged (no migration needed).
 
 ## Consequences
 - Per-host BM25 prunes no longer clobber foreign hosts' keyword artifacts; each host only rewrites its own files.
