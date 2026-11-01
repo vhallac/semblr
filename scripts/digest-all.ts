@@ -16,6 +16,7 @@ import * as path from "node:path";
 import { pathToFileURL } from "node:url";
 import {
 	deleteBm25Round,
+	LEGACY_BM25_FILENAME,
 	loadBm25Index,
 	ownBm25IndexPath,
 	roundTextForBm25,
@@ -274,6 +275,7 @@ export async function runDigestAll(options: DigestAllOptions = {}): Promise<numb
 	// (`index.bm25.<hostId>.json`, `index-tools.<hostId>.fulltext.csv`); a legacy
 	// artifact is adopted by rename on the first rewrite (decision 024).
 	const bm25IndexPath = ownBm25IndexPath(roundsDir, hostId);
+	const bm25LegacyPath = path.join(roundsDir, LEGACY_BM25_FILENAME);
 	const out = options.stdout ?? console;
 	const err = options.stderr ?? console;
 	const f = options.fsImpl ?? fs;
@@ -494,7 +496,15 @@ export async function runDigestAll(options: DigestAllOptions = {}): Promise<numb
 	// flushBm25 seam, lib/session-backfill.ts). The tool-index and vector-index
 	// sets are seeded once and updated in memory as rows are appended/replaced,
 	// so processRound never re-parses index.csv or the tool index per round.
-	const bm25Index = loadBm25Index(bm25IndexPath, f);
+	let bm25Index = loadBm25Index(bm25IndexPath, f);
+	// Issue #152 F2: seed-from-legacy — when the host has no own BM25 artifact
+	// yet but a legacy `index.bm25.json` exists, load the legacy content into
+	// memory before any upserts so the flushed artifact is a superset of the
+	// legacy content (the adopt-on-flush rename is then immediately followed
+	// by a publishing write that keeps every legacy row, even on a no-op run).
+	if (!f.existsSync(bm25IndexPath) && f.existsSync(bm25LegacyPath)) {
+		bm25Index = loadBm25Index(bm25LegacyPath, f);
+	}
 	const toolIndexPath = ownToolIndexPath(roundsDir, hostId);
 	const toolIndexedRounds = loadToolIndexedRoundFiles(toolIndexPath, f);
 	// Seed the in-memory indexed/mismatched sets from the one index load and

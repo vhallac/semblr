@@ -2,7 +2,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { ownBm25IndexPath } from "../lib/bm25-index.ts";
+import { LEGACY_BM25_FILENAME, loadBm25Index, ownBm25IndexPath } from "../lib/bm25-index.ts";
 import { computeContentHash } from "../lib/hash.ts";
 import { encodeVectorIndexLine, loadVectorIndex, readIndexLines } from "../lib/index-io.ts";
 import { ownShardPath } from "../lib/index-shards.ts";
@@ -1839,6 +1839,56 @@ describe("digest-all script", () => {
 			toolIndexReads: reads.filter((r) => r === ownToolIndexPath(roundsDir, os.hostname())).length,
 		};
 	}
+
+	// claim: issue-152/digest-all-seeds-bm25-from-legacy/keeps legacy rows across flush
+	it("seeds the bm25 index from the legacy artifact before the flush", async () => {
+		const root = tmpDir();
+		const sessionsDir = tmpDir(); // no session files: force the rounds-dir sweep
+		const roundsDir = path.join(root, "rounds");
+		fs.mkdirSync(roundsDir, { recursive: true });
+		const indexPath = ownShardPath(roundsDir);
+
+		// A round only present in the legacy BM25 artifact — its round file is
+		// gone from disk (e.g. swept/migrated elsewhere), so the sweep must not
+		// process it this run, but the flushed own artifact must keep its row.
+		const legacyRoundFile = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.json";
+		fs.writeFileSync(
+			path.join(roundsDir, LEGACY_BM25_FILENAME),
+			JSON.stringify({
+				version: 1,
+				documentCount: 1,
+				averageDocumentLength: 3,
+				documents: { [legacyRoundFile]: { length: 3, termFrequencies: { alpha: 2, beta: 1 } } },
+			}),
+		);
+
+		const userPrompt = "Fresh sweep round with a distinct prompt body.";
+		const responseSequence = "Fresh sweep round with a distinct response body.";
+		const roundFile = `${computeContentHash(userPrompt, responseSequence, [])}.json`;
+		fs.writeFileSync(
+			path.join(roundsDir, roundFile),
+			JSON.stringify({ userPrompt, responseSequence, toolCalls: [], recovered: true }),
+		);
+
+		await expect(
+			runDigestAll({
+				sessionsDir,
+				roundsDir,
+				indexPath,
+				apiKey: "key",
+				fetchImpl: embeddingFetch([[1, 0], [0, 1], [1, 1]]),
+				stdout: logger().out,
+				stderr: logger().err,
+			}),
+		).resolves.toBe(0);
+
+		// The legacy artifact was adopted (renamed away) and the flushed own
+		// artifact keeps every legacy row plus the new round's row.
+		expect(fs.existsSync(path.join(roundsDir, LEGACY_BM25_FILENAME))).toBe(false);
+		const ownIndex = loadBm25Index(ownBm25IndexPath(roundsDir, os.hostname()));
+		expect(Object.keys(ownIndex.documents)).toContain(legacyRoundFile);
+		expect(Object.keys(ownIndex.documents)).toContain(roundFile);
+	});
 
 	it("loads whole-store structures once per run, not once per round", async () => {
 		const small = await runSweepFixture(3);
