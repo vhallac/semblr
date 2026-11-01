@@ -142,6 +142,14 @@ export function appendToolIndexRows(
 	deps: AppendToolIndexDeps = {},
 ): void {
 	if (rows.length === 0) return;
+	const fsImpl = deps.fsImpl ?? fs;
+	// Issue #152 F3: the append path adopts the legacy artifact too — the first
+	// runtime append on a store that only has `index-tools.fulltext.csv` claims
+	// it by rename, so the upgraded store searches the legacy tool history
+	// without a full rewrite. Same clobber-guard/lost-race semantics as the
+	// rewrite path (writeToolIndexRows).
+	fsImpl.mkdirSync(path.dirname(indexPath), { recursive: true });
+	adoptLegacyToolIndex(indexPath, fsImpl);
 	const line = `${rows.map(encodeToolIndexRow).join("\n")}\n`;
 	appendLineWithLock(indexPath, roundsDir, line, deps);
 }

@@ -160,6 +160,27 @@ describe("appendToolIndexRows", () => {
 		appendToolIndexRows(indexPath, dir, []);
 		expect(fs.existsSync(indexPath)).toBe(false);
 	});
+
+	// claim: issue-152/append-adopts-legacy-tool-index/first append adopts by rename
+	it("adopts the legacy artifact on the first append to a host's own path", () => {
+		const dir = tmpDir();
+		const legacyPath = path.join(dir, "index-tools.fulltext.csv");
+		const ownPath = ownToolIndexPath(dir, "host-a");
+		fs.mkdirSync(dir, { recursive: true });
+		fs.writeFileSync(legacyPath, "legacy.json,0,bash,legacy text\n");
+
+		appendToolIndexRows(ownPath, dir, [
+			{ hash: "new.json", toolIndex: 0, toolName: "read", searchableText: "appended row" },
+		]);
+
+		// The legacy file is gone — renamed onto the own path, and the appended
+		// row lands beside the legacy rows (no full rewrite needed).
+		expect(fs.existsSync(legacyPath)).toBe(false);
+		expect(loadToolIndex(ownPath)).toEqual([
+			{ hash: "legacy.json", toolIndex: 0, toolName: "bash", searchableText: "legacy text" },
+			{ hash: "new.json", toolIndex: 0, toolName: "read", searchableText: "appended row" },
+		]);
+	});
 });
 
 describe("per-host tool index artifacts (issue #152, decision 024)", () => {
