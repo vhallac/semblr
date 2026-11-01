@@ -6,7 +6,7 @@
 Decisions 023–025 made the vector index a set of per-host shards with own-shard writes and merged reads. Two derived keyword artifacts remained single shared files: the BM25 index (`index.bm25.json`) and the tool index (`index-tools.fulltext.csv`). Multiple hosts sharing a rounds directory overwrote each other's keyword artifacts, and a per-host BM25 prune (the duplicate-resolution path) would clobber a foreign host's rows. Issue #152.
 
 ## Decision
-**The keyword artifacts become per-host files, mirroring the vector shard model:** `index.<hostId>.bm25.json` and `index-tools.<hostId>.fulltext.csv` beside the vector shards.
+**The keyword artifacts become per-host files, mirroring the vector shard model:** `index.bm25.<hostId>.json` and `index-tools.<hostId>.fulltext.csv` beside the vector shards.
 
 - **Derived, not sharded.** Both indexes are fully rebuildable from round files, so there is no cross-shard merge logic; each host maintains only its own derived artifact. A sharded BM25 needing cross-shard term statistics has no consumer.
 - **Legacy adoption by rename-once**, mirroring decision 024: on the first write by a host, a pre-existing legacy `index.bm25.json` / `index-tools.fulltext.csv` is adopted by rename into the host's own name, with a clobber guard and a swallowed lost race. A legacy index built from all rounds stays valid as a superset; per-host flushes then upsert the host's own rounds.
