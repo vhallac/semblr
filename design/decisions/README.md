@@ -4,6 +4,7 @@ One indexed line per decision. Newest at the top.
 
 ## Multi-host index layout
 
+- 026 — Per-host keyword indexes: BM25 and tool-index shards — proposed
 - 025 — Foreign shards are read-only; shared round files are kept and reported — accepted
 - 024 — Legacy index adoption by rename and shard discovery exclusions — accepted
 - 023 — Per-host index shards: own-shard writes, merged reads — accepted
