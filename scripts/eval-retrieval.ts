@@ -13,7 +13,13 @@ import { type IndexEntry, loadIndexFromShards } from "../lib/index-storage.ts";
 import type { RoundData } from "../lib/round-data.ts";
 import { resolveScriptConfig, type ScriptConfigOptions } from "../lib/script-config.ts";
 import { collectSearchRoundScores } from "../lib/search-interactions.ts";
-import { loadToolIndex, ownToolIndexPath, searchToolIndex, toolIndexPathForRoundsDir, type ToolIndexRow } from "../lib/search-tools.ts";
+import {
+	loadToolIndex,
+	ownToolIndexPath,
+	searchToolIndex,
+	type ToolIndexRow,
+	toolIndexPathForRoundsDir,
+} from "../lib/search-tools.ts";
 import { loadStatsFile } from "../lib/stats.ts";
 import type { GoldenLabelsFile } from "./ingest-golden-labels.ts";
 

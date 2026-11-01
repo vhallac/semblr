@@ -1878,7 +1878,11 @@ describe("digest-all script", () => {
 				roundsDir,
 				indexPath,
 				apiKey: "key",
-				fetchImpl: embeddingFetch([[1, 0], [0, 1], [1, 1]]),
+				fetchImpl: embeddingFetch([
+					[1, 0],
+					[0, 1],
+					[1, 1],
+				]),
 				stdout: logger().out,
 				stderr: logger().err,
 			}),
