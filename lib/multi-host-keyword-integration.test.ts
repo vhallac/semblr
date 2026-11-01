@@ -87,6 +87,9 @@ function ownTools(hostname: string): string {
 const silentStdout = { log: () => {} };
 
 describe("two-host keyword artifacts (issue #152)", () => {
+	// claim: issue-152/foreign-rebuild-leaves-own-artifacts-byte-identical/host-B-rebuild-leaves-host-A-keyword-artifacts-byte-identical
+	// claim text: a host's rebuild of the keyword artifacts never modifies another host's own BM25 or tool artifact bytes
+	// scenario: two hosts share a rounds dir; host B runs a rebuild — host A's own artifacts stay byte-identical
 	it("host B's rebuild leaves host A's keyword artifacts byte-identical", async () => {
 		writeRoundFile("a.json", "The round carries the aetherwave marker", "host A answered with aetherwave", [
 			TOOL_CALL_A,
@@ -123,6 +126,9 @@ describe("two-host keyword artifacts (issue #152)", () => {
 		expect(toolRowsB.map((row) => row.hash).sort()).toEqual(["a.json", "b.json"]);
 	});
 
+	// claim: issue-152/foreign-keyword-artifacts-never-read-as-local-index/never-reads-a-foreign-hosts-keyword-artifacts-as-the-local-index
+	// claim text: the extension reads only its own host's keyword artifacts; foreign keyword artifacts are never loaded as the local index
+	// scenario: a foreign host's BM25 and tool artifacts exist in the shared rounds dir — the local search sees none of their rows
 	it("never reads a foreign host's keyword artifacts as the local index", async () => {
 		writeRoundFile("b.json", "The round carries the basaltcrane marker", "host B answered with basaltcrane");
 
@@ -150,6 +156,9 @@ describe("two-host keyword artifacts (issue #152)", () => {
 		expect(fs.readFileSync(ownTools(HOST_A)).equals(toolsABefore)).toBe(true);
 	});
 
+	// claim: issue-152/interrupted-keyword-rewrite-preserves-previous-artifact/an-interrupted-rewrite-leaves-the-previous-artifact-byte-identical
+	// claim text: a keyword artifact rewrite interrupted mid-write leaves the previous artifact byte-identical
+	// scenario: a rewrite crashes between stage and rename — the on-disk artifact is byte-identical to the pre-write state
 	it("an interrupted rewrite leaves the previous artifact byte-identical and the next run rebuilds it", async () => {
 		writeRoundFile("b.json", "The round carries the basaltcrane marker", "host B answered with basaltcrane", [
 			TOOL_CALL_B,

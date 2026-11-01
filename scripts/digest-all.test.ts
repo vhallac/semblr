@@ -1840,7 +1840,9 @@ describe("digest-all script", () => {
 		};
 	}
 
-	// claim: issue-152/digest-all-seeds-bm25-from-legacy/keeps legacy rows across flush
+	// claim: issue-152/scripts-route-keyword-io-to-own-artifacts/seeds-the-bm25-index-from-the-legacy-artifact-before-the-flush
+	// claim text: digest-all loads the legacy BM25 content before upserts when the own artifact is missing, so the flushed artifact keeps every legacy row
+	// scenario: a legacy-only BM25 artifact with a row for a round not processed this run — after digest-all, the own artifact still contains that row
 	it("seeds the bm25 index from the legacy artifact before the flush", async () => {
 		const root = tmpDir();
 		const sessionsDir = tmpDir(); // no session files: force the rounds-dir sweep

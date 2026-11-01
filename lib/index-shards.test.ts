@@ -26,6 +26,9 @@ describe("isIndexShardFilename", () => {
 		expect(isIndexShardFilename("index.csv.bak.20260101")).toBe(false);
 	});
 
+	// claim: issue-152/discovery-excludes-per-host-keyword-artifacts/excludes-per-host-keyword-artifacts
+	// claim text: shard discovery excludes the per-host keyword artifacts (BM25 and tool index) so they are never read as vector shards
+	// scenario: a rounds dir containing index.bm25.<hostId>.json and index-tools.<hostId>.fulltext.csv — discovery returns only vector shards
 	it("excludes per-host keyword artifacts (issue #152)", () => {
 		expect(isIndexShardFilename("index.bm25.cowork.json")).toBe(false);
 		expect(isIndexShardFilename("index.bm25.my-host.name.json")).toBe(false);

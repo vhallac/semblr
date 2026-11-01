@@ -161,7 +161,9 @@ describe("appendToolIndexRows", () => {
 		expect(fs.existsSync(indexPath)).toBe(false);
 	});
 
-	// claim: issue-152/append-adopts-legacy-tool-index/first append adopts by rename
+	// claim: issue-152/legacy-keyword-adoption-rename-first-write/adopts-the-legacy-artifact-on-the-first-append-to-a-hosts-own-path
+	// claim text: the tool-index append path adopts the legacy artifact by rename on the first write (same clobber guard and lost-race semantics as the rewrite path)
+	// scenario: a store with only index-tools.fulltext.csv — the first runtime append renames it onto the own path and keeps the legacy rows
 	it("adopts the legacy artifact on the first append to a host's own path", () => {
 		const dir = tmpDir();
 		const legacyPath = path.join(dir, "index-tools.fulltext.csv");

@@ -57,6 +57,9 @@ describe("bm25 index", () => {
 		expect(scores.get("exact.json")).toBeGreaterThan(scores.get("conceptual.json") ?? 0);
 	});
 
+	// claim: issue-152/keyword-artifact-formats-unchanged/upserts-round-text-and-persists-a-loadable-sidecar-index
+	// claim text: the keyword artifact on-disk formats are unchanged from the pre-152 single-file formats
+	// scenario: an artifact written by the per-host code path loads with the unchanged pre-152 loader and yields the same rows
 	it("upserts round text and persists a loadable sidecar index", () => {
 		const roundsDir = tmpDir();
 		const indexPath = bm25IndexPathForRoundsDir(roundsDir);
@@ -185,6 +188,9 @@ describe("per-host BM25 artifacts (issue #152, decision 024)", () => {
 		expect(ownBm25IndexPath("/rounds", "laptop-x")).toBe(path.join("/rounds", "index.bm25.laptop-x.json"));
 	});
 
+	// claim: issue-152/legacy-keyword-adoption-rename-first-write/adopts-the-legacy-artifact-by-rename-on-the-first-write-bm25
+	// claim text: the first write to a host's own keyword artifact adopts the legacy artifact by rename (decision 024)
+	// scenario: a store with only index.bm25.json — the first own-path write renames it and the legacy rows survive
 	it("adopts the legacy artifact by rename on the first write to a host's own path", () => {
 		const roundsDir = tmpDir();
 		const legacyPath = path.join(roundsDir, "index.bm25.json");
@@ -200,6 +206,9 @@ describe("per-host BM25 artifacts (issue #152, decision 024)", () => {
 		expect(loadBm25Index(ownPath).documents["a.json"]).toBeDefined();
 	});
 
+	// claim: issue-152/legacy-keyword-adoption-rename-first-write/leaves-the-legacy-artifact-untouched-when-the-own-artifact-already-exists
+	// claim text: the clobber guard — a host that owns its artifact never renames a legacy artifact over it
+	// scenario: both legacy and own artifacts exist — a write updates only the own artifact and leaves the legacy file untouched
 	it("leaves the legacy artifact untouched when the own artifact already exists (clobber guard)", () => {
 		const roundsDir = tmpDir();
 		const legacyPath = path.join(roundsDir, "index.bm25.json");
@@ -216,6 +225,9 @@ describe("per-host BM25 artifacts (issue #152, decision 024)", () => {
 		expect(fs.readFileSync(legacyPath, "utf-8")).toBe(legacyBytes);
 	});
 
+	// claim: issue-152/legacy-keyword-adoption-rename-first-write/swallows-a-lost-adoption-race-and-still-writes-its-own-artifact
+	// claim text: a lost adoption race (legacy claimed by another host between check and rename) is swallowed; the host still writes its own artifact
+	// scenario: the legacy artifact disappears between the exists check and the rename — the write proceeds without error
 	it("swallows a lost adoption race and still writes its own artifact", () => {
 		const roundsDir = tmpDir();
 		const legacyPath = path.join(roundsDir, "index.bm25.json");

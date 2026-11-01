@@ -348,7 +348,9 @@ describe("digest-session script", () => {
 		expect(fs.readdirSync(roundsDir).filter((f) => f.includes(".tmp.") || f.includes(".lock"))).toEqual([]);
 	}, 60_000);
 
-	// claim: issue-152/digest-session-bm25-own-path/limits bm25 io to the host's own artifact
+	// claim: issue-152/scripts-route-keyword-io-to-own-artifacts/routes-bm25-reads-and-writes-to-the-own-artifact-never-the-legacy-path
+	// claim text: digest-session reads and writes BM25 only at the host's own artifact and never creates or writes index.bm25.json
+	// scenario: digest-session ingests a session on a store without an own BM25 artifact — the legacy path is absent afterwards and the own path holds the rows
 	it("routes bm25 reads and writes to the own artifact, never the legacy path", async () => {
 		const root = tmpDir();
 		const sessionFile = path.join(root, "session.jsonl");
