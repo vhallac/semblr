@@ -4,6 +4,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { computeContentHash } from "../lib/hash.ts";
+import { loadBm25Index, ownBm25IndexPath } from "../lib/bm25-index.ts";
 import { encodeVectorIndexLine, loadVectorIndex, readIndexLines } from "../lib/index-io.ts";
 import { ownShardPath } from "../lib/index-shards.ts";
 import { hashEmbeddingInput } from "../lib/round-capture.ts";
@@ -346,6 +347,33 @@ describe("digest-session script", () => {
 		expect(rows.some((row) => row.includes("live.json:prompt"))).toBe(true);
 		expect(fs.readdirSync(roundsDir).filter((f) => f.includes(".tmp.") || f.includes(".lock"))).toEqual([]);
 	}, 60_000);
+
+	// claim: issue-152/digest-session-bm25-own-path/limits bm25 io to the host's own artifact
+	it("routes bm25 reads and writes to the own artifact, never the legacy path", async () => {
+		const root = tmpDir();
+		const sessionFile = path.join(root, "session.jsonl");
+		const roundsDir = path.join(root, "rounds");
+		const userPrompt = "bm25 routing";
+		const responseSequence = "bm25 response";
+		writeSession(sessionFile, userPrompt, responseSequence);
+		const logs = logger();
+		const fetchImpl = embeddingFetch([
+			[1, 0],
+			[0, 1],
+		]);
+
+		await expect(
+			runDigestSession({ sessionFile, roundsDir, apiKey: "key", fetchImpl, stdout: logs.out, stderr: logs.err }),
+		).resolves.toBe(0);
+
+		const legacyPath = path.join(roundsDir, "index.bm25.json");
+		expect(fs.existsSync(legacyPath)).toBe(false);
+		const ownPath = ownBm25IndexPath(roundsDir, os.hostname());
+		expect(fs.existsSync(ownPath)).toBe(true);
+		const roundFile = `${computeContentHash(userPrompt, responseSequence, [])}.json`;
+		const index = loadBm25Index(ownPath);
+		expect(Object.keys(index.documents)).toContain(roundFile);
+	});
 
 	it("leaves round files byte-identical when the atomic write fails", async () => {
 		const root = tmpDir();

@@ -16,9 +16,9 @@ import * as path from "node:path";
 import { pathToFileURL } from "node:url";
 import { type AtomicWriteFs, atomicWriteFileSync } from "../lib/atomic-write.ts";
 import {
-	bm25IndexPathForRoundsDir,
 	deleteBm25Round,
 	loadBm25Index,
+	ownBm25IndexPath,
 	roundTextForBm25,
 	upsertBm25Round,
 	writeBm25Index,
@@ -100,7 +100,7 @@ export async function runDigestSession(options: DigestSessionOptions = {}): Prom
 		fsImpl: options.indexFsImpl,
 		script: "digest-session",
 	});
-	const bm25IndexPath = bm25IndexPathForRoundsDir(roundsDir);
+	const bm25IndexPath = ownBm25IndexPath(roundsDir, config.hostId);
 	const modelRegistry = resolveScriptModelRegistry(config, options);
 	const embeddingConfig = scriptEmbeddingConfig(config);
 	const out = options.stdout ?? console;
