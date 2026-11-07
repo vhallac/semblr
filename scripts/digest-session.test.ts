@@ -377,6 +377,45 @@ describe("digest-session script", () => {
 		expect(Object.keys(index.documents)).toContain(roundFile);
 	});
 
+	// claim: issue-152/scripts-seed-bm25-from-legacy-in-digest-session/legacy-rows-outside-the-session-survive-the-adopt-on-flush
+	// claim text: on a legacy-only store, digest-session's flushed own BM25 artifact is a superset of the legacy rows — rows for rounds not in the session survive
+	// scenario: a legacy index.bm25.json holds a foreign round row; digest-session ingests a different session — the foreign row exists in the own artifact afterwards and the legacy path is gone
+	it("seeds bm25 from the legacy artifact so foreign rows survive the flush", async () => {
+		const root = tmpDir();
+		const sessionFile = path.join(root, "session.jsonl");
+		const roundsDir = path.join(root, "rounds");
+		fs.mkdirSync(roundsDir, { recursive: true });
+		const foreignRoundFile = "foreign-round.json";
+		fs.writeFileSync(
+			path.join(roundsDir, "index.bm25.json"),
+			JSON.stringify({
+				version: 1,
+				documentCount: 1,
+				averageDocumentLength: 3,
+				documents: {
+					[foreignRoundFile]: { length: 3, termFrequencies: { foreign: 3 } },
+				},
+			}),
+		);
+		writeSession(sessionFile, "bm25 seed legacy", "bm25 seed response");
+		const logs = logger();
+		const fetchImpl = embeddingFetch([
+			[1, 0],
+			[0, 1],
+		]);
+
+		await expect(
+			runDigestSession({ sessionFile, roundsDir, apiKey: "key", fetchImpl, stdout: logs.out, stderr: logs.err }),
+		).resolves.toBe(0);
+
+		expect(fs.existsSync(path.join(roundsDir, "index.bm25.json"))).toBe(false);
+		const ownPath = ownBm25IndexPath(roundsDir, os.hostname());
+		const index = loadBm25Index(ownPath);
+		expect(Object.keys(index.documents)).toContain(foreignRoundFile);
+		const roundFile = `${computeContentHash("bm25 seed legacy", "bm25 seed response", [])}.json`;
+		expect(Object.keys(index.documents)).toContain(roundFile);
+	});
+
 	it("leaves round files byte-identical when the atomic write fails", async () => {
 		const root = tmpDir();
 		const sessionFile = path.join(root, "session.jsonl");
