@@ -154,8 +154,13 @@ describe("pruneRecoveryDuplicates shard awareness (#149)", () => {
 		);
 		const ownShard = path.join(dir, "index.host-a");
 		fs.writeFileSync(ownShard, `${[row("live.json"), row("dup.json")].join("\n")}\n`);
-		const toolIndex = path.join(dir, "index-tools.fulltext.csv");
+		const toolIndex = path.join(dir, "index-tools.host-a.fulltext.csv");
 		fs.writeFileSync(toolIndex, "live.json,abc,0,bash\ndup.json,def,0,bash\n");
+		// A legacy artifact (adoption is a full-rebuild concern, not the prune's
+		// filtered rewrite) is never read or written here.
+		const legacyToolIndex = path.join(dir, "index-tools.fulltext.csv");
+		fs.writeFileSync(legacyToolIndex, "legacy.json,ghi,0,bash\n");
+		const legacyBefore = fs.readFileSync(legacyToolIndex, "utf-8");
 		const inodeBefore = fs.statSync(toolIndex).ino;
 
 		await pruneRecoveryDuplicates({
@@ -175,6 +180,9 @@ describe("pruneRecoveryDuplicates shard awareness (#149)", () => {
 		expect(fs.statSync(toolIndex).ino).not.toBe(inodeBefore);
 		// No temp artifact is left behind.
 		expect(fs.readdirSync(dir).filter((name) => name.includes(".tmp."))).toEqual([]);
+		// The legacy artifact stays byte-identical: the prune only touches the
+		// host's own artifact (issue #152).
+		expect(fs.readFileSync(legacyToolIndex, "utf-8")).toBe(legacyBefore);
 	});
 
 	it("prunes only the duplicates this host owns and cleans its own shard", async () => {

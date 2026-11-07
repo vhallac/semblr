@@ -26,6 +26,23 @@ describe("isIndexShardFilename", () => {
 		expect(isIndexShardFilename("index.csv.bak.20260101")).toBe(false);
 	});
 
+	// claim: issue-152/discovery-excludes-per-host-keyword-artifacts/excludes-per-host-keyword-artifacts
+	// claim text: shard discovery excludes the per-host keyword artifacts (BM25 and tool index) so they are never read as vector shards
+	// scenario: a rounds dir containing index.bm25.<hostId>.json and index-tools.<hostId>.fulltext.csv — discovery returns only vector shards
+	it("excludes per-host keyword artifacts (issue #152)", () => {
+		expect(isIndexShardFilename("index.bm25.cowork.json")).toBe(false);
+		expect(isIndexShardFilename("index.bm25.my-host.name.json")).toBe(false);
+		expect(isIndexShardFilename("index-tools.cowork.fulltext.csv")).toBe(false);
+		expect(isIndexShardFilename("index-tools.my-host.name.fulltext.csv")).toBe(false);
+	});
+
+	it("excludes per-host keyword artifact backups, temps, and locks (issue #152)", () => {
+		expect(isIndexShardFilename("index.bm25.cowork.json.bak.20260101")).toBe(false);
+		expect(isIndexShardFilename("index.bm25.cowork.json.tmp.1234")).toBe(false);
+		expect(isIndexShardFilename("index.bm25.cowork.json.lock")).toBe(false);
+		expect(isIndexShardFilename("index-tools.cowork.fulltext.csv.bak.20260101")).toBe(false);
+	});
+
 	it("excludes lockfiles and atomic-write temps", () => {
 		expect(isIndexShardFilename("index.cowork.lock")).toBe(false);
 		expect(isIndexShardFilename("index.csv.lock")).toBe(false);
@@ -86,6 +103,10 @@ describe("discoverIndexShards", () => {
 			"index-tools.fulltext.csv",
 			"index.bm25.json",
 			"index.csv.bak.x",
+			// Foreign hosts' per-host keyword artifacts (issue #152) never join
+			// the vector shard set.
+			"index.bm25.host-b.json",
+			"index-tools.host-b.fulltext.csv",
 		]) {
 			fs.writeFileSync(path.join(tempDir, name), "");
 		}

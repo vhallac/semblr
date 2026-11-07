@@ -28,14 +28,14 @@ digest-session path:
     SEMBLR_ROUNDS_DIR="{{SEMBLR_ROUNDS_DIR}}" \
         npx tsx scripts/digest-session.ts {{path}}
 
-# Rebuild the tool-call fulltext index (index-tools.fulltext.csv) from existing
-# round files, without re-embedding. Safe to re-run.
+# Rebuild the tool-call fulltext index (index-tools.<hostId>.fulltext.csv, per
+# host) from existing round files, without re-embedding. Safe to re-run.
 index-tools:
     SEMBLR_ROUNDS_DIR="{{SEMBLR_ROUNDS_DIR}}" \
         npx tsx scripts/digest-all.ts --tools-only
 
-# Rebuild the BM25 keyword index (index.bm25.json) from existing round files,
-# without re-embedding. Safe to re-run.
+# Rebuild the BM25 keyword index (index.bm25.<hostId>.json, per host) from
+# existing round files, without re-embedding. Safe to re-run.
 rebuild-bm25:
     SEMBLR_ROUNDS_DIR="{{SEMBLR_ROUNDS_DIR}}" \
         npx tsx scripts/rebuild-bm25.ts

@@ -19,7 +19,10 @@ export interface RecoveryIndexDepsOptions {
 	 */
 	loadBm25Index: () => Bm25Index;
 	/** Storage seam for tests (defaults to node:fs). */
-	fsImpl?: Pick<typeof fs, "existsSync" | "mkdirSync" | "readFileSync" | "readdirSync" | "writeFileSync">;
+	fsImpl?: Pick<
+		typeof fs,
+		"existsSync" | "mkdirSync" | "readFileSync" | "readdirSync" | "writeFileSync" | "renameSync"
+	>;
 }
 
 /**

@@ -33,7 +33,7 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { pathToFileURL } from "node:url";
-import { bm25IndexPathForRoundsDir, buildBm25Index, roundTextForBm25, writeBm25Index } from "../lib/bm25-index.ts";
+import { buildBm25Index, ownBm25IndexPath, roundTextForBm25, writeBm25Index } from "../lib/bm25-index.ts";
 // Shared duplicate key lives in lib/hash.ts so the backfill existence check
 // uses the exact same canonicalization as this prune script.
 import { canonicalDuplicateKey } from "../lib/hash.ts";
@@ -44,7 +44,7 @@ import {
 	resolveScriptIndexContext,
 	type ScriptConfigOptions,
 } from "../lib/script-config.ts";
-import { toolIndexPathForRoundsDir } from "../lib/search-tools.ts";
+import { ownToolIndexPath } from "../lib/search-tools.ts";
 
 export { canonicalDuplicateKey };
 
@@ -123,6 +123,10 @@ export async function pruneRecoveryDuplicates(options: PruneOptions = {}): Promi
 
 	const config = resolveScriptConfig(options);
 	const roundsDir = options.roundsDir ?? config.roundsDir;
+	// Issue #152: the keyword artifacts are the host's own
+	// (`index.bm25.<hostId>.json`, `index-tools.<hostId>.fulltext.csv`); the BM25
+	// rewrite adopts a legacy `index.bm25.json` by rename (decision 024).
+	const hostId = options.hostname ?? config.hostId;
 	// Issue #149: the index is a set of per-host shards (`index.<host>`). This
 	// host cleans its own shard only (D-005) — a foreign shard keeps its rows
 	// and is updated when that host runs this script.
@@ -196,7 +200,7 @@ export async function pruneRecoveryDuplicates(options: PruneOptions = {}): Promi
 	}
 
 	// The tools fulltext index stays a single artifact (never a shard).
-	const toolIndexPath = toolIndexPathForRoundsDir(roundsDir);
+	const toolIndexPath = ownToolIndexPath(roundsDir, hostId);
 	if (fs.existsSync(toolIndexPath)) {
 		const lines = readIndexLines(toolIndexPath);
 		const kept = lines.filter((line) => !allPrunes.has(line.slice(0, line.indexOf(","))));
@@ -206,7 +210,7 @@ export async function pruneRecoveryDuplicates(options: PruneOptions = {}): Promi
 		}
 	}
 
-	const bm25Path = bm25IndexPathForRoundsDir(roundsDir);
+	const bm25Path = ownBm25IndexPath(roundsDir, hostId);
 	const documents = fs
 		.readdirSync(roundsDir)
 		.filter((f) => f.endsWith(".json") && !f.startsWith("index"))

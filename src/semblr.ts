@@ -16,9 +16,9 @@ import type { ContextEvent, ExtensionAPI, ExtensionContext } from "@earendil-wor
 import { Type } from "@sinclair/typebox";
 import { defaultAgentEndPersistFs, persistAgentEndRound, type WriteGapGate } from "../lib/agent-end-persist.ts";
 import {
-	bm25IndexPathForRoundsDir,
 	loadOrRebuildBm25Index,
 	normalizeBm25Scores,
+	ownBm25IndexPath,
 	roundTextForBm25,
 	scoreBm25Query,
 	upsertBm25Round,
@@ -91,8 +91,8 @@ import {
 	appendToolIndexRows,
 	buildToolIndexRows,
 	loadToolIndex,
+	ownToolIndexPath,
 	searchToolIndex,
-	toolIndexPathForRoundsDir,
 } from "../lib/search-tools.ts";
 import { loadSemblrConfig, type SemblrConfig } from "../lib/semblr-config.ts";
 import {
@@ -201,8 +201,10 @@ export {
 const SEMBLR_CONFIG = loadSemblrConfig();
 const ROUNDS_DIR = SEMBLR_CONFIG.roundsDir;
 const INDEX_PATH = SEMBLR_CONFIG.indexPath;
-const BM25_INDEX_PATH = bm25IndexPathForRoundsDir(ROUNDS_DIR);
-const TOOLS_INDEX_PATH = toolIndexPathForRoundsDir(ROUNDS_DIR);
+// Issue #152: the extension reads and writes only its own keyword artifacts.
+// The legacy paths are adopted by rename on first write (decision 024).
+const BM25_INDEX_PATH = ownBm25IndexPath(ROUNDS_DIR, SEMBLR_CONFIG.hostId);
+const TOOLS_INDEX_PATH = ownToolIndexPath(ROUNDS_DIR, SEMBLR_CONFIG.hostId);
 const SEMBLR_DIR = path.dirname(ROUNDS_DIR);
 const STATS_PATH = path.join(SEMBLR_DIR, "chain-read-stats.json");
 const EMBEDDING_RESPONSE_MAX_BYTES = embeddingMaxTokensToResponseBytes(SEMBLR_CONFIG.embeddingMaxTokens);

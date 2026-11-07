@@ -16,9 +16,10 @@ import * as path from "node:path";
 import { pathToFileURL } from "node:url";
 import { type AtomicWriteFs, atomicWriteFileSync } from "../lib/atomic-write.ts";
 import {
-	bm25IndexPathForRoundsDir,
 	deleteBm25Round,
+	LEGACY_BM25_FILENAME,
 	loadBm25Index,
+	ownBm25IndexPath,
 	roundTextForBm25,
 	upsertBm25Round,
 	writeBm25Index,
@@ -100,7 +101,8 @@ export async function runDigestSession(options: DigestSessionOptions = {}): Prom
 		fsImpl: options.indexFsImpl,
 		script: "digest-session",
 	});
-	const bm25IndexPath = bm25IndexPathForRoundsDir(roundsDir);
+	const bm25IndexPath = ownBm25IndexPath(roundsDir, config.hostId);
+	const bm25LegacyPath = path.join(roundsDir, LEGACY_BM25_FILENAME);
 	const modelRegistry = resolveScriptModelRegistry(config, options);
 	const embeddingConfig = scriptEmbeddingConfig(config);
 	const out = options.stdout ?? console;
@@ -109,6 +111,16 @@ export async function runDigestSession(options: DigestSessionOptions = {}): Prom
 	if (!sessionFile) {
 		err.error("Usage: npx tsx scripts/digest-session.ts <session-file>");
 		return 1;
+	}
+
+	// Issue #152 F1: hoist the BM25 load above the round loop and seed-from-legacy
+	// when the host has no own BM25 artifact yet but a legacy `index.bm25.json`
+	// exists — the flushed artifact is then a superset of the legacy content, so
+	// the adopt-on-flush rename keeps every legacy row even when this session
+	// does not contain them.
+	let bm25Index = loadBm25Index(bm25IndexPath);
+	if (!fs.existsSync(bm25IndexPath) && fs.existsSync(bm25LegacyPath)) {
+		bm25Index = loadBm25Index(bm25LegacyPath);
 	}
 
 	out.log(`📂 Session: ${sessionFile}`);
@@ -149,7 +161,6 @@ export async function runDigestSession(options: DigestSessionOptions = {}): Prom
 		// Atomic (decision-015): tmp write + rename, so a failure leaves the
 		// existing round file byte-identical.
 		atomicWriteFileSync(path.resolve(roundsDir, roundFile), JSON.stringify(round, null, 2), options.fsImpl);
-		const bm25Index = loadBm25Index(bm25IndexPath);
 		upsertBm25Round(bm25Index, roundFile, roundTextForBm25(round));
 		for (const staleFile of removableStaleFiles) {
 			deleteBm25Round(bm25Index, staleFile);

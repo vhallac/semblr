@@ -8,20 +8,28 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { pathToFileURL } from "node:url";
-import { bm25IndexPathForRoundsDir, buildBm25Index, roundTextForBm25, writeBm25Index } from "../lib/bm25-index.ts";
+import { buildBm25Index, ownBm25IndexPath, roundTextForBm25, writeBm25Index } from "../lib/bm25-index.ts";
 import { resolveScriptConfig, type ScriptConfigOptions } from "../lib/script-config.ts";
 
 export interface RebuildBm25Options extends ScriptConfigOptions {
 	roundsDir?: string;
+	/** Host id override for tests; defaults to the configured host id (`config.hostId`). */
+	hostname?: string;
 	stdout?: Pick<typeof console, "log">;
 	stderr?: Pick<typeof console, "error">;
-	fsImpl?: Pick<typeof fs, "existsSync" | "mkdirSync" | "readFileSync" | "readdirSync" | "writeFileSync">;
+	fsImpl?: Pick<
+		typeof fs,
+		"existsSync" | "mkdirSync" | "readFileSync" | "readdirSync" | "writeFileSync" | "renameSync"
+	>;
 }
 
 export async function runRebuildBm25(options: RebuildBm25Options = {}): Promise<number> {
 	const config = resolveScriptConfig(options);
 	const roundsDir = options.roundsDir ?? config.roundsDir;
-	const bm25IndexPath = bm25IndexPathForRoundsDir(roundsDir);
+	// Issue #152: the BM25 artifact is the host's own (`index.bm25.<hostId>.json`);
+	// a legacy `index.bm25.json` is adopted by rename on this write (decision 024).
+	const hostId = options.hostname ?? config.hostId;
+	const bm25IndexPath = ownBm25IndexPath(roundsDir, hostId);
 	const out = options.stdout ?? console;
 	const err = options.stderr ?? console;
 	const f = options.fsImpl ?? fs;

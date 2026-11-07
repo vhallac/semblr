@@ -11,6 +11,7 @@ import {
 	encodeToolIndexRow,
 	loadToolIndex,
 	loadToolIndexedRoundFiles,
+	ownToolIndexPath,
 	parseToolIndexLine,
 	searchToolIndex,
 	type ToolIndexRow,
@@ -158,6 +159,153 @@ describe("appendToolIndexRows", () => {
 		const indexPath = path.join(dir, "index-tools.fulltext.csv");
 		appendToolIndexRows(indexPath, dir, []);
 		expect(fs.existsSync(indexPath)).toBe(false);
+	});
+
+	// claim: issue-152/legacy-keyword-adoption-rename-first-write/adopts-the-legacy-artifact-on-the-first-append-to-a-hosts-own-path
+	// claim text: the tool-index append path adopts the legacy artifact by rename on the first write (same clobber guard and lost-race semantics as the rewrite path)
+	// scenario: a store with only index-tools.fulltext.csv — the first runtime append renames it onto the own path and keeps the legacy rows
+	it("adopts the legacy artifact on the first append to a host's own path", () => {
+		const dir = tmpDir();
+		const legacyPath = path.join(dir, "index-tools.fulltext.csv");
+		const ownPath = ownToolIndexPath(dir, "host-a");
+		fs.mkdirSync(dir, { recursive: true });
+		fs.writeFileSync(legacyPath, "legacy.json,0,bash,legacy text\n");
+
+		appendToolIndexRows(ownPath, dir, [
+			{ hash: "new.json", toolIndex: 0, toolName: "read", searchableText: "appended row" },
+		]);
+
+		// The legacy file is gone — renamed onto the own path, and the appended
+		// row lands beside the legacy rows (no full rewrite needed).
+		expect(fs.existsSync(legacyPath)).toBe(false);
+		expect(loadToolIndex(ownPath)).toEqual([
+			{ hash: "legacy.json", toolIndex: 0, toolName: "bash", searchableText: "legacy text" },
+			{ hash: "new.json", toolIndex: 0, toolName: "read", searchableText: "appended row" },
+		]);
+	});
+});
+
+describe("per-host tool index artifacts (issue #152, decision 024)", () => {
+	it("ownToolIndexPath places the artifact beside the shards", () => {
+		expect(ownToolIndexPath("/rounds", "laptop-x")).toBe(path.join("/rounds", "index-tools.laptop-x.fulltext.csv"));
+	});
+
+	it("adopts the legacy artifact by rename on the first write to a host's own path", () => {
+		const dir = tmpDir();
+		const legacyPath = path.join(dir, "index-tools.fulltext.csv");
+		const ownPath = ownToolIndexPath(dir, "host-a");
+		fs.mkdirSync(dir, { recursive: true });
+		fs.writeFileSync(legacyPath, "legacy.json,0,bash,legacy text\n");
+
+		writeToolIndexRows(ownPath, [{ hash: "a.json", toolIndex: 0, toolName: "bash", searchableText: "fresh text" }]);
+
+		// The legacy file is gone — renamed onto the own path and immediately
+		// replaced by the rewrite built from locally visible rounds.
+		expect(fs.existsSync(legacyPath)).toBe(false);
+		expect(loadToolIndex(ownPath)).toEqual([
+			{ hash: "a.json", toolIndex: 0, toolName: "bash", searchableText: "fresh text" },
+		]);
+	});
+
+	it("leaves the legacy artifact untouched when the own artifact already exists (clobber guard)", () => {
+		const dir = tmpDir();
+		const legacyPath = path.join(dir, "index-tools.fulltext.csv");
+		const ownPath = ownToolIndexPath(dir, "host-a");
+		fs.mkdirSync(dir, { recursive: true });
+		writeToolIndexRows(ownPath, [
+			{ hash: "a.json", toolIndex: 0, toolName: "bash", searchableText: "host artifact" },
+		]);
+		const legacyBytes = "legacy.json,0,bash,legacy text\n";
+		fs.writeFileSync(legacyPath, legacyBytes);
+
+		writeToolIndexRows(ownPath, [
+			{ hash: "b.json", toolIndex: 0, toolName: "bash", searchableText: "another rewrite" },
+		]);
+
+		// Renaming would clobber the host's own artifact (POSIX rename
+		// overwrites) — the orphan legacy file stays on disk untouched.
+		expect(fs.readFileSync(legacyPath, "utf-8")).toBe(legacyBytes);
+	});
+
+	it("swallows a lost adoption race and still writes its own artifact", () => {
+		const dir = tmpDir();
+		const legacyPath = path.join(dir, "index-tools.fulltext.csv");
+		const ownPath = ownToolIndexPath(dir, "host-a");
+		fs.mkdirSync(dir, { recursive: true });
+		fs.writeFileSync(legacyPath, "legacy.json,0,bash,legacy text\n");
+		const fsImpl: Pick<typeof fs, "existsSync" | "mkdirSync" | "writeFileSync" | "renameSync"> = {
+			existsSync: fs.existsSync,
+			mkdirSync: fs.mkdirSync,
+			writeFileSync: fs.writeFileSync,
+			renameSync: (from, to) => {
+				if (String(from) === legacyPath) throw new Error("claimed by another host");
+				return fs.renameSync(from, to);
+			},
+		};
+
+		writeToolIndexRows(ownPath, [{ hash: "a.json", toolIndex: 0, toolName: "bash", searchableText: "text" }], fsImpl);
+
+		// The lost legacy claim does not block the rewrite.
+		expect(loadToolIndex(ownPath)).toEqual([
+			{ hash: "a.json", toolIndex: 0, toolName: "bash", searchableText: "text" },
+		]);
+	});
+
+	it("writes the artifact atomically: staged tmp write, rename publish, never in-place (decision 015)", () => {
+		const dir = tmpDir();
+		const indexPath = ownToolIndexPath(dir, "host-a");
+		const writes: string[] = [];
+		const renames: Array<[string, string]> = [];
+		const fsImpl: Pick<typeof fs, "existsSync" | "mkdirSync" | "writeFileSync" | "renameSync"> = {
+			existsSync: fs.existsSync,
+			mkdirSync: fs.mkdirSync,
+			writeFileSync: (p, data) => {
+				writes.push(String(p));
+				fs.writeFileSync(p, data);
+			},
+			renameSync: (from, to) => {
+				renames.push([String(from), String(to)]);
+				fs.renameSync(from, to);
+			},
+		};
+
+		writeToolIndexRows(
+			indexPath,
+			[{ hash: "a.json", toolIndex: 0, toolName: "bash", searchableText: "text" }],
+			fsImpl,
+		);
+
+		const tmpPath = `${indexPath}.tmp.${process.pid}`;
+		expect(writes).toEqual([tmpPath]);
+		expect(renames).toEqual([[tmpPath, indexPath]]);
+		expect(fs.existsSync(tmpPath)).toBe(false);
+	});
+
+	it("writes the legacy path directly without attempting adoption", () => {
+		const dir = tmpDir();
+		const legacyPath = toolIndexPathForRoundsDir(dir);
+		const renames: Array<[string, string]> = [];
+		const fsImpl: Pick<typeof fs, "existsSync" | "mkdirSync" | "writeFileSync" | "renameSync"> = {
+			existsSync: fs.existsSync,
+			mkdirSync: fs.mkdirSync,
+			writeFileSync: fs.writeFileSync,
+			renameSync: (from, to) => {
+				renames.push([String(from), String(to)]);
+				return fs.renameSync(from, to);
+			},
+		};
+
+		writeToolIndexRows(
+			legacyPath,
+			[{ hash: "a.json", toolIndex: 0, toolName: "bash", searchableText: "text" }],
+			fsImpl,
+		);
+
+		// Only the atomic-publish rename runs — no legacy adoption rename.
+		expect(renames).toEqual([[`${legacyPath}.tmp.${process.pid}`, legacyPath]]);
+		expect(loadToolIndex(legacyPath)).toEqual([
+			{ hash: "a.json", toolIndex: 0, toolName: "bash", searchableText: "text" },
+		]);
 	});
 });
 

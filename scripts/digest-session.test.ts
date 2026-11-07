@@ -3,6 +3,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { loadBm25Index, ownBm25IndexPath } from "../lib/bm25-index.ts";
 import { computeContentHash } from "../lib/hash.ts";
 import { encodeVectorIndexLine, loadVectorIndex, readIndexLines } from "../lib/index-io.ts";
 import { ownShardPath } from "../lib/index-shards.ts";
@@ -346,6 +347,74 @@ describe("digest-session script", () => {
 		expect(rows.some((row) => row.includes("live.json:prompt"))).toBe(true);
 		expect(fs.readdirSync(roundsDir).filter((f) => f.includes(".tmp.") || f.includes(".lock"))).toEqual([]);
 	}, 60_000);
+
+	// claim: issue-152/scripts-route-keyword-io-to-own-artifacts/routes-bm25-reads-and-writes-to-the-own-artifact-never-the-legacy-path
+	// claim text: digest-session reads and writes BM25 only at the host's own artifact and never creates or writes index.bm25.json
+	// scenario: digest-session ingests a session on a store without an own BM25 artifact — the legacy path is absent afterwards and the own path holds the rows
+	it("routes bm25 reads and writes to the own artifact, never the legacy path", async () => {
+		const root = tmpDir();
+		const sessionFile = path.join(root, "session.jsonl");
+		const roundsDir = path.join(root, "rounds");
+		const userPrompt = "bm25 routing";
+		const responseSequence = "bm25 response";
+		writeSession(sessionFile, userPrompt, responseSequence);
+		const logs = logger();
+		const fetchImpl = embeddingFetch([
+			[1, 0],
+			[0, 1],
+		]);
+
+		await expect(
+			runDigestSession({ sessionFile, roundsDir, apiKey: "key", fetchImpl, stdout: logs.out, stderr: logs.err }),
+		).resolves.toBe(0);
+
+		const legacyPath = path.join(roundsDir, "index.bm25.json");
+		expect(fs.existsSync(legacyPath)).toBe(false);
+		const ownPath = ownBm25IndexPath(roundsDir, os.hostname());
+		expect(fs.existsSync(ownPath)).toBe(true);
+		const roundFile = `${computeContentHash(userPrompt, responseSequence, [])}.json`;
+		const index = loadBm25Index(ownPath);
+		expect(Object.keys(index.documents)).toContain(roundFile);
+	});
+
+	// claim: issue-152/scripts-seed-bm25-from-legacy-in-digest-session/legacy-rows-outside-the-session-survive-the-adopt-on-flush
+	// claim text: on a legacy-only store, digest-session's flushed own BM25 artifact is a superset of the legacy rows — rows for rounds not in the session survive
+	// scenario: a legacy index.bm25.json holds a foreign round row; digest-session ingests a different session — the foreign row exists in the own artifact afterwards and the legacy path is gone
+	it("seeds bm25 from the legacy artifact so foreign rows survive the flush", async () => {
+		const root = tmpDir();
+		const sessionFile = path.join(root, "session.jsonl");
+		const roundsDir = path.join(root, "rounds");
+		fs.mkdirSync(roundsDir, { recursive: true });
+		const foreignRoundFile = "foreign-round.json";
+		fs.writeFileSync(
+			path.join(roundsDir, "index.bm25.json"),
+			JSON.stringify({
+				version: 1,
+				documentCount: 1,
+				averageDocumentLength: 3,
+				documents: {
+					[foreignRoundFile]: { length: 3, termFrequencies: { foreign: 3 } },
+				},
+			}),
+		);
+		writeSession(sessionFile, "bm25 seed legacy", "bm25 seed response");
+		const logs = logger();
+		const fetchImpl = embeddingFetch([
+			[1, 0],
+			[0, 1],
+		]);
+
+		await expect(
+			runDigestSession({ sessionFile, roundsDir, apiKey: "key", fetchImpl, stdout: logs.out, stderr: logs.err }),
+		).resolves.toBe(0);
+
+		expect(fs.existsSync(path.join(roundsDir, "index.bm25.json"))).toBe(false);
+		const ownPath = ownBm25IndexPath(roundsDir, os.hostname());
+		const index = loadBm25Index(ownPath);
+		expect(Object.keys(index.documents)).toContain(foreignRoundFile);
+		const roundFile = `${computeContentHash("bm25 seed legacy", "bm25 seed response", [])}.json`;
+		expect(Object.keys(index.documents)).toContain(roundFile);
+	});
 
 	it("leaves round files byte-identical when the atomic write fails", async () => {
 		const root = tmpDir();

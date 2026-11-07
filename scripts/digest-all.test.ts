@@ -2,13 +2,13 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { bm25IndexPathForRoundsDir } from "../lib/bm25-index.ts";
+import { LEGACY_BM25_FILENAME, loadBm25Index, ownBm25IndexPath } from "../lib/bm25-index.ts";
 import { computeContentHash } from "../lib/hash.ts";
 import { encodeVectorIndexLine, loadVectorIndex, readIndexLines } from "../lib/index-io.ts";
 import { ownShardPath } from "../lib/index-shards.ts";
 import { appendLineWithLock } from "../lib/index-storage.ts";
 import { hashEmbeddingInput } from "../lib/round-capture.ts";
-import { loadToolIndex, toolIndexPathForRoundsDir } from "../lib/search-tools.ts";
+import { loadToolIndex, ownToolIndexPath } from "../lib/search-tools.ts";
 import { SEMBLR_CONFIG_DEFAULTS } from "../lib/semblr-config.ts";
 import { embedRecoveredRounds } from "../lib/session-backfill.ts";
 import { isMainModule, runDigestAll } from "./digest-all.ts";
@@ -1778,11 +1778,14 @@ describe("digest-all script", () => {
 		// Seed a valid bm25 sidecar so the run's single load actually reads it
 		// (loadBm25Index skips a missing file without a read).
 		fs.writeFileSync(
-			bm25IndexPathForRoundsDir(roundsDir),
+			ownBm25IndexPath(roundsDir, os.hostname()),
 			JSON.stringify({ version: 1, documentCount: 0, averageDocumentLength: 0, documents: {} }),
 		);
 		// Seed the tool index too, so its once-per-run load is exercised.
-		fs.writeFileSync(toolIndexPathForRoundsDir(roundsDir), "00000000000000000000000000000000,0,bash,placeholder\n");
+		fs.writeFileSync(
+			ownToolIndexPath(roundsDir, os.hostname()),
+			"00000000000000000000000000000000,0,bash,placeholder\n",
+		);
 
 		const vectors: number[][] = [];
 		for (let i = 0; i < roundCount; i++) {
@@ -1826,14 +1829,72 @@ describe("digest-all script", () => {
 		).resolves.toBe(0);
 
 		return {
-			bm25Writes: writes.filter((w) => w === bm25IndexPathForRoundsDir(roundsDir)).length,
+			// The flush stages to a tmp file and renames (decision 015): count the
+			// staged write of the bm25 artifact.
+			bm25Writes: writes.filter((w) => w.startsWith(`${ownBm25IndexPath(roundsDir, os.hostname())}.tmp.`)).length,
 			// One full-index load = one openSync; readSync fires per chunk, so it
 			// is not a load counter.
 			indexReads: opens.filter((r) => r === indexPath).length,
-			bm25Reads: reads.filter((r) => r === bm25IndexPathForRoundsDir(roundsDir)).length,
-			toolIndexReads: reads.filter((r) => r === toolIndexPathForRoundsDir(roundsDir)).length,
+			bm25Reads: reads.filter((r) => r === ownBm25IndexPath(roundsDir, os.hostname())).length,
+			toolIndexReads: reads.filter((r) => r === ownToolIndexPath(roundsDir, os.hostname())).length,
 		};
 	}
+
+	// claim: issue-152/scripts-route-keyword-io-to-own-artifacts/seeds-the-bm25-index-from-the-legacy-artifact-before-the-flush
+	// claim text: digest-all loads the legacy BM25 content before upserts when the own artifact is missing, so the flushed artifact keeps every legacy row
+	// scenario: a legacy-only BM25 artifact with a row for a round not processed this run — after digest-all, the own artifact still contains that row
+	it("seeds the bm25 index from the legacy artifact before the flush", async () => {
+		const root = tmpDir();
+		const sessionsDir = tmpDir(); // no session files: force the rounds-dir sweep
+		const roundsDir = path.join(root, "rounds");
+		fs.mkdirSync(roundsDir, { recursive: true });
+		const indexPath = ownShardPath(roundsDir);
+
+		// A round only present in the legacy BM25 artifact — its round file is
+		// gone from disk (e.g. swept/migrated elsewhere), so the sweep must not
+		// process it this run, but the flushed own artifact must keep its row.
+		const legacyRoundFile = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.json";
+		fs.writeFileSync(
+			path.join(roundsDir, LEGACY_BM25_FILENAME),
+			JSON.stringify({
+				version: 1,
+				documentCount: 1,
+				averageDocumentLength: 3,
+				documents: { [legacyRoundFile]: { length: 3, termFrequencies: { alpha: 2, beta: 1 } } },
+			}),
+		);
+
+		const userPrompt = "Fresh sweep round with a distinct prompt body.";
+		const responseSequence = "Fresh sweep round with a distinct response body.";
+		const roundFile = `${computeContentHash(userPrompt, responseSequence, [])}.json`;
+		fs.writeFileSync(
+			path.join(roundsDir, roundFile),
+			JSON.stringify({ userPrompt, responseSequence, toolCalls: [], recovered: true }),
+		);
+
+		await expect(
+			runDigestAll({
+				sessionsDir,
+				roundsDir,
+				indexPath,
+				apiKey: "key",
+				fetchImpl: embeddingFetch([
+					[1, 0],
+					[0, 1],
+					[1, 1],
+				]),
+				stdout: logger().out,
+				stderr: logger().err,
+			}),
+		).resolves.toBe(0);
+
+		// The legacy artifact was adopted (renamed away) and the flushed own
+		// artifact keeps every legacy row plus the new round's row.
+		expect(fs.existsSync(path.join(roundsDir, LEGACY_BM25_FILENAME))).toBe(false);
+		const ownIndex = loadBm25Index(ownBm25IndexPath(roundsDir, os.hostname()));
+		expect(Object.keys(ownIndex.documents)).toContain(legacyRoundFile);
+		expect(Object.keys(ownIndex.documents)).toContain(roundFile);
+	});
 
 	it("loads whole-store structures once per run, not once per round", async () => {
 		const small = await runSweepFixture(3);
@@ -2231,7 +2292,7 @@ describe("digest-all script", () => {
 				}),
 			).resolves.toBe(0);
 
-			const toolIndexPath = toolIndexPathForRoundsDir(roundsDir);
+			const toolIndexPath = ownToolIndexPath(roundsDir, os.hostname());
 			const rows = loadToolIndex(toolIndexPath);
 			expect(rows).toHaveLength(1);
 			expect(rows[0]).toMatchObject({ toolIndex: 0, toolName: "bash" });
@@ -2266,7 +2327,7 @@ describe("digest-all script", () => {
 				stdout: logger().out,
 			});
 
-			const toolIndexPath = toolIndexPathForRoundsDir(roundsDir);
+			const toolIndexPath = ownToolIndexPath(roundsDir, os.hostname());
 			expect(loadToolIndex(toolIndexPath)).toHaveLength(1);
 
 			// Force a model mismatch so the round is re-processed on the next run.
@@ -2313,7 +2374,7 @@ describe("digest-all script", () => {
 			).resolves.toBe(0);
 
 			expect(fetchImpl).not.toHaveBeenCalled();
-			const toolIndexPath = toolIndexPathForRoundsDir(roundsDir);
+			const toolIndexPath = ownToolIndexPath(roundsDir, os.hostname());
 			expect(loadToolIndex(toolIndexPath)).toEqual([
 				{ hash: "abc.json", toolIndex: 0, toolName: "bash", searchableText: "bash curl x" },
 			]);
