@@ -102,7 +102,7 @@ import {
 	embedRecoveredRounds,
 	indexRecoveredRounds,
 	isBackfillStartReason,
-	planStartupEmbedding,
+	planStartupPendingScan,
 	startupEmbedStatusMessage,
 } from "../lib/session-backfill.ts";
 import type { CheckpointSummary, ToolCallDetail } from "../lib/state.ts";
@@ -1264,6 +1264,13 @@ export default function (pi: ExtensionAPI) {
 							"semblr",
 							`\u{1f9e0} backfill: recovered ${backfill.recoveredFiles.length} round(s) from previous session`,
 						);
+						}
+						// Issue #136: the pending scan runs on skippedComplete AND after normal
+						// recovery — a session that exited complete (early exit) may still have
+						// rounds stranded by a crash between round write and embedding. Only
+						// the trigger widens; pending semantics, defer threshold, and the pinned
+						// defer message are unchanged (decision 011).
+						if (backfill.recoveredFiles.length > 0 || backfill.skippedComplete) {
 						// Issue #133: defer the embedding burst when a large backlog of
 						// recovered rounds is unembedded — inline startup embedding beyond
 						// the threshold can block startup for minutes; `just index` sweeps
@@ -1303,10 +1310,15 @@ export default function (pi: ExtensionAPI) {
 							forcingSuffixesByFile.set(fileName, suffixes);
 							return suffixes;
 						};
-						const embedPlan = planStartupEmbedding(
-							backfill.recoveredFiles,
-							(fileName) => readRoundJson(ROUNDS_DIR, fileName) as { promptEmbedding?: unknown } | null,
+						const roundFileNames = fs
+							.readdirSync(ROUNDS_DIR)
+							.filter((fn) => fn.endsWith(".json") && !fn.startsWith("index"));
+						// Issue #136: the scan yields the pending file list, so the inline pass
+						// runs over exactly the scanned candidates (caller change only).
+						const embedPlan = planStartupPendingScan(
+							roundFileNames,
 							buildCurrentModelRowPredicate(indexEntries, SEMBLR_CONFIG.embeddingModel, forcingSuffixesFor),
+							(fileName) => readRoundJson(ROUNDS_DIR, fileName) as { promptEmbedding?: unknown } | null,
 						);
 						if (embedPlan.mode === "defer") {
 							ctx.ui.setStatus("semblr", startupEmbedStatusMessage(embedPlan));
@@ -1321,7 +1333,7 @@ export default function (pi: ExtensionAPI) {
 									// blocking startup work with a large index).
 									const indexedLabels = new Set(ownShardEntries.map((entry) => entry.filePath));
 									const embedResult = await embedRecoveredRounds(
-										backfill.recoveredFiles,
+										embedPlan.pendingFiles,
 										ROUNDS_DIR,
 										{
 											embed: (text) => embedText(text, embedKey, embeddingClientDeps(ctx)),
@@ -1350,7 +1362,7 @@ export default function (pi: ExtensionAPI) {
 											promptNoiseOptions: PROMPT_NOISE_CLEANUP,
 											promptMaxTokens: SEMBLR_CONFIG.embeddingMaxTokens,
 											// Issue #140 (D1): reuse the same current-model rows predicate as
-											// planStartupEmbedding above, so a round counted non-pending is not
+											// planStartupPendingScan above, so a round counted non-pending is not
 											// re-embedded by this pass (rows authoritative, marker derived).
 											hasCurrentModelRows: buildCurrentModelRowPredicate(
 												indexEntries,
@@ -1362,7 +1374,7 @@ export default function (pi: ExtensionAPI) {
 									if (embedResult.embedded.length > 0) {
 										ctx.ui.setStatus(
 											"semblr",
-											`\u{1f9e0} backfill: embedded ${embedResult.embedded.length} recovered round(s)`,
+											`\u{1f9e0} backfill: embedded ${embedResult.embedded.length} pending round(s)`,
 										);
 									}
 									for (const message of embedResult.errors) {
