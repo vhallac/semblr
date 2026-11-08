@@ -3,8 +3,8 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { forcingReproducibleSuffixes } from "./embed-round.ts";
-import { appendIndexRowToShards } from "./index-storage.ts";
 import { loadShardVectorIndex } from "./index-io.ts";
+import { appendIndexRowToShards } from "./index-storage.ts";
 import {
 	backfillMissingRounds,
 	buildCurrentModelRowPredicate,
@@ -62,11 +62,7 @@ function forcingSuffixesFor(roundsDir: string) {
 }
 
 function hasCurrentModelRows(roundsDir: string, fileName: string, forcing: (f: string) => ReadonlySet<string>) {
-	const predicate = buildCurrentModelRowPredicate(
-		loadShardVectorIndex(roundsDir),
-		CURRENT_MODEL,
-		forcing,
-	);
+	const predicate = buildCurrentModelRowPredicate(loadShardVectorIndex(roundsDir), CURRENT_MODEL, forcing);
 	return predicate(fileName);
 }
 
@@ -81,7 +77,10 @@ describe("two-run crash-stranding harness (issue #136 acceptance)", () => {
 
 	it("run 2 surfaces rounds stranded by a run-1 crash after round writes before embedding (inline under cap)", async () => {
 		// ── Run 1: recover from the previous session, then crash ──
-		const sessionFile = writeSessionFile(tmp, [userMsg("please explain the border provinces dispute in full", "u1"), assistantMsg("a long answer")]);
+		const sessionFile = writeSessionFile(tmp, [
+			userMsg("please explain the border provinces dispute in full", "u1"),
+			assistantMsg("a long answer"),
+		]);
 		const roundsDir = path.join(tmp, "rounds");
 		const run1 = backfillMissingRounds(sessionFile, roundsDir, undefined, { liveWindowMs: 0 });
 		expect(run1.recoveredFiles).toHaveLength(1);
@@ -99,9 +98,7 @@ describe("two-run crash-stranding harness (issue #136 acceptance)", () => {
 		// The scan (readdirSync + index diff over an empty shard set) counts the
 		// stranded round pending and — under the inline cap — queues it.
 		const forcing = forcingSuffixesFor(roundsDir);
-		const roundFileNames = fs
-			.readdirSync(roundsDir)
-			.filter((fn) => fn.endsWith(".json") && !fn.startsWith("index"));
+		const roundFileNames = fs.readdirSync(roundsDir).filter((fn) => fn.endsWith(".json") && !fn.startsWith("index"));
 		const embedPlan = planStartupPendingScan(
 			roundFileNames,
 			() => false,
@@ -139,7 +136,10 @@ describe("two-run crash-stranding harness (issue #136 acceptance)", () => {
 		// Run 1: 11 stranded rounds (above STARTUP_EMBED_INLINE_MAX = 10).
 		const lines: object[] = [];
 		for (let i = 0; i < 11; i++) {
-			lines.push(userMsg(`please discuss border province dispute number ${i} at length`, `u${i}`), assistantMsg(`answer number ${i}`));
+			lines.push(
+				userMsg(`please discuss border province dispute number ${i} at length`, `u${i}`),
+				assistantMsg(`answer number ${i}`),
+			);
 		}
 		const sessionFile = writeSessionFile(tmp, lines);
 		const roundsDir = path.join(tmp, "rounds");
@@ -151,9 +151,7 @@ describe("two-run crash-stranding harness (issue #136 acceptance)", () => {
 		const run2 = backfillMissingRounds(sessionFile, roundsDir, undefined, { liveWindowMs: 0 });
 		expect(run2.skippedComplete).toBe(true);
 		const forcing = forcingSuffixesFor(roundsDir);
-		const roundFileNames = fs
-			.readdirSync(roundsDir)
-			.filter((fn) => fn.endsWith(".json") && !fn.startsWith("index"));
+		const roundFileNames = fs.readdirSync(roundsDir).filter((fn) => fn.endsWith(".json") && !fn.startsWith("index"));
 		const embedPlan = planStartupPendingScan(
 			roundFileNames,
 			() => false,

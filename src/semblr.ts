@@ -1264,13 +1264,13 @@ export default function (pi: ExtensionAPI) {
 							"semblr",
 							`\u{1f9e0} backfill: recovered ${backfill.recoveredFiles.length} round(s) from previous session`,
 						);
-						}
-						// Issue #136: the pending scan runs on skippedComplete AND after normal
-						// recovery — a session that exited complete (early exit) may still have
-						// rounds stranded by a crash between round write and embedding. Only
-						// the trigger widens; pending semantics, defer threshold, and the pinned
-						// defer message are unchanged (decision 011).
-						if (backfill.recoveredFiles.length > 0 || backfill.skippedComplete) {
+					}
+					// Issue #136: the pending scan runs on skippedComplete AND after normal
+					// recovery — a session that exited complete (early exit) may still have
+					// rounds stranded by a crash between round write and embedding. Only
+					// the trigger widens; pending semantics, defer threshold, and the pinned
+					// defer message are unchanged (decision 011).
+					if (backfill.recoveredFiles.length > 0 || backfill.skippedComplete) {
 						// Issue #133: defer the embedding burst when a large backlog of
 						// recovered rounds is unembedded — inline startup embedding beyond
 						// the threshold can block startup for minutes; `just index` sweeps

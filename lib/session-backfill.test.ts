@@ -858,11 +858,11 @@ describe("planStartupPendingScan (issue #136)", () => {
 	});
 
 	// claim: issue-136-BVR-1/test_pending_scan_rows_not_marker
-// claim text: a round with current-model index rows but no promptEmbedding
-//   marker is not counted pending and is not re-embedded by the inline pass
-// scenario: Scenario: Rows are truth — parity with the embed pass — Given a
-//   round with current-model index rows but no promptEmbedding marker Then it
-//   is not counted pending and not re-embedded by the inline pass
+	// claim text: a round with current-model index rows but no promptEmbedding
+	//   marker is not counted pending and is not re-embedded by the inline pass
+	// scenario: Scenario: Rows are truth — parity with the embed pass — Given a
+	//   round with current-model index rows but no promptEmbedding marker Then it
+	//   is not counted pending and not re-embedded by the inline pass
 	it("does not count a round pending when it has current-model rows but no promptEmbedding marker", () => {
 		const hasRows = buildCurrentModelRowPredicate(
 			[{ vector: [0.1], filePath: "rows-only.json:prompt", model: "text-embedding-3-small" }],
@@ -893,71 +893,71 @@ describe("planStartupPendingScan (issue #136)", () => {
 	});
 });
 
-	// F2 (PR !141 review): the start-up predicate must classify a round exactly
-	// as the `just index` sweep does, including the non-forcing rows the sweep
-	// ignores. Each case pins one previously divergent configuration; the sweep
-	// side of the same rule is pinned in scripts/digest-all.test.ts.
-	describe("forcing-suffix coverage agrees with the sweep (F2)", () => {
-		// A long prompt reproduces :prompt and :response; a summary present in the
-		// round reproduces :summary. Only the first two may force a reindex.
-		const forcingSuffixesFor = () =>
-			forcingReproducibleSuffixes(
-				"a long enough prompt that certainly survives the short-prompt drop with comfortably more than twenty words in total added right here",
-				true,
-			);
-		const covered = (entries: VectorIndexEntry[], file: string) =>
-			buildCurrentModelRowPredicate(entries, "text-embedding-3-small", forcingSuffixesFor)(file);
+// F2 (PR !141 review): the start-up predicate must classify a round exactly
+// as the `just index` sweep does, including the non-forcing rows the sweep
+// ignores. Each case pins one previously divergent configuration; the sweep
+// side of the same rule is pinned in scripts/digest-all.test.ts.
+describe("forcing-suffix coverage agrees with the sweep (F2)", () => {
+	// A long prompt reproduces :prompt and :response; a summary present in the
+	// round reproduces :summary. Only the first two may force a reindex.
+	const forcingSuffixesFor = () =>
+		forcingReproducibleSuffixes(
+			"a long enough prompt that certainly survives the short-prompt drop with comfortably more than twenty words in total added right here",
+			true,
+		);
+	const covered = (entries: VectorIndexEntry[], file: string) =>
+		buildCurrentModelRowPredicate(entries, "text-embedding-3-small", forcingSuffixesFor)(file);
 
-		it("treats current :prompt/:response with a foreign :summary as covered (:summary never forces)", () => {
-			expect(
-				covered(
-					[
-						{ vector: [0.1], filePath: "r.json:prompt", model: "text-embedding-3-small" },
-						{ vector: [0.2], filePath: "r.json:response", model: "text-embedding-3-small" },
-						{ vector: [0.3], filePath: "r.json:summary", model: "text-embedding-ada-002" },
-					],
-					"r.json",
-				),
-			).toBe(true);
-		});
+	it("treats current :prompt/:response with a foreign :summary as covered (:summary never forces)", () => {
+		expect(
+			covered(
+				[
+					{ vector: [0.1], filePath: "r.json:prompt", model: "text-embedding-3-small" },
+					{ vector: [0.2], filePath: "r.json:response", model: "text-embedding-3-small" },
+					{ vector: [0.3], filePath: "r.json:summary", model: "text-embedding-ada-002" },
+				],
+				"r.json",
+			),
+		).toBe(true);
+	});
 
-		it("treats a :summary-only round as not covered (the sweep queues it to add forcing rows)", () => {
-			expect(
-				covered([{ vector: [0.1], filePath: "r.json:summary", model: "text-embedding-3-small" }], "r.json"),
-			).toBe(false);
-		});
+	it("treats a :summary-only round as not covered (the sweep queues it to add forcing rows)", () => {
+		expect(covered([{ vector: [0.1], filePath: "r.json:summary", model: "text-embedding-3-small" }], "r.json")).toBe(
+			false,
+		);
+	});
 
-		it("treats a legacy :round-only round as not covered", () => {
-			expect(covered([{ vector: [0.1], filePath: "r.json:round", model: "text-embedding-3-small" }], "r.json")).toBe(
-				false,
-			);
-		});
+	it("treats a legacy :round-only round as not covered", () => {
+		expect(covered([{ vector: [0.1], filePath: "r.json:round", model: "text-embedding-3-small" }], "r.json")).toBe(
+			false,
+		);
+	});
 
-		it("still treats a stale forcing row as not covered", () => {
-			expect(
-				covered(
-					[
-						{ vector: [0.1], filePath: "r.json:prompt", model: "text-embedding-ada-002" },
-						{ vector: [0.2], filePath: "r.json:response", model: "text-embedding-3-small" },
-					],
-					"r.json",
-				),
-			).toBe(false);
-		});
-
-		it("treats a short-prompt round's stale :prompt as a non-forcing orphan", () => {
-			const shortPrompt = () => forcingReproducibleSuffixes("short prompt", false);
-			const hasRows = buildCurrentModelRowPredicate(
+	it("still treats a stale forcing row as not covered", () => {
+		expect(
+			covered(
 				[
 					{ vector: [0.1], filePath: "r.json:prompt", model: "text-embedding-ada-002" },
 					{ vector: [0.2], filePath: "r.json:response", model: "text-embedding-3-small" },
 				],
-				"text-embedding-3-small",
-				shortPrompt,
-			);
-			expect(hasRows("r.json")).toBe(true);
-		});
+				"r.json",
+			),
+		).toBe(false);
 	});
+
+	it("treats a short-prompt round's stale :prompt as a non-forcing orphan", () => {
+		const shortPrompt = () => forcingReproducibleSuffixes("short prompt", false);
+		const hasRows = buildCurrentModelRowPredicate(
+			[
+				{ vector: [0.1], filePath: "r.json:prompt", model: "text-embedding-ada-002" },
+				{ vector: [0.2], filePath: "r.json:response", model: "text-embedding-3-small" },
+			],
+			"text-embedding-3-small",
+			shortPrompt,
+		);
+		expect(hasRows("r.json")).toBe(true);
+	});
+});
 
 describe("listBackfillCandidates", () => {
 	let tmp: string;
