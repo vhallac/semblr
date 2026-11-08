@@ -27,6 +27,7 @@ import {
 	listBackfillCandidates,
 	loadDiskCanonicalKeys,
 	planStartupEmbedding,
+	planStartupPendingScan,
 	type RecoveredRoundLike,
 	startupEmbedStatusMessage,
 	TAIL_PEEK_BYTES,
@@ -830,6 +831,67 @@ describe("planStartupEmbedding (issue #133)", () => {
 		);
 		expect(hasRows("mixed.json")).toBe(false);
 	});
+});
+
+// claim: issue-136-GUAR/test_pending_scan_boundary_at_inline_cap
+// claim text: a later startup reports the pending count via the pinned defer
+//   message when pending rounds exceed the inline cap, and embeds them inline
+//   (bounded like the recovery burst) when within the cap
+// scenario: Scenario: Stranded rounds surface on a later completed-session
+//   startup — Then the pending count is reported via the pinned defer message
+//   when above the inline cap, or embedded inline when within the cap
+describe("planStartupPendingScan (issue #136)", () => {
+	const unmarked = (n: number): string[] => Array.from({ length: n }, (_, i) => `p${i}.json`);
+	const noRows = () => false;
+	const unreadable = () => null;
+
+	it("keeps the scan inline when the pending count is exactly at the cap (boundary: 10)", () => {
+		const plan = planStartupPendingScan(unmarked(10), noRows, unreadable);
+		expect(plan).toEqual({ mode: "inline", pendingCount: 10, pendingFiles: unmarked(10) });
+	});
+
+	it("defers with the pending count when just above the cap (boundary: 11)", () => {
+		const plan = planStartupPendingScan(unmarked(11), noRows, unreadable);
+		// Feeds the pinned message: `🧠 11 rounds pending embedding backfill — run just index`
+		expect(plan).toEqual({ mode: "defer", pendingCount: 11, pendingFiles: unmarked(11) });
+		expect(startupEmbedStatusMessage(plan)).toBe("🧠 11 rounds pending embedding backfill — run just index");
+	});
+
+	// claim: issue-136-BVR-1/test_pending_scan_rows_not_marker
+// claim text: a round with current-model index rows but no promptEmbedding
+//   marker is not counted pending and is not re-embedded by the inline pass
+// scenario: Scenario: Rows are truth — parity with the embed pass — Given a
+//   round with current-model index rows but no promptEmbedding marker Then it
+//   is not counted pending and not re-embedded by the inline pass
+	it("does not count a round pending when it has current-model rows but no promptEmbedding marker", () => {
+		const hasRows = buildCurrentModelRowPredicate(
+			[{ vector: [0.1], filePath: "rows-only.json:prompt", model: "text-embedding-3-small" }],
+			"text-embedding-3-small",
+		);
+		const plan = planStartupPendingScan(["rows-only.json"], hasRows, () => ({}));
+		expect(plan).toEqual({ mode: "inline", pendingCount: 0, pendingFiles: [] });
+	});
+
+	it("treats an unreadable round file as pending and lists it for the embed pass", () => {
+		const plan = planStartupPendingScan(["missing.json"], noRows, unreadable);
+		expect(plan).toEqual({ mode: "inline", pendingCount: 1, pendingFiles: ["missing.json"] });
+	});
+
+	it("reads only candidates lacking rows — covered rounds are skipped without a read", () => {
+		const reads: string[] = [];
+		const files = new Map<string, { promptEmbedding?: unknown } | null>([
+			["marked.json", { promptEmbedding: [0.1] }],
+			["bare.json", {}],
+		]);
+		const plan = planStartupPendingScan(["marked.json", "bare.json"], noRows, (f) => {
+			reads.push(f);
+			return files.get(f) ?? null;
+		});
+		expect(plan).toEqual({ mode: "inline", pendingCount: 1, pendingFiles: ["bare.json"] });
+		// Only candidates lacking rows are read — no parse for covered rounds.
+		expect(reads).toEqual(["marked.json", "bare.json"]);
+	});
+});
 
 	// F2 (PR !141 review): the start-up predicate must classify a round exactly
 	// as the `just index` sweep does, including the non-forcing rows the sweep
@@ -896,7 +958,6 @@ describe("planStartupEmbedding (issue #133)", () => {
 			expect(hasRows("r.json")).toBe(true);
 		});
 	});
-});
 
 describe("listBackfillCandidates", () => {
 	let tmp: string;
