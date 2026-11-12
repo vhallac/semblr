@@ -744,12 +744,13 @@ export interface StartupPendingScanPlan extends StartupEmbedPlan {
  * `embedRecoveredRounds` pass cannot disagree (issue #140 D1, decision 010:
  * rows are truth; the marker is derived).
  *
- * `readRoundForSuffixes` reads a round for candidates lacking rows: the same
- * read yields the `promptEmbedding` marker check and, at the call site, the
- * prompt/summary fields needed for forcing-suffix derivation (a short
- * prompt's `:prompt` row is non-reproducible; `:summary` never forces a
- * reindex). A missing/unreadable round is always pending. Pure — no I/O
- * beyond the injected predicate/reader.
+ * `readRound` supplies the parsed round for candidates lacking current-model
+ * rows: the scan checks only its `promptEmbedding` marker. R1.F6 (PR !160
+ * review): the call site backs this reader with the same parsed-round cache
+ * the coverage predicate's forcing-suffix derivation uses, so a row-failing
+ * candidate is read once per startup rather than twice — once for suffix
+ * derivation, once for the marker check. A missing/unreadable round is always
+ * pending. Pure — no I/O beyond the injected predicate/reader.
  *
  * Must not change (decision 011): the defer threshold, the pinned defer
  * message, and the `just index` sweep are untouched — only the trigger
@@ -758,13 +759,13 @@ export interface StartupPendingScanPlan extends StartupEmbedPlan {
 export function planStartupPendingScan(
 	roundFileNames: readonly string[],
 	hasCurrentModelRows: (fileName: string) => boolean,
-	readRoundForSuffixes: (fileName: string) => { promptEmbedding?: unknown } | null,
+	readRound: (fileName: string) => { promptEmbedding?: unknown } | null,
 ): StartupPendingScanPlan {
 	let pendingCount = 0;
 	const pendingFiles: string[] = [];
 	for (const fileName of roundFileNames) {
 		if (hasCurrentModelRows(fileName)) continue;
-		const round = readRoundForSuffixes(fileName);
+		const round = readRound(fileName);
 		if (!round?.promptEmbedding) {
 			pendingCount++;
 			pendingFiles.push(fileName);

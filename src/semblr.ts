@@ -1302,19 +1302,23 @@ export default function (pi: ExtensionAPI) {
 						// F2 (PR !141 review): the pending count and the `just index` sweep must
 						// classify a recovered round alike. The sweep derives the *forcing*
 						// suffix set per round from the round file (a short prompt's `:prompt`
-						// row is non-reproducible; `:summary` never forces a reindex). Derive it
-						// the same way here, memoized per file so the round file is read once.
-						const forcingSuffixesByFile = new Map<string, ReadonlySet<string>>();
-						const forcingSuffixesFor = (fileName: string): ReadonlySet<string> => {
-							const cached = forcingSuffixesByFile.get(fileName);
-							if (cached) return cached;
+						// row is non-reproducible; `:summary` never forces a reindex).
+						// R1.F6 (PR !160 review): one parsed-round cache backs both the suffix
+						// derivation (via the coverage predicate) and the pending-scan reader,
+						// so a row-failing candidate is read once per startup — the scan
+						// callback receives the already-parsed round instead of re-reading it.
+						const roundsByFile = new Map<string, Record<string, unknown> | null>();
+						const readRoundMemo = (fileName: string): Record<string, unknown> | null => {
+							if (roundsByFile.has(fileName)) return roundsByFile.get(fileName) ?? null;
 							const round = readRoundJson(ROUNDS_DIR, fileName);
-							const suffixes =
-								round === null
-									? FORCING_INDEX_SUFFIXES
-									: forcingReproducibleSuffixes(String(round.userPrompt ?? ""), Boolean(round.summary));
-							forcingSuffixesByFile.set(fileName, suffixes);
-							return suffixes;
+							roundsByFile.set(fileName, round);
+							return round;
+						};
+						const forcingSuffixesFor = (fileName: string): ReadonlySet<string> => {
+							const round = readRoundMemo(fileName);
+							return round === null
+								? FORCING_INDEX_SUFFIXES
+								: forcingReproducibleSuffixes(String(round.userPrompt ?? ""), Boolean(round.summary));
 						};
 						const roundFileNames = fs
 							.readdirSync(ROUNDS_DIR)
@@ -1333,7 +1337,7 @@ export default function (pi: ExtensionAPI) {
 						const embedPlan = planStartupPendingScan(
 							roundFileNames,
 							pendingRowsPredicate,
-							(fileName) => readRoundJson(ROUNDS_DIR, fileName) as { promptEmbedding?: unknown } | null,
+							(fileName) => readRoundMemo(fileName) as { promptEmbedding?: unknown } | null,
 						);
 						if (embedPlan.mode === "defer") {
 							ctx.ui.setStatus("semblr", startupEmbedStatusMessage(embedPlan));
