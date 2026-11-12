@@ -664,6 +664,14 @@ export interface StartupEmbedPlan {
  * `:prompt`/`:response` set is used, preserving behaviour for callers with no
  * round data.
  *
+ * R1.F2 (PR !160 review): the derived set is consulted per round, not
+ * eagerly. The derived set differs from the static set only when the prompt
+ * is short (`:prompt` is dropped); a round whose rows answer the coverage
+ * question identically under both sets is classified without reading its
+ * file. A round is read only when it has a `:prompt` row and does not have
+ * both a current-model `:prompt` and a current-model `:response` row — the
+ * healthy covered case (both forcing rows current) never triggers a read.
+ *
  * Keyed by round-file basename so the start-up counter and the sweep agree on
  * what "this round is indexed" means: index rows, not the promptEmbedding
  * marker.
@@ -680,14 +688,28 @@ export function buildCurrentModelRowPredicate(
 		if (list) list.push(entry);
 		else entriesByRound.set(roundFile, [entry]);
 	}
+	const isCurrent = (entry: VectorIndexEntry): boolean => entry.model === undefined || entry.model === currentModel;
 	const coverage = new Map<string, boolean>();
 	for (const [roundFile, roundEntries] of entriesByRound) {
+		const hasPromptRow = roundEntries.some((entry) => indexRowSuffix(entry.filePath) === ":prompt");
+		const hasCurrentPrompt = roundEntries.some(
+			(entry) => indexRowSuffix(entry.filePath) === ":prompt" && isCurrent(entry),
+		);
+		const hasCurrentResponse = roundEntries.some(
+			(entry) => indexRowSuffix(entry.filePath) === ":response" && isCurrent(entry),
+		);
+		// R1.F2 (PR !160 review): read the round's derived suffix set only when
+		// the static classification could differ from it — a `:prompt` row whose
+		// forcing membership depends on the prompt length, and the healthy
+		// both-current case ruled out. Everything else classifies statically.
+		const needsDerivedSuffixes =
+			forcingSuffixesFor !== undefined && hasPromptRow && !(hasCurrentPrompt && hasCurrentResponse);
 		coverage.set(
 			roundFile,
 			classifyRoundCoverage(
 				roundEntries,
 				currentModel,
-				forcingSuffixesFor?.(roundFile) ?? FORCING_INDEX_SUFFIXES,
+				needsDerivedSuffixes ? forcingSuffixesFor(roundFile) : FORCING_INDEX_SUFFIXES,
 				indexRowSuffix,
 			).covered,
 		);
@@ -704,34 +726,55 @@ export function startupEmbedStatusMessage(plan: StartupEmbedPlan): string {
 }
 
 /**
- * Issue #133: decide how startup should handle embedding for recovered
- * rounds. A round is "pending" when its round file is missing/unreadable or
- * is not covered by current-model vector-index rows. Pure — no I/O beyond the
- * injected reader/predicate.
- *
- * Issue #140 (D1): the pending count keys on index rows, not the
- * `promptEmbedding` marker. A recovered round may already have current-model
- * rows but no marker (rows written by `just index`/recovery without the
- * marker, e.g. after a crash); counting it pending inflated the startup count
- * and made startup and the `just index` sweep disagree. When
- * `hasCurrentModelRows` is omitted the marker is the only evidence available
- * (a missing/unreadable round is always pending), preserving the previous
- * behaviour for callers with no index loaded.
+ * Issue #136: the plan for the startup pending scan. Extends the recovered-
+ * rounds embed plan with the list of pending round files so the inline path
+ * can run `embedRecoveredRounds` over exactly the scanned candidates instead
+ * of the recovered-this-run list.
  */
-export function planStartupEmbedding(
-	fileNames: readonly string[],
-	readRoundData: (fileName: string) => { promptEmbedding?: unknown } | null,
-	hasCurrentModelRows?: (fileName: string) => boolean,
-): StartupEmbedPlan {
+export interface StartupPendingScanPlan extends StartupEmbedPlan {
+	pendingFiles: string[];
+}
+
+/**
+ * Issue #136: decide how a later startup should handle rounds stranded by a
+ * mid-embedding crash from an earlier run. A pure scan over the round
+ * directory's file names: a round is pending when it is not covered by
+ * current-model vector-index rows AND carries no `promptEmbedding` marker —
+ * the count and the
+ * `embedRecoveredRounds` pass cannot disagree (issue #140 D1, decision 010:
+ * rows are truth; the marker is derived).
+ *
+ * `readRound` supplies the parsed round for candidates lacking current-model
+ * rows: the scan checks only its `promptEmbedding` marker. R1.F6 (PR !160
+ * review): the call site backs this reader with the same parsed-round cache
+ * the coverage predicate's forcing-suffix derivation uses, so a row-failing
+ * candidate is read once per startup rather than twice — once for suffix
+ * derivation, once for the marker check. A missing/unreadable round is always
+ * pending. Pure — no I/O beyond the injected predicate/reader.
+ *
+ * Must not change (decision 011): the defer threshold, the pinned defer
+ * message, and the `just index` sweep are untouched — only the trigger
+ * widens from "recovered this run" to "pending on disk".
+ */
+export function planStartupPendingScan(
+	roundFileNames: readonly string[],
+	hasCurrentModelRows: (fileName: string) => boolean,
+	readRound: (fileName: string) => { promptEmbedding?: unknown } | null,
+): StartupPendingScanPlan {
 	let pendingCount = 0;
-	for (const fileName of fileNames) {
-		if (hasCurrentModelRows?.(fileName)) continue;
-		const round = readRoundData(fileName);
-		if (!round?.promptEmbedding) pendingCount++;
+	const pendingFiles: string[] = [];
+	for (const fileName of roundFileNames) {
+		if (hasCurrentModelRows(fileName)) continue;
+		const round = readRound(fileName);
+		if (!round?.promptEmbedding) {
+			pendingCount++;
+			pendingFiles.push(fileName);
+		}
 	}
 	return {
 		mode: pendingCount > STARTUP_EMBED_INLINE_MAX ? "defer" : "inline",
 		pendingCount,
+		pendingFiles,
 	};
 }
 
@@ -752,7 +795,7 @@ export async function embedRecoveredRounds(
 		try {
 			// Issue #140 (D1): a round covered by current-model index rows is not
 			// re-embedded, even when its promptEmbedding marker is missing — the
-			// same predicate the start-up count uses (planStartupEmbedding), so the
+			// same predicate the start-up count uses (planStartupPendingScan), so the
 			// count and the pass cannot disagree. A row written without a marker
 			// (e.g. a crash between appends and the marker write) must not spend an
 			// embedding call. Omitted by callers with no index loaded, preserving
