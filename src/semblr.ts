@@ -43,11 +43,10 @@ import {
 	shouldDropRelevanceList,
 	stripEnvPreamble,
 } from "../lib/context-messages.ts";
-import { embedRound, FORCING_INDEX_SUFFIXES, forcingReproducibleSuffixes } from "../lib/embed-round.ts";
+import { embedRound } from "../lib/embed-round.ts";
 import { embedText, getApiKey } from "../lib/embedding-client.ts";
 import { assignToGroup, formatGroupStats } from "../lib/grouping.ts";
-import { indexRoundFileFromPath, loadShardVectorIndex, type VectorIndexEntry } from "../lib/index-io.ts";
-import { ownShardPath } from "../lib/index-shards.ts";
+import { indexRoundFileFromPath, loadShardVectorIndex } from "../lib/index-io.ts";
 import {
 	appendIndexRowToShards,
 	buildSessionStartStatus,
@@ -74,7 +73,6 @@ import {
 	renderToolDetailsToolResult,
 	type ToolDetailsParams,
 } from "../lib/round-tool-results.ts";
-import { saveScanCutoff } from "../lib/scan-register.ts";
 import {
 	collectMultiModelSearchRoundScores,
 	collectSearchRoundScores,
@@ -95,16 +93,7 @@ import {
 	searchToolIndex,
 } from "../lib/search-tools.ts";
 import { loadSemblrConfig, type SemblrConfig } from "../lib/semblr-config.ts";
-import {
-	backfillMissingRounds,
-	buildBackfillCandidates,
-	buildCurrentModelRowPredicate,
-	embedRecoveredRounds,
-	indexRecoveredRounds,
-	isBackfillStartReason,
-	planStartupPendingScan,
-	startupEmbedStatusMessage,
-} from "../lib/session-backfill.ts";
+import { runStartupBackfill } from "../lib/startup-backfill.ts";
 import type { CheckpointSummary, ToolCallDetail } from "../lib/state.ts";
 import { contextCacheStore, contextCacheValid, createRound, createSession } from "../lib/state.ts";
 import {
@@ -1204,215 +1193,38 @@ export default function (pi: ExtensionAPI) {
 		// Clear session scoped state — new session starts fresh
 		session = createSession();
 
-		// Issue #130: recover rounds lost to process death in previous sessions.
-		// F2 (PR !131): scan ALL prior session files in the session dir (newest
-		// first, per-file tail-completeness early exit) — a source deferred as live
-		// on one start is retried automatically on the next. F5 (PR !131): the
-		// gate covers every session_start reason, not just startup/resume — pi
-		// supplies previousSessionFile for "new"/"resume"/"fork" (pinned first
-		// when the dir scan misses it); "reload" carries none but still gets the
-		// dir scan, since a source live at startup may be closed by the time
-		// /reload restarts the extension. Sessions outside the current cwd's dir
-		// are not ours.
-		// R1.F2 (PR !160 review): the merged index is loaded at most once per
-		// startup. The pending scan's load is reused for the final status line
-		// unless the inline embed pass appended rows (then it is stale and the
-		// status re-reads); startups without a pending scan still read once.
-		let mergedIndexForStatus: VectorIndexEntry[] | null = null;
-		if (isBackfillStartReason(event.reason)) {
-			const sessionFile = ctx.sessionManager?.getSessionFile?.();
-			if (sessionFile) {
-				try {
-					const candidates = buildBackfillCandidates(
-						path.dirname(sessionFile),
-						sessionFile,
-						event.previousSessionFile,
-						fs,
-						{ stateDir: SEMBLR_DIR },
-					);
-					const backfill = backfillMissingRounds(candidates, ROUNDS_DIR);
-					// Issue #133 unit-003 / issue #147: advance the scan register whenever
-					// the scan conclusively examined at least one source file — skipped
-					// complete, live-deferred, or recovered with writes re-verified on
-					// disk. Recovery WORK happening no longer freezes the cutoff (a
-					// persistently mis-hashing round would otherwise keep recovery
-					// non-convergent and the register at null forever).
-					if (backfill.examinedMtime !== undefined) {
-						saveScanCutoff(SEMBLR_DIR, path.dirname(sessionFile), backfill.examinedMtime);
-					}
-					if (backfill.deferredLive) {
-						ctx.ui.setStatus(
-							"semblr",
-							`\u{1f9e0} backfill deferred: ${backfill.deferredLive} previous session(s) look live (F2/F3)`,
-						);
-					}
-					if (backfill.recoveredFiles.length > 0) {
-						// F3 (PR !131): index recovered rounds exactly like the live agent_end
-						// post-write — bm25 upsert AND tool-index rows — so a recovered round
-						// is reachable from every search surface, not just bm25. Each round is
-						// guarded independently (best-effort, never the round files).
-						const indexReport = indexRecoveredRounds(
-							backfill.recoveredFiles,
-							// Memory-only upsert; the whole batch commits with a single index
-							// write (issue #137: per-round rewrites dominated startup recovery).
-							createRecoveryIndexDeps({
-								roundsDir: ROUNDS_DIR,
-								bm25IndexPath: BM25_INDEX_PATH,
-								toolIndexPath: TOOLS_INDEX_PATH,
-								loadBm25Index: loadSearchBm25Index,
-							}),
-						);
-						for (const message of indexReport.errors) {
-							ctx.ui.setStatus("semblr", `\u{1f9e0} backfill index error: ${message}`);
-						}
-						ctx.ui.setStatus(
-							"semblr",
-							`\u{1f9e0} backfill: recovered ${backfill.recoveredFiles.length} round(s) from previous session`,
-						);
-					}
-					// Issue #136: the pending scan runs on skippedComplete AND after normal
-					// recovery — a session that exited complete (early exit) may still have
-					// rounds stranded by a crash between round write and embedding. Only
-					// the trigger widens; pending semantics, defer threshold, and the pinned
-					// defer message are unchanged (decision 011).
-					if (backfill.recoveredFiles.length > 0 || backfill.skippedComplete) {
-						// Issue #133: defer the embedding burst when a large backlog of
-						// recovered rounds is unembedded — inline startup embedding beyond
-						// the threshold can block startup for minutes; `just index` sweeps
-						// it instead. BM25 + tool indexing above stays synchronous.
-						// Issue #140 (D1): the pending count keys on current-model index
-						// rows, not the promptEmbedding marker. A recovered round with
-						// current-model rows but no marker (rows written without one, e.g.
-						// after a crash) is not pending — counting it inflated the startup
-						// count and made startup disagree with the `just index` sweep.
-						// Issue #149 (D-010): the pending predicate counts rows across ALL
-						// shards — a round a foreign host already embedded with the current
-						// model must not be re-embedded locally on every startup.
-						const indexEntries = loadShardVectorIndex(ROUNDS_DIR);
-						mergedIndexForStatus = indexEntries;
-						// Issue #149 (D-006 scope): the live label guard consults only the
-						// host's own shard — the post-adoption write surface.
-						// Issue #154 (PR !151 R1.F4): the own-shard startup read must tolerate
-						// corrupt rows like merged reads do — skip with a warning instead of
-						// crashing startup; the sweep's strict reload catches corruption at
-						// write time.
-						const ownShardEntries = loadShardVectorIndex(ROUNDS_DIR, {
-							shards: [ownShardPath(ROUNDS_DIR, SEMBLR_CONFIG.hostId)],
-						});
-						// F2 (PR !141 review): the pending count and the `just index` sweep must
-						// classify a recovered round alike. The sweep derives the *forcing*
-						// suffix set per round from the round file (a short prompt's `:prompt`
-						// row is non-reproducible; `:summary` never forces a reindex).
-						// R1.F6 (PR !160 review): one parsed-round cache backs both the suffix
-						// derivation (via the coverage predicate) and the pending-scan reader,
-						// so a row-failing candidate is read once per startup — the scan
-						// callback receives the already-parsed round instead of re-reading it.
-						const roundsByFile = new Map<string, Record<string, unknown> | null>();
-						const readRoundMemo = (fileName: string): Record<string, unknown> | null => {
-							if (roundsByFile.has(fileName)) return roundsByFile.get(fileName) ?? null;
-							const round = readRoundJson(ROUNDS_DIR, fileName);
-							roundsByFile.set(fileName, round);
-							return round;
-						};
-						const forcingSuffixesFor = (fileName: string): ReadonlySet<string> => {
-							const round = readRoundMemo(fileName);
-							return round === null
-								? FORCING_INDEX_SUFFIXES
-								: forcingReproducibleSuffixes(String(round.userPrompt ?? ""), Boolean(round.summary));
-						};
-						const roundFileNames = fs
-							.readdirSync(ROUNDS_DIR)
-							.filter((fn) => fn.endsWith(".json") && !fn.startsWith("index"));
-						// Issue #136: the scan yields the pending file list, so the inline pass
-						// runs over exactly the scanned candidates (caller change only).
-						// R1.F2 (PR !160 review): build the current-model rows predicate once
-						// — the scan and the inline pass share the same instance, so the
-						// entry map is not rebuilt and the derived-suffix reads are not
-						// re-done for the embed pass.
-						const pendingRowsPredicate = buildCurrentModelRowPredicate(
-							indexEntries,
-							SEMBLR_CONFIG.embeddingModel,
-							forcingSuffixesFor,
-						);
-						const embedPlan = planStartupPendingScan(
-							roundFileNames,
-							pendingRowsPredicate,
-							(fileName) => readRoundMemo(fileName) as { promptEmbedding?: unknown } | null,
-						);
-						if (embedPlan.mode === "defer") {
-							ctx.ui.setStatus("semblr", startupEmbedStatusMessage(embedPlan));
-						} else
-							try {
-								const embedKey = await getApiKey(ctx, { config: SEMBLR_CONFIG });
-								if (embedKey) {
-									// Label guard backed by a single index load: the index is read
-									// once before embedding, kept as an in-memory Set, and updated on
-									// every append. Previously hasIndexRow re-read the full index
-									// file per recovered round (O(n × index size) — minutes of
-									// blocking startup work with a large index).
-									const indexedLabels = new Set(ownShardEntries.map((entry) => entry.filePath));
-									const embedResult = await embedRecoveredRounds(
-										embedPlan.pendingFiles,
-										ROUNDS_DIR,
-										{
-											embed: (text) => embedText(text, embedKey, embeddingClientDeps(ctx)),
-											appendIndexRow: (label, vec, hash) => {
-												appendToIndex(label, vec, SEMBLR_CONFIG.embeddingModel, hash);
-												indexedLabels.add(label);
-											},
-											// F4+F6 (PR !131): prompt derivation, clipping, and row labels now
-											// come from the shared core, so recovered rows are in the same domain
-											// as agent_end by construction; only the config is passed here.
-											// F5 (PR !131): label-guard so a re-run after a crash between the
-											// appends and the embedding write does not duplicate index rows.
-											hasIndexRow: (label) => indexedLabels.has(label),
-											writeRoundEmbedding: (fileName, vec) => {
-												const p = `${ROUNDS_DIR}/${fileName}`;
-												const existing = JSON.parse(fs.readFileSync(p, "utf-8"));
-												existing.promptEmbedding = vec;
-												fs.writeFileSync(p + ".tmp." + process.pid, JSON.stringify(existing, null, 2));
-												fs.renameSync(p + ".tmp." + process.pid, p);
-											},
-										},
-										// F3 (PR !131): live-parity response budget — recovered embeddings are
-										// clipped with the same configured budget as agent_end, not the default.
-										{
-											maxResponseBytes: EMBEDDING_RESPONSE_MAX_BYTES,
-											promptNoiseOptions: PROMPT_NOISE_CLEANUP,
-											promptMaxTokens: SEMBLR_CONFIG.embeddingMaxTokens,
-											// Issue #140 (D1): reuse the same current-model rows predicate as
-											// planStartupPendingScan above, so a round counted non-pending is not
-											// re-embedded by this pass (rows authoritative, marker derived).
-											hasCurrentModelRows: pendingRowsPredicate,
-										},
-									);
-									// The inline pass may have appended index rows — the hoisted
-									// load is stale; the final status re-reads.
-									mergedIndexForStatus = null;
-									if (embedResult.embedded.length > 0) {
-										ctx.ui.setStatus(
-											"semblr",
-											`\u{1f9e0} backfill: embedded ${embedResult.embedded.length} pending round(s)`,
-										);
-									}
-									for (const message of embedResult.errors) {
-										ctx.ui.setStatus("semblr", `\u{1f9e0} backfill embed error: ${message}`);
-									}
-								}
-							} catch (err) {
-								ctx.ui.setStatus("semblr", `\u{1f9e0} backfill embed failed: ${(err as Error).message}`);
-							}
-					}
-				} catch (err) {
-					ctx.ui.setStatus("semblr", `🧠 backfill failed: ${(err as Error).message}`);
-				}
-			}
-		}
+		// R1.F1 (PR !160 review): the startup backfill block — previous-session
+		// recovery, the issue #136 pending scan on the skippedComplete/recovered
+		// path, and the inline embed / defer pass — is extracted into
+		// lib/startup-backfill.ts and driven here through the real deps, so the
+		// session_start wiring is exercised by lib/startup-backfill.test.ts
+		// (fake pi/ctx, real temp rounds dir).
+		const outcome = await runStartupBackfill({
+			reason: event.reason,
+			fs,
+			roundsDir: ROUNDS_DIR,
+			semblrDir: SEMBLR_DIR,
+			config: SEMBLR_CONFIG,
+			embeddingResponseBytes: EMBEDDING_RESPONSE_MAX_BYTES,
+			promptNoiseOptions: PROMPT_NOISE_CLEANUP,
+			recoveryIndexDeps: createRecoveryIndexDeps({
+				roundsDir: ROUNDS_DIR,
+				bm25IndexPath: BM25_INDEX_PATH,
+				toolIndexPath: TOOLS_INDEX_PATH,
+				loadBm25Index: loadSearchBm25Index,
+			}),
+			appendToIndex,
+			ui: ctx.ui,
+			getSessionFile: () => ctx.sessionManager?.getSessionFile?.(),
+			getApiKey: () => getApiKey(ctx, { config: SEMBLR_CONFIG }),
+			embed: (text, apiKey) => embedText(text, apiKey, embeddingClientDeps(ctx)),
+			previousSessionFile: event.previousSessionFile,
+		});
 		// R1.F2 (PR !160 review): reuse the pending scan's merged index load
 		// when it is still fresh; otherwise one merged read here (issue #149:
 		// the startup status counts rounds across the merged shard view; an
 		// empty shard set (fresh machine) reports zero without error).
-		const index = mergedIndexForStatus ?? loadIndexFromShards(ROUNDS_DIR);
+		const index = outcome.indexEntries ?? loadIndexFromShards(ROUNDS_DIR);
 		ctx.ui.setStatus("semblr", buildSessionStartStatus(index));
 
 		// Register the search_interactions tool here, not at factory level
