@@ -46,7 +46,7 @@ import {
 import { embedRound, FORCING_INDEX_SUFFIXES, forcingReproducibleSuffixes } from "../lib/embed-round.ts";
 import { embedText, getApiKey } from "../lib/embedding-client.ts";
 import { assignToGroup, formatGroupStats } from "../lib/grouping.ts";
-import { indexRoundFileFromPath, loadShardVectorIndex } from "../lib/index-io.ts";
+import { indexRoundFileFromPath, loadShardVectorIndex, type VectorIndexEntry } from "../lib/index-io.ts";
 import { ownShardPath } from "../lib/index-shards.ts";
 import {
 	appendIndexRowToShards,
@@ -1214,6 +1214,11 @@ export default function (pi: ExtensionAPI) {
 		// dir scan, since a source live at startup may be closed by the time
 		// /reload restarts the extension. Sessions outside the current cwd's dir
 		// are not ours.
+		// R1.F2 (PR !160 review): the merged index is loaded at most once per
+		// startup. The pending scan's load is reused for the final status line
+		// unless the inline embed pass appended rows (then it is stale and the
+		// status re-reads); startups without a pending scan still read once.
+		let mergedIndexForStatus: VectorIndexEntry[] | null = null;
 		if (isBackfillStartReason(event.reason)) {
 			const sessionFile = ctx.sessionManager?.getSessionFile?.();
 			if (sessionFile) {
@@ -1284,6 +1289,7 @@ export default function (pi: ExtensionAPI) {
 						// shards — a round a foreign host already embedded with the current
 						// model must not be re-embedded locally on every startup.
 						const indexEntries = loadShardVectorIndex(ROUNDS_DIR);
+						mergedIndexForStatus = indexEntries;
 						// Issue #149 (D-006 scope): the live label guard consults only the
 						// host's own shard — the post-adoption write surface.
 						// Issue #154 (PR !151 R1.F4): the own-shard startup read must tolerate
@@ -1315,9 +1321,18 @@ export default function (pi: ExtensionAPI) {
 							.filter((fn) => fn.endsWith(".json") && !fn.startsWith("index"));
 						// Issue #136: the scan yields the pending file list, so the inline pass
 						// runs over exactly the scanned candidates (caller change only).
+						// R1.F2 (PR !160 review): build the current-model rows predicate once
+						// — the scan and the inline pass share the same instance, so the
+						// entry map is not rebuilt and the derived-suffix reads are not
+						// re-done for the embed pass.
+						const pendingRowsPredicate = buildCurrentModelRowPredicate(
+							indexEntries,
+							SEMBLR_CONFIG.embeddingModel,
+							forcingSuffixesFor,
+						);
 						const embedPlan = planStartupPendingScan(
 							roundFileNames,
-							buildCurrentModelRowPredicate(indexEntries, SEMBLR_CONFIG.embeddingModel, forcingSuffixesFor),
+							pendingRowsPredicate,
 							(fileName) => readRoundJson(ROUNDS_DIR, fileName) as { promptEmbedding?: unknown } | null,
 						);
 						if (embedPlan.mode === "defer") {
@@ -1364,13 +1379,12 @@ export default function (pi: ExtensionAPI) {
 											// Issue #140 (D1): reuse the same current-model rows predicate as
 											// planStartupPendingScan above, so a round counted non-pending is not
 											// re-embedded by this pass (rows authoritative, marker derived).
-											hasCurrentModelRows: buildCurrentModelRowPredicate(
-												indexEntries,
-												SEMBLR_CONFIG.embeddingModel,
-												forcingSuffixesFor,
-											),
+											hasCurrentModelRows: pendingRowsPredicate,
 										},
 									);
+									// The inline pass may have appended index rows — the hoisted
+									// load is stale; the final status re-reads.
+									mergedIndexForStatus = null;
 									if (embedResult.embedded.length > 0) {
 										ctx.ui.setStatus(
 											"semblr",
@@ -1390,9 +1404,11 @@ export default function (pi: ExtensionAPI) {
 				}
 			}
 		}
-		// Issue #149: the startup status counts rounds across the merged shard
-		// view; an empty shard set (fresh machine) reports zero without error.
-		const index = loadIndexFromShards(ROUNDS_DIR);
+		// R1.F2 (PR !160 review): reuse the pending scan's merged index load
+		// when it is still fresh; otherwise one merged read here (issue #149:
+		// the startup status counts rounds across the merged shard view; an
+		// empty shard set (fresh machine) reports zero without error).
+		const index = mergedIndexForStatus ?? loadIndexFromShards(ROUNDS_DIR);
 		ctx.ui.setStatus("semblr", buildSessionStartStatus(index));
 
 		// Register the search_interactions tool here, not at factory level

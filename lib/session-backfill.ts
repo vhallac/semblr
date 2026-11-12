@@ -664,6 +664,14 @@ export interface StartupEmbedPlan {
  * `:prompt`/`:response` set is used, preserving behaviour for callers with no
  * round data.
  *
+ * R1.F2 (PR !160 review): the derived set is consulted per round, not
+ * eagerly. The derived set differs from the static set only when the prompt
+ * is short (`:prompt` is dropped); a round whose rows answer the coverage
+ * question identically under both sets is classified without reading its
+ * file. A round is read only when it has a `:prompt` row and does not have
+ * both a current-model `:prompt` and a current-model `:response` row — the
+ * healthy covered case (both forcing rows current) never triggers a read.
+ *
  * Keyed by round-file basename so the start-up counter and the sweep agree on
  * what "this round is indexed" means: index rows, not the promptEmbedding
  * marker.
@@ -680,14 +688,28 @@ export function buildCurrentModelRowPredicate(
 		if (list) list.push(entry);
 		else entriesByRound.set(roundFile, [entry]);
 	}
+	const isCurrent = (entry: VectorIndexEntry): boolean =>
+		entry.model === undefined || entry.model === currentModel;
 	const coverage = new Map<string, boolean>();
 	for (const [roundFile, roundEntries] of entriesByRound) {
+		const hasPromptRow = roundEntries.some((entry) => indexRowSuffix(entry.filePath) === ":prompt");
+		const hasCurrentPrompt = roundEntries.some(
+			(entry) => indexRowSuffix(entry.filePath) === ":prompt" && isCurrent(entry),
+		);
+		const hasCurrentResponse = roundEntries.some(
+			(entry) => indexRowSuffix(entry.filePath) === ":response" && isCurrent(entry),
+		);
+		// R1.F2 (PR !160 review): read the round's derived suffix set only when
+		// the static classification could differ from it — a `:prompt` row whose
+		// forcing membership depends on the prompt length, and the healthy
+		// both-current case ruled out. Everything else classifies statically.
+		const needsDerivedSuffixes = forcingSuffixesFor !== undefined && hasPromptRow && !(hasCurrentPrompt && hasCurrentResponse);
 		coverage.set(
 			roundFile,
 			classifyRoundCoverage(
 				roundEntries,
 				currentModel,
-				forcingSuffixesFor?.(roundFile) ?? FORCING_INDEX_SUFFIXES,
+				needsDerivedSuffixes ? forcingSuffixesFor(roundFile) : FORCING_INDEX_SUFFIXES,
 				indexRowSuffix,
 			).covered,
 		);

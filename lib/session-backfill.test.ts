@@ -893,6 +893,46 @@ describe("forcing-suffix coverage agrees with the sweep (F2)", () => {
 		).toBe(false);
 	});
 
+	// R1.F2 (PR !160 review): the derived forcing-suffix set is consulted per
+	// round, not eagerly — the healthy covered case (current :prompt AND
+	// current :response) and rounds without a :prompt row classify statically
+	// without reading the round file.
+	it("does not read a round whose current forcing rows answer coverage statically", () => {
+		const reads: string[] = [];
+		const spy = (file: string): ReadonlySet<string> => {
+			reads.push(file);
+			return forcingSuffixesFor();
+		};
+		const hasRows = buildCurrentModelRowPredicate(
+			[
+				{ vector: [0.1], filePath: "healthy.json:prompt", model: "text-embedding-3-small" },
+				{ vector: [0.2], filePath: "healthy.json:response", model: "text-embedding-3-small" },
+				{ vector: [0.3], filePath: "summary-only.json:summary", model: "text-embedding-3-small" },
+			],
+			"text-embedding-3-small",
+			spy,
+		);
+		expect(hasRows("healthy.json")).toBe(true);
+		expect(hasRows("summary-only.json")).toBe(false);
+		expect(reads).toEqual([]);
+	});
+
+	it("reads a round only when its :prompt row is not paired with a current :response row", () => {
+		const reads: string[] = [];
+		const spy = (file: string): ReadonlySet<string> => {
+			reads.push(file);
+			return forcingSuffixesFor();
+		};
+		const hasRows = buildCurrentModelRowPredicate(
+			[{ vector: [0.1], filePath: "prompt-only.json:prompt", model: "text-embedding-3-small" }],
+			"text-embedding-3-small",
+			spy,
+		);
+		// A long-prompt round keeps its current :prompt row forcing → covered.
+		expect(hasRows("prompt-only.json")).toBe(true);
+		expect(reads).toEqual(["prompt-only.json"]);
+	});
+
 	it("treats a short-prompt round's stale :prompt as a non-forcing orphan", () => {
 		const shortPrompt = () => forcingReproducibleSuffixes("short prompt", false);
 		const hasRows = buildCurrentModelRowPredicate(
