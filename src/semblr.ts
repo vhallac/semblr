@@ -46,7 +46,7 @@ import {
 import { embedRound } from "../lib/embed-round.ts";
 import { embedText, getApiKey } from "../lib/embedding-client.ts";
 import { assignToGroup, formatGroupStats } from "../lib/grouping.ts";
-import { indexRoundFileFromPath, loadShardVectorIndex } from "../lib/index-io.ts";
+import { indexRoundFileFromPath } from "../lib/index-io.ts";
 import {
 	appendIndexRowToShards,
 	buildSessionStartStatus,

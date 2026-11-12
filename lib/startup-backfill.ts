@@ -85,13 +85,9 @@ export async function runStartupBackfill(deps: StartupBackfillDeps): Promise<Sta
 	}
 	const mergedIndexForStatus: { value: VectorIndexEntry[] | null } = { value: null };
 	try {
-		const candidates = buildBackfillCandidates(
-			path.dirname(sessionFile),
-			sessionFile,
-			deps.previousSessionFile,
-			fs,
-			{ stateDir: semblrDir },
-		);
+		const candidates = buildBackfillCandidates(path.dirname(sessionFile), sessionFile, deps.previousSessionFile, fs, {
+			stateDir: semblrDir,
+		});
 		const backfill = backfillMissingRounds(candidates, roundsDir);
 		// Issue #133 unit-003 / issue #147: advance the scan register whenever
 		// the scan conclusively examined at least one source file — skipped

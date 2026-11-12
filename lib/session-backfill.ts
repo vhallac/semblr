@@ -688,8 +688,7 @@ export function buildCurrentModelRowPredicate(
 		if (list) list.push(entry);
 		else entriesByRound.set(roundFile, [entry]);
 	}
-	const isCurrent = (entry: VectorIndexEntry): boolean =>
-		entry.model === undefined || entry.model === currentModel;
+	const isCurrent = (entry: VectorIndexEntry): boolean => entry.model === undefined || entry.model === currentModel;
 	const coverage = new Map<string, boolean>();
 	for (const [roundFile, roundEntries] of entriesByRound) {
 		const hasPromptRow = roundEntries.some((entry) => indexRowSuffix(entry.filePath) === ":prompt");
@@ -703,7 +702,8 @@ export function buildCurrentModelRowPredicate(
 		// the static classification could differ from it — a `:prompt` row whose
 		// forcing membership depends on the prompt length, and the healthy
 		// both-current case ruled out. Everything else classifies statically.
-		const needsDerivedSuffixes = forcingSuffixesFor !== undefined && hasPromptRow && !(hasCurrentPrompt && hasCurrentResponse);
+		const needsDerivedSuffixes =
+			forcingSuffixesFor !== undefined && hasPromptRow && !(hasCurrentPrompt && hasCurrentResponse);
 		coverage.set(
 			roundFile,
 			classifyRoundCoverage(
