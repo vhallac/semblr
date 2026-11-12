@@ -781,7 +781,7 @@ describe("planStartupPendingScan (issue #133 cases moved)", () => {
 	});
 });
 
-// claim: issue-136-GUAR/test_pending_scan_boundary_at_inline_cap
+// claim: issue-136-GUAR/GUAR/test_pending_scan_boundary_at_inline_cap
 // claim text: a later startup reports the pending count via the pinned defer
 //   message when pending rounds exceed the inline cap, and embeds them inline
 //   (bounded like the recovery burst) when within the cap
@@ -805,7 +805,7 @@ describe("planStartupPendingScan (issue #136)", () => {
 		expect(startupEmbedStatusMessage(plan)).toBe("🧠 11 rounds pending embedding backfill — run just index");
 	});
 
-	// claim: issue-136-BVR-1/test_pending_scan_rows_not_marker
+	// claim: issue-136-BVR-1/BVR-1/test_pending_scan_rows_not_marker
 	// claim text: a round with current-model index rows but no promptEmbedding
 	//   marker is not counted pending and is not re-embedded by the inline pass
 	// scenario: Scenario: Rows are truth — parity with the embed pass — Given a
@@ -825,13 +825,16 @@ describe("planStartupPendingScan (issue #136)", () => {
 		expect(plan).toEqual({ mode: "inline", pendingCount: 1, pendingFiles: ["missing.json"] });
 	});
 
-	it("reads only candidates lacking rows — covered rounds are skipped without a read", () => {
+	// R1.F4+F5: the fixture includes a round covered by a current-model row;
+	// it is classified covered and never read.
+	it("reads only uncovered candidates — a rows-covered round is skipped without a read", () => {
 		const reads: string[] = [];
 		const files = new Map<string, { promptEmbedding?: unknown } | null>([
 			["marked.json", { promptEmbedding: [0.1] }],
 			["bare.json", {}],
 		]);
-		const plan = planStartupPendingScan(["marked.json", "bare.json"], noRows, (f) => {
+		const hasRows = (f: string) => f === "covered.json";
+		const plan = planStartupPendingScan(["marked.json", "bare.json", "covered.json"], hasRows, (f) => {
 			reads.push(f);
 			return files.get(f) ?? null;
 		});
