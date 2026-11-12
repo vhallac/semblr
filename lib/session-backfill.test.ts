@@ -26,7 +26,6 @@ import {
 	isSessionTailClosed,
 	listBackfillCandidates,
 	loadDiskCanonicalKeys,
-	planStartupEmbedding,
 	planStartupPendingScan,
 	type RecoveredRoundLike,
 	startupEmbedStatusMessage,
@@ -414,7 +413,7 @@ describe("session-backfill", () => {
 
 		// F2 (PR !141 review): a round covered by current-model index rows is not
 		// re-embedded when its promptEmbedding marker is missing. The start-up
-		// count (planStartupEmbedding) already treats it as non-pending via the
+		// count (planStartupPendingScan) already treats it as non-pending via the
 		// shared rows predicate; the embedding pass must apply the same predicate,
 		// or a rows-present/marker-missing round is counted 0 pending yet spends
 		// an embedding call — contradicting the README claim that such a round is
@@ -431,12 +430,10 @@ describe("session-backfill", () => {
 				[{ vector: [0.1], filePath: `${fileName}:prompt`, model: "text-embedding-3-small" }],
 				"text-embedding-3-small",
 			);
-			const plan = planStartupEmbedding(
-				outcome.recoveredFiles,
-				(name) => JSON.parse(fs.readFileSync(path.join(roundsDir, name), "utf-8")),
-				hasCurrentModelRows,
+			const plan = planStartupPendingScan(outcome.recoveredFiles, hasCurrentModelRows, (name) =>
+				JSON.parse(fs.readFileSync(path.join(roundsDir, name), "utf-8")),
 			);
-			expect(plan).toEqual({ mode: "inline", pendingCount: 0 });
+			expect(plan).toEqual({ mode: "inline", pendingCount: 0, pendingFiles: [] });
 			const embedCalls: string[] = [];
 			const result = await embedRecoveredRounds(
 				outcome.recoveredFiles,
@@ -733,90 +730,39 @@ describe("session-backfill", () => {
 	});
 });
 
-describe("planStartupEmbedding (issue #133)", () => {
-	type Round = { promptEmbedding?: number[] };
-	const embedded = (n: number): [string, Round][] =>
-		Array.from({ length: n }, (_, i) => [`r${i}.json`, { promptEmbedding: [0.1] }]);
-
-	it("keeps embedding inline when the unembedded count is exactly at the threshold (boundary: 10)", () => {
-		const files = new Map<string, Round>([
-			...embedded(2),
-			...Array.from({ length: 10 }, (_, i) => [`p${i}.json`, {}] as const),
-		]);
-		const plan = planStartupEmbedding([...files.keys()], (f) => files.get(f) ?? null);
-		expect(plan).toEqual({ mode: "inline", pendingCount: 10 });
-	});
-
-	it("defers when the unembedded count is just above the threshold (boundary: 11)", () => {
-		const files = new Map<string, Round>([
-			...embedded(2),
-			...Array.from({ length: 11 }, (_, i) => [`p${i}.json`, {}] as const),
-		]);
-		const plan = planStartupEmbedding([...files.keys()], (f) => files.get(f) ?? null);
-		expect(plan).toEqual({ mode: "defer", pendingCount: 11 });
-	});
-
+// Remaining coverage moved here from the removed production-dead
+// planStartupEmbedding (review-round-1 F3): these cases pin rows-over-marker
+// behaviour on the pending scan itself; boundary/defer/unreadable cases are
+// already pinned by the issue #136 tests below and were not duplicated.
+describe("planStartupPendingScan (issue #133 cases moved)", () => {
 	it("builds the defer status message with exact wording", () => {
 		expect(startupEmbedStatusMessage({ mode: "defer", pendingCount: 10 })).toBe(
 			"🧠 10 rounds pending embedding backfill — run just index",
 		);
 	});
 
-	it("defers when the unembedded count exceeds the threshold, reporting the pending count", () => {
-		const files = new Map<string, Round>([
-			...embedded(3),
-			...Array.from({ length: 11 }, (_, i) => [`p${i}.json`, {}] as const),
-		]);
-		const plan = planStartupEmbedding([...files.keys()], (f) => files.get(f) ?? null);
-		// Message built from this count: `🧠 11 rounds pending embedding backfill — run just index`
-		expect(plan).toEqual({ mode: "defer", pendingCount: 11 });
-	});
-
-	it("treats unreadable round files as pending", () => {
-		const files = new Map<string, { promptEmbedding: number[] }>([["a.json", { promptEmbedding: [1] }]]);
-		const plan = planStartupEmbedding(["a.json", "missing.json"], (f) => files.get(f) ?? null);
-		expect(plan).toEqual({ mode: "inline", pendingCount: 1 });
-	});
-
-	// Issue #140 (D1): a recovered round that already has current-model index
-	// rows is not pending even when the promptEmbedding marker is missing —
-	// rows, not the marker, decide. Anchored on the `just index` sweep
-	// predicate (lib/session-backfill.ts buildCurrentModelRowPredicate).
-	it("does not count a round pending when it has current-model rows but no promptEmbedding marker", () => {
-		const files = new Map<string, Round>([["rows-only.json", {}]]);
-		const hasRows = buildCurrentModelRowPredicate(
-			[{ vector: [0.1], filePath: "rows-only.json:prompt", model: "text-embedding-3-small" }],
-			"text-embedding-3-small",
-		);
-		const plan = planStartupEmbedding([...files.keys()], (f) => files.get(f) ?? null, hasRows);
-		expect(plan).toEqual({ mode: "inline", pendingCount: 0 });
-	});
-
 	it("counts a round pending when its only rows were written by a different model", () => {
-		const files = new Map<string, Round>([["stale-model.json", {}]]);
 		const hasRows = buildCurrentModelRowPredicate(
 			[{ vector: [0.1], filePath: "stale-model.json:prompt", model: "text-embedding-ada-002" }],
 			"text-embedding-3-small",
 		);
-		const plan = planStartupEmbedding([...files.keys()], (f) => files.get(f) ?? null, hasRows);
-		expect(plan).toEqual({ mode: "inline", pendingCount: 1 });
+		const plan = planStartupPendingScan(["stale-model.json"], hasRows, () => ({}));
+		expect(plan).toEqual({ mode: "inline", pendingCount: 1, pendingFiles: ["stale-model.json"] });
 	});
 
 	it("treats a legacy model-less row as current so a marked round stays non-pending (issue #62)", () => {
-		const files = new Map<string, Round>([["legacy.json", { promptEmbedding: [0.1] }]]);
 		const hasRows = buildCurrentModelRowPredicate(
 			[{ vector: [0.1], filePath: "legacy.json:prompt" }],
 			"text-embedding-3-small",
 		);
-		const plan = planStartupEmbedding([...files.keys()], (f) => files.get(f) ?? null, hasRows);
-		expect(plan).toEqual({ mode: "inline", pendingCount: 0 });
+		const plan = planStartupPendingScan(["legacy.json"], hasRows, () => ({ promptEmbedding: [0.1] }));
+		expect(plan).toEqual({ mode: "inline", pendingCount: 0, pendingFiles: [] });
 	});
 
 	it("still counts a missing round file as pending even when a rows predicate is supplied", () => {
-		const files = new Map<string, Round>([["a.json", { promptEmbedding: [1] }]]);
 		const hasRows = buildCurrentModelRowPredicate([{ vector: [0.1], filePath: "a.json:prompt", model: "m" }], "m");
-		const plan = planStartupEmbedding(["a.json", "missing.json"], (f) => files.get(f) ?? null, hasRows);
-		expect(plan).toEqual({ mode: "inline", pendingCount: 1 });
+		const plan = planStartupPendingScan(["a.json", "missing.json"], hasRows, () => null);
+		expect(plan).toEqual({ mode: "inline", pendingCount: 1, pendingFiles: ["missing.json"] });
 	});
 
 	// Matches the `just index` sweep, which reindexes a round that has ANY
@@ -830,6 +776,8 @@ describe("planStartupEmbedding (issue #133)", () => {
 			"text-embedding-3-small",
 		);
 		expect(hasRows("mixed.json")).toBe(false);
+		const plan = planStartupPendingScan(["mixed.json"], hasRows, () => ({}));
+		expect(plan).toEqual({ mode: "inline", pendingCount: 1, pendingFiles: ["mixed.json"] });
 	});
 });
 

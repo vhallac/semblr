@@ -704,38 +704,6 @@ export function startupEmbedStatusMessage(plan: StartupEmbedPlan): string {
 }
 
 /**
- * Issue #133: decide how startup should handle embedding for recovered
- * rounds. A round is "pending" when its round file is missing/unreadable or
- * is not covered by current-model vector-index rows. Pure — no I/O beyond the
- * injected reader/predicate.
- *
- * Issue #140 (D1): the pending count keys on index rows, not the
- * `promptEmbedding` marker. A recovered round may already have current-model
- * rows but no marker (rows written by `just index`/recovery without the
- * marker, e.g. after a crash); counting it pending inflated the startup count
- * and made startup and the `just index` sweep disagree. When
- * `hasCurrentModelRows` is omitted the marker is the only evidence available
- * (a missing/unreadable round is always pending), preserving the previous
- * behaviour for callers with no index loaded.
- */
-export function planStartupEmbedding(
-	fileNames: readonly string[],
-	readRoundData: (fileName: string) => { promptEmbedding?: unknown } | null,
-	hasCurrentModelRows?: (fileName: string) => boolean,
-): StartupEmbedPlan {
-	let pendingCount = 0;
-	for (const fileName of fileNames) {
-		if (hasCurrentModelRows?.(fileName)) continue;
-		const round = readRoundData(fileName);
-		if (!round?.promptEmbedding) pendingCount++;
-	}
-	return {
-		mode: pendingCount > STARTUP_EMBED_INLINE_MAX ? "defer" : "inline",
-		pendingCount,
-	};
-}
-
-/**
  * Issue #136: the plan for the startup pending scan. Extends the recovered-
  * rounds embed plan with the list of pending round files so the inline path
  * can run `embedRecoveredRounds` over exactly the scanned candidates instead
@@ -750,7 +718,7 @@ export interface StartupPendingScanPlan extends StartupEmbedPlan {
  * mid-embedding crash from an earlier run. A pure scan over the round
  * directory's file names: a round is pending when it is not covered by
  * current-model vector-index rows AND carries no `promptEmbedding` marker —
- * exactly `planStartupEmbedding`'s pending semantics, so the count and the
+ * the count and the
  * `embedRecoveredRounds` pass cannot disagree (issue #140 D1, decision 010:
  * rows are truth; the marker is derived).
  *
@@ -804,7 +772,7 @@ export async function embedRecoveredRounds(
 		try {
 			// Issue #140 (D1): a round covered by current-model index rows is not
 			// re-embedded, even when its promptEmbedding marker is missing — the
-			// same predicate the start-up count uses (planStartupEmbedding), so the
+			// same predicate the start-up count uses (planStartupPendingScan), so the
 			// count and the pass cannot disagree. A row written without a marker
 			// (e.g. a crash between appends and the marker write) must not spend an
 			// embedding call. Omitted by callers with no index loaded, preserving
